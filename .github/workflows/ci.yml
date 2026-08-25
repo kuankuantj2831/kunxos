@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  TARGET: aarch64-unknown-none
+
+jobs:
+  build:
+    name: build / test / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+          components: rustfmt
+
+      - name: cargo build
+        run: |
+          set -euo pipefail
+          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
+            echo "==> cargo build $m"
+            cargo build --release --target "$TARGET" --manifest-path "$m"
+          done
+
+      - name: cargo test (if any)
+        run: |
+          set -uo pipefail
+          # 仅当源码中存在测试代码时才运行 cargo test；
+          # 裸机 no_std crate（aarch64-unknown-none）无 libtest，跳过测试。
+          if grep -rqE '#\[test\]|#\[cfg\(test\)\]' --include='*.rs' . ; then
+            echo "检测到测试代码，运行 cargo test（宿主架构）"
+            for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
+              cargo test --manifest-path "$m"
+            done
+          else
+            echo "未发现测试代码，跳过 cargo test"
+          fi
+
+      - name: cargo fmt --check
+        run: |
+          set -euo pipefail
+          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
+            echo "==> cargo fmt --check $m"
+            cargo fmt --check --manifest-path "$m"
+          done
+
+      - name: lint.sh
+        run: bash tools/lint.sh
