@@ -1,0 +1,21 @@
+[package]
+name = "rust-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["qemu"]
+qemu = ["kunxhal/qemu"]
+pi4 = ["kunxhal/pi4"]
+
+[dependencies]
+kunxhal = { path = "../kunxhal", default-features = false }
+
+# 裸机环境：panic 直接中止，不展开栈（无 unwinding 支持）
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true

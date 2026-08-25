@@ -4,6 +4,75 @@
 
 ## [Unreleased]
 
+### 五项新功能：符号链接 / virtio-rng / AC97 音频 / 文件管理器 / SMP 调度框架（2025-08-25 轮）
+
+#### 符号链接（SFS + VFS + 系统调用 + shell）
+
+- **SFS 新增 `T_SYM` inode 类型（6）**：目标路径作为文件数据存储，无盘格式
+  变化；`fs_symlink`/`fs_readlink`，`fs_rename` 支持移动链接，`fs_unlink` 天然可删。
+- **VFS 路径解析支持符号链接跟随**：`walk_from` 逐分量行走，绝对目标重新
+  走挂载点、相对目标（含 `..`）从当前目录继续，8 跳环路上限；
+  `resolve_parent` 重构为「目录部分 resolve + 末段不跟随」（可在链接指向的
+  目录下创建/删除文件）；新增 `lstat_path`（不跟随末段）与 `symlink`/`readlink` API。
+- **系统调用**：`symlinkat`（36）实现并移出 ENOSYS 组；`readlinkat`（78）从
+  EINVAL 桩改为真实实现（截断语义）；`s_ifmt`/`dt_of`/statx 补 S_IFLNK/DT_LNK。
+- **shell**：新增 `ln -s` 命令；`ls -l` 显示 `L` 类型与 `-> 目标`；`stat` 显示
+  symlink 类型。
+- **内核启动自检 24 项全过**：绝对/相对/子目录（`../`）目标、open/read 穿透、
+  悬空解析失败、环路 hop 上限、链接指向目录下建文件、mv/unlink、lstat 类型。
+
+#### virtio-rng → /dev/urandom
+
+- 新驱动 `virtio_rng.rs`（DeviceID=4）：单 virtqueue「设备写入」描述符 +
+  轮询 used ring，legacy/modern 兼容；注册字符设备主设备号 10，
+  `/dev/urandom` 与 `/dev/random` 同源；`sys_getrandom` 优先用硬件熵源
+  （无 RNG 回退伪随机）。
+- QEMU 各运行目标加 `-device virtio-rng-device`；实测 `[rng] virtio-rng ready`。
+
+#### AC97 音频（PCI ECAM + AC97 驱动 + 启动提示音）
+
+- **极简 PCI ECAM 层 `pci.rs`**：从设备树解析 `pci-host-ecam-generic` 的 ECAM
+  基址（QEMU 11.x = 0x4010_0000_00），配置空间 MMIO 读写、vendor/device 扫描、
+  I/O BAR 分配（gpex 无固件，驱动自写 BAR）。
+- **AC97 驱动 `ac97.rs`**（Intel 82801AA，QEMU "AC97"）：混音器复位/取消静音/
+  EACS=0 固定 48kHz 立体声 16 位；NABM PCM 输出经 BD 链表 DMA（BD 格式按
+  QEMU 源码语义：低 16 位长度=16 位采样单元、bit31 IOC、bit30 BUP）；
+  正弦波合成（Bhaskara 近似正弦表 + 5ms 淡入淡出）。
+- **启动提示音**（120ms / 880Hz）在启动时自动播放，顺带验证 DMA 播放路径。
+- **端到端验证**：`-audiodev wav` 落盘，WAV 记录 0.242s @ 866Hz 正弦波
+  （目标 880Hz，误差来自整数步进截断）。
+- 内核恒等映射补 40 位物理地址支持：TCR.PS=40 位 + L1[256] 1GB DEVICE 块。
+
+#### 文件管理器应用（apps/files，替换 stub）
+
+- 全新 EL0 应用 `apps/files`：getdents64 列目录 + newfstatat 取大小、
+  按名排序、点击目录进入/`..` 返回/文件打开文本查看器（翻页滚动）、
+  标题栏返回键 + ESC 逐级退出；支持触摸与鼠标输入；CJK 中文界面
+  （`shared/cjk_font_files.rs` 290 字子集）。
+- Makefile 接入：独立构建目标，`/bin/files` 由 stub 占位替换为真应用。
+- **GUI 端到端验证**：驱动 OOBE 完成 → launcher 桌面 → 点击 files 图标 →
+  `[files] starting` → 渲染 540x960 文件列表（截图像素校验标题栏/返回按钮/
+  行/背景色全部正确）。
+
+#### SMP 多核调度框架
+
+- **调度器 SMP 化**（`sched_cfs.rs`）：`CURRENT` 每核独立、全局就绪队列 +
+  每核 idle 任务（槽位=CPU 号）、调度自旋锁（原子 CAS）「跨切换交接」：
+  切换前获取、被切到任务的恢复点释放；`tick`/`yield`/`block`/`resched`/
+  `wake*`/`reap`/`exit` 全部加锁；`start_secondary` 供 secondary 核进入。
+- **首次运行解锁点**：`thread_trampoline`（spawn）与新 `el0_resume_entry`
+  （fork/clone 子任务，先解锁再进 syscall_return_restore）——修复锁交接
+  不变量被首次运行任务打破导致的 fork 后死锁（networkd/OOBE 无法 exec）。
+- **每核 GIC/定时器**：`gic_init_secondary`（GICC per-CPU 偏移 0x20000）、
+  secondary 核自建虚拟定时器 + 调度 tick；`_start`/`secondary_entry` 支持
+  EL2→EL1 降级（secure=on 引导路径）。
+- **QEMU 限制说明**：QEMU 11.1 `-kernel` 直载模式下 secondary 核被
+  powered-off，需 PSCI CPU_ON 唤醒，而该模式无 PSCI 固件（secure=off 的
+  smc 触发 UND，secure=on 的 EL3 桩不实现 PSCI）。`smp_init` 因此默认不
+  调用 PSCI（避免 panic/挂死），多核调度代码在具备 PSCI 的环境（如真实
+  EL3 固件）即可生效；`run-smp` 目标保留用于观察 cpus=N 与单核回退。
+  单核默认路径完整回归（fork/exec/OOBE/launcher 全通，0 PANIC）。
+
 ### GUI 交互修复：OOBE 全步骤可点 + 账号输入框 + 应用占位页 + 应用内鼠标指针（2025-08-25 轮）
 
 - **OOBE 选项可点击**：语言 / 模块勾选 / 地区时区 / 网络跳过 / 协议同意 /
