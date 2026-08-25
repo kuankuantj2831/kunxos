@@ -1,0 +1,9 @@
+# KunxOS inittab：按 action 启动系统服务。
+# 格式：id:runlevels:action:path（id 与 runlevels 留空 -> `::action:path`）
+#   sysinit -> 启动并等待完成（fork/exec 不可用时回退为解释执行脚本）
+#   respawn -> 常驻服务，崩溃后按节流自动重启
+#   once    -> 仅启动一次并等待
+#   wait    -> 启动并等待
+::sysinit:/etc/init.d/S01-network
+::once:/etc/init.d/S03-launcher
+# ::respawn:/bin/sh

@@ -1,0 +1,4 @@
+#!/bin/sh
+# /etc/init.d/S01-network
+echo "[init] starting network..."
+exec /bin/networkd

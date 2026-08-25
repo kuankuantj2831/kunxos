@@ -1,0 +1,19 @@
+[package]
+name = "kunxhal"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["qemu"]
+qemu = []
+pi4 = []
+
+[dependencies]
+
+# 裸机环境：panic 直接中止，不展开栈（无 unwinding 支持）。
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

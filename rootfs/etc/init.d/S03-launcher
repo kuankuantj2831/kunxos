@@ -1,0 +1,4 @@
+#!/bin/sh
+# /etc/init.d/S03-launcher
+echo "[init] starting launcher..."
+exec /bin/launcher

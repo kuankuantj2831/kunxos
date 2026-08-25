@@ -1,0 +1,14 @@
+[package]
+name = "displayd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kunxhal = { path = "../../kunxhal" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

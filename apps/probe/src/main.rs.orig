@@ -1,0 +1,87 @@
+// KunxOS EL0 访问权限探针：验证用户态能否取指/读内核文本（1GB+ 恒等映射区）。
+//
+// 预期行为（若 AP_EL1_RO 正确生效）：
+//   - 跳转到内核文本地址（如 0x400a958c）→ EL0 取指权限故障（ESR EC=0x21）
+//   - 读取内核文本地址 → EL0 读权限故障（ESR EC=0x21）
+// 若出现 EC=0x02（未定义指令）或正常读到内容，说明内核文本对 EL0 可访问
+// （安全缺陷，需修复页表权限）。
+
+#![no_std]
+#![no_main]
+#![allow(static_mut_refs)]
+
+use core::arch::{asm, global_asm};
+use core::panic::PanicInfo;
+
+const SYS_WRITE: usize = 64;
+const SYS_EXIT: usize = 93;
+
+const KERNEL_TEXT: u64 = 0x400b_23bc; // 内核 uart_send_str 地址（当前构建）
+
+#[no_mangle]
+pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
+    // 1. 尝试从内核文本地址读一个字（应触发 EL0 读权限故障）
+    let mut v: u64 = 0;
+    unsafe {
+        asm!(
+            "ldr {v}, [{addr}]",
+            v = lateout(reg) v,
+            addr = in(reg) KERNEL_TEXT,
+        );
+    }
+    print_str("read kernel text OK: 0x");
+    print_hex(v);
+    print_str("\n");
+
+    // 2. 尝试跳转到内核文本地址（应触发 EL0 取指权限故障）
+    print_str("jumping to kernel text...\n");
+    unsafe {
+        asm!(
+            "br {addr}",
+            addr = in(reg) KERNEL_TEXT,
+        );
+    }
+    print_str("returned from kernel text?!\n");
+    0
+}
+
+fn print_str(s: &str) {
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_WRITE,
+            in("x0") 1usize,
+            in("x1") s.as_ptr(),
+            in("x2") s.len(),
+            options(nostack),
+        );
+    }
+}
+
+fn print_hex(v: u64) {
+    let mut buf = [0u8; 16];
+    for i in 0..16 {
+        let nib = ((v >> (60 - i * 4)) & 0xF) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+    }
+    print_str(core::str::from_utf8(&buf).unwrap_or(""));
+}
+
+global_asm!(
+    ".section .text._start, \"ax\"",
+    ".global _start",
+    ".type _start, %function",
+    "_start:",
+    "    mov x2, sp",
+    "    ldr x0, [x2], #8",
+    "    mov x1, x2",
+    "    bl k_main",
+    "    mov x8, #93",
+    "    svc #0",
+    "    b .",
+);
+
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! {
+    loop {}
+}

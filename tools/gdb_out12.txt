@@ -1,0 +1,102 @@
+GNU gdb (GDB) 17.2
+Copyright (C) 2025 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "--host=x86_64-pc-linux-gnu --target=aarch64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+    <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from kunxcore/target/aarch64-unknown-none/release/rust-kernel...
+(No debugging symbols found in kunxcore/target/aarch64-unknown-none/release/rust-kernel)
+Remote debugging using localhost:1234
+[remote] start_remote_1: enter
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+Ignoring packet error, continuing...
+  [remote] packet_ok: Packet qSupported (supported-packets) is supported
+warning: unrecognized item "timeout" in "qSupported" response
+  [remote] Sending packet: $vCont?#49
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] packet_ok: Packet vCont (verbose-resume) is NOT supported
+  [remote] Sending packet: $vMustReplyEmpty#3a
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] Sending packet: $Hg0#df
+  [remote] Received Ack
+  [remote] Packet received: OK
+  [remote] Sending packet: $qTStatus#49
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] packet_ok: Packet qTStatus (trace-status) is NOT supported
+  [remote] Sending packet: $?#3f
+  [remote] Received Ack
+  [remote] Packet received: S05
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Nak
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Nak
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Nak
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Nak
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+Ignoring packet error, continuing...
+  [remote] Sending packet: $Hc-1#09
+  [remote] Received Ack
+  [remote] Packet received: OK
+  [remote] Sending packet: $qC#b4
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] Sending packet: $qAttached#8f
+  [remote] Received Ack
+  [remote] Packet received: 1
+  [remote] packet_ok: Packet qAttached (query-attached) is supported
+  [remote] Sending packet: $qOffsets#4b
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] wait: enter
+    [remote] select_thread_for_ambiguous_stop_reply: enter
+      [remote] select_thread_for_ambiguous_stop_reply: process_wide_stop = 0
+      [remote] select_thread_for_ambiguous_stop_reply: first resumed thread is Thread <main>
+      [remote] select_thread_for_ambiguous_stop_reply: is this guess ambiguous? = 0
+    [remote] select_thread_for_ambiguous_stop_reply: exit
+  [remote] wait: exit
+  [remote] Sending packet: $g#67
+  [remote] Received Ack
+  [remote] Packet received: 00ec144000000000a40e0000000000000700000000000000184d4c400000000000000000000000000040484000000000000000000000000000000000000000002f1a21400000000000502340000000000050234000000000a8162340000000000d0000000000000000001740000000000a000000000000002f1a21400000000000000009000000009000000000000000a50e000000000000184d4c40000000000080000000000000001a2140000000002f000000000000000080000000000000803c4c40000000000000000000000000ffffffff000000000000000000000000e09d2b4000000000a816234000000000e01d4c400000000044370c4000000000 [1064 of 1576 bytes omitted]
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Nak
+  [remote] Sending packet: $qfThreadInfo#bb
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] Sending packet: $qL1200000000000000000#50
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] Sending packet: $m80000345,4#61
+  [remote] Received Ack
+  [remote] Packet received: 
+  [remote] Sending packet: $m80000341,4#5d
+  [remote] Received Nak
+  [remote] Sending packet: $m80000341,4#5d
+  [remote] Received Ack
+[remote] start_remote_1: exit

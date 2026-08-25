@@ -1,0 +1,4 @@
+#!/bin/sh
+# /etc/init.d/S02-display
+# displayd 已废弃：launcher 直接 open/mmap /dev/fb0 绘制，无需合成器。
+echo "[init] display service disabled (launcher uses /dev/fb0 directly)"

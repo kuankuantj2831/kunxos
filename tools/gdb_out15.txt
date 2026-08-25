@@ -1,0 +1,37 @@
+GNU gdb (GDB) 17.2
+Copyright (C) 2025 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "--host=x86_64-pc-linux-gnu --target=aarch64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+    <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from kunxcore/target/aarch64-unknown-none/release/rust-kernel...
+(No debugging symbols found in kunxcore/target/aarch64-unknown-none/release/rust-kernel)
+Remote debugging using localhost:1234
+[remote] start_remote_1: enter
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] Sending packet: $qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;QThreadOptions+;no-resumed+;memory-tagging+;error-message+#89
+  [remote] Received Nak
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+  [remote] getpkt: Timed out.
+Ignoring packet error, continuing...
+  [remote] packet_ok: Packet qSupported (supported-packets) is supported
+warning: unrecognized item "timeout" in "qSupported" response
+  [remote] Sending packet: $vCont?#49
+  [remote] Sending packet: $vCont?#49
+  [remote] Sending packet: $vCont?#49
+  [remote] Sending packet: $vCont?#49
+[remote] start_remote_1: exit

@@ -1,0 +1,15 @@
+[package]
+name = "kunxinit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# 裸机 EL0 用户程序：panic 直接中止，不展开栈（无 unwinding 支持）。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+# 剥离符号表，保证 ELF 小于内核 ELF 加载器的 16KB 缓冲上限。
+strip = "symbols"
