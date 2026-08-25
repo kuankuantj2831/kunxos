@@ -77,6 +77,20 @@ def swipe(x1, y1, x2, y2, steps=10, step_ms=0.012):
     send_frame(frame(FRAME_UP))
     time.sleep(0.1)
 
+def send_esc():
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(MON)
+        s.sendall(b"sendkey esc\n")
+        time.sleep(0.3)
+        try:
+            s.settimeout(0.5); s.recv(4096)
+        except socket.timeout:
+            pass
+        s.close()
+    except Exception:
+        pass
+
 def shot(name):
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -120,21 +134,24 @@ try:
     time.sleep(1.5)
     shot("00_desktop_page0.ppm")
 
-    # 第 0 页 9 个应用（icon 中心）
+    # 第 0 页 12 个应用（3x4 网格，icon 中心）
     page0 = [
-        ("phone",    130, 100, "PHONE"),
-        ("sms",      270, 100, "SMS"),
-        ("contacts", 410, 100, "Contacts"),
-        ("settings", 130, 228, "Settings"),
-        ("files",    270, 228, "Files"),
-        ("browser",  410, 228, "Browser"),
-        ("calc",     130, 356, "Calculator"),
-        ("calendar", 270, 356, "Calendar"),
-        ("camera",   410, 356, "Camera"),
+        ("phone",    130, 100, "Phone",     "[phone] ready"),
+        ("sms",      270, 100, "SMS",       "[sms] ready"),
+        ("contacts", 410, 100, "Contacts",  "[contacts] ready"),
+        ("settings", 130, 228, "Settings",  "[settings] ready"),
+        ("files",    270, 228, "Files",     "[files] ready"),
+        ("browser",  410, 228, "Browser",   "[browser] ready"),
+        ("calc",     130, 356, "Calculator","[calculator] ready"),
+        ("calendar", 270, 356, "Calendar",  "[calendar] ready"),
+        ("camera",   410, 356, "Camera",    "[camera] ready"),
+        ("clock",    130, 484, "Clock",     "[clock] ready"),
+        ("gallery",  270, 484, "Gallery",   "[gallery] ready"),
+        ("music",    410, 484, "Music",     "[music] ready"),
     ]
-    for name, x, y, disp in page0:
+    for name, x, y, disp, marker in page0:
         tap(x, y)
-        ok = wait_for("[%s] ready" % name, 20)
+        ok = wait_for(marker, 20)
         time.sleep(0.8)
         shot("01_%s.ppm" % name)
         tap(24, 24)  # 返回键
@@ -149,28 +166,30 @@ try:
     shot("02_desktop_page1.ppm")
 
     page1 = [
-        ("clock",    130, 100, "Clock"),
-        ("gallery",  270, 100, "Gallery"),
-        ("music",    410, 100, "Music"),
-        ("mail",     130, 228, "Mail"),
-        ("map",      270, 228, "Maps"),
-        ("weather",  410, 228, "Weather"),
-        ("store",    130, 356, "Store"),
-        ("terminal", 270, 356, "Terminal"),
+        ("mail",    130, 100, "Mail",     "[mail] ready"),
+        ("map",     270, 100, "Maps",     "[map] ready"),
+        ("weather", 410, 100, "Weather",  "[weather] ready"),
+        ("store",   130, 228, "Store",    "[store] ready"),
+        ("terminal", 270, 228, "Terminal","[terminal] interactive shell ready"),
     ]
-    for name, x, y, disp in page1:
+    for name, x, y, disp, marker in page1:
         tap(x, y)
-        ok = wait_for("[%s] ready" % name, 20)
+        ok = wait_for(marker, 20)
         time.sleep(0.8)
         shot("03_%s.ppm" % name)
-        tap(24, 24)
-        back = wait_for("app '%s' exited" % disp, 20)
+        if name == "terminal":
+            # 终端无触摸返回键：经 QEMU monitor 发送 ESC
+            send_esc()
+            back = wait_for("app '%s' exited" % disp, 20)
+        else:
+            tap(24, 24)
+            back = wait_for("app '%s' exited" % disp, 20)
         time.sleep(0.6)
         results.append((name, ok and back))
         print("%s: ready=%s back=%s" % (name, ok, back))
 
-    # 交互抽查：phone 拨号 + 呼叫
-    swipe(400, 500, 120, 500)
+    # 交互抽查：phone 拨号 + 呼叫（先右滑回第 0 页）
+    swipe(120, 500, 400, 500)
     time.sleep(0.8)
     tap(130, 100)  # phone
     wait_for("[phone] ready", 20)
@@ -199,10 +218,8 @@ try:
     wait_for("app 'Calendar' exited", 20)
     print("calendar interaction done")
 
-    # 交互抽查：music 播放/暂停
-    swipe(400, 500, 120, 500)
-    time.sleep(0.8)
-    tap(410, 100)  # music (page1 slot2)
+    # 交互抽查：music 播放/暂停（第 0 页 row3 col2）
+    tap(410, 484)  # music
     wait_for("[music] ready", 20)
     time.sleep(0.5)
     tap(288, 608)  # 播放/暂停
@@ -214,10 +231,8 @@ try:
     wait_for("app 'Music' exited", 20)
     print("music interaction done")
 
-    # 交互抽查：browser 书签
-    swipe(400, 500, 120, 500)
-    time.sleep(0.8)
-    tap(410, 228)  # browser (page0 slot5)
+    # 交互抽查：browser 书签（第 0 页 slot5）
+    tap(410, 228)  # browser
     wait_for("[browser] ready", 20)
     time.sleep(0.5)
     tap(60, 148)  # 第一个书签「主页」

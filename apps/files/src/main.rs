@@ -887,7 +887,7 @@ fn render_list() {
         }
         // 底部提示
         draw_text(12, DISPLAY_H as i32 - 20, "点击进入 / 返回上级".as_bytes(), C_DIM);
-        let mut cnt = [0u8; 8];
+        let mut cnt = [0u8; 32];
         let mut off = 0usize;
         for &c in "共 ".as_bytes() {
             cnt[off] = c;
@@ -1358,9 +1358,25 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
     unsafe {
-        write_fd(2, b"PANIC: files\n");
+        write_fd(2, b"PANIC: files @ ");
+        if let Some(loc) = info.location() {
+            let f = loc.file().as_bytes();
+            let fl = f.len().min(48);
+            write_fd(2, &f[f.len() - fl..]);
+            write_fd(2, b":");
+            let mut nb = [0u8; 8];
+            let mut i = nb.len();
+            let mut v = loc.line() as u64;
+            while v > 0 {
+                i -= 1;
+                nb[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+            write_fd(2, &nb[i..]);
+        }
+        write_fd(2, b"\n");
         syscall1(SYS_EXIT, 1);
     }
     loop {}
