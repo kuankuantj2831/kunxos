@@ -749,9 +749,22 @@ pub(crate) fn put_pixel(x: i32, y: i32, color: u32) {
 }
 
 pub(crate) fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            put_pixel(x + dx, y + dy, color);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    // 先整体裁剪再逐行 slice::fill（宽通道 memset）：逐像素 put_pixel 的
+    // 每像素 4 次边界检查降为每行一次。
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(DISPLAY_W as i32);
+    let y1 = (y + h).min(DISPLAY_H as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    unsafe {
+        for yy in y0..y1 {
+            let base = yy as usize * DISPLAY_W + x0 as usize;
+            BACK_BUF[base..base + (x1 - x0) as usize].fill(color);
         }
     }
 }

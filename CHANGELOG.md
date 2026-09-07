@@ -137,8 +137,9 @@
 - **字形缓存扫描局部化**：256 槽线性扫描落在连续 2KB 的键旁路数组
   `GLYPH_KEYS`（此前每字符每帧跨 1KB 步长扫 256KB）；`cache_store` 就地
   写字段（去掉每次未命中 1KB 栈临时）。
-- **fill_rect 行填充**：app_kit / launcher 两处逐像素 `put_pixel`（每像素 4
-  次边界比较）改为整体裁剪 + 逐行 `slice::fill`（宽通道 memset）。
+- **fill_rect 行填充**：app_kit / launcher / calculator / terminal / stub /
+  oobe / settings 共 7 处逐像素 `put_pixel`（每像素 4 次边界比较）改为整体
+  裁剪 + 逐行 `slice::fill`（宽通道 memset）。
 - **app_kit 字形混合**：三个 TTF 字形路径（cn/bold/icon）共用 `blit_glyph`
   —— 求交一次、直写 BACK_BUF、a==255 直通（此前每像素 4 比较 + put_pixel
   再检查 + 全 alpha 走 blend）。
