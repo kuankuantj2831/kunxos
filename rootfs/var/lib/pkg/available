@@ -19,7 +19,7 @@ Provides: calc
 Description: KunxOS 计算器（示例）
 Filename: calculator-1.0.0.kunx
 Size: 108266
-KunxHash: 7eae2da68359d1b06c498a322613d075
+KunxHash: 1423eed9a9195b70bdef698656fd560b
 SignedBy: kunx-repo
 
 Package: terminal
@@ -31,6 +31,6 @@ Provides: term
 Description: 系统终端模拟器
 Filename: terminal-1.1.0.kunx
 Size: 150177
-KunxHash: 1a3b1f88ae5c065dec1abf3f151793fc
+KunxHash: 48eefbe42007a1d6f53506c2afc24d2a
 SignedBy: kunx-repo
 

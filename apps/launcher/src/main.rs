@@ -6768,6 +6768,9 @@ fn handle_gesture(g: Gesture) -> bool {
 ///
 /// 注意：鼠标移动不再触发整屏重绘 —— process_events 只置 CURSOR_DIRTY，
 /// 主循环走 `move_cursor_fb`（overlay 快速路径），只有手势/状态变化才整屏重绘。
+/// 最近一次输入事件到达时刻（丢抬起看门狗用）。
+static mut LAST_EV_US: u64 = 0;
+
 fn handle_input(input_fd: isize) -> bool {
     let mut redraw = false;
     loop {
@@ -6778,6 +6781,7 @@ fn handle_input(input_fd: isize) -> bool {
         if n <= 0 {
             break; // EAGAIN（无事件）或读取错误
         }
+        unsafe { LAST_EV_US = now_us(); }
         let (g, _moved) = process_events(&buf[..n as usize]);
         if let Some(g) = g {
             if handle_gesture(g) {
@@ -7248,6 +7252,25 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 DRAG_X = x;
                 DRAG_Y = y;
                 NEEDS_REDRAW = true;
+            }
+        }
+
+        // 2.44 丢抬起事件看门狗：任一跟手拖拽态激活但按压态持续 2 秒无
+        // 任何输入事件 → BTN_TOUCH up 已丢失（注入帧被风暴窗口吞掉/设备
+        // 异常）—— 清除按压态，让下方「抬手兜底」收敛全部跟手状态。否则
+        // 翻页/控制中心/锁屏/最近任务跟手永久停摆，120Hz 预算重绘不退。
+        // 仅在拖拽态激活时触发：正常长按（无拖拽）不受影响。
+        if unsafe { TOUCH.pressed } && now.saturating_sub(unsafe { LAST_EV_US }) > 2_000_000 {
+            unsafe {
+                let drag_stuck = PAGE_DRAG
+                    || LOCK_DRAG
+                    || REC_DRAG_SLOT != usize::MAX
+                    || control_center::shade_drag_active()
+                    || DRAG_ACTIVE;
+                if drag_stuck {
+                    print("[input] 抬起事件丢失（2s 无输入），自动结算跟手状态\n");
+                    TOUCH.pressed = false;
+                }
             }
         }
 
