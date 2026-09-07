@@ -1371,7 +1371,14 @@ fn cc_tile(x: i32, y: i32, size: i32, r: i32, on: bool, icon: u8, scale: f32) {
 fn cc_fill_round_blend(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, a: u32) {
     for dy in 0..h {
         for dx in 0..w {
-            if in_round_rect(dx, dy, w, h, r) {
+            // 仅四角盒做超采样预判（与 glass_rect_style 同款）：圆角矩形
+            // 内部（四个 r×r 角盒之外）的像素免去每像素的浮点
+            // in_round_rect 求值（面板滑条/开关 ~80% 像素）。
+            let not_corner = !((dx < r && dy < r)
+                || (dx >= w - r && dy < r)
+                || (dx < r && dy >= h - r)
+                || (dx >= w - r && dy >= h - r));
+            if not_corner || in_round_rect(dx, dy, w, h, r) {
                 let px = x + dx;
                 let py = y + dy;
                 if px >= 0 && py >= 0 && px < DISPLAY_W as i32 && py < DISPLAY_H as i32 {

@@ -5832,6 +5832,12 @@ fn recents_hit(x: i32, y: i32) -> Option<usize> {
 /// 绘制最近任务面板：全屏压暗 + 液态玻璃卡片网格（图标 + 名称）。
 /// 动效（对标 ColorOS 15）：打开时卡片按槽位错峰上滑入场；关闭时整体下滑
 /// + 压暗淡出；卡片可按住上拖清理（跟手 → 上飞出屏 → 其余卡片补位）。
+/// 最近任务压暗底图缓存：面板打开期间桌面背景静止（仅卡片运动），打开后
+/// 首帧把「已绘桌面 + 全屏压暗」存入 REC_BG_BUF，动画帧整块 memcpy 替代
+/// 52 万像素的逐像素 blend。失效：壁纸交叉淡化期间（背景逐帧变化）。
+static mut REC_BG_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0; DISPLAY_W * DISPLAY_H];
+static mut REC_BG_OK: bool = false;
+
 fn draw_recents() {
     unsafe {
         let now = now_us();
@@ -5842,11 +5848,27 @@ fn draw_recents() {
             0.0
         };
         let dim = (170.0 * (1.0 - close_e)) as u32;
+        if wallpaper_fade_active() {
+            REC_BG_OK = false;
+        }
         if dim > 0 {
-            // 全屏压暗（在已绘制的桌面上混合，随关闭淡出）。
-            for i in 0..DISPLAY_W * DISPLAY_H {
-                BACK_BUF[i] = blend(BACK_BUF[i], 0x00_05_0A_14, dim);
+            if REC_BG_OK && !RECENTS_CLOSING && close_e == 0.0 {
+                // 缓存命中：整块恢复「桌面 + 压暗」底图。
+                BACK_BUF[..DISPLAY_W * DISPLAY_H].copy_from_slice(&REC_BG_BUF);
+            } else {
+                // 全屏压暗（在已绘制的桌面上混合，随关闭淡出），并存入缓存
+                // （关闭动画期间进度变化，不缓存）。
+                for i in 0..DISPLAY_W * DISPLAY_H {
+                    let c = blend(BACK_BUF[i], 0x00_05_0A_14, dim);
+                    BACK_BUF[i] = c;
+                    REC_BG_BUF[i] = c;
+                }
+                if !RECENTS_CLOSING {
+                    REC_BG_OK = true;
+                }
             }
+        } else {
+            REC_BG_OK = false;
         }
         let drop = (12.0 * close_e) as i32;
         let title = txt("RECENT APPS", "最近任务");
@@ -6026,6 +6048,7 @@ fn recents_advance(now: u64) -> bool {
         if RECENTS_CLOSING {
             if now.saturating_sub(RECENTS_CLOSE_T0) >= 150_000 {
                 RECENTS_OPEN = false;
+                REC_BG_OK = false;
                 RECENTS_CLOSING = false;
                 NEEDS_REDRAW = true;
             } else {
@@ -6770,6 +6793,8 @@ fn handle_gesture(g: Gesture) -> bool {
 /// 主循环走 `move_cursor_fb`（overlay 快速路径），只有手势/状态变化才整屏重绘。
 /// 最近一次输入事件到达时刻（丢抬起看门狗用）。
 static mut LAST_EV_US: u64 = 0;
+/// 主循环帧计数（低频轮询分频用）。
+static mut POLL_DIV: u32 = 0;
 
 fn handle_input(input_fd: isize) -> bool {
     let mut redraw = false;
@@ -7114,7 +7139,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             continue;
         }
         // 0.5 桌面期间：处理 lifd 事件（LMK 击杀后台应用 → 回收清理）。
-        if poll_background_events() {
+        // 每 4 帧轮询一次（lifd 事件低频；此前每帧一次 open(ENOENT) 的
+        // 空 syscall 占掉主循环预算）。
+        let poll_div = unsafe { POLL_DIV.wrapping_add(1) };
+        unsafe { POLL_DIV = poll_div };
+        if poll_div & 3 == 0 && poll_background_events() {
             unsafe {
                 NEEDS_REDRAW = true;
             }
