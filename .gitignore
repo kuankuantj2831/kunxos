@@ -17,3 +17,10 @@ kunxos.dtb
 *.pyc
 __pycache__/
 subprocess
+
+# 本地工具/会话状态（不入库；曾被误加进索引）
+.zcode/
+.v2c/
+.video_agent/
+.audit_draft.md
+null
