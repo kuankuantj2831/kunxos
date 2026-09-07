@@ -51,6 +51,13 @@ pub extern "C" fn irq_handler() {
         static mut STORM_N: u64 = 0;
         if irq == STORM_IRQ {
             STORM_N += 1;
+            // 风暴期间 CPU 被同号中断持续重入占据（episode 可达数百 ms），
+            // 远超 PL011 RX FIFO 的 ~1.4ms 容量 —— 仅在转储时刻排空 RX 不够。
+            // 每 256 次重入主动排空一次（一次 volatile 读，常态零开销），
+            // 注入的触摸帧/终端输入不再按帧丢失。
+            if STORM_N & 0xFF == 0 {
+                crate::uart_rx_drain();
+            }
         } else {
             STORM_IRQ = irq;
             STORM_N = 0;
@@ -78,6 +85,9 @@ pub extern "C" fn irq_handler() {
             crate::uart_send_str(" pid=");
             crate::print_dec(crate::process::current_pid() as u64);
             crate::uart_send_str("\n");
+            // 转储全程 IRQ 关闭且逐字节忙等 TX（~13ms）：间隙主动排空
+            // UART RX，避免 16 字节硬件 FIFO 溢出丢输入。
+            crate::uart_rx_drain();
         }
         // 风暴护栏（冷路径，每次风暴 episode 只执行一次）：把风暴源中断号从
         // GICD 层禁用（GICD_ICENABLERn 写 1 清除对应 enable 位，复用

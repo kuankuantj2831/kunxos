@@ -159,6 +159,74 @@
   calendar/contacts/map/weather/stub 等）、iOS 系统绿 `0x34C759`（settings
   开关/图标、clock 开关）、变体绿 `0x1ABB5E`（sms）—— 22 个文件统一。
 
+### 2026-09-07 第二轮（内核测试全绿 + 玻璃带缓存 + 内核级修复）
+
+> 目标：把此前一直红着的内核级无头回归全部拉绿（power 18/21 → 21/21，
+> lifecycle-core 0/38 → 38/38），并落地剩余的性能项。`make` 全量构建
+> exit 0 / 0 警告。
+
+#### 内核修复
+
+- **双 shell 劈开 UART 输入流**：bootargs `shell` 先拉起一个内置 shell，
+  /init 退出后又回退拉起第二个 —— 两个 shell 并发读同一 UART，自动化注入
+  的命令按字节被劈成两半（`cat /proc/pressur|e`），双方都不执行。init
+  退出路径在 BOOT_SHELL 已有时不再重复 spawn。
+- **lifd 多段日志被 log() 强制换行拆行**：`[lifd] 已登记 ` 与
+  `appA pid=N FG` 被拆成两行（第二行丢失 [lifd] 前缀），影响日志可读性
+  与自动化匹配。新增 `log_raw`（无换行），10 处拼接式消息（已登记/
+  已转入后台/已回前台/已终止/已挂起/已到期/通知已投递/已延迟/已丢弃/
+  后台任务已授予）改整行输出；补上立即投递路径缺失的 `通知已投递` 日志。
+- **风暴饿死 UART RX**：转储 ~150 字符在 IRQ 关闭下逐字节忙等 ≈13ms，
+  PL011 16 字节硬件 FIFO（115200 下 ~1.4ms 填满）溢出即丢输入字节。抽出
+  `uart_rx_drain()`：风暴转储间隙主动排空，且风暴 episode 每 256 次同号
+  重入排空一次（一次 volatile 读，常态零开销）—— 注入帧不再按帧丢失。
+- **启动期电源自检结论被安静模式吞掉**：违反 kinfo! 自身的日志规范
+  （「自检 PASS-FAIL 必须可见」），`[kernel] 电源自检完成：N 个失败` 改为
+  无条件输出；shell `power selftest` 输出与启动期格式统一
+  （`自检完成: N 个失败项` → `自检完成：N 个失败`）。
+
+#### 服务
+
+- **pushd 恢复开机自启**：本地通知队列（/data/push/in → lifd DELIVER）
+  随 pushd 被移出 init 启动列表而整体不可用，通知推送链路（含
+  lifecycle-core 推送断言）重新接通。
+
+#### 测试修复（测试与实现脱节）
+
+- **power_test**：`dvfs switch logged` 依赖 kinfo 门控的 `[power] dvfs`
+  行 —— 安静模式默认开启后永远无法命中；改为 shell `verbose on`（热节流
+  段前，等待启动日志洪水沉降）+ bootargs 补 `selftest`（启动期自检根本
+  未运行）；(shell) 自检字节串与实现漂移按统一后格式匹配。21/21。
+- **lifecycle_core_test**：启动语中文化后断言仍匹配英文（lifd/pushd
+  starting、registered/background/foreground/granted/denied/expired/
+  suspend/terminated/deferred 等十余处）；`BTASK 3` 前缺 `BTASK_END`
+  （每应用上限 2 已满，短任务恒被拒，到期路径不可达）；「notify
+  forwarded」期望的日志此前不存在。38/38。
+
+#### 性能（第二轮）
+
+- **状态栏 / Dock 玻璃带缓存**：玻璃源只是壁纸，键 =（调色板，主题），
+  命中时按行 memcpy（~4.2 万重像素/帧的降采样+模糊+着色归零）；换壁纸
+  交叉淡化期间键逐帧变化、自动回落实算。
+- **最近任务卡片启动快照残影**：卡片点击启动不再播 150ms 关闭动画
+  （快照含面板残影），直接复位面板状态后从卡片位置放大。
+
+#### 回归稳定性（风暴窗口丢帧 → 注入验证重试）
+
+- 全应用回归 page-1 应用（map/store/video/notes）稳定 FAIL：注入的滑动
+  MOVE 帧在内核风暴窗口丢字节 → 手势判定退化为原地长按（Gesture::None
+  静默）→ 翻页未生效，脚本却盲目递增本地页码状态，随后的瓦片点击命中
+  第 0 页的其它应用。修复两层：launcher 翻页结算打印 `[launcher] page=N`
+  （此前翻页对外不可观测）；回归脚本 goto_page 改为按页码日志确认、
+  未生效重试（最多 4 次），不再假设滑动必然生效。14/14 PASS 恢复。
+
+#### 其它
+
+- 删除死代码模块 `kunxcore/src/input_stack.rs`（无调用点，且 grab 裸
+  窗口 id 有复用隐患）。
+- launcher：锁屏快扫解锁阈值与跟手结算对齐（>18% 屏高或 >600px/s，此前
+  任何 ≥30px 上滑轻扫直接解锁）。
+
 ### 动画渲染提速（2026-09-07 轮）
 
 动画帧的三大逐像素热点改为缓存/整块拷贝，输出逐位一致：

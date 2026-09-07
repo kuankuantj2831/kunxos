@@ -1255,5 +1255,32 @@ QEMU GUI 模式偶发 `EL0 fault pid=N ESR=... ELR=0`（eret 到 PC=0，用户�
 ### 验证
 
 - `make` 全量构建 exit 0、**0 警告**；宿主测试 sync_tests 57 / wireless 105。
-- 全应用回归（apps_regression.py）：结果见下轮记录。
+- 全应用回归（apps_regression.py）：**14/14 PASS** + 4 项交互抽查全过。
 - QEMU 无头 `-kernel` 冒烟：启动链完整、0 PANIC / 0 EL0 fault。
+
+---
+
+## 十七、2026-09-07 第二轮（内核测试全绿 + 玻璃带缓存 + 内核级修复）
+
+> 上一轮验证遗留的三项内核级无头回归此轮全部拉绿：power 18/21 → **21/21**、
+> lifecycle-core 0/38 → **38/38**、sfsrace/wifi PASS。详见 CHANGELOG 同名章节，
+> 摘要：
+
+- **双 shell 劈开 UART 输入流**（bootargs shell + init 退出回退 spawn）：
+  自动化注入命令按字节被两个并发 shell 劈开，双方都不执行。init 退出时
+  不再重复拉起。
+- **lifd log() 强制换行拆行多段日志**：新增 log_raw，10 处拼接消息改整行；
+  补「通知已投递」日志。
+- **风暴转储（IRQ 关闭 ~13ms 忙等 TX）饿死 PL011 RX FIFO**：抽出
+  `uart_rx_drain()`，转储间隙主动排空 RX —— 终端粘贴/自动化注入不再截断。
+- **pushd 恢复开机自启**：本地通知推送链路重新接通。
+- **power_test / lifecycle_core_test 与实现脱节修复**：verbose 门控、
+  bootargs selftest、中文化断言、BTASK_END 前置步骤等。
+- **状态栏/Dock 玻璃带缓存**（键 = 调色板+主题，命中按行 memcpy）；
+  最近任务卡片启动快照残影消除；删除死代码 input_stack 模块；锁屏快扫
+  解锁阈值与跟手结算对齐。
+
+### 验证
+
+- `make` exit 0 / 0 警告；sfsrace PASS / wifi PASS / power 21/21 /
+  lifecycle-core 38/38；宿主 sync 57 / wireless 105；全应用回归结果见下。

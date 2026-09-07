@@ -1621,8 +1621,15 @@ fn lock_swipe_settle(dy: i32, dur_ms: u64) {
         }
         let h = DISPLAY_H as f32;
         if !LOCK_DRAG {
-            // 未进入跟手（快速轻扫直接抬起）：按手势位移判定。
-            if dy < 0 {
+            // 未进入跟手（快速轻扫直接抬起）：与跟手结算同一阈值
+            // （>18% 屏高或上滑速度 >600px/s 才解锁）—— 此前任何 dy<0 的
+            // 轻扫（含从键盘区起手的 30px 误触）都会直接解锁。
+            let vel = if dur_ms > 0 {
+                dy as f32 / dur_ms as f32 * 1000.0
+            } else {
+                0.0
+            };
+            if dy < 0 && ((-dy) as f32 > h * 0.18 || vel < -600.0) {
                 LOCK_FROM = 0.0;
                 unlock_success();
             }
@@ -3088,9 +3095,32 @@ fn time_hhmm(buf: &mut [u8; 5]) {
 
 // ==================== 桌面渲染 ====================
 
+/// 状态栏玻璃带缓存：玻璃源只是壁纸（网格内容不落入该带），键 =
+/// (调色板, 主题)。玻璃渲染是逐像素降采样+模糊+着色（~1.3 万重像素），
+/// 翻页/最近任务等动画每帧都经 draw_desktop_full 重画，命中时按行 memcpy。
+static mut GLASS_SB_BUF: [u32; STATUS_H as usize * DISPLAY_W] =
+    [0; STATUS_H as usize * DISPLAY_W];
+static mut GLASS_SB_KEY: ((u32, u32, u32), bool) =
+    ((u32::MAX, u32::MAX, u32::MAX), false);
+
+/// 命中缓存时按行恢复状态栏玻璃带；未命中时实算并回填缓存。
+fn draw_glass_status_band() {
+    unsafe {
+        let key = (wallpaper_colors(), THEME_DARK);
+        let rows = STATUS_H as usize * DISPLAY_W;
+        if GLASS_SB_KEY == key {
+            BACK_BUF[..rows].copy_from_slice(&GLASS_SB_BUF[..rows]);
+            return;
+        }
+        draw_glass(0, 0, DISPLAY_W as i32, STATUS_H, 0);
+        GLASS_SB_BUF[..rows].copy_from_slice(&BACK_BUF[..rows]);
+        GLASS_SB_KEY = key;
+    }
+}
+
 fn draw_status_bar() {
     // 液态玻璃状态栏：模糊壁纸 + 浅色着色 + 底部高光描边（深色文字/图标）。
-    draw_glass(0, 0, DISPLAY_W as i32, STATUS_H, 0);
+    draw_glass_status_band();
     // 左侧：时间
     let mut hhmm = [0u8; 5];
     time_hhmm(&mut hhmm);
@@ -3633,6 +3663,11 @@ fn page_settle(dir: i32, vel: f32) {
                     PAGE_OFFSET - w
                 };
                 CURRENT_PAGE = np as usize;
+                // 页码结算日志：宿主回归脚本据此确认翻页是否生效
+                // （注入帧在风暴窗口可能丢字节 → 滑动丢失，脚本重试）。
+                print("[launcher] page=");
+                print_dec(CURRENT_PAGE as u32);
+                print("\n");
             }
         }
         PAGE_ANIM = true;
@@ -3704,10 +3739,48 @@ fn dock_rect(i: usize) -> (i32, i32) {
     }
 }
 
+/// Dock 玻璃带缓存（同状态栏规则）：带区 = [12, 12+516) × [DOCK_Y+2,
+/// DOCK_Y+2+56)，516×56 ≈ 2.9 万重像素/帧。
+const DOCK_GX: i32 = 12;
+const DOCK_GW: usize = (DISPLAY_W as i32 - 24) as usize;
+const DOCK_GH: usize = (DOCK_H - 4) as usize;
+static mut GLASS_DOCK_BUF: [u32; DOCK_GH * DOCK_GW] = [0; DOCK_GH * DOCK_GW];
+static mut GLASS_DOCK_KEY: ((u32, u32, u32), bool) =
+    ((u32::MAX, u32::MAX, u32::MAX), false);
+
+/// 命中缓存时按行恢复 Dock 玻璃带；未命中时实算并回填缓存。
+fn draw_glass_dock_band() {
+    unsafe {
+        let key = (wallpaper_colors(), THEME_DARK);
+        let y0 = (DOCK_Y + 2) as usize;
+        if GLASS_DOCK_KEY == key {
+            for r in 0..DOCK_GH {
+                let base = (y0 + r) * DISPLAY_W + DOCK_GX as usize;
+                BACK_BUF[base..base + DOCK_GW]
+                    .copy_from_slice(&GLASS_DOCK_BUF[r * DOCK_GW..(r + 1) * DOCK_GW]);
+            }
+            return;
+        }
+        draw_glass(
+            DOCK_GX,
+            DOCK_Y + 2,
+            DOCK_GW as i32,
+            DOCK_GH as i32,
+            30,
+        );
+        for r in 0..DOCK_GH {
+            let base = (y0 + r) * DISPLAY_W + DOCK_GX as usize;
+            GLASS_DOCK_BUF[r * DOCK_GW..(r + 1) * DOCK_GW]
+                .copy_from_slice(&BACK_BUF[base..base + DOCK_GW]);
+        }
+        GLASS_DOCK_KEY = key;
+    }
+}
+
 fn draw_dock() {
     // 悬浮液态玻璃 Dock：圆角药丸（模糊壁纸 + 浅色着色 + 顶部高光描边），
     // 图标仍绘制在原有 dock_rect 位置上，命中逻辑不变。
-    draw_glass(12, DOCK_Y + 2, DISPLAY_W as i32 - 24, DOCK_H - 4, 30);
+    draw_glass_dock_band();
     unsafe {
         let limit = if BOOT_ACTIVE { BOOT_LIMIT } else { usize::MAX };
         for i in 0..DOCK_COUNT {
@@ -6419,7 +6492,19 @@ fn handle_gesture(g: Gesture) -> bool {
                             }
                         }
                     }
-                    recents_close();
+                    // 不走 150ms 关闭动画：启动转场立即从卡片放大覆盖全屏，
+                    // 动画期快照桌面时不再绘制面板（否则快照带面板残影）。
+                    // 直接复位面板状态（recents_open 打开时全部重建，无残留）。
+                    unsafe {
+                        RECENTS_OPEN = false;
+                        RECENTS_CLOSING = false;
+                        REC_DRAG_SLOT = usize::MAX;
+                        REC_FLY_APP = usize::MAX;
+                        REC_BACK = false;
+                        REC_BACK_SLOT = usize::MAX;
+                        REC_SHIFT_T0 = 0;
+                        REC_REMOVED_SLOT = usize::MAX;
+                    }
                     start_launch(i);
                 } else {
                     print("[input] 点击关闭最近任务\n");

@@ -925,9 +925,11 @@ pub fn handle_cmd(args: &[&str]) -> i32 {
         }
         "selftest" => {
             let fails = selftest();
-            crate::uart_send_str("[power] 自检完成: ");
+            // 与启动期自检结论（[kernel] 电源自检完成：N 个失败）同格式；
+            // power_test.py (shell) 断言按此匹配。
+            crate::uart_send_str("[power] 自检完成：");
             crate::print_dec(fails as u64);
-            crate::uart_send_str(" 个失败项\n");
+            crate::uart_send_str(" 个失败\n");
             fails as i32
         }
         _ => -1,

@@ -144,7 +144,7 @@ mod gpu_simple;
 mod gesture;
 mod heap;
 mod input;
-mod input_stack;
+
 mod interrupt;
 mod ipc;
 mod linux_compat;
@@ -543,7 +543,6 @@ pub(crate) fn uart_take_dropped() -> usize {
     d
 }
 
-
 // ==================== 数字打印 ====================
 
 /// 打印无符号 64 位整数（十六进制，带 0x 前缀，固定 16 位）
@@ -616,33 +615,40 @@ unsafe fn read_elr_el1() -> u64 {
     v
 }
 
-
 // ==================== UART 中断处理 ====================
 
 /// UART 接收中断：读取所有可用字符并送入接收环形缓冲（不在此回显，
 /// 回显由消费方如 shell 的行编辑完成）。
 fn uart_handle_rx() {
+    unsafe { uart_rx_drain() };
+    let uart = uart();
+    // 清除接收中断与接收超时中断
+    unsafe {
+        write_volatile(&mut uart.icr, ICR_RXIC | ICR_RTIC);
+    }
+}
+
+/// 排空 UART 接收 FIFO 并按正常路径分发（输入子系统优先，其余入 tty 环形缓冲）。
+///
+/// 供两处调用：RX 中断处理本体，以及 IRQ 关闭的长 TX 路径（风暴转储等）
+/// 的间隙轮询 —— PL011 RX FIFO 仅 16 字节（115200 下 ~1.4ms 填满），转储
+/// 忙等超过该窗口会静默丢输入字节（终端粘贴/自动化测试注入被截断）。
+pub(crate) unsafe fn uart_rx_drain() {
     let uart = uart();
     // 只要接收 FIFO 非空（RXFE=0）就读取
-    while unsafe { read_volatile(&uart.fr) } & FR_RXFE == 0 {
-        let c = unsafe { read_volatile(&uart.dr) } as u8;
+    while read_volatile(&uart.fr) & FR_RXFE == 0 {
+        let c = read_volatile(&uart.dr) as u8;
         // 触摸协议帧优先：被输入子系统消费的字节不再进入 tty/shell 缓冲
         if input::feed_uart_byte(c) {
             continue;
         }
-        unsafe {
-            if UART_RX_COUNT < UART_RX_BUF_SIZE {
-                UART_RX_BUF[UART_RX_TAIL] = c;
-                UART_RX_TAIL = (UART_RX_TAIL + 1) % UART_RX_BUF_SIZE;
-                UART_RX_COUNT += 1;
-            } else {
-                UART_RX_DROPPED = UART_RX_DROPPED.saturating_add(1);
-            }
+        if UART_RX_COUNT < UART_RX_BUF_SIZE {
+            UART_RX_BUF[UART_RX_TAIL] = c;
+            UART_RX_TAIL = (UART_RX_TAIL + 1) % UART_RX_BUF_SIZE;
+            UART_RX_COUNT += 1;
+        } else {
+            UART_RX_DROPPED = UART_RX_DROPPED.saturating_add(1);
         }
-    }
-    // 清除接收中断与接收超时中断
-    unsafe {
-        write_volatile(&mut uart.icr, ICR_RXIC | ICR_RTIC);
     }
 }
 
@@ -1057,11 +1063,12 @@ fn init_main(_: usize) -> ! {
     if crate::bootargs_selftest() {
         kinfo! { crate::uart_send_str("[kernel] 电源自检开始\n"); }
         let power_fails = power::selftest();
-        kinfo! {
-            crate::uart_send_str("[kernel] 电源自检完成：");
-            crate::print_dec(power_fails as u64);
-            crate::uart_send_str(" 个失败\n");
-        }
+        // 自检 PASS/FAIL 结论必须可见（不受安静模式门控 —— 见 kinfo! 的
+        // 使用规范：「自检 PASS-FAIL 等必须可见的输出不要包进来」），
+        // power_test.py 的 (boot) 断言依赖此行。
+        crate::uart_send_str("[kernel] 电源自检完成：");
+        crate::print_dec(power_fails as u64);
+        crate::uart_send_str(" 个失败\n");
     }
 
     // bootargs 含 "shell"（QEMU -append "shell"）：GUI 启动同时拉起内置
@@ -1145,7 +1152,12 @@ fn init_main(_: usize) -> ! {
     }
 
     // 回退：内置交互式 Shell（内核线程，独立进程槽位）。
-    process::spawn("shell", shell::shell_main, 0, sched_cfs::PriorityClass::Normal, 0);
+    // bootargs "shell" 已并行拉起过一个 shell（BOOT_SHELL）：init 退出后
+    // 不再重复拉起 —— 两个 shell 并发读同一 UART 输入流会把输入按字节
+    // 劈开（lifecycle_core_test 的命令被劈成两半，双方都不执行）。
+    if !crate::bootargs_shell() {
+        process::spawn("shell", shell::shell_main, 0, sched_cfs::PriorityClass::Normal, 0);
+    }
 
     // 按需分页 / COW 统计（诊断）：累计落地缺页数与 COW break 次数。
     kinfo! {

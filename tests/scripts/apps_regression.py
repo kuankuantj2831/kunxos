@@ -189,12 +189,24 @@ try:
     state = {"page": 0}
 
     def goto_page(p):
-        while state["page"] != p:
+        # 注入帧在内核风暴窗口可能丢字节（滑动 MOVE 帧丢失 → 手势判定为
+        # 原地长按 → 翻页不生效）：按 launcher 的页码结算日志确认，未生效
+        # 则重试（最多 4 次），不再盲目递增本地页码状态。
+        for _ in range(4):
+            if state["page"] == p:
+                return
+            before = len(log)
             if p > state["page"]:
                 swipe(440, 500, 100, 500)   # 左滑 → 下一页
             else:
                 swipe(100, 500, 440, 500)   # 右滑 → 上一页
-            state["page"] += 1 if p > state["page"] else -1
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                seg = log[before:].decode(errors="replace")
+                if ("[launcher] page=%d" % p) in seg:
+                    state["page"] = p
+                    break
+            time.sleep(0.3)
 
     def app_coords(key):
         """dock 优先，其次网格瓦片；返回 (x, y, page) 或 None（被过滤）。"""

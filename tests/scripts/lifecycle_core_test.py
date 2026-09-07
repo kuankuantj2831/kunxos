@@ -138,7 +138,7 @@ def kernel_state(pid):
 
 def reg(key, pid, mode):
     return run_wait("echo %s %s > /data/life/reg_%s" % (pid, mode, key),
-                    "registered %s pid=%s" % (key, pid), 8.0)
+                    "已登记 %s pid=%s" % (key, pid), 8.0)
 
 
 def recents_frag(frag):
@@ -152,8 +152,9 @@ try:
     check("boot to shell", True)
     time.sleep(0.4)
 
-    check("lifd starting", wait_for("[lifd] KunxOS lifecycle daemon starting", 60))
-    check("pushd starting", wait_for("[pushd] KunxOS push daemon starting", 60))
+    # 内核/守护进程启动语已中文化，按实际输出匹配。
+    check("lifd starting", wait_for("[lifd] KunxOS 生命周期守护进程启动中", 60))
+    check("pushd starting", wait_for("[pushd] KunxOS 推送守护进程启动中", 60))
     check("pressure readable", run_wait("cat /proc/pressure", "total_kB", 10.0))
 
     # 守护进程 pid 解析：等待并重试（daemon 逐一 fork，启动慢于首个提示符）
@@ -177,49 +178,54 @@ try:
     check("recents appB B", recents_frag("appB %s B" % sen))
 
     # ---- 多应用切换 + SIGSTOP/SIGCONT ----
-    check("bg appA", run_wait("echo BG > /data/life/cmd_%s" % aud, "background appA", 5.0))
+    check("bg appA", run_wait("echo BG > /data/life/cmd_%s" % aud, "已转入后台 appA", 5.0))
     time.sleep(0.4)
     check("appA T (SIGSTOP)", kernel_state(aud) == "T")
-    check("fg appB", run_wait("echo FG %s > /data/life/cmd_0" % sen, "foreground appB", 5.0))
+    check("fg appB", run_wait("echo FG %s > /data/life/cmd_0" % sen, "已回前台 appB", 5.0))
     check("appB R", kernel_state(sen) == "R")
-    check("fg appA", run_wait("echo FG %s > /data/life/cmd_0" % aud, "foreground appA", 5.0))
+    check("fg appA", run_wait("echo FG %s > /data/life/cmd_0" % aud, "已回前台 appA", 5.0))
     check("appA R (SIGCONT)", kernel_state(aud) == "R")
 
     # ---- 后台任务白名单 ----
     check("btask0 granted", run_wait("echo BTASK 0 500000 > /data/life/cmd_%s" % sen,
-                                     "bg task granted", 5.0))
+                                     "后台任务已授予", 5.0))
     check("btask1 granted", run_wait("echo BTASK 1 500000 > /data/life/cmd_%s" % sen,
-                                     "bg task granted", 5.0))
+                                     "后台任务已授予", 5.0))
     check("btask2 denied", run_wait("echo BTASK 2 500000 > /data/life/cmd_%s" % sen,
-                                    "bg task denied: per-app limit", 5.0))
+                                    "后台任务被拒: 单应用数量已达上限", 5.0))
+    # 每应用上限 2 已满：先结束任务释放槽位，再请求 400ms 短任务测到期路径
+    # （docs/lifecycle-test.md A7 的前置步骤 BTASK_END 在此脚本中缺失，
+    #  此前 BTASK 3 恒被「单应用数量已达上限」拒绝）。
+    check("btask end", run_wait("echo BTASK_END > /data/life/cmd_%s" % sen,
+                                "后台任务已结束", 5.0))
     check("btask3 expiring", run_wait("echo BTASK 3 400 > /data/life/cmd_%s" % sen,
-                                      "bg task granted", 5.0))
-    check("btask expired", wait_for("bg task expired pid=", 4.0))
+                                      "后台任务已授予", 5.0))
+    check("btask expired", wait_for("后台任务已到期 pid=", 4.0))
 
     # ---- 超时挂起 ----
     check("set timeout 1500", run_wait("echo SET_TIMEOUT 1500 > /data/life/cmd_0",
-                                       "bg->suspend timeout set to 1500", 5.0))
-    check("bg appA(2)", run_wait("echo BG > /data/life/cmd_%s" % aud, "background appA", 5.0))
-    check("appA suspended", wait_for("suspend appA", 4.0))
+                                       "bg->suspend 超时已设为 1500", 5.0))
+    check("bg appA(2)", run_wait("echo BG > /data/life/cmd_%s" % aud, "已转入后台 appA", 5.0))
+    check("appA suspended", wait_for("已挂起 appA", 4.0))
     time.sleep(0.3)
     check("recents appA S", recents_frag("appA %s S" % aud))
 
     # ---- 内存压力 + LMK ----
-    check("force 2", run_wait("echo force 2 > /proc/pressure", "pressure Critical", 5.0))
-    check("LMK terminated appA", wait_for("terminated appA", 5.0))
+    check("force 2", run_wait("echo force 2 > /proc/pressure", "内存压力严重", 5.0))
+    check("LMK terminated appA", wait_for("已终止 appA", 5.0))
     time.sleep(0.3)
     check("recents cleared", not recents_frag("appA %s" % aud))
-    check("clear pressure", run_wait("echo clear > /proc/pressure", "pressure Normal", 5.0))
+    check("clear pressure", run_wait("echo clear > /proc/pressure", "内存压力正常", 5.0))
 
     # ---- 本地推送 ----
     check("notify forwarded", run_wait("echo Hello World > /data/push/in/%s_1" % sen,
-                                       "forwarded", 5.0))
+                                       "通知已投递", 5.0))
     check("evt NOTIFY", run_wait("cat /data/life/evt_%s" % sen, "NOTIFY", 5.0))
-    check("bg appB(2)", run_wait("echo BG > /data/life/cmd_%s" % sen, "background appB", 5.0))
-    check("notify deferred", run_wait("echo Deferred msg > /data/push/in/%s_2" % sen,
-                                      "notify deferred", 5.0))
+    check("bg appB(2)", run_wait("echo BG > /data/life/cmd_%s" % sen, "已转入后台 appB", 5.0))
+    check("通知已延迟", run_wait("echo Deferred msg > /data/push/in/%s_2" % sen,
+                                      "通知已延迟", 5.0))
     check("pending NOTIFY", run_wait("cat /data/push/pending/%s" % sen, "NOTIFY", 5.0))
-    check("fg appB(2)", run_wait("echo FG %s > /data/life/cmd_0" % sen, "foreground appB", 5.0))
+    check("fg appB(2)", run_wait("echo FG %s > /data/life/cmd_0" % sen, "已回前台 appB", 5.0))
     check("evt RESUME+NOTIFY", run_wait("cat /data/life/evt_%s" % sen, "RESUME NOTIFY", 5.0))
     check("pending removed", not run_wait("cat /data/push/pending/%s" % sen, "NOTIFY", 2.5))
 

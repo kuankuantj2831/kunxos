@@ -190,6 +190,14 @@ fn log(s: &str) {
     print("\n");
 }
 
+/// 无换行日志前缀：多段消息（前缀 + 名字/pid + 结尾）必须整行输出 ——
+/// log() 自带的换行会把「已登记 <名> pid=<n> FG」劈成两行（第二行丢失
+/// [lifd] 前缀，且自动化测试的连续子串匹配失败）。
+fn log_raw(s: &str) {
+    print("[lifd] ");
+    print(s);
+}
+
 fn log2(s: &str, v: u64) {
     print("[lifd] ");
     print(s);
@@ -568,7 +576,7 @@ fn go_background(idx: usize, reason: &[u8]) {
         n += k2;
         send_launcher(&evt[..n]);
         update_recents();
-        log("已转入后台 ");
+        log_raw("已转入后台 ");
         print(name_as_str(&name, name_len));
         print("\n");
     }
@@ -615,7 +623,7 @@ fn go_foreground(idx: usize) {
         push_dec_to(&mut levt, &mut l, pid as u64);
         send_launcher(&levt[..l]);
         update_recents();
-        log("已回前台 ");
+        log_raw("已回前台 ");
         print(name_as_str(&name, name_len));
         print("\n");
     }
@@ -642,7 +650,7 @@ fn terminate_app(idx: usize, reason: &[u8]) {
         send_launcher(&evt[..n]);
         remove_entry(idx);
         update_recents();
-        log("已终止 ");
+        log_raw("已终止 ");
         print(name_as_str(&name, name_len));
         print("\n");
     }
@@ -785,7 +793,7 @@ fn grant_bg_task(pid: u32, ty: u8, dur_ms: u32) {
         e.task_expire[slot] = now_us().saturating_add(dur as u64 * 1000);
         e.tasks += 1;
         // 持有任务的应用不被挂起超时转入 Suspended
-        log("后台任务已授予 type=");
+        log_raw("后台任务已授予 type=");
         print_dec(ty as u64);
         print(" pid=");
         print_dec(pid as u64);
@@ -810,19 +818,22 @@ fn deliver_notify(target_pid: u32, payload: &[u8]) {
             let st = unsafe { APPS[i].state };
             if st == ST_RUNNING {
                 send_evt(target_pid, &evt[..n]);
+                log("通知已投递 pid=");
+                print_dec(target_pid as u64);
+                print("\n");
             } else {
                 // 延迟补投（覆盖式：只保留最新一条）
                 let mut pp = [0u8; 96];
                 let m = build_pending_path(target_pid, &mut pp);
                 write_file(core::str::from_utf8(&pp[..m]).unwrap_or(""), &evt[..n]);
-                log("通知已延迟 pid=");
+                log_raw("通知已延迟 pid=");
                 print_dec(target_pid as u64);
                 print("\n");
             }
         }
         None => {
             // 应用不在注册表（未启动/已终止）：丢弃并记录（v1 简化）
-            log("通知已丢弃: 应用未登记 pid=");
+            log_raw("通知已丢弃: 应用未登记 pid=");
             print_dec(target_pid as u64);
             print("\n");
         }
@@ -1046,7 +1057,7 @@ fn register_app(pid: u32, name: &[u8], fg: bool) {
     let i = find_by_pid(pid).unwrap();
     let e = unsafe { &APPS[i] };
     let nm = entry_name(e);
-    log("已登记 ");
+    log_raw("已登记 ");
     print(name_as_str(nm, nm.len()));
     print(" pid=");
     print_dec(pid as u64);
@@ -1086,7 +1097,7 @@ fn poll_timeouts() {
             // 1) 后台任务到期
             for t in 0..e.tasks.min(MAX_TASKS_PER_APP) {
                 if e.task_expire[t] != 0 && now >= e.task_expire[t] {
-                    log("后台任务已到期 pid=");
+                    log_raw("后台任务已到期 pid=");
                     print_dec(e.pid as u64);
                     print("\n");
                     send_evt(e.pid, b"BG_TASK_EXPIRED");
@@ -1105,7 +1116,7 @@ fn poll_timeouts() {
                 && now.saturating_sub(e.last_used_us) >= BG_TIMEOUT_US
             {
                 e.state = ST_SUSPENDED;
-                log("已挂起 ");
+                log_raw("已挂起 ");
                 print(name_as_str(&e.name, e.name_len));
                 print("\n");
                 update_recents();
@@ -1123,7 +1134,7 @@ fn poll_deaths() {
                 continue; // Running 应用退出由 launcher wait4 回收 + EXITED 命令
             }
             if !alive(e.pid) {
-                log("应用已死亡 (后台) ");
+                log_raw("应用已死亡 (后台) ");
                 print(name_as_str(&e.name, e.name_len));
                 print("\n");
                 let mut evt = [0u8; 96];

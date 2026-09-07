@@ -293,6 +293,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 调制解调器 / Pi4 UART2），实现 AT 命令层、通话状态机、SMS PDU
         // 编解码与持久化；应用经 /var/run/rild.cmd + rild.state 交互。
         let rild_pid = spawn_service("rild", "/bin/rild");
+
+        // pushd：本地通知队列（/data/push/in/<pid>_<seq> → lifd DELIVER）。
+        // 此前被移出启动列表导致通知子系统开机不可用（lifecycle_core_test
+        // 的推送链路断言全部依赖 pushd 运行）。
+        let _pushd_pid = spawn_service("pushd", "/bin/pushd");
         if rild_pid <= 0 {
             print("[init] FATAL: 无法启动 rild\n");
         }

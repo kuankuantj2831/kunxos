@@ -33,7 +33,9 @@ os.mkfifo(PIPE + ".out")
 
 cmd = [
     "qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
-    "-kernel", KERNEL, "-append", "shell",
+    # selftest：启动期内核电源自检（BOOT_SELFTEST 默认跳过）；(boot) 断言
+    # 依赖其结论行 [kernel] 电源自检完成：0 个失败（结论不受安静模式门控）。
+    "-kernel", KERNEL, "-append", "shell selftest",
     "-serial", "pipe:" + PIPE,
     "-no-reboot", "-display", "none",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
@@ -118,7 +120,12 @@ try:
     for field in [b"governor", b"load", b"freq", b"thermal", b"battery", b"idle", b"events"]:
         check(f"status field {field.decode()}", field in log)
 
-    # 3. 热注入 → 节流（检查 force 命令之后的新日志段）
+    # 3. 热注入 → 节流（检查 force 命令之后的新日志段）。
+    # 安静模式默认开启：kinfo 门控的 [power] dvfs 行不上串口（dvfs switch
+    # logged 永远无法命中）—— 此处运行时打开完整日志，并等启动期积压的
+    # 守护进程日志洪水沉降（TCG 下数秒），再继续断言。
+    run_cmd_and_wait("verbose on", "", 2.0)
+    time.sleep(4.0)
     before = len(log)
     run_cmd_and_wait("power thermal force 95", "", 2.0)
     time.sleep(1.2)  # 等 200ms 热采样生效
