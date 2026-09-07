@@ -20,6 +20,7 @@
 use core::arch::asm;
 
 use crate::allocator;
+use crate::bionic_shim;
 use crate::process;
 use crate::sched_cfs::{self, PriorityClass};
 use crate::syscall_table::TrapFrame;
@@ -28,12 +29,18 @@ use crate::vfs;
 use crate::vm;
 
 /// 用户进程数量上限（与 `process` 进程表一致）。
-const MAX_ELF_PROCS: usize = 16;
+///
+/// 随 `process::MAX_PROC` 扩到 24：进程表扩大后若 ELF 运行时表仍是 16，
+/// pid ≥ 16 的 fork 子进程无法继承 ASLR 栈基址/brk，且 `elf::spawn_from_path`
+/// 会直接拒绝 pid ≥ 16 的新进程（见 `spawn_from_path`/`execve` 边界检查）。
+const MAX_ELF_PROCS: usize = 24;
 
 /// argv/envp 元素上限。
 const MAX_ARGC: usize = 16;
-/// execve 读取 ELF 文件的缓冲区上限（launcher 等大应用 ELF 可达 25KB+，留足余量）。
-const EXEC_BUF_CAP: usize = 65536;
+/// execve 读入缓冲的安全上限：缓冲按文件实际大小分配（64KB→256KB 固定上限
+/// 已两次被应用体积增长撞爆，表现为 execve 静默失败、桌面起不来），固定值
+/// 只用于拦截损坏文件系统的异常大小，不再作为正常路径的容量约束。
+const EXEC_MAX_CAP: usize = 4 * 1024 * 1024;
 
 // ==================== ELF 常量 ====================
 
@@ -64,30 +71,83 @@ fn rd_u64(b: &[u8], off: usize) -> u64 {
 // ==================== 加载结果 ====================
 
 /// 一次 ELF 加载的结果：入口、进程私有页表与程序断点（brk）。
+///
+/// `pt` 用 Box 承载：`ProcPageTable` 含 `user_pages[4096]`（约 96KB），
+/// 内联进 `ElfImage` 会让 `load` 的返回值与 `execve`/`spawn` 的栈帧
+/// 超过内核任务栈（256KB）的安全余量。
 pub struct ElfImage {
     pub entry: usize,
-    pub pt: vm::ProcPageTable,
+    pub pt: alloc::boxed::Box<vm::ProcPageTable>,
     /// 初始程序断点：所有 PT_LOAD 段 (vaddr + memsz) 的最大值按页对齐。
     pub brk: usize,
 }
 
 // ==================== 用户进程注册表 ====================
 
-/// 已启动用户进程的运行时信息（供 trampoline / brk 读取）。
+/// 已启动用户进程的运行时信息（供 trampoline / brk / 信号帧边界读取）。
 struct ElfProc {
     used: bool,
     entry: usize,
+    /// 初始用户栈指针（argv/envp 压栈后，`sp_el0` 初值）。
     stack_top: usize,
+    /// 用户栈区基址（ASLR 随机化后的栈底；区顶 = `stack_base + USER_STACK_SIZE`）。
+    stack_base: usize,
+    /// 程序断点（ASLR 随机化后的堆基址）。
     brk: usize,
 }
 
 impl ElfProc {
     const fn empty() -> Self {
-        ElfProc { used: false, entry: 0, stack_top: 0, brk: 0 }
+        ElfProc { used: false, entry: 0, stack_top: 0, stack_base: 0, brk: 0 }
     }
 }
 
 static mut ELF_PROCS: [ElfProc; MAX_ELF_PROCS] = [const { ElfProc::empty() }; MAX_ELF_PROCS];
+
+/// 当前进程 ASLR 随机化后的用户栈区基址（供信号帧边界校验等）。
+/// 非 ELF 进程（内核线程/fork 后未 exec 的进程）回退固定基址。
+pub fn current_stack_base() -> usize {
+    let pid = process::current_pid();
+    unsafe {
+        if (pid as usize) < MAX_ELF_PROCS && ELF_PROCS[pid as usize].used {
+            let b = ELF_PROCS[pid as usize].stack_base;
+            if b != 0 {
+                return b;
+            }
+        }
+    }
+    vm::USER_STACK_BASE
+}
+
+/// 当前进程用户栈区顶（= 栈底 + 1MB；ASLR 后可能低于固定 `USER_STACK_TOP`）。
+pub fn current_stack_top() -> usize {
+    current_stack_base() + vm::USER_STACK_SIZE
+}
+
+/// fork 时把父进程的 ELF 运行时信息（栈基址/初始 sp/brk）复制给子进程：
+/// 子进程继承父进程地址空间（COW），其用户栈布局与堆基址与父进程一致，
+/// 信号帧边界/brk 初始化才能用正确的随机化值。父进程非 ELF 进程时跳过。
+pub fn fork_runtime_info(parent_pid: u32, child_pid: u32) {
+    unsafe {
+        if (parent_pid as usize) < MAX_ELF_PROCS
+            && (child_pid as usize) < MAX_ELF_PROCS
+            && ELF_PROCS[parent_pid as usize].used
+        {
+            // 逐字段拷贝（ElfProc 非 Copy，静态数组不能整体 move）
+            let p_entry = ELF_PROCS[parent_pid as usize].entry;
+            let p_stack_top = ELF_PROCS[parent_pid as usize].stack_top;
+            let p_stack_base = ELF_PROCS[parent_pid as usize].stack_base;
+            let p_brk = ELF_PROCS[parent_pid as usize].brk;
+            ELF_PROCS[child_pid as usize] = ElfProc {
+                used: true,
+                entry: p_entry,
+                stack_top: p_stack_top,
+                stack_base: p_stack_base,
+                brk: p_brk,
+            };
+        }
+    }
+}
 
 // ==================== 段权限 ====================
 
@@ -113,8 +173,19 @@ fn seg_flags(pf: u32) -> vm::MapFlags {
 #[inline(never)]
 pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
     let t0 = timer::now_us();
-    if data.len() < 64 {
+    // 长度检查必须先于任何 data 索引：kinfo! 块在 verbose 开启时必然求值，
+    // 若先 rd_u32(data,0)，execve 1-3 字节的文件会切片越界 panic 杀死内核。
+    // 下界 72 而非 64：诊断读取 read_volatile(data.as_ptr().add(64)) 取 8 字节
+    // 需要 len ≥ 72，否则读入 slab 对象未初始化尾部（切片越界语义）。
+    if data.len() < 72 {
         return Err(-1);
+    }
+    crate::kinfo! {
+        crate::uart_send_str("[diag] 加载 len=");
+        crate::print_dec(data.len() as u64);
+        crate::uart_send_str(" magic=");
+        crate::print_hex(rd_u32(data, 0) as u64);
+        crate::uart_send_str("\n");
     }
     if rd_u32(data, 0) != ELF_MAGIC {
         return Err(-1);
@@ -144,7 +215,30 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
         return Err(-1);
     }
 
-    let mut pt = vm::ProcPageTable::new();
+    let v64_entry = unsafe { core::ptr::read_volatile(data.as_ptr().add(64)) };
+    crate::kinfo! {
+        crate::uart_send_str("[diag] data ptr=");
+        crate::print_hex(data.as_ptr() as u64);
+        crate::uart_send_str(" v64-entry=");
+        crate::print_hex(v64_entry as u64);
+        crate::uart_send_str("\n");
+    }
+    // 根页表 OOM：物理内存耗尽时干净失败（无已分配资源需要回滚）。
+    let mut pt = match vm::ProcPageTable::try_new_boxed() {
+        Some(pt) => pt,
+        None => return Err(-1),
+    };
+    let v64_after = unsafe { core::ptr::read_volatile(data.as_ptr().add(64)) };
+    let boxa = (&*pt as *const vm::ProcPageTable) as usize;
+    crate::kinfo! {
+        crate::uart_send_str("[diag] pt boxa=");
+        crate::print_hex(boxa as u64);
+        crate::uart_send_str(" datap=");
+        crate::print_hex(data.as_ptr() as u64);
+        crate::uart_send_str(" v64-after=");
+        crate::print_hex(v64_after as u64);
+        crate::uart_send_str("\n");
+    }
     let mut brk = 0usize;
     let mut mapped = 0usize;
 
@@ -159,8 +253,11 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
     }
 
     for i in 0..phnum {
-        let off = phoff + i * phentsize;
-        if off + 56 > data.len() {
+        // ★ 程序头偏移用 checked 运算：构造的 ELF 可使 e_phoff / e_phentsize 接近
+        // usize::MAX，未校验的 `phoff + i*phentsize` 与 `off + 56` 会整数回绕通过
+        // 长度检查，随后 `rd_u32` 越界切片 → panic → 内核崩溃（用户态可触发的 DoS）。
+        let Some(off) = phoff.checked_add(i * phentsize) else { fail!() };
+        if off.checked_add(56).map_or(true, |e| e > data.len()) {
             fail!();
         }
         let p_type = rd_u32(data, off);
@@ -168,6 +265,12 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
             continue;
         }
         let p_flags = rd_u32(data, off + 4);
+        // ★ W^X：拒绝「可写且可执行」段（PF_W | PF_X）。此前 `seg_flags` 接受
+        // W+X 段并映射为可执行可写文本页，与内核声明的 W^X 策略相矛盾（ELF 内
+        // 注入代码的路径）。执行与可写互斥：只读可执行或可写不可执行。
+        if (p_flags & (PF_W | PF_X)) == (PF_W | PF_X) {
+            fail!();
+        }
         let p_offset = rd_u64(data, off + 8) as usize;
         let p_vaddr = rd_u64(data, off + 16) as usize;
         let p_filesz = rd_u64(data, off + 32) as usize;
@@ -220,6 +323,12 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
                         allocator::mark_shared_page(pa);
                     }
                     if !pt.add_page(va, pa, flags) {
+                        // add_page 失败：记录表只覆盖 base..base+i，整段
+                        // 连续块的剩余页（含本页）必须就地归还，否则 fail!
+                        // 的逐记录释放回收不到它们 → 物理页泄漏。
+                        for k in i..seg_pages {
+                            allocator::free_page(base + k * vm::PAGE_SIZE);
+                        }
                         fail!();
                     }
                     mapped += 1;
@@ -269,15 +378,31 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
         fail!();
     }
     let t1 = timer::now_us();
-    crate::uart_send_str("[perf] elf load pages=");
-    crate::print_dec(mapped as u64);
-    crate::uart_send_str(" took=");
-    crate::print_dec((t1 - t0) as u64);
-    crate::uart_send_str("us\n");
+    crate::kinfo! {
+        crate::uart_send_str("[perf] ELF 加载 pages=");
+        crate::print_dec(mapped as u64);
+        crate::uart_send_str(" 耗时=");
+        crate::print_dec((t1 - t0) as u64);
+        crate::uart_send_str("us\n");
+    }
+    // ASLR：堆基址在 ELF 断点之上随机上移 4MB（页对齐）。打破固定 brk 布局，
+    // 与栈随机化共同构成地址空间布局随机化（mmap 区 0x30000000 与 fb 0x20000000
+    // 在堆区上方，余量充足，无碰撞风险）。
+    //
+    // 堆下限钳制到 `vm::USER_HEAP_BASE`（0x0C000000，设备窗口之上）：应用堆
+    // 若从 BSS 尾（~0x600000）起涨，大堆（fontdue 解析 1.7MB 字体膨胀 ~62MB/
+    // 个）会跨过 0x08000000 的 GIC/UART/virtio 设备区，用户页覆盖设备寄存器
+    // → 内核读 GIC 全 0 → 中断风暴冻结（见 vm::USER_HEAP_BASE 注释）。
+    let heap_base = ((brk + vm::PAGE_SIZE - 1) & !(vm::PAGE_SIZE - 1)).max(vm::USER_HEAP_BASE);
+    // 堆基址（含 4MB ASLR）必须留在匿名 mmap 区（0x30000000）之下、用户区
+    // 上界之内：段尾靠近 0x3FF00000 的 ELF 会派生出 ≥ 0x40000000 的 brk
+    // （brk_set 拒绝一切增长 → 堆永久损坏）或与 mmap 区重叠。
+    const BRK_LIMIT: usize = bionic_shim::MMAP_BASE - 8 * 1024 * 1024;
+    let brk_init = (heap_base + process::aslr_pages(1024)).min(BRK_LIMIT);
     Ok(ElfImage {
         entry,
         pt,
-        brk: (brk + vm::PAGE_SIZE - 1) & !(vm::PAGE_SIZE - 1),
+        brk: brk_init,
     })
 }
 
@@ -286,29 +411,73 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
 /// 用户栈页数。
 const STACK_PAGES: usize = vm::USER_STACK_SIZE / vm::PAGE_SIZE;
 
+/// ASLR：每次 exec 随机化用户栈区顶（16MB 熵窗口，页对齐）。
+///
+/// 栈区顶 ∈ [USER_STACK_TOP - 16MB, USER_STACK_TOP)，栈区（1MB）随之整体
+/// 下移；栈区下方保留 15MB 隔离带（mmap 游标上限 `MMAP_CAP`），栈底之下
+/// 不映射任何页（栈溢出 → 干净的 EL0 fault/SIGSEGV，而非写穿 mmap 区）。
+/// 与 Linux `mmap_rnd_bits` 思路一致：布局随机化打破固定地址攻击面。
+fn aslr_stack_top() -> usize {
+    vm::USER_STACK_TOP - process::aslr_pages((vm::STACK_ASLR_PAGES) as u32)
+}
+
 /// 把数据写入用户栈对应的物理内存（栈 VA → 物理页翻译后写入）。
-fn stack_write(pages: &[usize; STACK_PAGES], va: usize, data: &[u8]) {
-    let idx = (va - vm::USER_STACK_BASE) / vm::PAGE_SIZE;
-    let off = (va - vm::USER_STACK_BASE) % vm::PAGE_SIZE;
-    unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), (pages[idx] + off) as *mut u8, data.len());
+///
+/// ★ 跨页安全：写入可能跨越两个物理页（栈物理页不保证相邻），必须按页
+/// 切分 —— 此前一次性 copy_nonoverlapping 会越过第一页的物理帧边界写进
+/// **紧随其后的任意物理内存**（其它进程页/内核数据）。argv/envp 字符串
+/// 总长超过一页且恰跨边界时触发（当前调用方串短，属防御性修复）。
+fn stack_write(pages: &[usize; STACK_PAGES], base: usize, va: usize, data: &[u8]) {
+    let mut cur_va = va;
+    let mut done = 0usize;
+    while done < data.len() {
+        let idx = (cur_va - base) / vm::PAGE_SIZE;
+        let off = (cur_va - base) % vm::PAGE_SIZE;
+        let chunk = (vm::PAGE_SIZE - off).min(data.len() - done);
+        if idx >= STACK_PAGES {
+            return;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data[done..].as_ptr(),
+                (pages[idx] + off) as *mut u8,
+                chunk,
+            );
+        }
+        done += chunk;
+        cur_va += chunk;
     }
 }
 
-fn stack_write_u64(pages: &[usize; STACK_PAGES], va: usize, v: u64) {
-    stack_write(pages, va, &v.to_le_bytes());
+fn stack_write_u64(pages: &[usize; STACK_PAGES], base: usize, va: usize, v: u64) {
+    stack_write(pages, base, va, &v.to_le_bytes());
 }
 
-/// 分配并映射用户栈，写入 argc/argv/envp 初始布局，返回初始 `sp`。
+/// 分配并映射用户栈（ASLR 随机化的 `stack_top` 起 1MB），写入
+/// argc/argv/envp 初始布局，返回初始 `sp` 与栈区基址。
 ///
 /// 映射记录表满（`add_page` 失败）时回滚已分配栈页并返回 `None`，
 /// 由调用方清理地址空间（避免泄漏 + fork 不一致）。
 #[inline(never)]
-fn setup_stack(pt: &mut vm::ProcPageTable, argv: &[&str], envp: &[&str]) -> Option<usize> {
+fn setup_stack(
+    pt: &mut vm::ProcPageTable,
+    argv: &[&str],
+    envp: &[&str],
+    stack_top: usize,
+) -> Option<(usize, usize)> {
+    let stack_base = stack_top - vm::USER_STACK_SIZE;
     let mut pages: [usize; STACK_PAGES] = [0; STACK_PAGES];
     for i in 0..STACK_PAGES {
-        let va = vm::USER_STACK_BASE + i * vm::PAGE_SIZE;
-        let pa = allocator::alloc_page().expect("elf: out of memory for user stack");
+        let va = stack_base + i * vm::PAGE_SIZE;
+        // 用户栈页 OOM：回滚已分配页并返回 None（此前 panic，exec 路径
+        // 可被用户触发；调用方走既有 fail! 清理路径）。
+        let Some(pa) = allocator::alloc_page() else {
+            for j in 0..i {
+                allocator::free_page(pages[j]);
+            }
+            crate::uart_send_str("[elf] 用户栈内存不足\n");
+            return None;
+        };
         if !pt.add_page(va, pa, vm::FLAG_USER_DATA) {
             // 回滚已分配栈页
             for j in 0..i {
@@ -324,21 +493,21 @@ fn setup_stack(pt: &mut vm::ProcPageTable, argv: &[&str], envp: &[&str]) -> Opti
     let envc = envp.len().min(MAX_ARGC);
 
     // 1. 字符串区（自顶向下）：先 argv，后 envp
-    let mut sp = vm::USER_STACK_TOP;
+    let mut sp = stack_top;
     let mut str_addrs = [0usize; MAX_ARGC];
     for i in 0..argc {
         let s = argv[i].as_bytes();
         sp -= s.len() + 1;
-        stack_write(&pages, sp, s);
-        stack_write(&pages, sp + s.len(), &[0]);
+        stack_write(&pages, stack_base, sp, s);
+        stack_write(&pages, stack_base, sp + s.len(), &[0]);
         str_addrs[i] = sp;
     }
     let mut env_addrs = [0usize; MAX_ARGC];
     for i in 0..envc {
         let s = envp[i].as_bytes();
         sp -= s.len() + 1;
-        stack_write(&pages, sp, s);
-        stack_write(&pages, sp + s.len(), &[0]);
+        stack_write(&pages, stack_base, sp, s);
+        stack_write(&pages, stack_base, sp + s.len(), &[0]);
         env_addrs[i] = sp;
     }
 
@@ -347,29 +516,29 @@ fn setup_stack(pt: &mut vm::ProcPageTable, argv: &[&str], envp: &[&str]) -> Opti
 
     // 3. envp 终止符（NULL）
     sp -= 8;
-    stack_write_u64(&pages, sp, 0);
+    stack_write_u64(&pages, stack_base, sp, 0);
 
     // 4. envp 指针（倒序）
     for i in (0..envc).rev() {
         sp -= 8;
-        stack_write_u64(&pages, sp, env_addrs[i] as u64);
+        stack_write_u64(&pages, stack_base, sp, env_addrs[i] as u64);
     }
 
     // 5. argv 终止符（NULL）
     sp -= 8;
-    stack_write_u64(&pages, sp, 0);
+    stack_write_u64(&pages, stack_base, sp, 0);
 
     // 6. argv 指针（倒序）
     for i in (0..argc).rev() {
         sp -= 8;
-        stack_write_u64(&pages, sp, str_addrs[i] as u64);
+        stack_write_u64(&pages, stack_base, sp, str_addrs[i] as u64);
     }
 
     // 7. argc
     sp -= 8;
-    stack_write_u64(&pages, sp, argc as u64);
+    stack_write_u64(&pages, stack_base, sp, argc as u64);
 
-    Some(sp)
+    Some((sp, stack_base))
 }
 
 // ==================== 标准输入输出 ====================
@@ -446,10 +615,16 @@ fn user_trampoline(pid: usize) -> ! {
 pub fn spawn(name: &'static str, data: &[u8], argv: &[&str]) -> u32 {
     let mut img = match load(data) {
         Ok(i) => i,
-        Err(_) => return u32::MAX,
+        Err(e) => {
+            crate::uart_send_str("[diag] 加载失败 err=");
+            crate::print_dec(e as u64);
+            crate::uart_send_str("\n");
+            return u32::MAX;
+        }
     };
-    let stack_top = match setup_stack(&mut img.pt, argv, &[]) {
-        Some(sp) => sp,
+    let stack_top = aslr_stack_top();
+    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, &[], stack_top) {
+        Some((sp, base)) => (sp, base),
         None => {
             // 栈映射失败：回滚整个新地址空间（load 的页 + 页表）
             img.pt.free_user_pages();
@@ -472,7 +647,8 @@ pub fn spawn(name: &'static str, data: &[u8], argv: &[&str]) -> u32 {
         ELF_PROCS[pid as usize] = ElfProc {
             used: true,
             entry,
-            stack_top,
+            stack_top: initial_sp,
+            stack_base,
             brk,
         };
     }
@@ -497,13 +673,32 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
     // 1. 打开并读取 ELF 文件。
     // 读入缓冲按需堆分配而非 static：syscall 期间可被定时器抢占，若另一任务
     // 并发 execve，共享 static 缓冲会被覆写导致本任务加载被污染的 ELF 数据。
-    let buf = crate::heap::kmalloc(EXEC_BUF_CAP);
-    if buf.is_null() {
-        return -1;
-    }
+    // 大小按文件实际尺寸分配（EXEC_MAX_CAP 只拦截异常文件）。
     let fd = vfs::open(path, vfs::O_RDONLY);
     if fd < 0 {
-        unsafe { crate::heap::kfree(buf) };
+        crate::uart_send_str("[diag] 启动进程打开失败: ");
+        crate::uart_send_str(path);
+        crate::uart_send_str("\n");
+        return -1;
+    }
+    let fsize = vfs::file_size(fd);
+    if fsize <= 0 || fsize as usize > EXEC_MAX_CAP {
+        crate::uart_send_str("[diag] execve 文件大小异常 (");
+        crate::uart_send_str(path);
+        crate::uart_send_str(" size=");
+        crate::print_dec(fsize as u64);
+        crate::uart_send_str(")\n");
+        vfs::close(fd);
+        return -1;
+    }
+    let buf = crate::heap::kmalloc(fsize as usize);
+    if buf.is_null() {
+        crate::uart_send_str("[diag] execve 缓冲分配失败 (");
+        crate::uart_send_str(path);
+        crate::uart_send_str(" size=");
+        crate::print_dec(fsize as u64);
+        crate::uart_send_str(")\n");
+        vfs::close(fd);
         return -1;
     }
     let mut total = 0usize;
@@ -513,10 +708,8 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
         if n <= 0 {
             break;
         }
-        if total + n as usize > EXEC_BUF_CAP {
-            vfs::close(fd);
-            unsafe { crate::heap::kfree(buf) };
-            return -1;
+        if total + n as usize > fsize as usize {
+            break; // 文件被并发截断：按已读量交给 load() 头部校验兜底
         }
         unsafe {
             core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf.add(total), n as usize);
@@ -534,16 +727,25 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
     let mut img = match load(data) {
         Ok(i) => i,
         Err(e) => {
+            crate::uart_send_str("[diag] execve 加载失败 (");
+            crate::uart_send_str(path);
+            crate::uart_send_str(" err=");
+            crate::print_dec(e as u64);
+            crate::uart_send_str(")\n");
             unsafe { crate::heap::kfree(buf) };
             return e;
         }
     };
     unsafe { crate::heap::kfree(buf) };
 
-    // 3. 准备新用户栈（失败则回滚新地址空间，旧进程保持不变）
-    let stack_top = match setup_stack(&mut img.pt, argv, envp) {
-        Some(sp) => sp,
+    // 3. 准备新用户栈（ASLR 随机化区顶；失败则回滚新地址空间，旧进程不变）
+    let stack_top = aslr_stack_top();
+    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, envp, stack_top) {
+        Some((sp, base)) => (sp, base),
         None => {
+            crate::uart_send_str("[diag] execve 栈映射失败 (");
+            crate::uart_send_str(path);
+            crate::uart_send_str(")\n");
             img.pt.free_user_pages();
             vm::free_process_tables(img.pt.ttbr0);
             return -1;
@@ -557,8 +759,19 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
 
     // 4. 替换当前进程地址空间（先切到新根表，再释放旧地址空间）
     let pid = process::current_pid();
+    // ★ 终止同进程全部兄弟线程（必须在释放旧页表前）：CLONE_THREAD 线程共享
+    // 地址空间，replace_address_space 归还旧根表后，兄弟线程的 TTBR0 悬空，
+    // 下次被调度即命中已复用内存（与 exit 路径的 kill_pid 同族）。execve
+    // 调用者自身必须继续运行，故用排除当前任务的变体。
+    sched_cfs::kill_siblings_of(pid);
     process::replace_address_space(pid, img.pt);
     process::rename(pid, basename(path));
+    // ★ execve 复位堆断点/mmap 游标：BRK_CUR 仅在 reap 时清零，同 pid 先
+    // brk 再 execve（如 "malloc 后 re-exec"）会以旧断点为堆基线 —— 旧断点
+    // 低于新映像段尾时，brk_set 的全新零页映射会静默覆盖新映像的
+    // text/data（PTE 被同名 VA 覆盖）→ 新进程必然崩溃。以新映像的 brk
+    // 重新初始化（brk_init 首次 brk(0) 时取 current_brk）。
+    crate::bionic_shim::reset_brk_state(pid as usize);
     // 5. GUI 前台进程调度优待：launcher/oobe 及其拉起的应用提升权重，
     //    降低动画期间被后台进程（networkd 等）抢占的概率（CFS 语义不变）
     let name = basename(path);
@@ -568,25 +781,30 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
 
     // 启动计时（诊断）
     let t1 = timer::now_us();
-    crate::uart_send_str("[perf] execve ");
-    crate::uart_send_str(path);
-    crate::uart_send_str(" took=");
-    crate::print_dec((t1 - t0) as u64);
-    crate::uart_send_str("us\n");
+    crate::kinfo! {
+        crate::uart_send_str("[perf] execve ");
+        crate::uart_send_str(path);
+        crate::uart_send_str(" uid=");
+        crate::print_dec(process::current_uid() as u64);
+        crate::uart_send_str(" 耗时=");
+        crate::print_dec((t1 - t0) as u64);
+        crate::uart_send_str("us\n");
+    }
 
     unsafe {
         if (pid as usize) < MAX_ELF_PROCS {
             ELF_PROCS[pid as usize] = ElfProc {
                 used: true,
                 entry,
-                stack_top,
+                stack_top: initial_sp,
+                stack_base,
                 brk,
             };
         }
     }
 
     // 5. 改写陷阱帧：返回时 eret 到新入口
-    f.sp_el0 = stack_top as u64;
+    f.sp_el0 = initial_sp as u64;
     f.elr = entry as u64;
     f.spsr = SPSR_EL0T;
     f.x[0] = 0;
@@ -596,11 +814,13 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
     let fb = (f as *mut TrapFrame) as *mut u8;
     unsafe { core::ptr::write_bytes(fb.add(0x110), 0, 0x320 - 0x110) };
     // [诊断] 记录 execve 设置的初始栈顶与入口（核对 PC=0 故障中 sp 是否错位）
-    crate::uart_send_str("[execve-diag] entry=");
-    crate::print_hex(entry as u64);
-    crate::uart_send_str(" stack_top=");
-    crate::print_hex(stack_top as u64);
-    crate::uart_send_str("\n");
+    crate::kinfo! {
+        crate::uart_send_str("[execve-diag] entry=");
+        crate::print_hex(entry as u64);
+        crate::uart_send_str(" stack_top=");
+        crate::print_hex(stack_top as u64);
+        crate::uart_send_str("\n");
+    }
     0
 }
 
@@ -624,14 +844,20 @@ fn basename(path: &str) -> &str {
 #[inline(never)]
 pub fn spawn_from_path(path: &'static str, argv: &[&str]) -> i32 {
     let t0 = timer::now_us();
-    // 用户态 ELF 缓冲（堆分配，避免 64KB 局部数组压栈；launcher 等大应用可达 25KB+）。
-    let buf = crate::heap::kmalloc(65536);
-    if buf.is_null() {
-        return -1;
-    }
+    // 读入缓冲按文件实际大小堆分配（此前固定 64KB：launcher 等大应用被静默
+    // 截断后 load 必然失败，shell `run` 只能看到笼统的"加载失败"）。
     let fd = vfs::open(path, vfs::O_RDONLY);
     if fd < 0 {
-        unsafe { crate::heap::kfree(buf) };
+        return -1;
+    }
+    let fsize = vfs::file_size(fd);
+    if fsize <= 0 || fsize as usize > EXEC_MAX_CAP {
+        vfs::close(fd);
+        return -1;
+    }
+    let buf = crate::heap::kmalloc(fsize as usize);
+    if buf.is_null() {
+        vfs::close(fd);
         return -1;
     }
     let mut total = 0usize;
@@ -641,7 +867,7 @@ pub fn spawn_from_path(path: &'static str, argv: &[&str]) -> i32 {
         if n <= 0 {
             break;
         }
-        if total + n as usize > 65536 {
+        if total + n as usize > fsize as usize {
             break;
         }
         unsafe {
@@ -665,11 +891,13 @@ pub fn spawn_from_path(path: &'static str, argv: &[&str]) -> i32 {
         sched_cfs::set_current_nice(-3);
     }
     if pid != u32::MAX {
-        crate::uart_send_str("[perf] spawn ");
-        crate::uart_send_str(path);
-        crate::uart_send_str(" took=");
-        crate::print_dec((timer::now_us() - t0) as u64);
-        crate::uart_send_str("us\n");
+        crate::kinfo! {
+            crate::uart_send_str("[perf] 启动进程 ");
+            crate::uart_send_str(path);
+            crate::uart_send_str(" 耗时=");
+            crate::print_dec((timer::now_us() - t0) as u64);
+            crate::uart_send_str("us\n");
+        }
     }
     pid as i32
 }

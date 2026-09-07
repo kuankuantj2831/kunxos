@@ -1,0 +1,12 @@
+{
+  "name": "calculator",
+  "version": "1.0.0",
+  "api_level": 1,
+  "description": "KunxOS 计算器（示例）",
+  "author": "KunxOS Team",
+  "main": "bin/calculator",
+  "permissions": ["INTERNET", "LOCATION"],
+  "dependencies": {"libc": ">=1.0.0"},
+  "provides": ["calc"],
+  "conflicts": []
+}

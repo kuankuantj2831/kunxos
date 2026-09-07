@@ -30,8 +30,23 @@ pub type VirtAddr = usize;
 pub const USER_CODE_BASE: VirtAddr = 0x0040_0000;
 /// 用户数据段起始（紧随代码段之后）。
 pub const USER_DATA_BASE: VirtAddr = 0x0050_0000;
-/// 用户堆（brk）起始。
-pub const USER_HEAP_BASE: VirtAddr = 0x0060_0000;
+/// 用户堆（brk）下限：置于 QEMU virt 设备窗口之上。
+///
+/// ⚠️ 用户堆绝不能从低地址（BSS 尾，~0x600000）向上无限增长：低 1GB 中
+/// [0x0800_0000, 0x0C00_0000) 是内核设备区（GIC 0x08000000、UART/RTC
+/// 0x09000000+、virtio-mmio 0x0A000000）。应用堆（brk bump 分配器）跨入该
+/// 窗口时，`ensure_l3` 会把用户进程页表中继承的 1GB 设备块就地拆分，用户
+/// 普通内存页覆盖 GIC 寄存器区 —— 内核（以当前进程 TTBR0 运行）读 GIC 全 0，
+/// 定时器中断无法确认/EOI → 中断风暴 → 全系统冻结（实测：应用解析第二个
+/// ~1.7MB 字体时堆增长跨过 0x0800_0000 即触发）。堆下限移到设备窗口之上后，
+/// 堆向 [0x0C00_0000, 0x2E00_0000)（file-mmap 区下界）增长，约 352MB 余量。
+pub const USER_HEAP_BASE: VirtAddr = 0x0C00_0000;
+
+/// 内核设备窗口（用户映射禁区）：QEMU virt 平台 GIC / UART / RTC / fw_cfg /
+/// virtio-mmio 寄存器区。用户 brk/mmap/ELF/mmap(MAP_FIXED) 不得映射该区间，
+/// `user_va_range_ok` 对其返回 false（add_page 层硬断言兜底）。
+pub const USER_DEVICE_WINDOW_BASE: VirtAddr = 0x0800_0000;
+pub const USER_DEVICE_WINDOW_END: VirtAddr = 0x0C00_0000;
 
 /// 用户栈顶：置于内核恒等映射（0x4000_0000）之下，使整个用户地址空间
 /// 落在 L1[0]（0x0000_0000-0x3FFF_FFFF）区域，从而与共享的内核 RAM 恒等
@@ -42,6 +57,12 @@ pub const USER_STACK_SIZE: usize = 0x0010_0000;
 /// 用户栈底。
 pub const USER_STACK_BASE: VirtAddr = USER_STACK_TOP - USER_STACK_SIZE;
 
+/// ASLR 用户栈随机化窗口（页数）：栈区顶在 `[USER_STACK_TOP - 16MB,
+/// USER_STACK_TOP)` 内随机（16MB = 4096 页熵）。栈区下方保留 15MB 隔离带
+/// （匿名/文件 mmap 游标上限 `bionic_shim::MMAP_CAP = 0x3D00_0000`，
+/// 最低栈底 0x3DF0_0000 之下还有守护空间），栈溢出不会静默写进 mmap 区。
+pub const STACK_ASLR_PAGES: usize = 0x1000;
+
 /// 内核空间（高地址）起始：恒等映射内核位于低 39 位地址空间，
 /// 此常量仅用于描述内核与用户空间的逻辑分界（用户指针上界）。
 pub const KERNEL_SPACE_BASE: VirtAddr = 0x0000_0080_0000_0000;
@@ -50,24 +71,40 @@ pub const KERNEL_SPACE_BASE: VirtAddr = 0x0000_0080_0000_0000;
 /// 否则会经继承的内核共享 L2/L3 页表改写内核全局页表（安全关键）。
 pub const USER_VA_TOP: VirtAddr = RAM_START; // 0x4000_0000
 
-/// 校验 `[va, va+len)` 是否完整落在用户地址空间内（不含 0 地址，不含内核恒等映射）。
+/// 校验 `[va, va+len)` 是否完整落在用户地址空间内（不含 0 地址，不含内核恒等映射，
+/// 不与内核设备窗口重叠）。
 pub fn user_va_range_ok(va: VirtAddr, len: usize) -> bool {
-    va > 0 && va.checked_add(len).map_or(false, |e| e <= USER_VA_TOP)
+    if !(va > 0 && va.checked_add(len).map_or(false, |e| e <= USER_VA_TOP)) {
+        return false;
+    }
+    // 内核设备窗口（GIC/UART/virtio 寄存器区）禁止任何用户映射：
+    // 用户页表继承的 L1[0] 是 1GB 设备块，向该区间建映射会拆分设备块、
+    // 以普通内存页覆盖设备寄存器（中断风暴 / 内核外设失效）。
+    let end = va + len;
+    !(va < USER_DEVICE_WINDOW_END && end > USER_DEVICE_WINDOW_BASE)
 }
 
-/// 校验 `[va, va+len)` 中每一页在根表 `root` 中都已建立有效映射。
+/// 校验 `[va, va+len)` 中每一页都已建立有效映射。
 ///
-/// 用户地址空间是稀疏的（仅代码/数据/栈/堆/匿名区已映射）。若只做范围检查
-/// 就解引用，未映射地址会在 EL1 触发 data abort，当前同步异常处理器死循环
-/// 会挂死整个内核（用户态 DoS）。所有解引用用户指针的路径必须先经此校验。
+/// ⚠️ 此校验**不漫游页表**，而是查询进程地址空间映射记录（`ProcPageTable::user_pages`）：
+/// 所有用户页表都继承内核根表的 L1[0] = 1GB 设备块，漫游页表会把 0~1GB 内任意
+/// 虚拟地址（包括未映射空洞、GIC 0x08000000 / UART 0x09000000 设备区）误判为
+/// 「已映射」，等于只做范围检查——内核解引用任意低地址将直接读写设备寄存器，
+/// 解引用未映射地址会在 EL1 触发 data abort 挂死内核（用户态 DoS）。
+/// 映射记录按页维护、由 `add_page/reserve_page/…` 在建立映射时同步写入，
+/// 是用户地址空间唯一权威来源；`LAZY_PAGE` 预留页（未落地）视为未映射。
 pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
     if !user_va_range_ok(va, len) {
         return false;
     }
     let end = va + len;
-    let mut cur = va;
+    let mut cur = va & !(PAGE_SIZE - 1);
     while cur < end {
-        if !page_mapped_in(root, cur) {
+        // 记录表是权威来源（不误判设备块），但 SHM / framebuffer 等共享映射
+        // 不写记录。未命中记录时再做「EL0 可访问（AP≠EL1-only）」的页表漫游：
+        // 两路合取 —— 共享映射不再被误拒（此前 fork/SHM 用户缓冲被 EFAULT），
+        // 设备块（AP_EL1_RW）依然被拒绝，杜绝「把设备区当用户内存」误判。
+        if !crate::process::root_page_recorded(root, cur) && !user_page_pte_el0(root, cur) {
             return false;
         }
         cur += PAGE_SIZE;
@@ -75,32 +112,36 @@ pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
     true
 }
 
-/// 校验 `va` 所在页在根表 `root` 中已映射（4KB 页或块描述符均视为已映射）。
-fn page_mapped_in(root: usize, va: VirtAddr) -> bool {
+/// 漫游页表：`va` 所在叶子/块的 AP 字段是否允许 EL0 访问。
+///
+/// 用于记录表未命中的共享映射（SHM / framebuffer）校验：必须真正映射到
+/// 用户可访问的地址（AP 字段非 `AP_EL1_RW`）。继承的内核设备块（L1[0] =
+/// UART/GIC 等）是 `AP_EL1_RW`，此函数对它们返回 `false` —— 与记录表一致，
+/// 不把设备寄存器区放行给用户指针。
+fn user_page_pte_el0(root: usize, va: usize) -> bool {
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
     unsafe {
-        let root_ptr = root as *mut PageTable;
-        let l1 = (*root_ptr).entries[l1_idx];
+        let l1 = (*(root as *const PageTable)).entries[l1_idx];
         if l1 & VALID == 0 {
             return false;
         }
         if l1 & TABLE_BIT == 0 {
-            return true; // 1GB 块
+            // 1GB 块：仅当 EL0 可访问（AP != EL1-only）才放行
+            return l1 & AP_MASK != AP_EL1_RW;
         }
-        let l2 = (l1 & ADDR_MASK) as usize;
-        let l2_ptr = l2 as *mut PageTable;
-        let e2 = (*l2_ptr).entries[l2_idx];
-        if e2 & VALID == 0 {
+        let l2p = (l1 & ADDR_MASK) as usize as *const PageTable;
+        let l2 = (*l2p).entries[l2_idx];
+        if l2 & VALID == 0 {
             return false;
         }
-        if e2 & TABLE_BIT == 0 {
-            return true; // 2MB 块
+        if l2 & TABLE_BIT == 0 {
+            return l2 & AP_MASK != AP_EL1_RW;
         }
-        let l3 = (e2 & ADDR_MASK) as usize;
-        let l3_ptr = l3 as *mut PageTable;
-        (*l3_ptr).entries[l3_idx] & VALID != 0
+        let l3p = (l2 & ADDR_MASK) as usize as *const PageTable;
+        let l3 = (*l3p).entries[l3_idx];
+        l3 & VALID != 0 && l3 & AP_MASK != AP_EL1_RW
     }
 }
 
@@ -226,10 +267,25 @@ pub struct PageTable {
 /// 每个进程可跟踪的用户映射页数上限（vaddr/paddr/flags 三元组）。
 ///
 /// 需要容纳最坏情况：launcher 含两个 2MB 帧缓冲（约 1017 页）+ 1MB 栈
-/// （256 页）= 1273 页。1536 项（ProcPageTable 约 24KB，任务栈 256KB 可
-/// 容纳其栈帧）提供余量；超过则拒绝映射（`add_page` 返回 `false`），
-/// 调用方回滚，避免「只建映射不记录」导致的泄漏与 fork 不一致。
-pub const MAX_USER_PAGES: usize = 1536;
+/// （256 页）= 1273 页。接入 cn.ttf 平滑字体后，应用 bss 段膨胀（launcher
+/// 约 4.2MB = 1062 页）+ 字体读取/解析堆（数 MB）可达 3000+ 页，
+/// 16384 项（ProcPageTable 约 384KB）提供余量；超过则拒绝映射
+/// （`add_page` 返回 `false`），调用方回滚，避免「只建映射不记录」
+/// 导致的泄漏与 fork 不一致。字节 bump 下 brk ≈ fontdue 实际分配
+/// ~48MB = 12300 页，16384 提供足够余量。
+///
+/// 2026-08：cn.ttf 子集约 3.1MB（3465 码点）经 fontdue 解析时用户堆实际
+/// 增长 ~62MB（heap 从 0x600000 到 0x4395000 = 15765 页），加上 OOBE/launcher
+/// 自身的代码/BSS 页（launcher bss 2379 页）会立刻耗尽 16384 记录 → brk
+/// 映射失败 → alloc PANIC（首次开机 OOBE 崩溃的根因）。提高到 32768（128MB）
+/// 后两者共需约 18144 页，仍留一半余量。
+///
+/// 2026-08-30：uiputong.ttf（cn 子集 1.68MB）与 bold.ttf（子集 1.68MB）由
+/// `ttf_text::font_init()` 在同进程内一并解析，fontdue 每个字体约增长
+/// 15765 页（实测同 3465 码点），双字体 ≈ 31530 页 + launcher OOBE bss
+/// ~2400 页 ≈ 33900 页，已逼近 32768 → 提高到 65536（ProcPageTable 约 1.5MB），
+/// 双字体加载与普通应用（bss 约 200-1000 页）继续留一半余量。
+pub const MAX_USER_PAGES: usize = 65536;
 
 /// 一条用户地址空间映射记录。
 #[derive(Clone, Copy)]
@@ -247,7 +303,7 @@ pub const EMPTY_USER_PAGE: UserPage = UserPage { vaddr: 0, paddr: 0, flags: 0 };
 ///
 /// 用户态首次访问该地址会触发 EL0 data abort，内核在 page fault 处理器中
 /// 落地（分配物理页 + 清零 + 建映射 + 更新记录）后重试故障指令，实现
-/// demand paging。`usize::MAX` 不是合法物理地址，任何"释放物理页"路径
+/// 按需分页。`usize::MAX` 不是合法物理地址，任何"释放物理页"路径
 /// 都必须先判断 `paddr == LAZY_PAGE` 跳过，避免把哨兵值当地址释放。
 pub const LAZY_PAGE: PhysAddr = usize::MAX;
 
@@ -273,13 +329,50 @@ impl ProcPageTable {
     }
 
     /// 新建页表：分配清零根表并继承内核恒等映射。
+    /// 根表（单页）分配失败直接 panic——进程创建路径，非用户可直接触发的
+    /// OOM 增长点（中间级页表/任务栈的 OOM 已改为错误上抛）。
     pub fn new() -> Self {
-        let root = new_table();
+        let root = new_table().expect("vm：根页表物理内存不足");
         inherit_kernel_mapping(root);
         ProcPageTable {
             ttbr0: root,
             user_pages: [EMPTY_USER_PAGE; MAX_USER_PAGES],
             count: 0,
+        }
+    }
+
+    /// 在堆上新建页表（`Box`），**不在栈上构造 96KB 临时对象**。
+    ///
+    /// `user_pages[4096]` 约 96KB；`Box::new(Self::new())` 会在栈上先构造
+    /// 完整的 `Self` 再移入堆，叠加 fork/execve 深调用链会使内核任务栈
+    /// （256KB）溢出并破坏相邻内存。本函数用 `Box::new_uninit` + 直接写
+    /// 字段的方式初始化，全程不产生栈上大对象。
+    pub fn new_boxed() -> alloc::boxed::Box<ProcPageTable> {
+        match ProcPageTable::try_new_boxed() {
+            Some(b) => b,
+            None => panic!("vm：根页表物理内存不足"),
+        }
+    }
+
+    /// `new_boxed` 的可失败版本：根表分配失败返回 `None` 而非 panic
+    /// （用户进程可通过 brk/文件 mmap 耗尽物理内存后 fork 触发 OOM，
+    /// fork/elf 路径必须能干净失败而不是挂死整机）。
+    pub fn try_new_boxed() -> Option<alloc::boxed::Box<ProcPageTable>> {
+        use core::ptr;
+        let mut b = alloc::boxed::Box::new_uninit();
+        unsafe {
+            let p: *mut ProcPageTable = b.as_mut_ptr();
+            let root = new_table()?;
+            ptr::write(&mut (*p).ttbr0, root);
+            ptr::write(&mut (*p).count, 0usize);
+            let up = &mut (*p).user_pages as *mut [UserPage; MAX_USER_PAGES] as *mut u8;
+            let up_len = core::mem::size_of::<[UserPage; MAX_USER_PAGES]>();
+            for b in 0..up_len {
+                ptr::write_volatile(up.add(b), 0u8);
+            }
+            inherit_kernel_mapping((*p).ttbr0);
+            // 安全性：所有字段均已初始化。
+            Some(b.assume_init())
         }
     }
 
@@ -293,7 +386,10 @@ impl ProcPageTable {
         if !user_va_range_ok(vaddr, PAGE_SIZE) || self.count >= MAX_USER_PAGES {
             return false;
         }
-        map_page_in(self.ttbr0, vaddr, paddr, flags);
+        // 映射失败（中间级页表 OOM）时同样不记录，避免记录与映射不一致。
+        if !map_page_in(self.ttbr0, vaddr, paddr, flags) {
+            return false;
+        }
         self.user_pages[self.count] = UserPage { vaddr, paddr, flags };
         self.count += 1;
         true
@@ -314,7 +410,10 @@ impl ProcPageTable {
         if !user_va_range_ok(vaddr, PAGE_SIZE) || self.count >= MAX_USER_PAGES {
             return false;
         }
-        map_page_in(self.ttbr0, vaddr, paddr, pte_flags);
+        // 映射失败（中间级页表 OOM）时不记录。
+        if !map_page_in(self.ttbr0, vaddr, paddr, pte_flags) {
+            return false;
+        }
         self.user_pages[self.count] = UserPage { vaddr, paddr, flags: record_flags };
         self.count += 1;
         true
@@ -340,6 +439,22 @@ impl ProcPageTable {
     /// 共享页（只读共享池 `AP_USER_RO` 或 COW `FLAG_COW`）引用计数 -1，
     /// 归零才真正归还物理页；私有 RW 数据页直接释放。
     pub fn free_user_pages(&mut self) {
+        // 去重：同一 VA 以相同物理页重复登记的记录（同 VA 多次 add_page）
+        // 只允许释放一次，否则 free_page 二次归还同一页会破坏空闲链。
+        for i in 0..self.count {
+            let p = self.user_pages[i];
+            if p.paddr == 0 || p.paddr == LAZY_PAGE {
+                continue;
+            }
+            for j in 0..i {
+                let q = self.user_pages[j];
+                if q.vaddr == p.vaddr && q.paddr == p.paddr {
+                    // 重复登记：标记为无需释放（置 0，与空记录同语义）
+                    self.user_pages[i].paddr = 0;
+                    break;
+                }
+            }
+        }
         for i in 0..self.count {
             let p = self.user_pages[i];
             if p.paddr != 0 && p.paddr != LAZY_PAGE {
@@ -396,19 +511,22 @@ fn page_descriptor(paddr: usize, flags: MapFlags) -> u64 {
 // ==================== 页表页分配 ====================
 
 /// 分配并清零一页作为页表，返回其物理地址。
-fn alloc_zero_table() -> usize {
-    let p = allocator::alloc_page().expect("vm: out of physical memory for page table");
+/// 物理内存耗尽时返回 `None`（调用方把 OOM 作为错误上抛，而非 panic——
+/// 此路径可被用户 mmap/COW/缺页直接触发）。
+fn alloc_zero_table() -> Option<usize> {
+    let p = allocator::alloc_page()?;
     let t = p as *mut u64;
     unsafe {
         for i in 0..512 {
             *t.add(i) = 0;
         }
     }
-    p
+    Some(p)
 }
 
 /// 分配一个清零的页表根（供用户地址空间等使用）。
-pub fn new_table() -> usize {
+/// 物理内存耗尽返回 `None`。
+pub fn new_table() -> Option<usize> {
     alloc_zero_table()
 }
 
@@ -430,56 +548,72 @@ pub fn inherit_kernel_mapping(root: usize) {
 /// 确保 L1 项指向一个有效的 L2 表，返回 L2 表物理地址。
 ///
 /// 若该 L1 项为 1GB 块，则将其拆分为 L2 表（512 个 2MB 块），保留原属性。
-unsafe fn ensure_l2(l1_entry: &mut u64) -> usize {
+/// 分配失败返回 `None`（调用方将 OOM 上抛）。
+unsafe fn ensure_l2(l1_entry: &mut u64) -> Option<usize> {
     if *l1_entry & VALID == 0 {
         // 无效项：分配新的 L2 表
-        let t = alloc_zero_table();
+        let t = alloc_zero_table()?;
         *l1_entry = table_descriptor(t);
-        t
+        Some(t)
     } else if *l1_entry & TABLE_BIT != 0 {
         // 已指向下一级表
-        (*l1_entry & ADDR_MASK) as usize
+        Some((*l1_entry & ADDR_MASK) as usize)
     } else {
         // 1GB 块 → 拆分为 512 个 2MB 块
         let desc = *l1_entry;
         let base = desc & 0x0000_FFFF_C000_0000;
         let low = desc & LOW_ATTR_MASK;
         let xn = desc & XN_MASK;
-        let t = alloc_zero_table();
+        let t = alloc_zero_table()?;
         let p = t as *mut PageTable;
         for i in 0..512usize {
             let a = base + (i as u64) * (L2_BLOCK as u64);
             (*p).entries[i] = (a & 0x0000_FFFF_FFE0_0000) | VALID | low | xn;
         }
         *l1_entry = table_descriptor(t);
-        t
+        // 块 → 表拆分必须在 TLB 中体现：该 1GB 范围此前若按块被访问过，
+        // 陈旧块项仍会命中（块项不细分属性）。对全 VA 失效（拆分是罕见
+        // 粗粒度操作，全冲刷成本可接受），随后 dsb+isb 保证观测顺序。
+        asm!("dsb ishst");
+        asm!("tlbi vmalle1");
+        asm!("dsb ish");
+        asm!("isb");
+        Some(t)
     }
 }
 
 /// 确保 L2 项指向一个有效的 L3 表，返回 L3 表物理地址。
 ///
 /// 若该 L2 项为 2MB 块，则将其拆分为 L3 表（512 个 4KB 页），保留原属性。
-unsafe fn ensure_l3(l2_entry: &mut u64) -> usize {
+/// 分配失败返回 `None`（调用方将 OOM 上抛）。
+unsafe fn ensure_l3(l2_entry: &mut u64) -> Option<usize> {
     if *l2_entry & VALID == 0 {
-        let t = alloc_zero_table();
+        let t = alloc_zero_table()?;
         *l2_entry = table_descriptor(t);
-        t
+        Some(t)
     } else if *l2_entry & TABLE_BIT != 0 {
-        (*l2_entry & ADDR_MASK) as usize
+        Some((*l2_entry & ADDR_MASK) as usize)
     } else {
         // 2MB 块 → 拆分为 512 个 4KB 页
         let desc = *l2_entry;
         let base = desc & 0x0000_FFFF_FFE0_0000;
         let low = desc & LOW_ATTR_MASK;
         let xn = desc & XN_MASK;
-        let t = alloc_zero_table();
+        let t = alloc_zero_table()?;
         let p = t as *mut PageTable;
         for i in 0..512usize {
             let a = base + (i as u64) * (PAGE_SIZE as u64);
             (*p).entries[i] = (a & ADDR_MASK) | VALID | TABLE_BIT | low | xn;
         }
         *l2_entry = table_descriptor(t);
-        t
+        // 块 → 表拆分需让 TLB 失效：该 2MB 范围此前若按块被访问过，
+        // 陈旧块项会掩盖新表的属性（如把用户页当成 EL1-only 块）。
+        // 对全 VA 失效（拆分是粗粒度罕见操作，全冲刷成本可接受）。
+        asm!("dsb ishst");
+        asm!("tlbi vmalle1");
+        asm!("dsb ish");
+        asm!("isb");
+        Some(t)
     }
 }
 
@@ -488,17 +622,19 @@ unsafe fn ensure_l3(l2_entry: &mut u64) -> usize {
 /// 在指定根表中建立 `vaddr → paddr` 的 4KB 页映射。
 ///
 /// 按需分配中间级页表，必要时拆分块描述符；覆盖已有映射时做 TLB 失效，
-/// 防止陈旧 TLB 项命中（重映射场景）。
-pub fn map_page_in(root: usize, vaddr: usize, paddr: usize, flags: MapFlags) {
+/// 防止陈旧 TLB 项命中（重映射场景）。返回是否成功：中间级页表分配失败
+/// （物理内存耗尽）返回 `false` 且**不建立映射**，调用方应把 OOM 上抛
+/// （此前直接 panic，用户 mmap/COW/缺页可打挂内核）。
+pub fn map_page_in(root: usize, vaddr: usize, paddr: usize, flags: MapFlags) -> bool {
     let l1_idx = (vaddr >> 30) & 0x1FF;
     let l2_idx = (vaddr >> 21) & 0x1FF;
     let l3_idx = (vaddr >> 12) & 0x1FF;
 
     unsafe {
         let root_ptr = root as *mut PageTable;
-        let l2 = ensure_l2(&mut (*root_ptr).entries[l1_idx]);
+        let Some(l2) = ensure_l2(&mut (*root_ptr).entries[l1_idx]) else { return false };
         let l2_ptr = l2 as *mut PageTable;
-        let l3 = ensure_l3(&mut (*l2_ptr).entries[l2_idx]);
+        let Some(l3) = ensure_l3(&mut (*l2_ptr).entries[l2_idx]) else { return false };
         let l3_ptr = l3 as *mut PageTable;
         let existed = (*l3_ptr).entries[l3_idx] & VALID != 0;
         (*l3_ptr).entries[l3_idx] = page_descriptor(paddr, flags);
@@ -511,11 +647,12 @@ pub fn map_page_in(root: usize, vaddr: usize, paddr: usize, flags: MapFlags) {
             asm!("isb");
         }
     }
+    true
 }
 
-/// 在内核根表（TTBR0_EL1）中建立 `vaddr → paddr` 映射。
-pub fn map_page(vaddr: usize, paddr: usize, flags: MapFlags) {
-    map_page_in(kernel_root_addr(), vaddr, paddr, flags);
+/// 在内核根表（TTBR0_EL1）中建立 `vaddr → paddr` 映射。返回是否成功。
+pub fn map_page(vaddr: usize, paddr: usize, flags: MapFlags) -> bool {
+    map_page_in(kernel_root_addr(), vaddr, paddr, flags)
 }
 
 /// 从指定根表翻译用户虚拟地址 → 物理地址（诊断用；未映射返回 0）。
@@ -582,7 +719,7 @@ pub fn unmap_page(vaddr: usize) {
 
 /// 读取 TTBR0_EL1。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 pub unsafe fn read_ttbr0_el1() -> u64 {
     let v: u64;
@@ -592,7 +729,7 @@ pub unsafe fn read_ttbr0_el1() -> u64 {
 
 /// 写 TTBR0_EL1 并做完整 TLB 维护（tlbi vmalle1）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限；base 必须为 4KB 对齐的页表物理地址，且已继承内核恒等映射。
 pub unsafe fn write_ttbr0_el1(base: PhysAddr) {
     asm!(
@@ -611,6 +748,10 @@ pub unsafe fn write_ttbr0_el1(base: PhysAddr) {
 /// 继承的 1GB 块，要么已被用户映射拆分为私有 L2 表。L1[1]（内核 RAM 恒等映射）
 /// 始终共享，绝不能被释放。此函数只回收 L1[0] 派生出的 L2/L3 与根表页。
 pub fn free_process_tables(root: usize) {
+    if root == 0 {
+        crate::uart_send_str("[fpt] root=0!\n");
+        return;
+    }
     unsafe {
         let l1 = root as *mut PageTable;
         let e0 = (*l1).entries[0];
@@ -621,7 +762,15 @@ pub fn free_process_tables(root: usize) {
                 let e = (*l2p).entries[i];
                 // 表描述符（L3）→ 回收；块描述符（设备/内存）→ 跳过
                 if e & VALID != 0 && e & TABLE_BIT != 0 {
-                    allocator::free_page((e & ADDR_MASK) as usize);
+                    let l3 = (e & ADDR_MASK) as usize;
+                    if l3 == 0 {
+                        crate::uart_send_str("[fpt] L3 表项为零，i=");
+                        crate::print_dec(i as u64);
+                        crate::uart_send_str(" l1e0=");
+                        crate::print_hex(e0);
+                        crate::uart_send_str("\n");
+                    }
+                    allocator::free_page(l3);
                 }
             }
             allocator::free_page(l2);

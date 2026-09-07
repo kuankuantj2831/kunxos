@@ -13,3 +13,7 @@ codegen-units = 1
 panic = "abort"
 # 剥离符号表，保证 ELF 小于内核 ELF 加载器的 16KB 缓冲上限。
 strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

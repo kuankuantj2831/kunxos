@@ -32,6 +32,12 @@ pub extern "C" fn syscall_dispatch(frame: *mut TrapFrame) {
     unsafe {
         let f = &mut *frame;
         let nr = f.x[8] as usize;
-        f.x[0] = linux_compat::dispatch(nr, f) as u64;
+        // 记录分发前的 elr：若信号投递把陷阱帧改写为进入 handler（elr 变化），
+        // 结果不得写回 x0（x0 此时是 handler 的 signum 参数，覆写会破坏信号语义）。
+        let elr_before = f.elr;
+        let ret = linux_compat::dispatch(nr, f);
+        if f.elr == elr_before {
+            f.x[0] = ret as u64;
+        }
     }
 }

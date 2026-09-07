@@ -10,7 +10,9 @@
 
 use core::arch::asm;
 
+use crate::compositor;
 use crate::devfs;
+use crate::gesture;
 use crate::sched_cfs;
 use crate::timer;
 use crate::vfs;
@@ -103,6 +105,11 @@ struct InputDevice {
     waiter: [Option<u32>; WAITERS],
     /// 最近一次非阻塞轮询的任务，用于事件到达时打断其帧等待。
     poller: Option<u32>,
+    /// 最近一次读取本设备的任务（前台 UI 应用）：指针/按键事件到达时对其
+    /// 做调度加速（boost_tid），交互任务即时抢占后台负载。
+    reader_tid: u32,
+    /// 上次触控加速时刻（µs），限频用。
+    last_boost_us: u64,
     /// 触摸面板 X 轴物理最大值。
     max_x: u32,
     /// 触摸面板 Y 轴物理最大值。
@@ -121,6 +128,8 @@ static mut DEV: InputDevice = InputDevice {
     count: 0,
     waiter: [None; WAITERS],
     poller: None,
+    reader_tid: 0,
+    last_boost_us: 0,
     max_x: 0,
     max_y: 0,
 };
@@ -208,6 +217,22 @@ fn handle_frame(frame: &[u8; FRAME_LEN]) {
     let sec = (us / 1_000_000) as i64;
     let usec = (us % 1_000_000) as i64;
 
+    // 转发给全屏手势系统（设备坐标 → 屏幕坐标）
+    let gk = match kind {
+        FRAME_DOWN => Some(gesture::InputKind::Down),
+        FRAME_MOVE => Some(gesture::InputKind::Move),
+        FRAME_UP => Some(gesture::InputKind::Up),
+        _ => None,
+    };
+    if let Some(gk) = gk {
+        let sw = compositor::width() as i64;
+        let sh = compositor::height() as i64;
+        let (mx, my) = unsafe { (DEV.max_x as i64, DEV.max_y as i64) };
+        let sx = if mx > 0 { (x as i64 * sw / mx) as i32 } else { x };
+        let sy = if my > 0 { (y as i64 * sh / my) as i32 } else { y };
+        gesture::handle(gesture::PointerEvent { kind: gk, x: sx, y: sy });
+    }
+
     match kind {
         FRAME_DOWN => {
             emit(sec, usec, EV_ABS, ABS_X, x);
@@ -241,6 +266,28 @@ fn emit(sec: i64, usec: i64, etype: u16, code: u16, value: i32) {
 /// [`sched_cfs::wake_irq`] 避免中途重新使能 IRQ。
 pub fn push_event(ev: InputEvent) {
     unsafe {
+        // 指针移动事件合并（Android 输入批处理思路）：积压过半时丢弃最旧
+        // 的完整移动帧（ABS_X,ABS_Y,SYN 三元组）。应用繁忙（整帧重绘）时
+        // 新位置直接覆盖旧位置，光标恢复后不再「追赶式」逐帧爬行。
+        if ev.etype == EV_ABS && DEV.count >= EV_BUF_SIZE / 2 {
+            while DEV.count >= EV_BUF_SIZE / 2 {
+                let h = DEV.head;
+                let e0 = DEV.ev_buf[h];
+                let e1 = DEV.ev_buf[(h + 1) % EV_BUF_SIZE];
+                let e2 = DEV.ev_buf[(h + 2) % EV_BUF_SIZE];
+                if e0.etype == EV_ABS
+                    && e0.code == ABS_X
+                    && e1.etype == EV_ABS
+                    && e1.code == ABS_Y
+                    && e2.etype == EV_SYN
+                {
+                    DEV.head = (h + 3) % EV_BUF_SIZE;
+                    DEV.count -= 3;
+                } else {
+                    break;
+                }
+            }
+        }
         if DEV.count == EV_BUF_SIZE {
             DEV.head = (DEV.head + 1) % EV_BUF_SIZE;
             DEV.count -= 1;
@@ -254,10 +301,27 @@ pub fn push_event(ev: InputEvent) {
                 sched_cfs::wake_irq(t);
             }
         }
-        // launcher 的帧循环可能正阻塞于 nanosleep；只提前唤醒最近轮询
-        // event0 的任务，不打断其它后台服务的正常睡眠。
-        if let Some(poller) = DEV.poller.take() {
-            sched_cfs::wake_sleeper_irq(poller);
+        // launcher 的帧循环可能正阻塞于 nanosleep：提前唤醒最近轮询
+        // event0 的任务，不打断其它后台服务的正常睡眠。poller 登记**不
+        // 消费**：此前 take() 会把「登记 poller 后、注册睡眠前」到达的
+        // 事件竞态变成白睡一个帧间隔（输入延迟 +16ms）。未睡眠时
+        // wake_sleeper_irq 无副作用，登记由下次 input_read 覆盖。
+        if let Some(p) = DEV.poller {
+            sched_cfs::wake_sleeper_irq(p);
+        }
+        // 输入触控加速（鸿蒙交互调度 / ColorOS 潮汐引擎思路）：指针/按键
+        // 事件到达时，把最近读取输入的 UI 任务 vruntime 拉到全局最小并
+        // 请求唤醒抢占 —— 交互任务即时抢占后台负载，输入→画面延迟不再
+        // 包含「等后台任务用完 10ms 时间片」。限频 2ms。
+        if ev.etype == EV_ABS
+            || ev.etype == EV_REL
+            || (ev.etype == EV_KEY && (ev.code == BTN_TOUCH || ev.code == BTN_LEFT))
+        {
+            let now = timer::now_us();
+            if DEV.reader_tid != 0 && now.saturating_sub(DEV.last_boost_us) >= 2_000 {
+                DEV.last_boost_us = now;
+                sched_cfs::boost_tid(DEV.reader_tid);
+            }
         }
     }
 }
@@ -304,6 +368,8 @@ fn input_read(_minor: u32, flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
             let saved = unsafe { irq_save() };
             unsafe {
                 DEV.poller = Some(sched_cfs::current_tid());
+                // 登记最近读者：指针事件到达时对其做调度加速（触控加速）
+                DEV.reader_tid = sched_cfs::current_tid();
             }
             unsafe { irq_restore(saved) };
             return -11; // EAGAIN
@@ -325,6 +391,8 @@ fn input_read(_minor: u32, flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
                     break;
                 }
             }
+            // 阻塞读者同样是最近读者（触控加速目标）
+            DEV.reader_tid = sched_cfs::current_tid();
             if !registered {
                 irq_restore(saved);
                 sched_cfs::yield_now();
@@ -390,7 +458,9 @@ pub fn init(info: Option<kunxhal::input::InputInfo>) {
     vfs::mkdir("/dev/input");
     vfs::mknod("/dev/input/event0", vfs::FileType::Chr, devfs::INPUT_MAJOR, devfs::INPUT_MINOR);
 
-    crate::uart_send_str("[input] /dev/input/event0 registered (");
-    crate::uart_send_str(DEV_NAME);
-    crate::uart_send_str(")\n");
+    crate::kinfo! {
+        crate::uart_send_str("[input] /dev/input/event0 已注册 (");
+        crate::uart_send_str(DEV_NAME);
+        crate::uart_send_str(")\n");
+    }
 }

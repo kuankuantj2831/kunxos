@@ -24,15 +24,15 @@ use kit::*;
 
 // ==================== 布局与配色 ====================
 
-const C_BG: u32 = 0x00_10_18_28;
-const C_ROW: u32 = 0x00_1B_2B_4A;
-const C_ROW_BORDER: u32 = 0x00_2A_3A_5A;
-const C_SENDER: u32 = 0x00_FF_FF_FF;
-const C_SUBJECT: u32 = 0x00_9A_A7_B5;
-const C_TIME: u32 = 0x00_6B_78_8C;
-const C_UNREAD: u32 = 0x00_22_C5_5E;
-const C_BODY: u32 = 0x00_BB_C5_D0;
-const C_DIM2: u32 = 0x00_6B_78_8C;
+const C_BG: u32 = 0x00_F7_F8_FA;
+const C_ROW: u32 = 0x00_FF_FF_FF;
+const C_ROW_BORDER: u32 = 0x00_E5_E9_F0;
+const C_SENDER: u32 = 0x00_1A_1C_22;
+const C_SUBJECT: u32 = 0x00_6B_72_80;
+const C_TIME: u32 = 0x00_6B_72_80;
+const C_UNREAD: u32 = 0x00_00_B9_6B;
+const C_BODY: u32 = 0x00_1A_1C_22;
+const C_DIM2: u32 = 0x00_6B_72_80;
 
 const LIST_TOP: i32 = 56;
 const ROW_H: i32 = 76;
@@ -64,15 +64,15 @@ static mut VIEWING: u32 = u32::MAX;
 // ==================== 渲染 ====================
 
 fn render_list() {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_BG);
+    draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("邮件".as_bytes());
     for (i, m) in MAILS.iter().enumerate() {
         let y = LIST_TOP + i as i32 * ROW_H;
         if y + ROW_H > DISPLAY_H as i32 {
             break;
         }
-        fill_rect(12, y, DISPLAY_W as i32 - 24, ROW_H - 8, C_ROW);
-        draw_rect(12, y, DISPLAY_W as i32 - 24, ROW_H - 8, C_ROW_BORDER);
+        // 邮件行：液态玻璃卡片（r = min(68*25/100, 24) = 17）
+        draw_glass(12, y, DISPLAY_W as i32 - 24, ROW_H - 8, 17);
         if m.unread {
             draw_disc(26, y + ROW_H / 2 - 4, 5, C_UNREAD);
         }
@@ -80,19 +80,21 @@ fn render_list() {
         draw_text(44, y + 38, m.subject.as_bytes(), C_SUBJECT);
         draw_text(DISPLAY_W as i32 - 16 - text_width(m.time.as_bytes()), y + 12, m.time.as_bytes(), C_TIME);
     }
-    draw_cursor();
+    draw_sys_nav();
 }
 
 fn render_view(idx: usize) {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_BG);
+    draw_gradient_bg(C_BG, glass_dark());
     let m = &MAILS[idx];
 
-    // 标题栏：返回 + 主题
-    fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_TITLE_BG);
-    fill_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN);
-    draw_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN_BORDER);
+    // 标题栏：返回 + 主题（玻璃，与 draw_title_bar 同款）
+    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
     draw_text(48, (TITLE_H - 8) / 2, m.subject.as_bytes(), C_TEXT);
+
+    // 邮件内容面板（液态玻璃，覆盖内容区到导航栏之上）
+    draw_glass(16, 64, DISPLAY_W as i32 - 32, content_bottom() - 64, 24);
 
     // 发件人 + 时间
     draw_text(24, 72, "发件人: ".as_bytes(), C_DIM2);
@@ -106,6 +108,13 @@ fn render_view(idx: usize) {
     let mut n = 0;
     for &c in m.body.as_bytes() {
         let cw = if c >= 0x80 { 16 } else { 8 };
+        // ★ 缓冲写满先落一行：折行按像素宽度判定，窄字符（'i'/'l'/空格等
+        // TTF 比例字形）96 字节可能仍不足一行宽 —— 无守卫时 line[96] 越界。
+        if n >= line.len() {
+            draw_text(24, y, &line[..n], C_BODY);
+            y += 28;
+            n = 0;
+        }
         if n > 0 && text_width(&line[..n]) + cw > DISPLAY_W as i32 - 48 {
             draw_text(24, y, &line[..n], C_BODY);
             y += 28;
@@ -119,37 +128,42 @@ fn render_view(idx: usize) {
     }
 
     draw_text(16, DISPLAY_H as i32 - 60, "返回键回到收件箱".as_bytes(), C_DIM2);
-    draw_cursor();
+    draw_sys_nav();
 }
 
 // ==================== 主循环 ====================
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[mail] starting\n");
+    print("[mail] 启动中\n");
     if !fb_init() {
-        print("[mail] /dev/fb0 mmap failed, no framebuffer\n");
+        print("[mail] /dev/fb0 mmap 失败，无帧缓冲\n");
         unsafe { exit(1); }
     }
-    print("[mail] ready\n");
+    print("[mail] 就绪\n");
 
     let mut dirty = true;
     loop {
         let ev = poll_input();
         if ev.moved {
-            dirty = true;
+            cursor_overlay_move();
         }
+        if ev.nav != NavAction::None {
+            print("[nav] 系统导航 -> 退出\n");
+            unsafe { exit(nav_exit_code(ev.nav)); }
+        }
+
         if let Some((x, y)) = ev.tap {
             let viewing = unsafe { VIEWING };
             if viewing == u32::MAX {
                 if back_hit(x, y) {
-                    print("[mail] back -> exit\n");
+                    print("[mail] 返回 -> 退出\n");
                     break;
                 }
                 let row = (y - LIST_TOP) / ROW_H;
                 if row >= 0 && (row as usize) < MAILS.len() {
                     unsafe { VIEWING = row as u32; }
-                    print("[mail] open mail ");
+                    print("[mail] 打开邮件 ");
                     print_dec(row as u64);
                     print("\n");
                     dirty = true;
@@ -163,13 +177,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         }
         match ev.key {
             KeyAction::Esc => {
-                print("[mail] ESC -> exit\n");
+                print("[mail] ESC -> 退出\n");
                 break;
             }
             _ => {}
         }
         if poll_tty_esc() {
-            print("[mail] ESC -> exit\n");
+            print("[mail] ESC -> 退出\n");
             break;
         }
         if dirty {
@@ -180,12 +194,15 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 render_view(viewing as usize);
             }
             flip();
+            cursor_overlay_redraw();
             dirty = false;
+            kit::font_init_checked();
+            if kit::font_just_refreshed() { dirty = true; }
         }
         sleep_ms(16);
     }
 
-    print("[mail] exiting\n");
+    print("[mail] 正在退出\n");
     unsafe { exit(0); }
 }
 
@@ -206,9 +223,26 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
+    struct BufWriter {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
     unsafe {
         write_fd(2, b"PANIC: mail\n");
+        write_fd(2, &w.buf[..w.len]);
         syscall1(SYS_EXIT, 1);
     }
     loop {}

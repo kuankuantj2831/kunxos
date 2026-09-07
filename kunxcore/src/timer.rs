@@ -23,7 +23,7 @@ static mut INTERVAL_US: u64 = 0;
 
 /// 读取计数频率 `CNTFRQ_EL0`。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn read_cntfrq() -> u64 {
     let v: u64;
@@ -33,7 +33,7 @@ unsafe fn read_cntfrq() -> u64 {
 
 /// 读取虚拟计数器 `CNTVCT_EL0` 当前值（单调递增）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn read_cntvct() -> u64 {
     let v: u64;
@@ -53,7 +53,7 @@ pub fn now_us() -> u64 {
 
 /// 写 `CNTV_TVAL_EL0`（虚拟定时器递减初值）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn write_cntv_tval(val: u64) {
     asm!("msr cntv_tval_el0, {}", in(reg) val);
@@ -61,7 +61,7 @@ unsafe fn write_cntv_tval(val: u64) {
 
 /// 写 `CNTV_CTL_EL0`（bit0 使能，bit1 屏蔽中断）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn write_cntv_ctl(val: u64) {
     asm!("msr cntv_ctl_el0, {}", in(reg) val);
@@ -144,8 +144,9 @@ pub fn timer_handle_irq() {
 //
 // 动画帧推进与调度器 tick 解耦：调度 tick 走虚拟定时器 CNTV（IRQ 27，动态
 // 10ms 周期），动画帧推进走**非安全 EL1 物理定时器 CNTP**（IRQ 30，固定
-// 8ms 周期）。两条硬件通道互不干扰，动画帧间隔不再被调度器上下文切换抖动
-// 污染，也不再被 100Hz 上限限制（8ms = 125Hz）。
+// 8.33ms 周期 = 120Hz，与 docs/animations.md 的帧时钟规范一致）。两条硬件
+// 通道互不干扰，动画帧间隔不再被调度器上下文切换抖动污染，也不再被 100Hz
+// 上限限制（120Hz 帧预算 8.33ms，留 ~1ms 余量给合成/翻转）。
 
 /// 物理定时器 CNTP PPI 中断号（GIC PPI 14 → ID 30，QEMU virt DTB 确认）。
 pub const TIMER2_IRQ: u32 = 30;
@@ -158,7 +159,7 @@ static mut INTERVAL2_US: u64 = 0;
 
 /// 读取物理计数器 `CNTPCT_EL0`。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn read_cntpct() -> u64 {
     let v: u64;
@@ -168,7 +169,7 @@ unsafe fn read_cntpct() -> u64 {
 
 /// 写 `CNTP_TVAL_EL0`（物理定时器递减初值）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn write_cntp_tval(val: u64) {
     asm!("msr cntp_tval_el0, {}", in(reg) val);
@@ -176,7 +177,7 @@ unsafe fn write_cntp_tval(val: u64) {
 
 /// 写 `CNTP_CTL_EL0`（bit0 使能，bit1 屏蔽中断）。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn write_cntp_ctl(val: u64) {
     asm!("msr cntp_ctl_el0, {}", in(reg) val);
@@ -222,6 +223,25 @@ pub fn timer2_register_handler(handler: TimerHandler) {
 /// 动画定时器中断确认：仅重装（清除中断源），供 IRQ 分发层在写 EOI 之前调用，
 /// 避免电平触发重触发风暴（与 `timer_ack` 同理）。
 pub fn timer2_ack() {
+    reload2();
+}
+
+/// 停止动画定时器（CNTP 关使能）：无活动动画时停掉 120Hz 恒定唤醒。
+///
+/// 动画定时器是系统空转开销的大头（120 次/秒 IRQ 进出 + GIC EOI，TCG 慢宿主
+/// 下每 8.33ms 一次异常往返）。`frame_tick` 在最后一个动画完成时调用本函数；
+/// 下次 `anim::tween`/`anim::spring` 启动动画时通过 [`timer2_start`] 重新点亮。
+pub fn timer2_stop() {
+    unsafe {
+        // CNTP_CTL：bit0 = ENABLE。写 0 即停止计数与中断触发（不清除重装值）。
+        asm!("msr cntp_ctl_el0, {}", in(reg) 0u64);
+        asm!("isb");
+    }
+}
+
+/// 按当前周期重装并启动动画定时器（CNTP）：供动画启动路径在「无动画停表」后
+/// 重新点亮。已在运行的定时器重复调用等价于一次平滑 reload，无副作用。
+pub fn timer2_start() {
     reload2();
 }
 

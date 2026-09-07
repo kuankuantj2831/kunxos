@@ -1,0 +1,16 @@
+# KunxOS 云服务 —— Cloudflare Workers 配置
+name = "kunxos-cloud"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "kunxos-cloud"
+database_id = "fb2000e0-3ea1-489c-bfdc-d6725926eb49"
+
+# 管理密钥用 `wrangler secret put ADMIN_KEY` 设置（secret 与 var 不能同名，
+# 故此处不声明 [vars] ADMIN_KEY）
+
+# 自定义域名用 `wrangler deploy --domains kunxoscloud.kuankuantj.com` 绑定
+# （需在 zone 关闭 Always Use HTTPS / Automatic HTTPS Rewrites 才能明文 HTTP）

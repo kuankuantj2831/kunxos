@@ -58,7 +58,6 @@ const LOG_PATH: &str = "/var/log/networkd.log";
 const PIPE_PATH: &str = "/var/run/networkd.pipe";
 
 /// 演示主循环轮数（每轮约 200ms，避免拖慢启动）。
-const DEMO_ROUNDS: usize = 3;
 
 // ==================== 系统调用封装 ====================
 
@@ -213,9 +212,9 @@ fn handle_command(cmd: &[u8]) {
         print_ip(&DNS);
         print("\n");
     } else if bytes_starts_with(cmd, b"RENEW") {
-        print("[networkd] DHCP renew requested\n");
+        print("[networkd] 已请求 DHCP renew\n");
     } else if !cmd.is_empty() {
-        print("[networkd] unknown command\n");
+        print("[networkd] 未知命令\n");
     }
 }
 
@@ -224,24 +223,48 @@ fn poll_pipe() {
     // 256B 缓冲会截断长命令（管道文件为普通文件模拟，read 后 ftruncate 清空，
     // 超长命令尾部直接丢失）。1024B 覆盖全部现有命令与扩展命令。
     static mut BUF: [u8; 1024] = [0u8; 1024];
+    static mut WARNED: bool = false;
     unsafe {
         let fd = open(PIPE_PATH, O_RDWR);
         if fd < 0 {
+            // 首次失败打印一次告警，避免每 200ms 刷屏。
+            if !WARNED {
+                print("[networkd] 警告：无法打开管道 ");
+                print(PIPE_PATH);
+                print("\n");
+                WARNED = true;
+            }
             return;
         }
         syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len());
+        // 循环读到 EOF：单次 read 长度有限，长命令尾部不能截断丢失。
+        let mut total = 0usize;
+        loop {
+            if total >= BUF.len() {
+                print("[networkd] 警告：管道命令过长，尾部已丢弃\n");
+                break;
+            }
+            let want = (BUF.len() - total).min(256);
+            let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr().add(total) as usize, want);
+            if n == 0 {
+                break; // 读至文件末尾（EOF）
+            }
+            if n > want {
+                break; // 读取出错（异常返回值），本轮丢弃
+            }
+            total += n as usize;
+        }
         // 清空管道文件：避免同一命令每轮重复执行、文件无限增长、
-        // 以及 >256 字节后新命令永远读不到（真 FIFO 语义）。
+        // 以及超出缓冲后新命令永远读不到（真 FIFO 语义）。
         // 注意：ftruncate 必须显式传 length=0（x1 寄存器残留值不可依赖，
         // 否则内核按「length != 0」拒绝，管道文件从不被清空）。
         syscall2(SYS_FTRUNCATE, fd as usize, 0);
         syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        if n > 0 && n <= BUF.len() {
-            let data = &BUF[..n];
+        if total > 0 {
+            let data = &BUF[..total];
             let mut start = 0usize;
-            for i in 0..=n {
-                if i == n || data[i] == b'\n' {
+            for i in 0..=total {
+                if i == total || data[i] == b'\n' {
                     if i > start {
                         handle_command(&data[start..i]);
                     }
@@ -257,7 +280,7 @@ fn poll_pipe() {
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[networkd] started\n");
+    print("[networkd] 已启动\n");
 
     // 网络状态（内核已由 virtio-net + DHCP 初始化，此处硬编码 QEMU 默认值）
     print("[networkd] IP=");
@@ -267,7 +290,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     print(", GW=");
     print_ip(&GW);
     print("\n");
-    print("[networkd] (no /proc/net; using QEMU slirp defaults)\n");
+    print("[networkd]（无 /proc/net；使用 QEMU slirp 默认值）\n");
 
     // 写日志文件
     log_to_file("[networkd] IP=10.0.2.15 MAC=52:54:00:12:34:56 GW=10.0.2.2");
@@ -277,28 +300,22 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         let fd = open(PIPE_PATH, O_CREAT | O_RDWR);
         if fd >= 0 {
             syscall1(SYS_CLOSE, fd as usize);
-            print("[networkd] listening on ");
+            print("[networkd] 正在监听 ");
             print(PIPE_PATH);
             print("\n");
+        } else {
+            print("[networkd] 致命错误：无法创建管道 ");
+            print(PIPE_PATH);
+            print(" (OOBE/launcher 网络操作将不可用)\n");
         }
     }
 
-    // 主循环：轮询管道 + 链路检查（计数器模拟）。
-    let mut tick = 0usize;
-    for _ in 0..DEMO_ROUNDS {
-        tick += 1;
+    // 主循环：轮询管道命令。常驻服务：OOBE/设置会随时经管道发 STATUS/配置
+    // 命令，限时轮次退出（3×200ms）后所有命令静默丢失，写入者无从得知。
+    loop {
         poll_pipe();
-        print_dec(tick);
-        print(": eth0 up (tx=");
-        print_dec(tick * 100);
-        print(", rx=");
-        print_dec(tick * 87);
-        print(")\n");
         sleep_ms(200);
     }
-
-    print("[networkd] exiting (single-EL0 demo)\n");
-    0
 }
 
 // ==================== 入口 ====================
@@ -318,9 +335,25 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：打印 panic 位置（文件:行:列），无堆、固定缓冲。
+    struct PanicBuf { buf: [u8; 256], len: usize }
+    impl core::fmt::Write for PanicBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = PanicBuf { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
     unsafe {
         write_fd(2, b"PANIC: networkd\n");
+        if w.len > 0 {
+            write_fd(2, &w.buf[..w.len]);;
+        }
         syscall1(SYS_EXIT, 1);
     }
     loop {}

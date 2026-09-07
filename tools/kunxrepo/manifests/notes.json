@@ -1,0 +1,12 @@
+{
+  "name": "notes",
+  "version": "0.9.0",
+  "api_level": 1,
+  "description": "备忘录（示例应用）",
+  "author": "KunxOS Team",
+  "main": "bin/notes",
+  "permissions": ["STORAGE"],
+  "dependencies": {"libc": ">=1.0.0", "libm": ">=1.0.0"},
+  "provides": [],
+  "conflicts": ["legacy-notes"]
+}

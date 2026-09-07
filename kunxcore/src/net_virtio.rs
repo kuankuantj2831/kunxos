@@ -285,6 +285,10 @@ unsafe fn tx_free_desc(idx: u16) {
 
 /// 回收 used ring：RX 包搬入软件队列并重新投递缓冲；TX 释放缓冲、归还描述符。
 unsafe fn drain_impl() {
+    // 设备被禁用（used id 越界等致命错误）后不再访问 MMIO/环，防重复故障
+    if BASE == 0 {
+        return;
+    }
     // ---- TX 回收 ----
     loop {
         // 使设备写入的 used ring 对 CPU 可见（KVM/真机有真实缓存时必需；
@@ -296,6 +300,13 @@ unsafe fn drain_impl() {
             break;
         }
         let id = used_id(TX_RING, (TX_USED_SEEN % QUEUE_SIZE as u16) as usize);
+        // 设备回报的描述符下标必须在本队范围：越界 id 若被用来索引 TX_BUFS /
+        // 归还空闲链表会破坏描述符环与堆状态，直接禁用网卡（宁停勿错）。
+        if (id as usize) >= QUEUE_SIZE {
+            crate::uart_send_str("[net] virtio-net：TX 已用 id 越界，禁用网卡\n");
+            BASE = 0;
+            return;
+        }
         let buf = TX_BUFS[id as usize];
         if buf != 0 {
             heap::kfree(buf as *mut u8);
@@ -313,6 +324,13 @@ unsafe fn drain_impl() {
             break;
         }
         let id = used_id(RX_RING, (RX_USED_SEEN % QUEUE_SIZE as u16) as usize);
+        // 同上：RX id 越界则无法安全索引 RX_BUFS / 描述符环并重投递，
+        // 直接禁用网卡，避免向环外地址写描述符。
+        if (id as usize) >= QUEUE_SIZE {
+            crate::uart_send_str("[net] virtio-net：RX 已用 id 越界，禁用网卡\n");
+            BASE = 0;
+            return;
+        }
         let len = used_len(RX_RING, (RX_USED_SEEN % QUEUE_SIZE as u16) as usize) as usize;
         let buf = RX_BUFS[id as usize];
 
@@ -360,6 +378,12 @@ pub fn drain() {
 
 /// 中断处理入口（此时 IRQ 已被硬件屏蔽）。
 fn irq_handler() {
+    // ★ 设备被禁用（drain_impl 对故障置 BASE=0）后 GIC 该 IRQ 仍使能、迟到的
+    // 中断仍可能到达：此前不检查 BASE 就读 REG_IRQ_STATUS(0x60)/写 ACK(0x64)，
+    // 地址 0x60 未映射 → IRQ 上下文 data abort 直接挂死内核。禁用态直接吞掉。
+    if unsafe { BASE } == 0 {
+        return;
+    }
     // 只处理 used-ring 更新中断
     let st = r32(REG_IRQ_STATUS);
     if st & IRQ_USED != 0 {
@@ -421,12 +445,14 @@ pub fn init(devs: &[MmioDev]) -> bool {
 
         // 5. 建立两个队列
         if !setup_queue(0, RX_RING) || !setup_queue(1, TX_RING) {
-            crate::uart_send_str("[net] virtio-net: queue depth < 64 unsupported\n");
+            crate::uart_send_str("[net] virtio-net：队列深度 < 64 不受支持\n");
+            BASE = 0; // 失败复位：残留 BASE 会让 ready() 误报就绪
             return false;
         }
 
         // 6. 初始化 RX / TX 环内容
         if !rx_ring_fill() {
+            BASE = 0; // 失败复位：残留 BASE 会让 ready() 误报就绪
             return false;
         }
         tx_ring_init();
@@ -491,7 +517,7 @@ unsafe fn rx_ring_fill() -> bool {
     for i in 0..QUEUE_SIZE {
         let buf = heap::kmalloc(RX_BUF_LEN);
         if buf.is_null() {
-            crate::uart_send_str("[net] virtio-net: RX buffer alloc failed\n");
+            crate::uart_send_str("[net] virtio-net：RX 缓冲分配失败\n");
             return false;
         }
         let buf = buf as usize;

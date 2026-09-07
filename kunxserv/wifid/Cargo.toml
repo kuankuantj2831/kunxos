@@ -1,0 +1,19 @@
+[package]
+name = "wifid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 无线协议栈共享库：/dev/wifi 字节协议常量（devproto）与扫描/状态记录布局。
+kunxwireless = { path = "../../wireless" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

@@ -10,8 +10,12 @@ use crate::vfs;
 
 /// tmpfs 块设备主号（ramdisk=1，磁盘=2，tmpfs=3）。
 pub const TMPFS_MAJOR: u32 = 3;
-/// tmpfs 容量（块数，每块 4KB；256KB 足够 /tmp 临时文件）。
-pub const TMPFS_BLOCKS: usize = 64;
+/// tmpfs 容量（块数，每块 4KB）。
+///
+/// 必须是 SFS 布局可用的最小卷：JLOG_MIN=64 + inode 表 16 + 位图 1 + 前导
+/// 元数据 3 = 84 块，64 块时 `layout()` 算出 data_start=84 > total=64，mkfs
+/// 直接拒绝（tmpfs 无法挂载）。取 160 留出 76 个数据块的余量（640KB）。
+pub const TMPFS_BLOCKS: usize = 160;
 
 /// 初始化 tmpfs：创建内存块设备 → mkfs → 挂载到 /tmp。
 /// 返回 0 成功；失败 -1（不致命，/tmp 退化为 rootfs 目录）。
@@ -25,8 +29,10 @@ pub fn init() -> i32 {
     if vfs::mount(TMPFS_MAJOR, "/tmp") != 0 {
         return -1;
     }
-    crate::uart_send_str("[fs] tmpfs mounted at /tmp (");
-    crate::print_dec((TMPFS_BLOCKS * 4) as u64);
-    crate::uart_send_str("KB)\n");
+    crate::kinfo! {
+        crate::uart_send_str("[fs] tmpfs 已挂载于 /tmp (");
+        crate::print_dec((TMPFS_BLOCKS * 4) as u64);
+        crate::uart_send_str("KB)\n");
+    }
     0
 }

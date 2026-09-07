@@ -1,0 +1,5 @@
+Project in progress.
+
+Task 1: [in_progress] Update project documentation.
+Task 2: [pending] Develop new feature A.
+Task 3: [pending] Integrate external library X.

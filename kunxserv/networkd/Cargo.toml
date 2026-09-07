@@ -12,3 +12,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

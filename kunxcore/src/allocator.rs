@@ -1,16 +1,31 @@
 //! 物理页分配器：用位图管理 0x40000000 - 0x7FFFFFFF（1GB）物理内存。
 
+use core::arch::asm;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 /// 管理的内存范围（1GB）
 pub const RAM_START: usize = 0x4000_0000;
-const RAM_END: usize = 0x8000_0000;
+pub const RAM_END: usize = 0x8000_0000;
 
 /// 页大小：4KB
 pub const PAGE_SIZE: usize = 4096;
 
 /// 总页数：1GB / 4KB = 262144 页（约 256K 页）
-const TOTAL_PAGES: usize = (RAM_END - RAM_START) / PAGE_SIZE;
+pub const TOTAL_PAGES: usize = (RAM_END - RAM_START) / PAGE_SIZE;
+
+/// 保存 DAIF 并屏蔽 IRQ（嵌套安全：恢复调用前的完整 DAIF 值）。
+/// 分配/释放全程屏蔽 IRQ，避免任务侧 `alloc_page`/`free_page` 的位图
+/// 读-改-写与 IRQ 侧（如 `net_virtio` used-ring 回收) 的并发破坏空闲链表。
+unsafe fn irq_save() -> u64 {
+    let d: u64;
+    asm!("mrs {}, daif", out(reg) d);
+    asm!("msr daifset, #2");
+    d
+}
+
+unsafe fn irq_restore(saved: u64) {
+    asm!("msr daif, {}", in(reg) saved);
+}
 
 /// 位图：每个 u64 管理 64 页，1 = 已用，0 = 空闲
 const BITMAP_WORDS: usize = TOTAL_PAGES / 64; // 4096 个 u64 = 32KB
@@ -25,7 +40,7 @@ static mut LIMIT_PAGES: usize = TOTAL_PAGES;
 
 /// 返回位图数组首元素的原始指针。
 ///
-/// # Safety
+/// # 安全
 /// 仅在开启 IRQ 之前的初始化阶段被调用，单线程，无并发访问。
 unsafe fn bitmap_ptr() -> *mut u64 {
     addr_of_mut!(BITMAP).cast::<u64>()
@@ -33,7 +48,7 @@ unsafe fn bitmap_ptr() -> *mut u64 {
 
 /// 设置位图中第 `page` 位（标记已用）。
 ///
-/// # Safety
+/// # 安全
 /// 仅在内核初始化阶段（开启 IRQ 之前）被调用，无并发访问。
 unsafe fn bitmap_set(page: usize) {
     let word = page / 64;
@@ -74,9 +89,12 @@ pub fn init(kernel_end: usize, ram_size: usize) {
 
 /// 分配一页物理内存，返回页的起始物理地址；失败返回 `None`。
 pub fn alloc_page() -> Option<usize> {
+    let saved = unsafe { irq_save() };
+    let mut found: Option<usize> = None;
     unsafe {
-        // 线性扫描位图，找第一个空闲位
-        for word in 0..BITMAP_WORDS {
+        // 线性扫描位图，找第一个空闲位（命中后必须走到尾部 irq_restore，
+        // 不可在临界区内提前 return，否则屏蔽态泄漏到调用方）
+        'outer: for word in 0..BITMAP_WORDS {
             let bits = read_volatile(bitmap_ptr().add(word));
             // 该字已全满则跳过
             if bits == u64::MAX {
@@ -85,49 +103,59 @@ pub fn alloc_page() -> Option<usize> {
             for bit in 0..64 {
                 let page = word * 64 + bit;
                 if page >= LIMIT_PAGES {
-                    return None;
+                    break;
                 }
                 if (bits >> bit) & 1 == 0 {
                     bitmap_set(page);
-                    return Some(RAM_START + page * PAGE_SIZE);
+                    found = Some(RAM_START + page * PAGE_SIZE);
+                    break 'outer;
                 }
             }
-        }
-        None // 内存耗尽
-    }
+        } // 内存耗尽时 found 保持 None
+    };
+    unsafe { irq_restore(saved) };
+    found
 }
 
 /// 分配 N 个**物理连续**的页，返回第一页起始地址；失败返回 `None`。
 ///
 /// 供内核栈、大块堆分配、帧缓冲、ramdisk 等需要连续物理内存的场景使用。
 pub fn alloc_pages_contig(n: usize) -> Option<usize> {
-    if n == 0 || n > unsafe { LIMIT_PAGES } {
-        return None;
-    }
-    unsafe {
-        let mut run = 0usize;
-        let mut start_page = 0usize;
-        for page in 0..LIMIT_PAGES {
-            let word = page / 64;
-            let bit = page % 64;
-            let bits = read_volatile(bitmap_ptr().add(word));
-            if (bits >> bit) & 1 == 0 {
-                if run == 0 {
-                    start_page = page;
-                }
-                run += 1;
-                if run == n {
-                    for p in start_page..start_page + n {
-                        bitmap_set(p);
+    let saved = unsafe { irq_save() };
+    let r = if n == 0 || n > unsafe { LIMIT_PAGES } {
+        None
+    } else {
+        unsafe {
+            let mut run = 0usize;
+            let mut start_page = 0usize;
+            for page in 0..LIMIT_PAGES {
+                let word = page / 64;
+                let bit = page % 64;
+                let bits = read_volatile(bitmap_ptr().add(word));
+                if (bits >> bit) & 1 == 0 {
+                    if run == 0 {
+                        start_page = page;
                     }
-                    return Some(RAM_START + start_page * PAGE_SIZE);
+                    run += 1;
+                    if run == n {
+                        for p in start_page..start_page + n {
+                            bitmap_set(p);
+                        }
+                        break;
+                    }
+                } else {
+                    run = 0;
                 }
+            }
+            if run == n {
+                Some(RAM_START + start_page * PAGE_SIZE)
             } else {
-                run = 0;
+                None
             }
         }
-        None
-    }
+    };
+    unsafe { irq_restore(saved) };
+    r
 }
 
 /// 统计当前已分配（位图中置 1）的物理页数，用于泄漏检测。
@@ -141,6 +169,38 @@ pub fn used_pages() -> usize {
     count
 }
 
+/// 当前空闲物理页数（供内存压力检测：`free = total - used`）。
+pub fn free_pages() -> usize {
+    total_pages().saturating_sub(used_pages())
+}
+
+/// 把 `[start, start+len)` 物理区间标记为已用，分配器不再分配这些页。
+///
+/// 供启动画面帧缓冲/交接信息等固定地址区域使用：内核接管 bootloader 渲染的
+/// 画面后，必须防止后续分配覆写正在扫描输出的像素。
+pub fn reserve_region(start: usize, len: usize) {
+    if len == 0 || start < RAM_START {
+        return;
+    }
+    // checked：`start + len - 1` 裸加法可回绕（len 无上界），回绕后 `last < first`
+    // 会只预留部分甚至完全不预留本应保留的区域。改用 checked/saturating 计算末尾。
+    let Some(end) = start.checked_add(len) else { return };
+    let end = end.min(RAM_END);
+    if end <= start {
+        return;
+    }
+    let first = (start - RAM_START) / PAGE_SIZE;
+    let last = (end - 1 - RAM_START) / PAGE_SIZE;
+    let limit = unsafe { LIMIT_PAGES };
+    let saved = unsafe { irq_save() };
+    for p in first..=last.min(limit.saturating_sub(1)) {
+        unsafe {
+            bitmap_set(p);
+        }
+    }
+    unsafe { irq_restore(saved) };
+}
+
 /// 物理内存总页数（分配器实际可分配的全部页，按真实内存钳制）。
 pub fn total_pages() -> usize {
     unsafe { LIMIT_PAGES }
@@ -149,18 +209,31 @@ pub fn total_pages() -> usize {
 /// 释放一页物理内存。永久页（`mark_permanent`）直接忽略，永不释放。
 pub fn free_page(addr: usize) {
     // 地址必须位于管理范围内且页对齐
-    assert!(addr >= RAM_START && addr < RAM_END && addr % PAGE_SIZE == 0);
+    let bad = !(addr >= RAM_START && addr < RAM_END && addr % PAGE_SIZE == 0);
+    if bad {
+        let lr: u64;
+        unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+        crate::uart_send_str("[free] BAD addr=");
+        crate::print_hex(addr as u64);
+        crate::uart_send_str(" lr=");
+        crate::print_hex(lr);
+        crate::uart_send_str("\n");
+    }
+    assert!(!bad);
     let page = (addr - RAM_START) / PAGE_SIZE;
-    assert!(page < unsafe { LIMIT_PAGES }, "allocator: free page out of limit");
+    assert!(page < unsafe { LIMIT_PAGES }, "allocator：空闲页超出限制");
     let word = page / 64;
     let bit = page % 64;
+    let saved = unsafe { irq_save() };
     unsafe {
         if read_volatile(PERMANENT.as_ptr().add(word)) & (1u64 << bit) != 0 {
+            irq_restore(saved);
             return; // 永久页：不释放
         }
         let ptr = bitmap_ptr().add(word);
         write_volatile(ptr, read_volatile(ptr) & !(1u64 << bit));
     }
+    unsafe { irq_restore(saved) };
 }
 
 // ==================== 共享只读页引用计数（fork 提速） ====================

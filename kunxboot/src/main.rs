@@ -12,12 +12,18 @@ mod fs_fat;
 mod jump;
 mod load_kernel;
 mod mmc;
+mod sec_boot;
+mod splash;
 mod uart;
 
 use uart::print_dec;
 
 /// 修复后写入 DTB 的内存大小：128MB。
 const RAM_SIZE: u64 = 128 * 1024 * 1024;
+
+/// DTB 安全属性值暂存区（static，&'static 引用给 fixup 用）。
+static mut PROP_ARENA: [u8; 256] = [0; 256];
+static mut PROP_N: usize = 0;
 
 // ==================== 启动汇编 ====================
 
@@ -103,50 +109,116 @@ pub extern "C" fn rust_main() -> ! {
     // DDR
     ddr::init();
     #[cfg(not(feature = "pi4"))]
-    println!("[boot] DDR: skipped (QEMU)");
+    println!("[boot] DDR：跳过（QEMU）");
+
+    // 启动画面：DDR 就绪后立即渲染，不等待文件系统/网络/其他驱动
+    if splash::show() {
+        println!("[boot] splash：ramfb 就绪");
+    } else {
+        println!("[boot] splash：无 ramfb，回退串口输出");
+    }
 
     // 块存储
     if !mmc::init() {
-        println!("[boot] MMC: init FAILED");
+        println!("[boot] MMC：初始化失败");
         hang();
     }
-    println!("[boot] MMC: virtio-blk init OK");
+    println!("[boot] MMC：virtio-blk 初始化完成");
 
-    // FAT32 分区
-    let vol = match fs_fat::FatVolume::mount() {
-        Some(v) => v,
+    // 安全启动链：BCB 槽位决策 + OTP 锚定 + KXSI 验签（含恢复模式）
+    let plan = match sec_boot::secure_boot_flow() {
+        Some(p) => p,
         None => {
-            println!("[boot] FAT32: mount FAILED");
+            println!("[boot] 安全启动失败：无受信任镜像（请手动进入恢复模式）");
             hang();
         }
     };
-    println!("[boot] FAT32: mounted");
+    print!("[sec] boot slot ");
+    if plan.slot == 0 {
+        print!("A");
+    } else {
+        print!("B");
+    }
+    print!(" kind=");
+    if matches!(plan.kind, sec_boot::BootKind::Recovery) {
+        print!("recovery");
+    } else {
+        print!("normal");
+    }
+    print!(" build=");
+    print_dec(plan.build as u64);
+    println!(" （KXSI 已校验）");
 
-    // 加载镜像
-    let loaded = match load_kernel::load_all(&vol) {
-        Some(l) => l,
+    // 组装 DTB 安全属性：值暂存于静态 arena（&'static 引用，绕开栈自引用借用冲突）
+    let mut props: [(&[u8], &[u8]); 6] = [(&[], &[]); 6];
+    let mut n = 0usize;
+    // arena 溢出必须硬失败：静默截断会在 DTB 里写入空属性值（无声数据损坏）
+    fn arena(v: &[u8]) -> &'static [u8] {
+        unsafe {
+            let off = PROP_N;
+            if off + v.len() > PROP_ARENA.len() {
+                panic!("prop arena overflow");
+            }
+            PROP_ARENA[off..off + v.len()].copy_from_slice(&v[..v.len()]);
+            PROP_N = off + v.len();
+            &PROP_ARENA[off..off + v.len()]
+        }
+    }
+    let mut bootargs_storage = [0u8; 64];
+    let bargs: &[u8] = if matches!(plan.kind, sec_boot::BootKind::Recovery) {
+        b"console=ttyAMA0 recovery"
+    } else {
+        b"console=ttyAMA0"
+    };
+    bootargs_storage[..bargs.len()].copy_from_slice(bargs);
+    bootargs_storage[bargs.len()] = 0;
+    props[n] = (b"bootargs", arena(&bootargs_storage[..bargs.len() + 1]));
+    n += 1;
+    props[n] = (b"kunx,secure-boot", arena(&1u32.to_be_bytes()));
+    n += 1;
+    props[n] = (b"kunx,boot-slot", arena(&(plan.slot as u32).to_be_bytes()));
+    n += 1;
+    props[n] = (b"kunx,build-version", arena(&plan.build.to_be_bytes()));
+    n += 1;
+    if matches!(plan.kind, sec_boot::BootKind::Recovery) {
+        let mut cells = [0u8; 8];
+        cells[0..4].copy_from_slice(&(load_kernel::RECOVERY_RAMDISK_LOAD_ADDR as u32).to_be_bytes());
+        cells[4..8].copy_from_slice(&(plan.recovrd_len as u32).to_be_bytes());
+        props[n] = (b"kunx,recovery-ramdisk", arena(&cells));
+        n += 1;
+    } else {
+        let sha_src = unsafe {
+            core::slice::from_raw_parts(load_kernel::RAMDISK_LOAD_ADDR as *const u8, plan.ramdisk_len)
+        };
+        props[n] = (b"kunx,ramdisk-sha256", arena(&kunxsec::sha256::sha256(sha_src)));
+        n += 1;
+    }
+
+    // DTB 修复（bootargs/安全属性缺失时内核无法识别启动链，必须成功）
+    let dtb_fixed_len = match dtb::fixup(load_kernel::DTB_LOAD_ADDR, RAM_SIZE, &props[..n]) {
+        Some(len) => len,
         None => {
-            println!("[boot] load FAILED");
+            println!("[boot] DTB 修正失败");
             hang();
         }
     };
-
-    // DTB 修复
-    dtb::fixup(load_kernel::DTB_LOAD_ADDR, RAM_SIZE);
-    print!("[boot] DTB fixup: memory=");
+    print!("[boot] DTB 修正：内存=");
     print_dec((RAM_SIZE / (1024 * 1024)) as u64);
-    println!("MB");
+    println!("MB，安全属性已注入");
 
-    // 跳转内核（先做已加载镜像的缓存维护：真机取指/读数据必须是最新内容）
-    println!("[boot] jumping to kernel...");
+    // 跳转内核（先做已加载镜像的缓存维护：真机取指/读数据必须是最新内容。
+    // DTB 长度用 fixup 后的实际总长——属性注入会增长 DTB，用旧长度会漏掉
+    // 增长尾部的 clean，内核读到陈旧数据）
+    println!("[boot] 正在跳转内核…");
     let regions = [
-        (load_kernel::KERNEL_LOAD_ADDR, loaded.kernel_size),
-        (load_kernel::DTB_LOAD_ADDR, loaded.dtb_size),
-        (load_kernel::RAMDISK_LOAD_ADDR, loaded.ramdisk_size),
+        (load_kernel::KERNEL_LOAD_ADDR, plan.kernel_len),
+        (load_kernel::DTB_LOAD_ADDR, dtb_fixed_len),
+        (load_kernel::RAMDISK_LOAD_ADDR, plan.ramdisk_len),
+        (load_kernel::RECOVERY_RAMDISK_LOAD_ADDR, plan.recovrd_len),
     ];
     jump::jump_to_kernel(
         load_kernel::DTB_LOAD_ADDR as u64,
-        load_kernel::KERNEL_LOAD_ADDR as u64,
+        plan.entry,
         &regions,
     );
 }
@@ -161,6 +233,6 @@ fn hang() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("\n[boot] PANIC: {}", info);
+    println!("\n[boot] 内核崩溃：{}", info);
     hang();
 }

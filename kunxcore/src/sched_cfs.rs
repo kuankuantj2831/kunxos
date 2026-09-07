@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::allocator;
 use crate::allocator::alloc_pages_contig;
+use crate::process::MAX_PROC;
 use crate::timer;
 use crate::vm;
 use crate::wfi;
@@ -45,6 +46,11 @@ const TIME_SLICE: u64 = 10_000_000;
 const TIME_SLICE_US: u64 = TIME_SLICE / 1_000;
 /// CFS 基准权重（nice = 0）。
 const WEIGHT_BASE: u32 = 1024;
+/// 唤醒抢占粒度（vruntime，纳秒）：被唤醒任务的 vruntime 比当前运行任务
+/// 落后超过该值时立即请求重调度，不必等当前任务用完整个 10ms 时间片
+/// （Linux `check_preempt_wakeup` 思路；交互任务响应延迟从最坏 10ms 降到
+/// 一次 IRQ 尾重调度）。鸿蒙交互调度 / ColorOS 潮汐引擎对交互线程的同款优待。
+const WAKEUP_GRAN_NS: u64 = 2_000_000;
 
 /// EL1h 模式、中断全开（DAIF = 0）的 SPSR 值。
 const SPSR_EL1H: u64 = 0x5;
@@ -64,6 +70,13 @@ pub enum TaskState {
     Blocked,
     /// 已退出
     Exited,
+    /// 已停止（SIGSTOP，应用后台/挂起；直到 SIGCONT 才恢复调度）。
+    ///
+    /// 生命周期：应用进入后台时 lifd 发送 SIGSTOP，任务在下次进入内核时
+    /// 置为 Stopped 并切走；SIGCONT 由 `cont_pid` 唤醒。Stopped 任务
+    /// 不被 `pick_next` 选中、不被 `wake`/`wake_pid`（IPC 唤醒）误唤醒，
+    /// 但会被 `kill_pid`（进程退出/终止）清理。
+    Stopped,
 }
 
 /// 调度优先级类。
@@ -97,7 +110,7 @@ pub struct TaskContext {
     pub x26: u64,
     pub x27: u64,
     pub x28: u64,
-    pub x29: u64, // frame pointer
+    pub x29: u64, // 帧指针
     pub x30: u64, // link register，即程序计数器（恢复地址/任务入口）
     pub sp: u64,  // 栈指针
     pub elr: u64, // 异常返回地址
@@ -171,6 +184,20 @@ pub struct Task {
     pub stack_top: usize,
     /// 所属进程 id
     pub pid: u32,
+    /// CPU 上限（0..=100，Doze 后台冻结用）：
+    ///   - 100：不限（默认）；
+    ///   - 1..=99：按比例限速 —— CFS 累加 vruntime 时按 `100/cap` 放大，
+    ///     该任务实际获得约 `cap%` 的 CPU 时间（linux cpu.max 思路）；
+    ///   - 0：软冻结 —— 保持 Ready 但永不被 `pick_next` 选中（与
+    ///     [`TaskState::Stopped`] 的 SIGSTOP 冻结互为补充）。
+    pub cpu_cap: u16,
+    /// 累计调度 tick 数（`top` 的 CPU 用量列；10ms/tick）。
+    pub cpu_ticks: u64,
+    /// SMP 终止请求：kill_pid 对**正在他核运行**的任务不直接置 `Exited`
+    /// （否则 reap 会在它仍执行时释放 256KB 内核栈 → 跨任务栈损坏），而是
+    /// 置此标志；目标核下次 tick（本任务现场已由 IRQ 帧保存完整）兑现为
+    /// `Exited` 并切走，栈随后由 reap 回收。
+    pub kill_req: bool,
 }
 
 impl Task {
@@ -187,6 +214,9 @@ impl Task {
             stack_base: 0,
             stack_top: 0,
             pid: 0,
+            cpu_cap: 100,
+            cpu_ticks: 0,
+            kill_req: false,
         }
     }
 }
@@ -233,6 +263,19 @@ struct Sleeper {
 
 const EMPTY_SLEEPER: Sleeper = Sleeper { active: false, tid: 0, deadline_us: 0 };
 static mut SLEEPERS: [Sleeper; MAX_TASKS] = [const { EMPTY_SLEEPER }; MAX_TASKS];
+
+/// 清除指定 tid 的睡眠登记。任务被杀/回收时必须调用：否则槽位随死亡任务
+/// 逐步占满（sleep_until 退化为忙等），且 tid 复用后过期唤醒会错杀新任务
+/// （如无限 futex_wait 收到假 ETIMEDOUT）。
+///
+/// 调用方须持有 sched_lock 且已屏蔽 IRQ。
+unsafe fn sleepers_clear_tid(tid: u32) {
+    for s in SLEEPERS.iter_mut() {
+        if s.active && s.tid == tid {
+            *s = EMPTY_SLEEPER;
+        }
+    }
+}
 static mut LAST_SLICE_US: [u64; MAX_CPUS] = [0; MAX_CPUS];
 static mut NEED_RESCHED: [bool; MAX_CPUS] = [false; MAX_CPUS];
 
@@ -373,6 +416,78 @@ fn min_vruntime() -> u64 {
     }
 }
 
+/// 为任务 `cur` 累加 `delta` vruntime，带 u64 溢出防护。
+///
+/// CFS 长期运行（尤其 `cpu_cap` 低时增量放大 100 倍）会让 vruntime 逼近
+/// u64 上限：一旦回绕，该任务 vruntime 突然变成全局最小 → 独占 CPU 直到
+/// 其它任务也回绕（公平性彻底翻转）。累加前若溢出在即，先做「rebase」：
+/// 全体非空任务减去当前最小值（等价 CFS 归一化，相对公平不变），把数值域
+/// 拉回安全区后再累加。
+fn vruntime_accrue(cur: usize, delta: u64) {
+    unsafe {
+        if TASKS[cur].vruntime > u64::MAX - delta {
+            let mut mn = u64::MAX;
+            for i in 0..MAX_TASKS {
+                if TASKS[i].state != TaskState::Empty && TASKS[i].state != TaskState::Exited {
+                    mn = mn.min(TASKS[i].vruntime);
+                }
+            }
+            if mn != u64::MAX {
+                for i in 0..MAX_TASKS {
+                    if TASKS[i].state != TaskState::Empty && TASKS[i].state != TaskState::Exited {
+                        TASKS[i].vruntime = TASKS[i].vruntime.wrapping_sub(mn);
+                    }
+                }
+            }
+        }
+        TASKS[cur].vruntime = TASKS[cur].vruntime.wrapping_add(delta);
+    }
+}
+
+/// 唤醒抢占检查（调用方须持 sched_lock）：被唤醒任务若为实时类、或其
+/// vruntime 比当前运行任务落后超过唤醒抢占粒度，则置 NEED_RESCHED。
+///
+/// 实际切换发生在：IRQ 上下文由 `irq_handler` 尾部的 `resched_if_needed`
+/// 兑现（输入/设备唤醒路径）；syscall 上下文由当前任务随后的阻塞/让出
+/// （`block_current`/`yield_now` 的 pick_next）或下一个定时器 tick 兑现。
+fn wakeup_preempt(woken: usize) {
+    unsafe {
+        let cpu = current_cpu();
+        let cur = CURRENT[cpu];
+        if cur >= MAX_TASKS || cur == woken {
+            return;
+        }
+        if class_rank(TASKS[woken].class) < class_rank(TASKS[cur].class)
+            || TASKS[woken].vruntime + WAKEUP_GRAN_NS < TASKS[cur].vruntime
+        {
+            NEED_RESCHED[cpu] = true;
+        }
+    }
+}
+
+/// 输入触控加速（CFS `place_entity` 唤醒置位思路）：把指定任务（最近读取
+/// 输入设备的 UI 任务）的 vruntime 拉到全局最小值，使其成为下一个最应
+/// 调度的任务，并对当前任务发起唤醒抢占检查 —— 指针/按键事件到达后，
+/// 前台应用立即抢占后台负载，输入→画面延迟不再包含「等后台任务用完
+/// 时间片」。供输入栈在设备 IRQ 上下文调用（IRQ 已屏蔽）；限频由调用方
+/// 负责（一次加速授予一个完整时间片的调度优待）。
+pub fn boost_tid(tid: u32) {
+    let t = tid as usize;
+    if t >= MAX_TASKS {
+        return;
+    }
+    sched_lock();
+    unsafe {
+        if TASKS[t].state == TaskState::Empty || TASKS[t].state == TaskState::Exited {
+            sched_unlock();
+            return;
+        }
+        TASKS[t].vruntime = min_vruntime();
+        wakeup_preempt(t);
+    }
+    sched_unlock();
+}
+
 /// 分配一个空闲任务槽位；表满返回 `None`（不再 panic，防 fork 炸弹 DoS）。
 fn alloc_tid() -> Option<usize> {
     for i in 0..MAX_TASKS {
@@ -386,15 +501,17 @@ fn alloc_tid() -> Option<usize> {
 }
 
 /// 分配一个 64KB 任务栈（物理连续），返回栈顶地址。
-pub fn alloc_stack() -> usize {
-    let base = alloc_pages_contig(STACK_PAGES).expect("sched_cfs: alloc task stack failed");
+/// 物理内存耗尽返回 `None`（调用方把 fork/spawn 失败上抛，而非 panic——
+/// 此路径可被用户 fork/clone 风暴直接触发）。
+pub fn alloc_stack() -> Option<usize> {
+    let base = alloc_pages_contig(STACK_PAGES)?;
     // 用 0xA5 填充整个任务栈：内核栈越界写会破坏该模式，供故障诊断检测溢出
     unsafe {
         for p in 0..STACK_PAGES {
             core::ptr::write_bytes((base + p * 4096) as *mut u8, 0xA5, 4096);
         }
     }
-    base + STACK_SIZE
+    Some(base + STACK_SIZE)
 }
 
 /// 挑选下一个要运行的任务（就绪任务中 vruntime 最小、优先级最高）。
@@ -407,6 +524,10 @@ fn pick_next() -> Option<usize> {
     unsafe {
         for i in 0..MAX_TASKS {
             if TASKS[i].state != TaskState::Ready {
+                continue;
+            }
+            // 软冻结（cpu_cap == 0）的任务保持 Ready 但永不被选中。
+            if TASKS[i].cpu_cap == 0 {
                 continue;
             }
             // 其他核的 idle 任务不可被本核选中（每核只运行自己的 idle）
@@ -454,9 +575,18 @@ unsafe fn do_switch(cur: usize, next: usize) {
 }
 
 /// idle 任务入口：等待中断，仅当无其他就绪任务时被调度。
-fn idle_loop(_: usize) -> ! {
+///
+/// 同时承担电源管理记账：测量 WFI 驻留时长（供 power 模块计算 CPU 负载
+/// 与空闲比例），并驱动 idle 状态机（enter/exit_wfi）。
+fn idle_loop(cpu: usize) -> ! {
     loop {
+        let t0 = timer::now_us();
+        crate::power::enter_wfi(cpu as u32);
         unsafe { wfi() };
+        // WFI 被中断唤醒（定时器 / 设备 IRQ）。若 IRQ 处理中发生了任务
+        // 切换，本行要等 idle 任务再次被调度才执行 —— 记账仍正确。
+        let t1 = timer::now_us();
+        crate::power::exit_wfi(cpu as u32, t1.saturating_sub(t0));
     }
 }
 
@@ -478,7 +608,8 @@ pub fn init() {
     // 每核一个 idle 任务，槽位 = CPU 号（单核仍为槽位 0，行为不变）
     let ncpu = (crate::smp::cpu_count() as usize).min(MAX_CPUS);
     for cpu in 0..ncpu {
-        let stack_top = alloc_stack();
+        // idle 任务栈：启动期一次性分配，失败即无法调度，panic 可接受。
+        let stack_top = alloc_stack().expect("sched_cfs：空闲任务栈分配失败");
         unsafe {
             let t = &mut TASKS[cpu];
             t.tid = cpu as u32;
@@ -509,15 +640,17 @@ pub fn spawn(
     nice: i32,
     ttbr0: usize,
 ) -> u32 {
+    // ★ 调度锁必须在 IRQ 屏蔽下获取：sched_lock 之后跟着 alloc_stack()（256KB
+    // 逐字节填充，耗时数百微秒），若 IRQ 使能，tick 在 IRQ 上下文 sched_lock
+    // 自旋 → 被中断的 spawn 永远无法释放锁 → 单核硬死锁（audio ioctl 等路径
+    // 在 IRQ 使能下调用本函数）。保存-恢复 DAIF，与 set_current_nice 同模式。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
     // 先取槽位再分配栈：槽位不足时不浪费物理页
     sched_lock();
-    let Some(tid) = alloc_tid() else { sched_unlock(); return u32::MAX };
-    let stack_top = alloc_stack();
-    // 保持调用方 IRQ 屏蔽状态（与 insert 同理）：boot 期调用时若无条件
-    // daifclr 会在中断处理注册前使能 IRQ。
-    let irq_unmasked: u64;
-    unsafe { asm!("mrs {}, daif", out(reg) irq_unmasked) };
-    unsafe { asm!("msr daifset, #2") };
+    let Some(tid) = alloc_tid() else { sched_unlock(); unsafe { write_daif(saved) }; return u32::MAX };
+    // 任务栈 OOM：明确失败（此前 panic，fork/clone 风暴可打挂内核）。
+    let Some(stack_top) = alloc_stack() else { sched_unlock(); unsafe { write_daif(saved) }; return u32::MAX };
     unsafe {
         let t = &mut TASKS[tid];
         t.tid = tid as u32;
@@ -531,11 +664,10 @@ pub fn spawn(
         t.stack_top = stack_top;
         t.pid = pid;
         t.context = TaskContext::new_thread(entry, arg, stack_top, ttbr0);
+        t.kill_req = false;
     }
     sched_unlock();
-    if irq_unmasked & (1 << 7) == 0 {
-        unsafe { asm!("msr daifclr, #2") };
-    }
+    unsafe { write_daif(saved) };
     tid as u32
 }
 
@@ -550,16 +682,12 @@ pub fn insert(
     class: PriorityClass,
     nice: i32,
 ) -> u32 {
-    sched_lock();
-    let Some(tid) = alloc_tid() else { sched_unlock(); return u32::MAX };
-    // ★ 保持调用方的 IRQ 屏蔽状态：`fork_parent` 在 IRQ 屏蔽的临界区里插入
-    // 子任务，若此处无条件 `daifclr`，子任务会在 fork 尚未完成（父进程还
-    // 在 fork_parent 尾部）时即可被调度 —— 与父进程的 syscall 返回路径
-    // 并发，曾疑为「fork 返回后偶发 PC=0 / LR 损坏」的诱因之一。先读 DAIF
-    // 的 I 位（bit7），仅当进入时 IRQ 未屏蔽才在退出时恢复。
-    let irq_unmasked: u64;
-    unsafe { asm!("mrs {}, daif", out(reg) irq_unmasked) };
+    // ★ 同 spawn：调度锁必须在 IRQ 屏蔽下获取（防 tick 自旋死锁）；
+    // 且 fork_parent 在 IRQ 屏蔽临界区内调用本函数，保持调用方 IRQ 状态。
+    let saved = unsafe { read_daif() };
     unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let Some(tid) = alloc_tid() else { sched_unlock(); unsafe { write_daif(saved) }; return u32::MAX };
     unsafe {
         let t = &mut TASKS[tid];
         t.tid = tid as u32;
@@ -573,11 +701,10 @@ pub fn insert(
         t.stack_top = stack_top;
         t.pid = pid;
         t.context = ctx;
+        t.kill_req = false;
     }
     sched_unlock();
-    if irq_unmasked & (1 << 7) == 0 {
-        unsafe { asm!("msr daifclr, #2") };
-    }
+    unsafe { write_daif(saved) };
     tid as u32
 }
 
@@ -600,6 +727,20 @@ pub fn current_tid() -> u32 {
     match current_idx() {
         Some(i) => unsafe { TASKS[i].tid },
         None => 0,
+    }
+}
+
+/// 指定 tid 的任务是否仍然存活（非 Empty/Exited）。
+///
+/// 供内核锁做「死亡持有者抢锁自愈」判断（fs_simple::fs_lock 等）：
+/// tid 不同且已死亡 → 持有者不会再来释放，允许夺回。
+pub fn tid_alive(tid: u32) -> bool {
+    let t = tid as usize;
+    if t >= MAX_TASKS {
+        return false;
+    }
+    unsafe {
+        TASKS[t].state != TaskState::Empty && TASKS[t].state != TaskState::Exited
     }
 }
 
@@ -695,6 +836,11 @@ pub fn current_nice() -> i32 {
 /// 权重越大，vruntime 增长越慢、被选中的概率越高：`nice = -3`（权重 2000）
 /// 约为普通任务（1024）的两倍 CPU 份额。保持 CFS 语义不变。
 pub fn set_current_nice(nice: i32) {
+    // 调度锁须在 IRQ 屏蔽下获取：syscall 上下文 IRQ 使能，持锁期间定时器
+    // tick 抢锁会自旋死锁。保存-恢复 DAIF（read_daif/write_daif 可嵌套，
+    // 调用方已屏蔽时不会错误重开中断）。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
     sched_lock();
     if let Some(cur) = current_idx() {
         unsafe {
@@ -704,6 +850,7 @@ pub fn set_current_nice(nice: i32) {
         }
     }
     sched_unlock();
+    unsafe { write_daif(saved) };
 }
 
 /// 当前任务的优先级类。
@@ -712,6 +859,23 @@ pub fn current_class() -> PriorityClass {
         Some(i) => unsafe { TASKS[i].class },
         None => PriorityClass::Idle,
     }
+}
+
+/// 提升当前任务到实时类（SCHED_FIFO 等价物）：音频服务等周期性、对调度
+/// 抖动敏感的任务使用。实时类任务不参与 CFS 时间片轮转，仅在主动让出
+/// （yield/阻塞/睡眠）时切换，保证音频混音/写入线程的稳定周期。
+pub fn set_current_class(class: PriorityClass) {
+    // 同 `set_current_nice`：调度锁须在 IRQ 屏蔽下获取（syscall 上下文 IRQ 使能）
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    if let Some(cur) = current_idx() {
+        unsafe {
+            TASKS[cur].class = class;
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
 }
 
 /// 转储任务表（panic 诊断用）：逐任务打印 tid/pid/state/name/栈范围/
@@ -752,6 +916,7 @@ fn state_code(s: TaskState) -> u8 {
         TaskState::Running => 2,
         TaskState::Blocked => 3,
         TaskState::Exited => 4,
+        TaskState::Stopped => 5,
     }
 }
 
@@ -770,6 +935,9 @@ fn state_code(s: TaskState) -> u8 {
 pub fn tick() {
     let cpu = current_cpu();
     let now = timer::now_us();
+    // 内存压力状态机（每 100ms 节流）：等级变化时打印内核日志，
+    // 供 lifd 经 SYS_LC_MEMPRESSURE / /proc/pressure 读取并执行挂起/LMK。
+    crate::mem_pressure::poll(now);
     sched_lock();
     unsafe {
         for s in SLEEPERS.iter_mut() {
@@ -780,8 +948,11 @@ pub fn tick() {
             if tid < MAX_TASKS && TASKS[tid].state == TaskState::Blocked {
                 TASKS[tid].state = TaskState::Ready;
                 NEED_RESCHED[cpu] = true;
+                // ★ 仅在真正唤醒（目标已 Blocked）时才消费槽位：目标尚在
+                // 「登记后、阻塞前」窗口（SMP 下他核 tick 可见）时保留槽位，
+                // 待其阻塞后的下个 tick 唤醒，否则丢唤醒 → 永久阻塞。
+                s.active = false;
             }
-            s.active = false;
         }
 
         // 精确睡眠可让物理定时器早于 10ms 时间片到期；只唤醒任务，不提前
@@ -800,8 +971,24 @@ pub fn tick() {
         return;
     }
     unsafe {
+        // ★ SMP 终止请求兑现：kill_pid 对他核正在运行的任务只置 kill_req、
+        // 不置 Exited（否则 reap 会在其未退出时释放内核栈）。此处（本核 IRQ
+        // 上下文，当前任务现场已由中断帧完整保存）把 kill_req 兑现为 Exited，
+        // 下方 pick_next 会跳过它并 do_switch 切走——语义与 exit_current 相同，
+        // 栈由后续 reap_pid 回收。
+        if TASKS[cur].kill_req {
+            TASKS[cur].kill_req = false;
+            TASKS[cur].state = TaskState::Exited;
+        }
+        // [perf] CPU 占用统计：idle 任务 tick vs 忙任务 tick（性能 overlay 数据源）
+        crate::perf::note_cpu_tick(TASKS[cur].class == PriorityClass::Idle);
+        // [top] 每任务累计调度 tick 计数（10ms/tick）
+        TASKS[cur].cpu_ticks += 1;
+        // CPU 上限（Doze）：cap<100 时按 100/cap 放大 vruntime 增量，
+        // 该任务实际获得约 cap% 的 CPU 时间（linux cpu.max 思路）。
         let w = TASKS[cur].weight.max(1) as u64;
-        TASKS[cur].vruntime += TIME_SLICE * WEIGHT_BASE as u64 / w;
+        let cap = TASKS[cur].cpu_cap.max(1) as u64;
+        vruntime_accrue(cur, TIME_SLICE * WEIGHT_BASE as u64 * 100 / (w * cap));
         if TASKS[cur].state == TaskState::Running {
             TASKS[cur].state = TaskState::Ready;
         }
@@ -809,7 +996,15 @@ pub fn tick() {
     let next = match pick_next() {
         Some(n) => n,
         None => {
-            unsafe { TASKS[cur].state = TaskState::Running };
+            // ★ 不把 Exited 拉回 Running：kill_req 刚在此兑现为 Exited 的任务
+            // 若被本分支复活，kill_pid 的终止请求即被撤销（任务永生）。留在
+            // Exited 的任务继续执行完当前内核路径，最迟下个 tick 被切走后
+            // 由 reap 回收（本核 idle 恒就绪，本分支实际极少触达）。
+            unsafe {
+                if TASKS[cur].state != TaskState::Exited {
+                    TASKS[cur].state = TaskState::Running;
+                }
+            }
             sched_unlock();
             return;
         }
@@ -846,6 +1041,17 @@ pub fn sleep_until(deadline_us: u64) {
     sched_unlock();
     if registered {
         block_current();
+        // 醒来后清掉本任务可能残留的睡眠槽位：提前唤醒（IPC/设备）时 tick
+        // 不消费槽位（目标非 Blocked），由这里自清，防槽位泄漏或过期唤醒。
+        sched_lock();
+        unsafe {
+            for s in SLEEPERS.iter_mut() {
+                if s.active && s.tid == tid {
+                    s.active = false;
+                }
+            }
+        }
+        sched_unlock();
     } else {
         // 槽位数量与任务数相同，正常情况下不会到达；保留可工作的降级路径。
         // 保持当前 DAIF（syscall 上下文为屏蔽态），yield_now 会正确保存恢复。
@@ -867,8 +1073,10 @@ pub fn wake_sleeper_irq(tid: u32) {
             if idx < MAX_TASKS && TASKS[idx].state == TaskState::Blocked {
                 TASKS[idx].state = TaskState::Ready;
                 NEED_RESCHED[current_cpu()] = true;
+                // 同 tick：仅真正唤醒才消费槽位（防「登记后、阻塞前」窗口丢唤醒），
+                // 未阻塞时保留槽位，由 sleep_until 醒来后自清或到期 tick 消费。
+                s.active = false;
             }
-            s.active = false;
             break;
         }
     }
@@ -968,8 +1176,13 @@ pub fn yield_now() {
         return;
     }
     unsafe {
+        // 此处已做出调度决策（pick_next），此前累积的唤醒抢占请求随之兑现，
+        // 清除标志避免被唤醒任务就绪后再被无谓抢占一次。
+        NEED_RESCHED[cpu] = false;
+        // CPU 上限（Doze）：与 tick 一致，让出也按 cap 放大 vruntime。
         let w = TASKS[cur].weight.max(1) as u64;
-        TASKS[cur].vruntime += TIME_SLICE * WEIGHT_BASE as u64 / w;
+        let cap = TASKS[cur].cpu_cap.max(1) as u64;
+        vruntime_accrue(cur, TIME_SLICE * WEIGHT_BASE as u64 * 100 / (w * cap));
         if TASKS[cur].state == TaskState::Running {
             TASKS[cur].state = TaskState::Ready;
         }
@@ -990,9 +1203,10 @@ pub fn yield_now() {
         return;
     }
     unsafe { do_switch(cur, next) };
-    // 被再次调度后恢复中断
+    // 被再次调度后恢复进入时的 DAIF（此前无条件 daifclr：屏蔽态调用者
+    // （如 futex_wait 在阻塞前压 IRQ）恢复后中断被错误重开，破坏嵌套屏蔽）。
     sched_unlock();
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { write_daif(saved) };
 }
 
 /// 阻塞当前任务（调用者须先记录阻塞原因），直到被 `wake` 唤醒。
@@ -1012,6 +1226,8 @@ pub fn block_current() {
         return;
     }
     unsafe {
+        // 调度决策点：清除累积的唤醒抢占请求（同 yield_now）。
+        NEED_RESCHED[cpu] = false;
         TASKS[cur].state = TaskState::Blocked;
     }
     let next = match pick_next() {
@@ -1025,21 +1241,178 @@ pub fn block_current() {
     };
     unsafe { do_switch(cur, next) };
     sched_unlock();
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { write_daif(saved) };
 }
 
-/// 唤醒指定任务（置为就绪）。
+/// 停止当前任务（SIGSTOP 语义）：置为 `Stopped` 并切走，直到
+/// [`cont_pid`]（SIGCONT）唤醒。DAIF 处理与 `block_current` 一致：
+/// 保存调用方 DAIF → 屏蔽 IRQ 执行切换 → 被再次调度后恢复中断。
+///
+/// 与 `block_current` 的区别：Stopped 不被 `wake`/`wake_pid`（IPC 唤醒）
+/// 唤醒，只能由 SIGCONT 显式恢复 —— 保证后台应用不会被管道/消息队列的
+/// 偶发写入"意外唤醒"。
+#[inline(never)]
+pub fn stop_current() {
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    let cpu = current_cpu();
+    sched_lock();
+    let cur = unsafe { CURRENT[cpu] };
+    if cur >= MAX_TASKS {
+        sched_unlock();
+        unsafe { write_daif(saved) };
+        return;
+    }
+    unsafe {
+        // 调度决策点：清除累积的唤醒抢占请求（同 yield_now）。
+        NEED_RESCHED[cpu] = false;
+        TASKS[cur].state = TaskState::Stopped;
+    }
+    let next = match pick_next() {
+        Some(n) => n,
+        None => {
+            unsafe { TASKS[cur].state = TaskState::Running };
+            sched_unlock();
+            unsafe { write_daif(saved) };
+            return;
+        }
+    };
+    unsafe { do_switch(cur, next) };
+    sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
+/// 唤醒属于指定进程的全部已停止任务（SIGCONT 语义），置为就绪。
+/// 调用方须已屏蔽 IRQ（`sys_kill` 路径）。
+pub fn cont_pid(pid: u32) {
+    // 调度锁须在 IRQ 屏蔽下获取（sys_kill → syscall 上下文 IRQ 使能）。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid && TASKS[i].state == TaskState::Stopped {
+                TASKS[i].state = TaskState::Ready;
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
+/// 调整指定进程所有任务的 nice 值（`setpriority(pid, prio)` 内核后端）。
+///
+/// nice 越负权重越大（CFS 份额越高）：前台应用 −3（权重 2000 ≈ 普通 2 倍），
+/// 后台/挂起应用 +2（权重 ~550）。供 lifd 按应用状态调整调度优待，
+/// 与 CFS 语义完全兼容（不替换调度器）。root 可改任意 pid。
+pub fn set_pid_nice(pid: u32, nice: i32) {
+    if (pid as usize) >= MAX_PROC {
+        return;
+    }
+    // 调度锁须在 IRQ 屏蔽下获取（sys_setpriority → syscall 上下文 IRQ 使能）。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid {
+                let t = &mut TASKS[i];
+                t.nice = nice.clamp(-5, 5);
+                t.weight = weight_of(t.nice);
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
+/// 设置指定进程所有任务的 CPU 上限（Doze 后台冻结）。
+///
+/// `cap` 0..=100：0 = 软冻结（保持 Ready 但不调度），100 = 不限，
+/// 其余按比例限速。进程不存在返回 `-1`（ESRCH 语义），成功返回 0。
+pub fn set_task_cpu_cap(pid: u32, cap: u16) -> i32 {
+    if (pid as usize) >= MAX_PROC {
+        return -1;
+    }
+    let cap = cap.min(100);
+    let mut found = false;
+    // 调度锁须在 IRQ 屏蔽下获取（SYS_KUNX_PM_* → syscall 上下文 IRQ 使能）
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid && TASKS[i].state != TaskState::Empty {
+                TASKS[i].cpu_cap = cap;
+                found = true;
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+    if found {
+        0
+    } else {
+        -1
+    }
+}
+
+/// 读取指定进程的 CPU 上限（取该进程首个非空任务；无则 100）。
+pub fn task_cpu_cap(pid: u32) -> u16 {
+    if (pid as usize) >= MAX_PROC {
+        return 100;
+    }
+    // 同 set_task_cpu_cap：调度锁须在 IRQ 屏蔽下获取
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let cap = unsafe {
+        let mut found = 100u16;
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid && TASKS[i].state != TaskState::Empty {
+                found = TASKS[i].cpu_cap;
+                break;
+            }
+        }
+        sched_unlock();
+        found
+    };
+    unsafe { write_daif(saved) };
+    cap
+}
+
+/// 遍历任务表（含 CPU 上限与冻结标志）：供 /proc/power 展示 Doze 状态。
+/// 回调参数 `(pid, cpu_cap, frozen)`，`frozen` = SIGSTOP 冻结中。
+pub fn for_each_task_cap(mut f: impl FnMut(u32, u16, bool)) {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            let t = &TASKS[i];
+            if t.state == TaskState::Empty {
+                continue;
+            }
+            f(t.pid, t.cpu_cap, t.state == TaskState::Stopped);
+        }
+    }
+}
+
+/// 唤醒指定任务（置为就绪）。仅唤醒 `Blocked`（IPC 阻塞）任务；
+/// `Stopped`（SIGSTOP）任务只能由 `cont_pid` 恢复。
 pub fn wake(tid: u32) {
     if (tid as usize) < MAX_TASKS {
+        // 保存-恢复 DAIF（而非无条件 daifclr）：从屏蔽中断的上下文调用时
+        // 不得在返回后错误重开中断（与 wake_pid 同源）。
+        let saved = unsafe { read_daif() };
         unsafe { asm!("msr daifset, #2") };
         sched_lock();
         unsafe {
             if TASKS[tid as usize].state == TaskState::Blocked {
                 TASKS[tid as usize].state = TaskState::Ready;
+                // 唤醒抢占检查：交互/实时任务唤醒后不必等当前任务用完时间片
+                wakeup_preempt(tid as usize);
             }
         }
         sched_unlock();
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { write_daif(saved) };
     }
 }
 
@@ -1079,15 +1452,23 @@ pub fn set_current_ttbr0(ttbr0: usize) {
 ///
 /// 与 [`wake_irq`] 一致：调用方须已屏蔽 IRQ，此处不操作 DAIF。
 pub fn wake_pid(pid: u32) {
+    // 调度锁须在 IRQ 屏蔽下获取：调用方（sys_kill / process::exit 等）上下文
+    // IRQ 可能是使能的，持锁期间定时器 tick 抢锁会自旋死锁。保存-恢复 DAIF，
+    // 调用方已屏蔽时不会错误重开中断。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
             if TASKS[i].pid == pid && TASKS[i].state == TaskState::Blocked {
                 TASKS[i].state = TaskState::Ready;
+                // 唤醒抢占检查（同 wake）
+                wakeup_preempt(i);
             }
         }
     }
     sched_unlock();
+    unsafe { write_daif(saved) };
 }
 
 /// 终止属于指定进程的所有任务（标记为 Exited，不再被调度）。
@@ -1096,18 +1477,72 @@ pub fn wake_pid(pid: u32) {
 /// 终止兄弟线程，否则它们会在父进程 reap 释放页表后继续以悬空 TTBR0 运行。
 /// 调用方须已屏蔽 IRQ。
 pub fn kill_pid(pid: u32) {
+    // 调度锁须在 IRQ 屏蔽下获取（sys_kill / process::exit 路径）。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASKS[i].pid == pid
-                && TASKS[i].state != TaskState::Empty
-                && TASKS[i].state != TaskState::Exited
-            {
+            if TASKS[i].pid != pid || TASKS[i].state == TaskState::Empty || TASKS[i].state == TaskState::Exited {
+                continue;
+            }
+            // 终止该线程的同时清掉其 futex 等待项（槽位不随线程死亡清空，
+            // 32 个槽位会被死亡线程逐步占满 → 后续 futex_wait 全返 EAGAIN）。
+            crate::bionic_shim::futex_cleanup_tid(TASKS[i].tid);
+            // 同理：清掉其持有的全局网络锁，否则持锁任务死亡后所有联网
+            // 操作在锁退避中无限等待。
+            crate::net_stack::net_cleanup_tid(TASKS[i].tid);
+            // 同理：清掉其睡眠/超时登记（nanosleep / 定时 futex_wait）。
+            sleepers_clear_tid(TASKS[i].tid);
+            if TASKS[i].state == TaskState::Running {
+                // ★ SMP：正在某核运行的任务不能就地置 Exited——reap 会把它还
+                // 在使用的 256KB 内核栈释放并复用，导致他核继续在已归还的栈上
+                // 执行（跨任务栈损坏）。置 kill_req，由该核下次 tick 兑现退出。
+                TASKS[i].kill_req = true;
+            } else {
                 TASKS[i].state = TaskState::Exited;
             }
         }
     }
     sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
+/// 终止指定进程除当前任务外的全部线程（execve 专用）。
+///
+/// 旧地址空间即将被释放，兄弟线程若继续运行会以悬空 TTBR0 调度（与 exit
+/// 路径的 kill_pid 同族缺陷）；但 execve 调用者自身必须继续运行，不能对
+/// 当前任务置 kill_req（否则下次 tick 误杀新映像）。
+pub fn kill_siblings_of(pid: u32) {
+    // 调度锁须在 IRQ 屏蔽下获取（与 kill_pid 同模式）。
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let cur = unsafe { CURRENT[current_cpu()] };
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if i == cur {
+                continue;
+            }
+            if TASKS[i].pid != pid
+                || TASKS[i].state == TaskState::Empty
+                || TASKS[i].state == TaskState::Exited
+            {
+                continue;
+            }
+            crate::bionic_shim::futex_cleanup_tid(TASKS[i].tid);
+            crate::net_stack::net_cleanup_tid(TASKS[i].tid);
+            sleepers_clear_tid(TASKS[i].tid);
+            if TASKS[i].state == TaskState::Running {
+                // SMP 兜底：他核正在运行的任务置 kill_req，由该核下次 tick 兑现。
+                TASKS[i].kill_req = true;
+            } else {
+                TASKS[i].state = TaskState::Exited;
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
 }
 
 /// 回收属于指定进程的全部已退出任务：复位 TCB 槽位并归还 64KB 内核栈。
@@ -1115,9 +1550,26 @@ pub fn kill_pid(pid: u32) {
 /// 由父进程 `wait`/`reap` 在目标进程已 Zombie（其全部线程均已 Exited）后调用；
 /// 内部屏蔽 IRQ 并持调度锁保护任务表。
 pub fn reap_pid(pid: u32) {
+    let saved = unsafe { read_daif() };
     unsafe { asm!("msr daifset, #2") };
     sched_lock();
     unsafe {
+        // ★ 护栏：该进程仍有存活任务（Running/Ready/Blocked/Stopped，含
+        // 他核 kill_req 待兑现）时拒绝回收——否则会归还仍在执行任务的内核栈
+        // （跨任务栈损坏，SMP 竞态）。kill_pid 已把非运行任务全部置 Exited，
+        // 单核下剩余的「存活」任务只可能是当前任务自身，而父进程必然在其
+        // 切走后才运行 reap，因此正常流程此护栏恒不触发（SMP 兜底）。
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid
+                && TASKS[i].state != TaskState::Empty
+                && TASKS[i].state != TaskState::Exited
+            {
+                sched_unlock();
+                // 恢复进入前 DAIF（不得无条件重开中断）
+                write_daif(saved);
+                return;
+            }
+        }
         for i in 0..MAX_TASKS {
             if TASKS[i].pid == pid && TASKS[i].state == TaskState::Exited {
                 let base = TASKS[i].stack_base;
@@ -1126,12 +1578,75 @@ pub fn reap_pid(pid: u32) {
                         allocator::free_page(base + p * allocator::PAGE_SIZE);
                     }
                 }
+                // 收尾：清掉可能残留的睡眠登记（兜底 kill 路径的遗漏）
+                sleepers_clear_tid(TASKS[i].tid);
                 TASKS[i] = Task::empty();
             }
         }
     }
     sched_unlock();
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { write_daif(saved) };
+}
+
+/// 判断进程是否仍有存活（非 Empty/Exited）任务 —— SMP 下 reap 前的硬护栏。
+///
+/// 供 process::reap 在释放地址空间/页表**之前**调用：目标若仍被某核执行，
+/// 先释放其页表 = 他核任务 use-after-free。
+pub fn has_live_tasks(pid: u32) -> bool {
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let mut live = false;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid
+                && TASKS[i].state != TaskState::Empty
+                && TASKS[i].state != TaskState::Exited
+            {
+                live = true;
+                break;
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+    live
+}
+
+/// 判断进程是否处于 SIGSTOP 停止态（其任一任务为 `Stopped`）。
+/// 供 procfs /proc/processes 与 lifd 诊断显示。
+pub fn process_stopped(pid: u32) -> bool {
+    // 同 wake_pid：调度锁须在 IRQ 屏蔽下获取
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let mut stopped = false;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if TASKS[i].pid == pid && TASKS[i].state == TaskState::Stopped {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+    stopped
+}
+
+/// 查询指定任务是否处于 `Blocked`（futex 唤醒前核对：仅当目标确实阻塞才
+/// 消费等待槽位，防「清槽但目标未阻塞」丢唤醒）。调度锁在 IRQ 屏蔽下获取。
+pub fn is_blocked(tid: u32) -> bool {
+    if (tid as usize) >= MAX_TASKS {
+        return false;
+    }
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    let r = unsafe { TASKS[tid as usize].state == TaskState::Blocked };
+    sched_unlock();
+    unsafe { write_daif(saved) };
+    r
 }
 
 /// 退出当前任务（不再返回）。
@@ -1151,6 +1666,7 @@ pub fn exit_current() -> ! {
         }
     }
     unsafe {
+        TASKS[cur].kill_req = false;
         TASKS[cur].state = TaskState::Exited;
     }
     let next = match pick_next() {
@@ -1159,6 +1675,67 @@ pub fn exit_current() -> ! {
     };
     unsafe { do_switch(cur, next) };
     // 不应到达（本任务已 Exited，锁由 next 的恢复路径释放）
+    loop {
+        unsafe { wfi() };
+    }
+}
+
+/// 线程级退出（Linux `exit(93)` 语义）：仅当同进程（CLONE_THREAD 共享
+/// pid）还有其它存活任务时，清理本线程全局登记并仅退出当前任务、切换走，
+/// 返回 `true`（调用点不再返回）。若当前任务已是进程最后一个存活任务，
+/// 恢复 IRQ 后返回 `false`，由调用方走完整进程退出（kill_pid + Zombie +
+/// 唤醒父进程）。
+///
+/// 「判定是否还有兄弟」与「退出当前任务」在同一调度锁临界区内完成：
+/// 两个线程并发退出时不会都误判"还有其它存活者"而把进程留成 0 存活任务
+/// 却永不 Zombie（父进程 wait 永久挂起）。判为整进程退出的竞争残留是
+/// 良性的：两方都走 `exit()`，kill_pid/置 Zombie/唤醒等待者均幂等。
+pub fn exit_thread_current() -> bool {
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    let cpu = current_cpu();
+    sched_lock();
+    let cur = unsafe { CURRENT[cpu] };
+    if cur >= MAX_TASKS {
+        sched_unlock();
+        unsafe { write_daif(saved) };
+        return false;
+    }
+    let pid = unsafe { TASKS[cur].pid };
+    let mut others = false;
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if i == cur {
+                continue;
+            }
+            let t = &TASKS[i];
+            if t.pid == pid && t.state != TaskState::Empty && t.state != TaskState::Exited {
+                others = true;
+                break;
+            }
+        }
+    }
+    if !others {
+        sched_unlock();
+        unsafe { write_daif(saved) };
+        return false;
+    }
+    // 仍有兄弟线程：清掉本线程的 futex 等待项 / 网络锁 / 睡眠登记
+    // （与 kill_pid 对每个任务的处理一致），然后仅退出当前任务。
+    unsafe {
+        let tid = TASKS[cur].tid;
+        crate::bionic_shim::futex_cleanup_tid(tid);
+        crate::net_stack::net_cleanup_tid(tid);
+        sleepers_clear_tid(tid);
+        TASKS[cur].kill_req = false;
+        TASKS[cur].state = TaskState::Exited;
+    }
+    let next = match pick_next() {
+        Some(n) => n,
+        None => idle_slot(),
+    };
+    unsafe { do_switch(cur, next) };
+    // 不应到达（本任务已 Exited）
     loop {
         unsafe { wfi() };
     }
@@ -1220,8 +1797,44 @@ pub fn for_each_task(mut f: impl FnMut(u32, &'static str, &'static str)) {
                 TaskState::Blocked => "S",
                 TaskState::Exited => "Z",
                 TaskState::Empty => "?",
+                TaskState::Stopped => "T", // stopped（SIGSTOP，应用后台/挂起）
             };
             f(t.pid, st, t.name);
         }
+    }
+}
+
+/// 遍历任务表，对每个非空任务调用
+/// `f(pid, tid, 状态名, 任务名, nice, cpu_ticks, cpu_cap)`。
+/// 供 `top` / procfs 等调试接口使用（只读，调用方自行屏蔽 IRQ 与否均可）。
+pub fn for_each_task_full(
+    mut f: impl FnMut(u32, u32, &'static str, &'static str, i32, u64, u16),
+) {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            let t = &TASKS[i];
+            if t.state == TaskState::Empty {
+                continue;
+            }
+            let st = match t.state {
+                TaskState::Running => "R",
+                TaskState::Ready => "R",
+                TaskState::Blocked => "S",
+                TaskState::Exited => "Z",
+                TaskState::Stopped => "T",
+                TaskState::Empty => "?",
+            };
+            f(t.pid, t.tid, st, t.name, t.nice, t.cpu_ticks, t.cpu_cap);
+        }
+    }
+}
+
+/// 当前任务累计调度 tick 数（`top` 显示当前任务 CPU 用量）。
+pub fn current_cpu_ticks() -> u64 {
+    let cur = unsafe { CURRENT[current_cpu()] };
+    if cur < MAX_TASKS {
+        unsafe { TASKS[cur].cpu_ticks }
+    } else {
+        0
     }
 }

@@ -6,6 +6,9 @@
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+#[path = "../../../shared/ttf_text.rs"]
+mod ttf_text;
+
 
 const SYS_WRITE: usize = 64;
 const SYS_KILL: usize = 129;
@@ -13,6 +16,7 @@ const SYS_GETPID: usize = 172;
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
+    ttf_text::font_init();
     let mypid: usize;
     unsafe {
         asm!("svc #0", "mov {}, x0", out(reg) mypid, in("x8") SYS_GETPID, options(nostack));
@@ -44,6 +48,29 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
+    // 保持原有行为：不主动 exit。
+    struct BufWriter {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
+    let msg = b"PANIC: sleepy\n";
+    let out: &[u8] = &w.buf[..w.len];
+    unsafe {
+        asm!("svc #0", in("x8") SYS_WRITE, in("x0") 2usize, in("x1") msg.as_ptr(), in("x2") msg.len(), options(nostack));
+        asm!("svc #0", in("x8") SYS_WRITE, in("x0") 2usize, in("x1") out.as_ptr(), in("x2") out.len(), options(nostack));
+    }
     loop {}
 }

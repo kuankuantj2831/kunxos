@@ -1,0 +1,6 @@
+{
+  "kunx-root": "ad1eec87463a7df3dfdc79fb6d58517c0f0128eff1659079957ecd61da959a94",
+  "kunx-repo": "d0026ef7713f5424fca6dc4a2ae069f17930e4b8126ea752e1b65ebdf633e540",
+  "kunx-dev": "435323706ea21e05c504671d7dbb0602c69c35b5fb342bbad53971d4874e2587",
+  "comment": "DEMO-ONLY keys; production must regenerate offline"
+}

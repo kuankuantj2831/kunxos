@@ -4,6 +4,1283 @@
 
 ## [Unreleased]
 
+### 2026-09-07 通宵修复轮（六路并行审查 → 30+ 项修复 + 性能 + 美化）
+
+> 方法：6 个并行审查代理（browser 新模块 / launcher 与动效库 / 媒体类应用 /
+> 内核图形动画输入 / settings+OOBE+共享 UI / 性能专项）逐行读码，人工复核后
+> 分批修复。全部通过 `make` 全量构建（exit 0）验证。
+
+#### OOBE 严重修复（用户选择静默丢失）
+
+- **`apply_step_defaults` 无条件重置用户选择**：主循环每步「下一步」前都执行
+  `apply_step_defaults(step)` 再 `save_step(step)` —— 用户选的英语/取消勾选的
+  模块/PIN 锁屏/深色主题全部被重置为默认值再保存（作者注释只豁免了密码步，
+  其余步骤全部中招）。现在仅「30 秒空闲自动推进」路径应用默认选择
+  （`wait_for_tap_next_button` 返回 4 区分），用户点击推进保留其选择。
+- **30 秒空闲绕过校验**：空闲路径直接 `return 1` 不经 `validate_step`，
+  密码页留空 30 秒会保存 `fnv1a("")` 空哈希。空闲到达密码步时关闭
+  `SEC_ENABLED`，且 `save_password` 在未启用安全时清空 `security_type`
+  （防「有 security_type 无 security_hash」→ launcher 开机即锁死）。
+- **完成页「进入系统」按钮是死代码**：step 12 从不等待点击直接进桌面，
+  `BTN_ENTER` 绘制与命中全部不可达。真实输入路径现在等待点击（30 秒空闲
+  自动进入，保留无人值守可推进）。
+- **闲置呼吸残影**：Hero 光晕/进度点呼吸逐帧在 BACK_BUF 上混合不恢复基线，
+  1-3 秒内光晕饱和成实心绿圈、r=6 外圈永久残留。改为「基线快照 + 每帧
+  恢复再绘制」（`HERO_SNAP`/`DOT_SNAP`，页面重渲染时失效重建）。
+- **选中脉冲绿 tint 永久残留**：三帧 tint 直接叠加在 canvas 上（96+48+0），
+  卡片永久残留 ~50% 绿色。改为每帧先从 BACK_BUF 恢复卡片底图再叠加本帧。
+- **`card_selected` 缺 step 11 分支**：外观页点击后局部重绘把新旧卡都画成
+  未选中态；step 7 分支未检查 `SEC_ENABLED`（未启用安全时悬停误显选中）。
+- **`present_rect` 超界矩形整体丢弃**：光标 overlay 旧+新位置并集 >540px 时
+  该帧更新整个丢失（光标瞬移停滞），改为裁剪到屏幕。
+
+#### 应用正确性（用户操作可触发 panic / 数据损坏）
+
+- **files**：存储栏 `render_storage` 写 `[u8;48]` 无边界检查（固定文案 26B +
+  三段 fmt_size，1GB 级卷三段 8 字符即越界 panic）—— 扩到 96B + `push_fmt`
+  有界追加。
+- **sms**：`modem.rs read_state` read 返回值按 usize（失败 -errno 当巨大值
+  → `buf[start..n]` panic）；`write_dec(0)` 缺 `i-=1` 写出空串（会话 id=0
+  路径缺号 → 所有 id=0 会话共用一个文件互相污染、时间戳变长错位）；
+  `now_stamp` 补零定长（显示层按固定偏移取 HHMMSS）；空号码拒绝入库 +
+  列表绘制 `title[0]` 空守卫。
+- **video / notes**：getdents64 返回值 `n <= 0` 按 usize 比较（负 errno 巨大
+  值当成功，继续解析残留旧数据 → 重复条目/越界 panic），按 isize 判负。
+- **camera**：`cam_poll_resp` 对 `RESP_BUF` 子切片 `copy_from_slice`（源/目
+  重叠 = UB）改 `copy_within`；录像计时 >10 分钟 `b'0'+x` 溢出成非数字。
+- **contacts/local**：`write_file` 单次 write 不重试（~130KB FILE_BUF 短写
+  即静默丢联系人且文件已截断），改分片写循环。
+- **map**：`push_dec` 丢弃负数（传感器姿态/南纬西经渲染为空），经 i128 绝对
+  值支持负号。
+- **phone**：通话计时分钟钳到 99（>99 分钟 `b'0'+mm/10` 溢出）。
+
+#### browser（远程页面即可触发）
+
+- **DOM 树深无上限**：`<a>` 重复 ~2 万层（64KB 页面即可构造）→ 递归遍历
+  （elements_by_tag/text_of/preorder/collect_text）打穿 1MB 用户栈。解析
+  阶段 `MAX_TREE_DEPTH=256` 封顶（超限按父级平铺）+ 遍历深度守卫。
+- **`<button>` 文本永远为空**：`Node::text()` 对元素节点恒返回 `""`，布局
+  与绘制按钮标签为空。新增 `Dom::inner_text()` 聚合子树文本。
+- **HTTP 头终止符跨段丢失**：`\r\n\r\n` 被 TCP 分段切开时只在「新增数据」
+  内搜索永远匹配不到（正常页面报「响应头不完整」）；改从拼接缝前 3 字节
+  扫描 + `\n\n` 终止符按实际长度取 body（原来多吞 2 字节）。
+- **图片加载无同源校验**：`same_origin` 是死代码，远程页面 `<img>` 可对任意
+  内网/外网地址发 GET（探测/追踪），file:// 页可读任意本地 PPM。预抓取
+  过滤 `same_origin || kunxos://`。
+- **CSS 长度无上限**：`1e30px` → inf → `as i32` 饱和 i32::MAX → 滚动条/绘制
+  坐标加乘回绕簇。`parse_length` 钳制 0..=8192px；max_scroll 钳 1e6 +
+  thumb_y i64 中间量；`visible()` i64 比较。
+- **`<a><img></a>` 链接失效**：Replaced 原子不计入行内盒矩形，仅含图片的
+  链接 0×0 被 retain 丢弃。Replaced 携带 ibox 并 add_ibox。
+- **chunked 传输编码**：明确报错（此前把分块元数据当页面内容呈现）。
+
+#### launcher
+
+- **锁屏按压卡死（每帧全屏重绘）**：锁屏时按压命中图标 → `PressIn` 抬起
+  路径被 `handle_lock_input` 消费无 `cancel_press` 机会 → 弹簧永不收敛，
+  60fps 常驻全屏重绘 + 解锁后图标卡在按压态。`on_press` 加 `!LOCKED` 门控 +
+  锁屏消费手势时兜底 `cancel_press()`。
+- **启动动画条纹镂空**：`launch_blit` 步进 4px 但只写 2×2 像素（ZOOM_BLOCK
+  从 2 改 4 时漏改，zoom_blit 同步改了这里漏了）→ 放大图标每 4px 出 2px
+  缝隙。补全整块填充（与 zoom_blit 同规则）。
+- **锁屏回拖负坐标回绕**：上滑后往回下拖 `LOCK_LAYER_OFF > 0`，
+  `draw_lock_background` 的 `gy as u32` 对负值回绕（顶部渐变变垃圾色）。
+  off>0 时跳过 y<off 行（露出桌面语义）。
+- **PressOut 吞点击**：回弹未收敛时按下与抬起都被静默吞（滑动结束后立即
+  点图标无反应）。`start_press`/`start_launch` 允许从 PressOut 打断。
+- **`app_uid` 解析溢出**：超长数字行回绕（debug panic / release 错误 uid），
+  改 saturating。
+- **控制中心**：跟手下拉速度无钳制（瞬时 10⁶ px/s 冲飞面板进度）钳 ±3000；
+  弹簧初速钳 ±4 面板/秒；跟手打开重建玻璃背景（此前沿用上一次缓存的旧
+  桌面 backdrop）；滑条拖动每个输入事件写盘 → 松手结算落盘一次。
+
+#### settings
+
+- **拖拽滚动公式两路全错**：`drag_to` 期望绝对 y —— 触摸路径传
+  `TOUCH_PY - value`（滚动量 = 手指绝对坐标，下半屏一碰就钳底）；鼠标路径
+  传单次 REL_Y 增量（≈ 常量，拖动立钳一端）。触摸改传绝对 y，鼠标改按
+  下点 + REL 累计。
+- **按压反馈**：设置页所有交互此前无任何按压反馈（对比 OOBE 按钮反馈）。
+  新增通用按压高亮（触点软边压暗圆斑写 canvas，抬起从 BACK_BUF 恢复；
+  滚动重绘自愈，不污染权威底图）。
+
+#### 内核
+
+- **compositor fb_present 脏区不覆盖内核失效区**：`copy`/`prev_app` 只含
+  应用脏区 —— alpha 窗口动画每 2 帧在同一 back 上重复混合（透明度逐帧
+  加深）、窗口移走后旧位置残影到应用恰好重绘为止。内核失效区并入拷贝集
+  与 prev_app（canvas 为权威底图，先回填再混合）。
+- **CNTP IRQ 内串口忙等 ~10ms**：帧统计每 60 帧（0.5s）在中断上下文逐字节
+  忙等输出 ~110 字符 ≈9.5ms 且全程 IRQ 关闭，超 8.33ms 帧预算本身，调度
+  tick 与 UART RX 全部顺延。改 IRQ 侧置标记、内核主循环线程上下文冲刷
+  （`anim::poll_deferred_stats`）。
+- **on_finish 回调迭代中重入**：完成回调（链式动画/销毁窗口）在 ANIMS
+  迭代循环内执行，回调内 tween/cancel_window 会改写槽位表。改为暂存
+  `FINISH_Q`、循环外统一执行。
+- **恰好 32 个脏矩形被降级整屏**：ioctl 侧 `>MAX_DIRTY` 才 EINVAL，
+  `fb_damage` 却 `>=` 判超限，改一致。
+- **perf overlay 重复混合**：overlay 画在 back 且不在拷贝/clean 集，40% 黑
+  底每 2 帧累积到底色全黑。绘制前先从 canvas 恢复该区域（新增
+  `restore_back_from_canvas`）。
+- **ui_framework Image 行距错位**：源宽被钳到目标宽导致每行内容整体错位，
+  新增 `blit_strided`（裁剪拷贝宽高、源按原行距推进）。
+- **eret/memset/memmove 宽通道**：内核 `memset` 升级 16B `stp`/8B `str`
+  （页清零/画布填充路径），`memmove` 无重叠走 memcpy 宽通道、重叠反向
+  保序（volatile 免疫 LoopIdiomRecognize 的 `call memset` 自递归变换）。
+
+#### 性能（输出逐位一致的优化）
+
+- **EL0 memcpy/memmove/memset 宽通道**：`shared/ttf_text.rs` 的字节循环
+  （所有应用唯一的 memcpy 定义）升级为与内核同款 `ldp/stp` 16B 宽通道 +
+  8B 回退 + volatile 字节尾。launcher 每个动画帧仅背景恢复 + flip 就有
+  ~4MB 拷贝走此路径。
+- **字形缓存扫描局部化**：256 槽线性扫描落在连续 2KB 的键旁路数组
+  `GLYPH_KEYS`（此前每字符每帧跨 1KB 步长扫 256KB）；`cache_store` 就地
+  写字段（去掉每次未命中 1KB 栈临时）。
+- **fill_rect 行填充**：app_kit / launcher 两处逐像素 `put_pixel`（每像素 4
+  次边界比较）改为整体裁剪 + 逐行 `slice::fill`（宽通道 memset）。
+- **app_kit 字形混合**：三个 TTF 字形路径（cn/bold/icon）共用 `blit_glyph`
+  —— 求交一次、直写 BACK_BUF、a==255 直通（此前每像素 4 比较 + put_pixel
+  再检查 + 全 alpha 走 blend）。
+- **小部件文件读 TTL 缓存**：天气温度/天气文字/电池/充电状态此前每帧
+  open/read/close（第二页动画 + 锁屏充电动效 60fps 常驻），加 1s TTL 缓存。
+- **滑条拖动不落盘**：控制中心亮度/音量拖动每个 ABS 事件写一次盘（可达
+  每秒百次），改松手落盘一次。
+- **缓动求解提前收敛**：内核 anim.rs 与 launcher 的 `solve_x` 牛顿收敛即
+  返回（每 tween 每帧省 ~20 次 bezier 求值）、二分区间用牛顿结果收窄。
+- **杂项**：`clean_needed()` 平台判定缓存（每矩形一次字符串扫描降为一次）；
+  frame_tick 复用 tick 时刻（省 1 次 CNTFRQ 读 + 除法）；launcher 输入批读
+  48B → 256B（快速滑动 read 次数降 ~5 倍）。
+
+#### 美化
+
+- **强调色统一为 ColorOS 绿**：`0x00B96B`（docs/animations.md 3.5 规范）。
+  清除三种绿并存：iOS 绿 `0x22C55E`（ds.rs/app_kit/launcher/browser/
+  calendar/contacts/map/weather/stub 等）、iOS 系统绿 `0x34C759`（settings
+  开关/图标、clock 开关）、变体绿 `0x1ABB5E`（sms）—— 22 个文件统一。
+
+### 动画渲染提速（2026-09-07 轮）
+
+动画帧的三大逐像素热点改为缓存/整块拷贝，输出逐位一致：
+
+- **launcher 背景缓存**：文件夹/翻页/控制中心/最近任务/按压等桌面动画每帧
+  都经 `draw_desktop_full` 重画整屏壁纸背景（54 万像素渐变+波形逐像素数学，
+  TCG 下 50~150ms/帧）。现在按调色板键缓存渲染结果（`BG_BUF`），键不变时
+  （绝大多数动画帧）整块 memcpy；换壁纸交叉淡化期间每帧键变化、按原路径
+  重渲染并更新缓存。`draw_background_rect`（时钟小组件每秒局部刷新）同样
+  命中缓存时按行 memcpy。
+- **启动转场快照压暗一次化**：`launch_blit` 每帧对全屏快照做 LUT 压暗扫描，
+  而快照在转场期间不变 —— 现在 `start_launch` 快照后就地压暗一次
+  （`darken_frame_buf`），转场各帧背景降为纯 memcpy。就地修改安全：
+  `FRAME_BUF` 的其它读者（Return/Resume 转场缩放）使用前都会重新快照。
+- **转场缩放采样降维**：`zoom_blit`（启动/返回/恢复转场）的列采样 sx 此前
+  每行重算（240 行 × 135 列 i64 乘移位/帧），改为每帧预计算一次列采样表；
+  块填充的末行/末列边界检查外提到块级，内层循环无分支。
+- **内核合成器 alpha 混合去除法**：`blend_pixel` 每像素 3 次整数除法改为
+  `(v + 1 + (v >> 8)) >> 8` 位运算（0..=65025 全域穷举验证与地板除逐位
+  等价，输出不变）—— OOBE 页面淡入淡出、Home Indicator 等覆盖层动画的
+  合成热路径直接受益。缩放窗口合成的源 X 采样表在构建时钳制到源宽内，
+  行内逐像素不再做边界分支。
+
+### 应用打开提速（2026-09-07 轮）
+
+点击图标到应用首帧的实测耗时（QEMU TCG 慢宿主，Settings）：**13.1s → 2.8s**。
+三处根因与修复：
+
+- **settings 整屏提交逐像素处理（占 ~4s）**：默认亮度 85 使 `flip()` 每帧走
+  逐像素 `lut_px` 路径，且每像素调用 `invert_on()`/`contrast_on()` 配置查询。
+  现把亮度×反色×对比度合成为一张 256 项通道 LUT（参数不变时复用，参数为
+  默认直通时仍走 memcpy 快路），整屏提交降为查表；输出逐位一致。
+- **fontdue 全量字体解析（占 ~3s）**：`cn.ttf`/`bold.ttf` 子集此前按整文件
+  文本收集字符集，被**未接线的拼音 IME 字典**（`shared/pinyin_dict.rs` 的
+  GB2312 一级全字表）撑到 3538 字/1.6MB。`make_fonts.py` 现显式排除该死代码
+  文件（接入 IME 时需移除排除并重建），并把 `tools/kunxrepo` 的包描述生成器
+  纳入扫描（store 显示的 Packages 文案）、显式解码 `\xNN` 字节转义文案；
+  子集降至 1731 字/742KB，解析时间减半。缺字审计确认运行期文案全覆盖
+  （源字体本身不含的阿语/文本 emoji 与旧版一致，emoji 走 Phosphor 图标路径）。
+- **启动期冗余首帧（占 ~4s）**：settings 此前「先画一帧像素字 → 加载字体 →
+  再画一帧」，首帧立即被覆盖且整屏提交最贵。现只画一次（字体就绪后），
+  字体加载期间屏幕由 launcher 的启动占位页覆盖。
+- 配套：`ttf_text::read_file` 读取分块 4KB → 32KB（1.6MB 字体 400 次
+  syscall 降至 ~50 次）；`font_init` 增加一行 `[perf] font_init` 诊断；
+  补上 oobe `finish.rs` 引用但未定义的 `draw_glass_dark`（工作区预存编译
+  破损，全量重编时暴露）。
+
+### 全系统浅色主题：应用白色背景打底（2026-09-07 轮）
+
+- **规范**：页面基底纯白（渐变 0xFFFFFF→0xE9EDF3）、主文字 0x1A1C22、
+  次要文字 0x6B7280、卡片描边 0xD9DEE6、分割线 0xE5E9F0；强调绿/
+  危险红/警示琥珀保留，彩色表面（红/绿/琥珀玻璃）上的文字保持白色。
+- **shared**：`app_kit` 的 `glass_dark()` 固定返回 false（不再读
+  /data/oobe/theme），默认调色板浅色化，玻璃按钮 accent 玻璃白字/
+  浅玻璃深字；`glass.rs` 的 `STYLE_LIGHT` 描边改浅灰以在白底保持轮廓；
+  `nav.rs` 底部导航栏改浅色玻璃 + 深色图标；`ds.rs` 固定浅色模式。
+- **apps**：全部 GUI 应用（launcher、oobe、settings、files、cloud、
+  contacts、clock、music、mail、sms、browser、weather、calendar、
+  gallery、map、notes、video、camera、phone、lcapp、calculator、
+  store、stub、terminal）背景改白色打底、白字改深色、深色玻璃改浅色
+  磨砂。特殊：terminal 白底深字 + ANSI 过亮色压暗；video/camera 取景/
+  播放画面保持黑色（内容非主题）；map 地图要素整体浅色化。
+- **主题开关**：launcher/oobe 的深浅色选择功能保留但系统渲染固定浅色
+  （THEME_DARK=false，读取配置时忽略深色字段）。无头测试/诊断应用
+  （probe、modemtest、audiotest、audiolat、audiomix、crashme、sfsrace、
+  recovery、sleepy）无界面不涉及。boot splash 为 bootloader 黑底
+  Logo，未改动。
+
+### 挂起缺陷清剿 + 应用内动效（2026-09-07 轮）
+
+- **内核 heap**：slab 半满状态双重释放防护补全（空闲链表遍历查重，此前
+  仅页标签拦截「页已归还/改作它用」的陈旧指针）。
+- **内核 signal**：pthread 工作线程信号帧边界放宽 —— 工作线程栈来自用户态
+  mmap、不在主栈 ASLR 区间，此前收信号一律被误判「栈越界」按默认动作
+  误杀；现接受用户空间内已映射可写的帧（LAZY 落地/COW break 仍强制）。
+- **内核 fat32**：目录簇链不可增长 → `find_free_slot` 走到链尾时追加
+  新簇扩容目录（分配即清零，根目录同样适用；卷满保持原错误）。
+- **内核 interrupt（严重）**：风暴护栏对 PPI 写 `GICD_ICENABLER` 在 QEMU
+  下会把调度器时钟中断真正关掉（架构规定该写对 SGI/PPI 无效，QEMU 照单
+  全收）→ 护栏触发即整机冻结。现仅对 SPI（irq≥32）执行屏蔽写；PPI 风暴
+  episode 实测自行消散，只静音诊断。
+- **launcher**：fb0 ioctl 分辨率合法性钳制（异常值致 `W*H*4` 回绕为 0、
+  mmap 恒 EINVAL 的可疑路径）；启动布局转储 `[launcher] tile/dock`。
+- **动画**：calculator 按压下沉/松开闪光/结果弹出；clock 标签指示条滑动
+  （均按 docs/animations.md 3.1 节奏，全整数运算）。
+- **测试**：apps_regression.py 按布局转储重写（真实坐标、模块过滤记
+  SKIP、返回语义修正）。
+
+### 流畅度：鼠标跟手 + 交互调度专项（2026-09-05 轮）
+
+对标鸿蒙（交互线程调度提速 / 唤醒抢占）与 ColorOS 15（潮汐引擎触控加速、
+极限稳帧）修复「鼠标不跟手、应用卡顿」：
+
+- **根因一（不跟手）**：约 14 个 kit 应用光标移动只画进画布、从不提交呈现，
+  光标要等下次全量重绘才上屏。`shared/app_kit.rs` 的 `cursor_overlay_move()/
+  cursor_overlay_redraw()` 现在随写随以小脏矩形（旧+新位置 ~26x26）提交
+  FBIO_PRESENT，输入→画面单次小矩形呈现即时上屏。
+- **根因二（卡顿）**：settings/calculator/store 等应用每次移动提交**整屏**
+  脏矩形，内核在屏蔽中断的 ioctl 内做整屏 canvas→back + 整屏 ramfb 拷贝
+  （每次移动 ~4MB）。全部改为小矩形提交；stub 补齐缺失的 FBIO_PRESENT
+  管线（此前 overlay 光标根本不上屏）。
+- **内核 `compositor::fb_present`**：prev_app（2 帧并集）语义保持不变——
+  `present()` 交换 front/back 后下一次写入的 back 是 2 帧前的旧缓冲，并集
+  负责补齐两帧间变化；ramfb 呈现指向整个 back，任何"只补小矩形"的捷径都
+  会把陈旧区域整屏翻上扫描输出（全屏闪烁）。应用侧小矩形提交配合该并集
+  正确工作：光标移动通常只拷贝 ~676×2 像素，仅全量重绘后的第一次移动
+  退化为整屏拷贝（~1ms，可接受）。
+- **内核调度（`sched_cfs`）**：新增唤醒抢占（`wakeup_preempt`，Linux
+  `check_preempt_wakeup` 思路，粒度 2ms）——交互/实时任务唤醒后无需等
+  后台任务用完 10ms 时间片；`yield_now`/`block_current`/`stop_current`
+  作为调度决策点清除累积请求，避免多抢占一次。
+- **输入触控加速（`input.rs` + `sched_cfs::boost_tid`）**：指针/按键事件
+  到达时把最近读取输入的前台 UI 任务 vruntime 拉到全局最小（CFS
+  `place_entity` 思路）并发起唤醒抢占，限频 2ms——交互任务即时抢占后台
+  负载。
+- **输入低延迟**：修复 poller 竞态（登记后、注册睡眠前到达的事件此前会把
+  帧循环白睡一个 16ms 间隔，poller 改为不消费登记）；指针移动事件积压过半
+  时合并丢弃最旧完整移动帧（Android 输入批处理思路），应用繁忙时光标不再
+  「追赶式」爬行。
+- **桌面每秒整屏重绘根因（launcher）**：首页时钟小组件含秒针，此前每秒置
+  `NEEDS_REDRAW` → 整屏 `render_frame()`+`flip()`（壁纸+毛玻璃+图标+TTF
+  全量渲染，TCG 下 50~150ms），期间主循环被占死、鼠标每秒顿一下 —— 这是
+  「桌面鼠标非常卡」的主因。新增 `redraw_clock_widget_fast()`：只重绘小组件
+  矩形（矩形内壁纸背景 `draw_background_rect` + 玻璃卡片 + 表盘 + 脏矩形
+  flip 呈现，~5ms）；分钟 tick 在首页同样改走状态栏 + 小组件局部路径。
+  光标落在小组件矩形内时随帧补画 overlay（矩形外不补，防 save_under 把
+  光标像素存成背景留下拖影）。
+- 验证：`make kernel` + `make launcher` 0 错误；QEMU 截图实测——桌面静止时
+  相邻秒帧差异仅剩表盘小区域（此前为整屏），1600px/s 匀速注入下光标往返
+  精确到折返点、无累积滞后；闪烁/黑框（prev_app 回归）已修复并回归通过。
+
+### 动效：共享运动库 + 壁纸淡化 / 锁屏充电动效 / 滑条数值气泡 / 设置页转场（2026-09-05 轮）
+
+对标 ColorOS 15（幻光影流动）与鸿蒙页面转场规范补齐 P0 动效（路线图见
+`docs/animations-roadmap.md`，数值并入 `docs/animations.md` §3.11~3.14）：
+
+- **共享运动库 `shared/motion.rs`**：贝塞尔缓动（8 曲线，牛顿+二分，与内核
+  anim.rs 同算法）+ 阻尼弹簧（半隐式欧拉，含 `retarget` 打断接续——当前值/
+  速度无缝交给新目标，springMotion 接续的应用侧等价物）+ 进度/三角波呼吸
+  辅助。launcher 与 settings 经 `#[path]` 引入（同 nav.rs 模式），应用侧
+  动画从此有了零分配公共底座。
+- **壁纸切换交叉淡化**（launcher）：应用返回前台时重读桌面偏好，壁纸/主题
+  调色板变化即播 300ms `EaseOut` 行级调色板混合（逐像素零额外开销）——
+  设置应用改外观回桌面即时生效，不再需要重启 launcher。
+- **锁屏充电动效**（ColorOS 幻光影流动风）：呼吸光晕电池药丸（三角波 1.2s，
+  三环光晕）+ 双圈错峰涟漪（周期 1.6s、圈间滞后 0.8s，半径 18→64 淡出）+
+  电量百分比；充电状态 1s 缓存轮询，涟漪圆环为整数中点圆 alpha 混合（无
+  sin/cos）。
+- **控制中心滑条数值气泡**：拖动亮度/音量滑条时上方弹出玻璃药丸实时显示
+  百分比，松手保持 900ms。
+- **设置应用页面切换转场**（鸿蒙页面转场规范）：推入/弹出 240ms
+  `FastOutSlowIn` 左右位移——新页滑入、离场页以 2MB `SNAP_BUF` 整帧快照补底，
+  行级平移 + 10px 接缝阴影（无第二渲染缓冲，转场期 8ms 帧预算同步推进）。
+- 验证：`make launcher` 全应用 0 错误；内核路径未动。
+
+### 修复：第二轮独立复查修复轮（2026-09-05）
+
+五路并行代码审查（内核核心/文件系统存储/网络 IPC/GUI 应用/服务 init pkg）→
+33 项修复，关键项（完整清单见 `BUG_REPORT.md` 第十四节）：
+
+- **Critical**：`alloc_page` 成功路径早退跳过 `irq_restore`（未提交改动引入），
+  单次页分配即把中断屏蔽态泄漏到整个 syscall 执行期。
+- **eret SPSR 白名单清洗**：堵住「伪造 rt_sigreturn 帧携带 DAIF 掩码 /
+  EL0 直写 DAIF → 单核整机冻结」的无条件 DoS（汇编路径 + sigreturn 双层）。
+- **socketpair/msgq 对端关闭语义**：EOF/短写/关闭复检（此前永久挂起 +
+  槽位复用后跨连接数据串扰）；IPC 引用计数全部加 IRQ 屏蔽窗口。
+- **文件系统**：fat32 目录簇链成环冻结、目录项块号伪造校验（防位图写入）、
+  数据位图日志暂存失败回滚（防掉电后跨文件踩踏）、fs_lock 单 CAS 取锁。
+- **TCP**：close 不再覆盖未确认数据段的重传登记（防连接静默失步丢数据）。
+- **用户态**：launcher 死 pid 复活假死、calculator/stub poll_key 越界、
+  audiod 死客户端回收、readv/writev 预校验内存放大、rild 短信存储改追加写、
+  kunxpkg/kunxverify 多证书链解析、mkfs_sfs 超级块版本号遮蔽等。
+- 验证：`make` 0 警告；宿主测试 sync_tests 57 / wireless 105 全过；QEMU
+  `-kernel` / `run-disk` 冒烟 0 PANIC。
+
+### 修复：ctl 命令信箱启动期 open 失败刷屏（2026-09-05）
+
+- `alarmd` / `camerad` 以 `O_RDWR`（不带 `O_CREAT`）轮询各自的
+  `/var/run/*.ctl` 信箱，而信箱要等客户端（clock / camera 应用）首次写入
+  才存在 → 启动后主循环持续 open 失败，`[vfs] open 失败` 行与其他进程
+  串口输出交错（还会提前耗尽 vfs 限流的前 24 行配额，掩盖真实错误）。
+- 修复：两服务启动即创建信箱文件（`O_TRUNC` 顺带清陈旧命令）；alarmd
+  轮询从「读后 unlink」（文件消失后失败复现）改为读后 `ftruncate(fd, 0)`
+  清零，信箱常驻（camerad 原本就是 ftruncate 语义）。顺手清除 alarmd/
+  camerad panic 路径的双分号与 `shared/tz.rs` 未使用变量告警（0 警告）。
+- 验证：`make` 全量构建 0 警告；QEMU 无头冒烟启动日志中
+  `alarmd.ctl`/`camerad.ctl` open 失败完全消失，仅剩合法的一次性首启探测。
+
+### 修复：独立复查修复轮（2026-09-05）
+
+四路并行代码审查（内核核心/文件系统/GUI 应用栈/服务与应用）+ QEMU 实机复现，
+与第十二轮互补，共修复 29 项，关键项（完整清单见 `BUG_REPORT.md` 第十三节）：
+
+- **桌面起不来根因**：陈旧构建产物中 launcher（396KB）超过旧 execve 读入
+  上限 256KB → execve 静默失败、init 随即退出。`make clean` 失效（clean 目标
+  引用已删除的 displayd 变量，永远 exit 2）导致陈旧产物残留。两者均已修复，
+  execve 失败路径保留诊断输出。
+- **内核安全**：socketpair/clipboard_get/statx/rt_sigaction-old 写用户内存
+  改可写校验（RO/COW 页 EL1 裸写 = 单 syscall 杀内核）；rt_sigreturn 清洗
+  用户可控 SPSR（伪造 EL1h 可 eret 进 EL1 挂死内核）；OTA 变更命令限 root；
+  wait4 ABI 修正（options 在 x2，真实 bionic 的 WNOHANG 此前失效）。
+- **内核正确性**：SFS fs_lock 改 (CPU,TID) 双令牌 + 死亡持有者抢锁自愈
+  （原 CPU 令牌被任务迁移破坏，SMP 并发入临界区）；被杀任务清理 SLEEPERS
+  （假唤醒 + 32 槽泄漏）；reap 存活护栏提前（SMP 先释放地址空间 UAF）；
+  dup3 越界目标泄漏引用；文件 mmap 游标与匿名游标重叠互踩 PTE；mmap_anon
+  失败回滚游标；virtio-blk reset_ring 完整设备复位（旧请求迟到完成被误判
+  新请求成功）；SFS 事务 copy-out 失败阻塞日志 head 前移（丢元数据）；
+  truncate 写 inode 失败中止事务；pkg uninstall 路径穿越（删任意文件）；
+  加密卷冲刷按设备路由（原全局单父冲错盘）。
+- **GUI**：oobe present_back_rect BACK_BUF 越界 panic（点「选择应用」页
+  任意一行必崩）；oobe 30 秒空闲判定把移动鼠标也算无输入（强推下一步）；
+  launcher flip() 脏矩形对 BACK_BUF 尺寸钳制（静默越界读）。
+- **服务/应用**：syscall 返回值按 usize 判负族第二批量清剿（wifid/rild/
+  settings/store/probe/phone/contacts/lifd/logd/audiod 共 11 处，读错误
+  即 panic 或吞错误数据）；networkd/wifid 改常驻（原 0.6s/5s 自退后所有
+  Wi-Fi/网络命令静默丢失）；wifid CONNECT/SAVE 长度校验 + 配置文件名净化；
+  rild 级联短信按 ref_id 匹配 + 槽位 TTL 回收；settings cloud_login 口令
+  缓冲扩容；files fmt_size 大尺寸显示截断；init 回收守护进程僵尸。
+- 验证：`make` 全量构建 exit 0 / 0 警告；宿主测试 jpeg 7 / wireless 105
+  全过；QEMU 无头与 run-disk GUI 双模式冒烟 0 PANIC；launcher_test 全流程
+  （OOBE 13 步 → 桌面 → 点 Clock → 启动/返回转场 → 二次点击存活）通过。
+
+### 新功能：Phosphor 图标字体接入（软件图标 + Emoji）（2026-09-05）
+
+- **码点表 `shared/icons.rs`（source of truth）**：应用桌面图标 / 天气图标 /
+  通用 UI 图标 / Emoji→图标映射共 228 个 Phosphor 码点，取自
+  @phosphor-icons/core 2.1.1 官方 meta（与 fonts/Phosphor-Fill.ttf /
+  Phosphor-Bold.ttf 的 Version 2.1 一致，两字重同码点）。
+- **软件图标**：`tools/make_icons.py` 改为用 fontTools 读取 Phosphor-Fill
+  矢量轮廓（quadratic/cubic 展平 + even-odd 填充挖洞），按 icons.rs 的
+  应用码点渲染 8 倍超采样贴图，替换手绘几何字形；桌面/Dock 21 个应用
+  图标即真实 Phosphor 设计（`shared/app_icons.rgba` 已重生成）。
+- **行内 Emoji**：`font_render` 新增两个图标字体槽（/fonts/icon-fill.ttf
+  实心、/fonts/icon-line.ttf 粗线）。文本路径上 emoji 码点经
+  `icons::emoji_icon` 自动映射为 Phosphor 单色图标（359 个 emoji 码点 →
+  210 图标），VS16/ZWJ/肤色修饰/区域指示符渲染为零宽空位；未映射 emoji
+  与旧行为一致（退回常规字体）。内核 `ui_framework` 与全部应用的
+  `font_init` 均加载图标字体。
+- **构建**：`tools/make_fonts.py` 新增 `build_icons()`（从 icons.rs 提取
+  PUA 码点生成 icon-fill/icon-line 子集，57KB/69KB）；Makefile 接入
+  rootfs `/fonts/icon-fill.ttf`、`/fonts/icon-line.ttf` 并把 icons.rs
+  加入 SHARED_SRC。
+- **修复**：字形缓存键字体选择器与 px 位段重叠（常规/标题/图标字形在
+  缓存中互撞）——选择器移至码点上方独立位段。
+- 验证：宿主栅格化测试全过；QEMU 实机截图确认桌面 Phosphor 应用图标、
+  浏览器「关于」页 Emoji 行内渲染（☀️⛅❄⚡❤⭐🔔📅📁💬👍😀 等映射为
+  单色图标）。
+
+### 修复：全量审查修复轮（2026-09-05）
+
+6 路并行代码审查（内核内存/存储/网络 UI、shared 库、全部应用与服务）后修复
+30 项正确性 bug，关键项：
+
+- 内核：恢复 `reap` 中丢失的 `reap_pid` 调用（任务槽位/内核栈泄漏回归）；
+  SFS `MAX_DEVS` 2→4（第三卷挂载复用槽位 0 摧毁根 FS）；FAT32 每卷独立根
+  表项；`wait` 丢唤醒竞态；`spawn`/`insert` 调度锁 IRQ 死锁；`execve` 终止
+  兄弟线程；gdbstub/virtio_snd 外部输入 panic；browser CSS 远程 panic 等。
+- shared/应用：字体大字形截断 panic、read/lseek 失败值按 usize 放行族
+  （lifecycle/audio/sms/modemtest/ttf_text）、cloud/kunxpkg/settings/mail
+  缓冲越界、launcher/oobe 防御守卫。
+- 完整清单见 `BUG_REPORT.md` 第十二节。验证：`make` 全量构建 0 错误 +
+  宿主测试（jpeg 7 / wireless 105 / sync_tests 57）+ QEMU `-kernel` 与
+  `run-disk` 双模式冒烟 0 PANIC。
+
+### 新功能：桌面应用真图标贴图（2026-09-05）
+
+- **此前**：launcher 桌面/Dock 的应用图标是"圆角矩形底色 + 白色几何线条"
+  的程序化占位绘制，系统没有真实图标资源（唯一位图资源是鼠标指针）。
+- **新增 `tools/make_icons.py`**：按 APPS 表顺序为 21 个应用逐个绘制
+  56×56 图标（8 倍超采样绘制 + LANCZOS 缩放，白色字形 alpha 蒙版 +
+  纵向渐变圆角底），写出 `shared/app_icons.rgba`（裸 RGBA8888，263KB）
+  与预览拼图 `tubiao/icons_preview.png`。生成物随源码提交，构建不需要
+  Python（Pillow 仅在重跑生成时需要）。
+- **新增 `shared/app_icons_sprite.rs`**：图标数据访问模块，顺序与 APPS
+  表严格同序。贴图随 rootfs 以 `/share/app_icons.rgba` 提供，launcher
+  启动时读入（`install()` 零拷贝借用）。**不放 ELF 内嵌**：263KB 会把
+  launcher ELF（现约 200KB）顶过内核 execve 的读取缓冲上限
+  `EXEC_BUF_CAP`（`kunxcore/src/elf.rs`，256KB），导致 execve 拒绝、
+  应用启动即退（实测复现过）；与系统字体一致走"rootfs 文件 + 运行时
+  读取"，后续增长不再受此上限约束。Makefile rootfs 目标同步拷贝该文件。
+- **launcher 接入**：图标瓦片缓存优先由烘焙贴图填充（半透明边缘的 alpha
+  编码进颜色最高位字节）；`put_pixel` 支持逐像素 alpha 混合（屏幕/文件夹
+  瓦片按目标现值混合，瓦片模式原样写入保留 alpha 供二次合成）；非 56px
+  路径（Dock 52px、按压反馈缩放、占位页 96px）改为贴图最近邻缩放采样；
+  撕裂淡出/编辑模式旋转/启动放大动画各路径透明像素跳过、半透明边缘混合。
+  原"几何线条"绘制保留为贴图缺失时的回退。
+
+### 重构：测试脚本统一归入 `tests/scripts/`（2026-09-05）
+
+- **删除一次性调试脚本**（使命完成、仓库内零引用）：`tools/repro_calc.py`、
+  `tools/repro_oobe.py`、`tools/verify_fixes.py`、`tools/verify_keys.py`、
+  `tools/glass_verify.sh`；并清理测试运行日志（`tools/*.log`，本就
+  gitignore）与 `__pycache__`。
+- **迁移 18 个测试脚本** `tools/` → `tests/scripts/`：QEMU 端到端与回归
+  （`apps_regression`、`lifecycle_test`、`lifecycle_core_test`、`power_test`、
+  `camera_e2e_test`、`browser_test`、`cloud_e2e`、`kunx_pkg_test`、
+  `launcher_test`、`weather_e2e`、`verify_files_app`、`devtool_verify`）、
+  输出验证（`verify_jpeg`）、可视化探针（`app_open_shots`、`app_ui_probe`、
+  `perf_harness`）及 `run_modemtest.sh`、`test_pdu.c`。Makefile 的
+  `power-test` / `lifecycle-test` / `lifecycle-core-test` / `test-pdu` 目标
+  与 `docs/`、`cloud/README.md` 中的路径已同步更新（历史 CHANGELOG 条目
+  与 BUG_REPORT 中的旧路径保持原样，属当时记录）。
+- **保留原处**：`tools/` 下构建/辅助工具（`mkdisk`、`mkfs_sfs`、`shot`、
+  `input_inject`、`httpd` 等）；宿主测试 crate `tools/sfs_host_test` 与
+  `tools/kunxverify`（`#[path]` 相对引用内核源码，移动会断链）；
+  `tools/kunxsec`（签名工具链 Python 包，`selftest.py` 依赖同目录模块）。
+
+### 修复：Contacts 启动即崩（SIGSEGV，栈溢出）（2026-09-04 轮）
+
+**现象**：从桌面点击「联系人」→ `[crash] tombstone: pid=12 name=fork-child
+sig=11 pc=0x4032bc`，应用退出码 245。pc 落在 `contacts::store` 的 Rust 栈
+探测序言（`str xzr, [sp]` 逐页写哨兵）——写穿了 1MB 用户栈的守卫页。
+
+**根因**：同步存储路径在栈上叠了三层巨型缓冲：调用方 `blob [u8; 262144]`
+（256KB）+ `Store` 结构体（`recs[512]×256B` = 128KB，按值返回落在栈上）+
+`Store::load`/`save` 的 `idx_buf [u8; 131088]`（128KB）。启动链
+`k_main → merge_stores → store` 与 `k_main → rebuild_list(456KB) → store(369KB)`
+叠加后超过 1MB，大帧函数的栈探测直接崩。大型栈帧 prologue（`sub x9, sp,
+#imm, lsl #12` + 探测循环）在反汇编中逐函数核实。
+
+**修复**（原则：巨型缓冲一律静态区，进程单线程顺序使用）：
+- `apps/contacts`：`STORE_BLOB`（256KB）与 `STORE_SLOT`（`MaybeUninit<Store>`
+  槽位）移到 static；`store()` 改为无参返回 `&'static mut Store<'static>`，
+  6 个调用点删除本地 blob。`rebuild_list` 456KB→74KB、`store` 369KB→116KB，
+  启动链峰值 ~350KB。
+- `shared/sync/store.rs`：`load`/`save` 的 128KB `idx_buf` 移入模块级
+  `IDX_SCRATCH` 暂存区（`idx_scratch()` 访问），所有 sync 应用共享受益。
+- `apps/calendar`：`do_sync` 与首播路径的两处 256KB 局部 blob 复用静态
+  `EV_BLOB`。`do_sync` 500KB→244KB，同步链峰值 ~590KB（含深子调用）。
+- 审计 files / mail / notes：无 ≥256KB 大帧，无需改动。
+
+### 修复：OOBE 首帧不再闪现像素字，全程平滑 TTF 汉字（2026-09-04 轮）
+
+- 此前 OOBE 首帧以内置点阵兜底上屏后才同步加载字体（`load_fonts_deferred`），
+  欢迎页先显示像素字、再重绘为平滑汉字，观感上「先像素后平滑」闪变一次。
+- `apps/oobe/src/main.rs`：字体加载移回首帧**之前**——`load_fonts_sync()`
+  在首次渲染前同步加载 OOBE 超小子集（oobe-cn/oobe-bold），首帧即平滑 TTF，
+  向导 13 步自始至终不再出现点阵兜底闪现；仅字体加载失败时才回退点阵。
+  依托 `shared/ttf_text.rs` 大块缓冲 brk 分配器，同步加载在 TCG 慢宿主下
+  也只需秒级，不会重现「卡在启动画面」。
+
+### 动效：桌面翻页 / 最近任务 / 锁屏转场 / Toast 四组动画对标 ColorOS 15（2026-09-04 轮）
+
+launcher 侧此前四类界面变化为瞬切/静态，本轮补齐为完整动效（全部复用
+`Spring`/`Easing` 运动库与现有渲染管线，规范数值已录入
+`docs/animations.md` §3.7~3.10）：
+
+- **桌面翻页动画**：左右滑动由瞬切改为 ColorOS 15 风格 —— 跟手段页面
+  1:1 随手指平移（页界外 0.35x 橡皮筋阻尼），松手按位移（>1/4 屏）或
+  速度（>600px/s）判定翻页，`Spring::page()`（ζ=0.8，≈260ms 近临界
+  无过冲）吸附收敛；翻页时先提交目标页、从原相邻页位置弹入，内容视觉
+  连续。当前页与相邻页经 `draw_page_at(page, offset)` 平移绘制（壁纸/
+  状态栏/Dock 不动），页码点随进度平移并与目标页颜色交叉过渡。跟手/
+  吸附期间帧预算升到 8ms（≈120Hz）。渐进式启动（BOOT_ACTIVE）期间
+  保持原瞬切行为。
+- **最近任务面板动效**：打开时卡片按槽位错峰 30ms 上滑入场（24px，
+  200ms EaseOut，后台返回动画结束与应用退出码 2 统一经 `recents_open()`
+  触发）；关闭改 150ms 下滑 + 压暗淡出（原瞬切）；新增单卡上滑清理 ——
+  按住卡片上拖跟手，越过 -80px 后 200ms `FastOutLinearIn` 上飞出屏并
+  从列表移除，其余卡片 220ms EaseOut 从旧格位插值补位，未达阈值回弹。
+- **锁屏解锁/锁定转场**：解锁由瞬切改为锁屏整层（渐变底 + 时钟/键盘/
+  图案内容）上滑出屏露出桌面（300ms FastOutSlowIn）；控制中心/远程
+  「锁屏」改为整层从屏幕上方下滑入位（320ms）；滑动解锁支持跟手 ——
+  层随手指 1:1 上移（下拖 0.15x 阻尼），越过 18% 屏高或速度足够即解锁，
+  否则 250ms 回弹。转场期间锁屏输入全部屏蔽；`render_lock_screen` 拆为
+  背景/内容/整层三函数（`draw_lock_background/content/layer`）供静态与
+  转场复用，桌面绘制抽出 `draw_desktop_full()` 作为转场下层。
+- **Toast 动效**：由静态 2s 改为「入场 180ms 底部上滑 16px + 淡入
+  （FastOutSlowIn）→ 保持 → 退场前 150ms 淡出」。新增全局像素透明度
+  `PIX_ALPHA`：`put_pixel` 写 BACK_BUF 时按其 alpha 混合（=255 零开销），
+  玻璃药丸与文字整体淡入淡出，无需逐元素改绘。
+- 顺带移除翻页/解锁后的「桌面页」「已解锁」Toast（动画本身即反馈，
+  避免双重打扰）。
+
+**验证**：`make launcher` 零警告；`make kernel` 全量编译 + ramdisk 重打
+通过。手势优先级保持 控制中心 → 锁屏 → 翻页/最近任务 → 桌面，触摸与
+鼠标（BTN_LEFT/BTN_TOUCH 合一路径）行为一致。
+
+### 变更：全系统圆滑度对标 ColorOS 15——超椭圆连续曲率 + 4x4 超采样抗锯齿（2026-09-04 轮）
+
+**背景**：此前全系统的圆角矩形 / 圆形都是硬边逐像素判定（`in_round_rect`
+系整数圆弧测试），边缘是锯齿阶梯，观感「像素化」。本次把圆角几何升级为
+ColorOS 15 同类的超椭圆连续曲率（squircle），并全面引入覆盖度抗锯齿。
+
+**实现**：
+- `shared/glass.rs` 新增 AA 核心：`rr_coverage`（4x4 = 16 超采样覆盖度）、
+  `smooth_fill_rr` / `smooth_stroke_rr`（抗锯齿超椭圆圆角矩形填充 / 描边，
+  内部直线段走整像素快路径，仅四个 r×r 圆角盒逐像素混合）、
+  `smooth_fill_circle` / `smooth_stroke_circle`（抗锯齿实心圆 / 1px 圆环）、
+  `SmoothTarget` trait。超椭圆隐函数 `(1-k)·(qx²+qy²)/r² + k·(qx⁴+qy⁴)/r⁴ ≤ 1`，
+  k 随半径 0→24px 从正圆弧渐变到 n=4 超椭圆（只用整数次幂，no_std 可用）。
+- `in_round_rect` 切换到同一超椭圆几何（命中区与视觉一致）；毛玻璃
+  `glass_rect_style` / `glass_rect_solid` 裁剪与描边升级为覆盖度 AA
+  （直边描边保持锐利 1px，圆角段随曲线淡出）；`blend` 增加不透明快路径。
+- 接入点：launcher（图标 / 文件夹 / 小组件毛玻璃 / 控制中心 / 锁屏图案）、
+  settings、oobe（含 widgets/button）、clock、camera（快门圆盘 / 圆环）、
+  browser（裁剪圆点）、app_kit（`aa_fill_round_rect` / `aa_stroke_round_rect`
+  / `aa_fill_circle` / `draw_disc` / `draw_circle` / `blend_put`）、kunxui
+  （Canvas 默认 `fill_rounded` / `rounded_border` / `fill_circle` / `draw_circle`
+  经 `#[path]` 复用 glass.rs，零第二份实现）。
+- 圆角取值对标 ColorOS 15（540x960 屏）：桌面图标圆角比例 25%→**30%**
+  （56px→17px）；玻璃按钮 / OOBE 按钮全胶囊（h/2）或 30% 比例（上限 16px）；
+  卡片 / 面板统一 16px（等比 1080p 的 32px）；键盘按键 25%→30%；settings
+  图标底座 6→7px（30% 比例）；oobe 卡片 18→16、输入框 14→16。
+
+### 变更：系统鼠标指针换为 tubiao/shubiao.png 贴图（2026-09-04 轮）
+
+**背景**：此前系统鼠标指针是各处硬编码的 9x9 位图箭头（黑描边 + 白填充），
+散落在 7 个文件里（`shared/cursor_overlay.rs`、`shared/app_kit.rs`、launcher、
+oobe、calculator、store、stub 各有一份拷贝），无法定制外观。
+
+**实现**：
+- 新增 `shared/cursor_sprite.rs`：指针贴图单一来源。`tools/make_cursor.py`
+  把 `tubiao/shubiao.png`（256x256 RGBA）面积平均缩放为 24x24 RGBA8888
+  写入 `shared/cursor.rgba`（仅标准库 zlib，无需第三方依赖），由
+  cursor_sprite `include_bytes!` 编译期内嵌；热点取源图尖端 (56,16) 的等比
+  映射 (5,2)。像素混合从「描边+实心覆写」改为逐像素 alpha 混合，支持
+  launcher 亮度 LUT（`draw_at(..., Some(apply_lut))`）。
+- 各绘制点统一改为经 `cursor_sprite::draw_at` 绘制；光标备份/脏区从
+  11x11 扩为 26x26（贴图 24x24 + 1px 边距），`CUR_UNDER` 及 launcher/oobe
+  的 `mark_dirty`/`present_rect` 矩形同步放大，旧位置恢复不再有残影。
+- 删除 calculator/store/stub/oobe 里无调用的死代码 9x9 位图拷贝
+  （真实路径早已全部走 overlay）。
+- Makefile：`SHARED_SRC` 加入 `cursor_sprite.rs` 与 `cursor.rgba`，并新增
+  规则 `shared/cursor.rgba: tubiao/shubiao.png tools/make_cursor.py`——
+  换指针图只需替换源图后重跑 `make`，所有 GUI 应用自动重编生效。
+
+### 修复：QEMU 下全面屏手势失效（virtio-tablet 点击以 BTN_LEFT 上报）（2026-09-02 轮）
+
+**现象**：`make run-gui` / `run-phone`（QEMU + virtio-tablet-device）里用鼠标拖拽
+无法触发全面屏手势 —— 底部上滑不回桌面、边缘内滑不返回，只有点击有效。
+
+**根因**（对照 QEMU 源码 hw/input/virtio-input-hid.c 确认，非推测）：
+- QEMU 的 virtio-tablet-device 是**绝对定位鼠标**：宿主左键点击经 `keymap_button`
+  映射为 **BTN_LEFT**（0x110）下发，`BTN_TOUCH`（0x14a）只出现在设备能力位图、
+  实际点击并不产生。
+- launcher 与 app_kit 此前只在 **BTN_TOUCH** 路径做完整手势识别（`finish_touch` /
+  `classify_swipe`：底部上滑、边缘返回、滑动、长按）；**BTN_LEFT 只映射为 Tap**，
+  因而 QEMU GUI 下全面屏手势完全失效（真机触摸面板经 UART 协议帧 → BTN_TOUCH，
+  不受影响）。
+
+**修复**：
+- `apps/launcher/src/main.rs`：BTN_LEFT 按下与抬起**并入与 BTN_TOUCH 完全相同
+  的手势识别路径** —— 按下记录 `TOUCH`（press 坐标/事件时间戳），拖动期间在
+  EV_REL / EV_ABS 同步推进手势轨迹（cur/max_dist），抬起走 `finish_touch()`：
+  导航手势（三键点击 / 底部上滑 / 边缘返回）优先，其次点击 / 滑动 / 长按。
+- `shared/app_kit.rs`：应用内同一修复 —— BTN_LEFT 按下记录 `TOUCH_DOWN/PX/PY/US`，
+  抬起按导航栏点击 → 全面屏手势 → 点击 顺序分类，QEMU 下应用内上滑回桌面可用。
+- 长按吞点击（`MOUSE_LONG`）、控制中心滑块拖动吞噬逻辑保持不变；QEMU 与真机
+  从同一套手势判定，行为一致。
+
+**验证**：`make kernel` 全量编译通过（launcher/kernel 重编并重打包 ramdisk）。
+TCG `-display none` 串口注入路径（BTN_TOUCH）与真机不受影响；GUI 鼠标路径
+（BTN_LEFT）已与触摸路径合并为同一识别逻辑（`shared/nav.rs::classify_swipe`）。
+
+### 修复：TCG 宿主「开机卡死、进不了系统」+ 起动路径 TTF 平滑字（2026-08-30 轮）
+
+**现象**：QEMU（x86 宿主 → 强制 TCG）下串口只有 sensord/logd/positiond 的周期
+日志循环刷屏，OOBE 向导永不出现、桌面永不呈现、内核 Shell 也不接管。
+
+**根因**（QEMU + 插桩实测确认，非推测）：
+- 启动链中 OOBE 的 `k_main` 第一步同步调用 `ttf_text::font_init()`：fontdue 解析
+  两个 ~1.6MB TTF 子集时，用户态 bump 分配器**每页做一次 brk 系统调用**（实测
+  ~15765 页/字体），每次 brk 在内核里逐页分配/清零/插页表/失效 TLB。TCG 下
+  单字体解析实测 **~30s**（宿主原生仅 23ms），两个字体 ~60s；期间 init 阻塞在
+  `wait4(oobe)`，launcher 永不启动，hence「永远卡住」。
+- 低配 TCG 宿主上该 ~128MB 堆增长还可能把整个客户机拖入长时间停滞（所有守护
+  进程周期日志一起消失），进一步掩盖问题。
+
+**修复**：
+- `shared/ttf_text.rs`：brk bump 分配器改为**大块缓存 bump**——逻辑游标与内核
+  映射断点分离，余量内分配零系统调用，仅余量耗尽时一次 brk 拉入整块（4MB）。
+  fontdue 解析期间 ~3 万次逐页 brk 降为 ~几十次，两个字体解析在正常宿主上
+  秒级完成；bump 语义不变，全量消费无浪费。**全系统（OOBE + launcher + 全部
+  桌面应用）平滑 TTF 字体在此得以保留并按需快速加载（正文 = fonts/uiputong.ttf
+  子集 cn.ttf，标题 = fonts/bold.ttf 子集）。**
+- `apps/oobe/src/main.rs`：字体加载从启动路径**移到首帧之后**——先用内置点阵
+  兜底把欢迎页渲染上屏（用户立即看到向导，消除「卡在启动画面」的感觉），随后
+  同步 `font_init()`（配合大块缓冲 brk，TCG 下秒级），完成后重绘当前步并把
+  向导全部 13 步文字切到平滑 TTF（正文 uiputong / 标题 bold）。
+- `apps/launcher/src/main.rs`：恢复 `font_init()`（桌面使用 cn.ttf + bold.ttf
+  平滑文字），依靠新的块缓冲分配器在慢宿主下也只需秒级；字体未就绪时仍回退
+  内置点阵，桌面可靠呈现。
+
+**验证**（QEMU TCG，x86 宿主）：
+- 宿主基准：cn.ttf/bold.ttf 各 ~23ms 原生解析通过（字体内容正常）。
+- `-nographic`（make run）：OOBE 秒级退出（无帧缓冲 → WARNING → launcher 退出）
+  → 内核 Shell `kunxos$` 正常接管，guest 持续健康运行不再全局停滞。
+- ramfb GUI：OOBE 即时映射 540×960 帧缓冲、欢迎页立刻上屏（点阵兜底，瞬时）；
+  随后 fontdue 解析平滑字体（正文 uiputong / 标题 bold），完成后整屏重绘为
+  平滑字；30s 无输入自动推进向导。桌面随用户完成后以平滑字启动。
+- 说明：极端重度负载的 TCG 宿主上 ~128MB 字体堆增长可能让客户机短时停滞
+  （两次 allocator 变体均出现，属模拟环境载荷问题而非逻辑死锁；你的宿主日志
+  持续推进证实正常宿主不受影响）；真机/KVM 宿主为瞬时完成。
+
+### 样式与动效：OOBE 首次开机向导全面对标小米澎湃3（2026-08-28 轮）
+
+功能保持不变（13 步流程、配置落盘格式、输入/模拟点击回退语义均不动），
+仅视觉样式与交互动效整体对齐澎湃3 新机设置向导：
+
+- **澎湃3 配色**：纯白渐变底（#F9FBFD → #E9F1F4）+ 近黑正文（#14161A）+
+  澎湃 teal 高亮（#10B89E 主色 / #0C9682 深色 / #E6F8F4 选中底）；
+  底部导航面板改为白色半透液态玻璃（中性灰描边），按钮主色由 iOS 蓝改为
+  澎湃近黑 CTA（#17171B），按压时轻微提亮（#2C2D33）并 0.96 缩放回弹。
+- **版式重构**（`apps/oobe/src/main.rs`）：语言/时区/锁屏/胁迫动作/外观一律
+  使用白色圆角卡片（492×54，r=18）+ 右侧 teal 单选圈；模块/网络/协议改为
+  右侧 teal 圆角复选方框（内带白色对勾）；输入框白底圆角 + 聚焦 teal 描边 +
+  淡 teal 底；外观步骤带浅/深色预览圆；完成页新增 teal 对勾圆盘 + 摘要白卡；
+  欢迎页新增渐变 teal Hero 徽标（K 字）+ 标语；底部按钮欢迎页为通栏
+  「开始使用」，其余步骤为返回芯片 + 主按钮组合。
+- **动效引擎**（`transition_pages` / `draw_nav_anim` / `animate_welcome` /
+  `pulse_selection`，260ms @ 16ms 帧）：
+  - 步间转场：旧页交叉淡化 + 新页上滑 16px（平滑阶梯 EaseInEaseOut），
+    底部面板每帧重绘、进度圆点滚动放大；
+  - 欢迎页：Hero 徽标缩放淡入（14 帧）+ 标题/副标题上滑淡入（12 帧）；
+  - 选中卡片：teal 高亮脉冲淡出（≈110ms）；
+  - `finish.rs`：桌面壁纸从白屏淡入 12 帧，「进入系统」进度条改为澎湃 teal。
+- 按钮组件（`apps/oobe/src/widgets/button.rs`）：新增通栏按钮 `draw_full`、
+  按压 0.96 缩放与回弹、主按钮最小宽度 176，主按钮按压提亮而不是变暗。
+- **OOBE 无法进入的两个根因修复**（QEMU 实机验证）：
+  - `MODULES` 新增到 21 项后 `MODULE_ON` 仍为 `[bool; 20]`，启动初始化
+    `MODULE_ON[i] = MODULES[i].default_on` 越界 panic → 改为 `[bool; 21]`；
+  - OOBE 直写 `/dev/fb0` 映射（合成器 canvas）后从未提交
+    `FBIO_PUT_DAMAGE`/`FBIO_PRESENT`，屏幕始终停留在 bootloader 启动画面
+    （用户看到「两个大方块」）→ 新增 `present_fb()`：保留 fb0 fd，每帧
+    `flip()`/转场帧/选中脉冲后提交整屏脏区并请求合成器翻页；
+  - `font_init` 在 QEMU TCG 下对 3MB cn.ttf 的 fontdue 解析同步卡死
+    （宿主机解析 46ms，客户机无限旋转）→ OOBE 改为直接使用内置 CJK
+    点阵字库（text 管线在 `font_ready()==false` 时自动回退），不再阻塞。
+- 验证：`make kernel` 通过；QEMU 实机截图确认向导上屏（背景 #F9FBFD、
+  teal 高亮 #10B89E、近黑主按钮 #17171B、浅色底部面板）。
+
+### 修复：OOBE 缺字与指针不跟随（2026-08-29 轮）
+
+- **缺字**：`shared/cjk_font_oobe.rs` 是按旧源码生成的 GB2312 子集，
+  新文案（胁迫/伪装/警报/外观等）中不在子集内的字只推进宽度不绘制
+  → 用 `tools/gen_cjk_font.py subset` 依当前 `main.rs`/`finish.rs`/
+  `widgets/button.rs` 重新生成（689 字形，覆盖源码全部 690 个 CJK 字符）。
+- **指针（鼠标）不跟随/不可见**：光标画进合成器 canvas 后未触发
+  `FBIO_PRESENT`，屏幕上看不到指针移动 → `cursor_overlay_init` 与
+  `move_cursor_fb` 结束后统一 `present_fb()`；`ABS_X/ABS_Y/ABS_MT`
+  坐标补 `clamp` 到屏幕范围，触摸板/平板绝对坐标不再越界。
+- 顺带补齐并发重构遗留的机械编译错误（非本次功能改动）：
+  `linux_compat.rs`/`process.rs` 的 `pipe_drop_ref` 增补 `is_write`
+  参数、`FD_WRITE` 改引 `crate::ipc::FD_WRITE`；launcher 内置点阵
+  字形像素坐标补 `as i32` 类型转换 —— `make kernel` 恢复通过。
+- 验证：QEMU 实机截图确认屏幕中心 (270,480) 呈现代理指针（白描边黑）、
+  标题/锁核心模块行正常渲染，向导按步推进无空白缺字。
+
+### 性能与动效：OOBE 卡顿治理 + 常驻动画（2026-08-29 轮）
+
+**卡顿根因**：光标/微动画每帧都提交「整屏 540×960 脏矩形」→ 合成器每次
+canvas→back 整屏 2MB 拷贝 + 合成 + 翻页；QEMU TCG 下鼠标每动一次都触发，
+拖动明显掉帧。
+
+- 新增 `present_rect(x,y,w,h)`（脏矩形呈现）：
+  - 光标移动/重绘 → 旧+新位置并集小矩形（≤14×14）；
+  - 选中脉冲 → 卡片矩形；按钮回弹 → 导航条矩形（540×84）；
+  - Hero/进度点呼吸 → 各自小区域。
+- **常驻动画**（等待输入期间不再静止，对标澎湃3 活页感）：
+  - 欢迎页 Hero 徽标持续呼吸缩放（0.975..1.025，周期 ≈640ms）；
+  - 其余页当前进度点呼吸脉动（半径 4..5，周期 ≈380ms，玻璃底快照恢复）；
+  - 卡片「进入悬浮态」：语言/时区/锁屏/胁迫动作步骤，指针悬停卡片呈
+    teal 描边高亮，离开恢复（同页脏矩形重绘）；
+  - 按钮松开回弹只重绘底部导航条（`btn_tick_nav_only`），不再整屏渲染。
+- 验证：QEMU 实机两次 0.25s 间隔截图对比 —— 进度点带区域 340 像素变化
+  （呼吸在走），页面/桌面正常呈现。
+
+### 修复：OOBE 后的「两个大方块」观感（2026-08-29 轮）
+
+排查：OOBE 全程正常、向导页渲染正确；「两个大方块」出现在 OOBE 完成后
+launcher 锁屏阶段 —— 根因有二：
+
+- OOBE 默认外观是**深色主题**（`THEME_DARK` 初值/默认推进均为 true，壁纸 2），
+  launcher 桌面=深色壁纸；launcher 锁屏背景又是**硬编码深蓝渐变**
+  （#101527→#1B2436）+ 按键玻璃块，整体一片深色，用户观感就是「两块」。
+- 修复：
+  - `apps/oobe/src/main.rs`：`THEME_DARK` 默认与默认推进改为 `false`（浅色），
+    `WALLPAPER=1`（浅色 teal 壁纸）；
+  - `apps/launcher/src/main.rs`：锁屏背景随主题（浅色=浅灰蓝渐变
+    #F7FAFD→#E7EFF7），时钟/日期/提示/指示点/按键文字颜色随主题
+    （浅色用深字 `#14161A`/灰 `#6B7076`），按键玻璃本身已随主题自适应。
+- 验证：QEMU 实机截屏 —— 锁屏上部为浅色渐变+深色大时钟/日期/teal 锁图标，
+  下部为浅玻璃数字键盘（深色数字可见），不再是深色大方块；OOBE → 桌面
+  全程渲染正常。
+
+### 修复：OOBE 后进不了系统（默认 PIN 锁屏挡路）（2026-08-29 轮）
+
+**根因**：`rootfs/etc/oobe_default` 默认配置自带 `security_type`（pin）与
+`security_hash`（默认 1234），首启迁移进 `/data/oobe` 后 launcher 读到即
+自动上锁（`[lock] screen locked at boot`）——用户没设过密码却被锁屏挡住，
+表现为「进不了系统」；该目录 theme 也是 `dark,wallpaper:2`。
+
+修复：
+- `apps/oobe/src/main.rs`：新增 `SEC_ENABLED`，默认（无交互推进/未选锁屏
+  方式）为 false —— `save_security_type/save_password(security_hash)/
+  save_duress/save_duress_action` 仅在启用安全时写文件；点击锁屏方式卡片
+  才置位。用户主动设置安全时功能完全保留。
+- `rootfs/etc/oobe_default`：移除 `security_type`/`security_hash`/
+  `duress_action`/`duress_hash`（不再迁移默认锁）；`theme` 改为
+  `light,wallpaper:1`（浅色 teal）。
+- 验证：QEMU 实测一轮 OOBE → launcher 启动日志**无** `[lock] screen
+  locked`；截屏为浅色 teal 桌面（壁纸渐变 + 顶部小组件 + 底部 Dock 图标），
+  可直接进入系统。
+  `[lock] screen locked`；截屏为浅色 teal 桌面（壁纸渐变 + 顶部小组件 +
+  底部 Dock 图标），可直接进入系统。
+
+### 性能：OOBE 交互卡顿治理（2026-08-29 轮）
+
+剩余卡顿来源：每次点击/打字都走「整屏 render + flip（2MB）+ 全屏呈现
+（2MB）」，且转场/入场帧数多、帧间还 sleep。
+
+- 点击选项改为**局部重绘**（`partial_redraw`）：卡片页（语言/时区/锁屏/
+  胁迫动作/外观）只重绘选中变化的旧/新两张卡片并呈现小矩形；模块/网络/
+  协议复选只重绘复选框；不再整屏 render + 4MB 搬移。外观卡片局部重绘
+  补齐颜色预览圆（`draw_theme_swatch`）。
+- 转场：`TRANS_FRAMES` 15→8，帧间不再 `sleep_ms(16)`（TCG 下每帧本就
+  含 47 万像素合成 + 全屏呈现，越少帧越顺）；欢迎页入场 26→19 帧；选中
+  脉冲 7→6 帧。
+- 验证：QEMU 实测 12 步全部走完 → launcher 正常、无自动锁屏日志。
+
+### 新增：图形终端 / TTY / PTY 子系统（Phase 21）（2026-08-28 轮）
+
+- **内核 TTY 会话**（`kunxcore/src/tty.rs`）：`/dev/tty1..4` 会话终端 +
+  `/dev/ptmx` 分配器；in_q/out_q 环形缓冲（4096B / 16KB）、`attached`/
+  `overflow`/窗口尺寸；输出镜像（`uart_send_char` → 活动会话 out_q）与
+  输入路由（Shell 会话附接时只读 in_q，未附接回退 UART）均在内核 DAIF
+  临界区内完成。
+- **PTY 主从模型**：图形终端（EL0）为 PTY 主侧，内核 Shell（EL1，
+  `shell_main` 内核进程）绑定会话 0 为从侧 —— 等价于「GUI 终端 fork shell
+  子进程」；`/dev/ptmx` 预留多会话（TIOCGPTN 返回从侧号）。
+- **Shell 行编辑增强**（`shell.rs::read_line`）：光标左右移动（ESC[D/C）、
+  Ctrl+A/E（行首/行尾）、行中插入/删除、Ctrl+U/W（删至行尾/删前一词）、
+  历史 ↑↓ 浏览、Tab 补全；Ctrl+C/D/Z 信号（SIGINT/SIGTERM/SIGTSTP，面向
+  前台 `run`/`busybox` 子进程）；提示符取 `$PS1`。
+- **新内置命令**：`alias` / `unalias`（定义/查询/删除别名）、`source`
+  （脚本逐行执行，跳过空行与 `#` 注释，命令词先做别名展开）——简单脚本
+  支持，配合既有管道 `|`、重定向 `< > >>` 与环境变量（`export`）。
+- **图形终端应用**（`apps/terminal/src/main.rs` 重写）：玻璃标题栏 + 文本区 +
+  滚动条 + 系统导航栏；精简 VT 仿真器（96×60 网格；ESC[A/B/C/D/H/f/G/d 光标、
+  ESC[J/K 清屏、SGR 16 色 + 粗体、`\r\n\t\b\f` 控制字符、DEC 私有序列忽略）；
+  24 行回看 + 触摸拖动滚动 + 滚动条滑块；CJK/ASCII 混排（复用 ttf_text，
+  提示词 #11 文本渲染）；光标块闪烁；输入转发（方向键 CSI、Ctrl+字母控制
+  字节、Shift 大写）——哑终端不本地回显。
+- 设计文档 `docs/terminal.md`（关键问题确认：Shell 内建于内核；图形终端走
+  合成器 `/dev/fb0` 持久画布 + FBIO_PRESENT 脏区上屏）。
+- 验证：内核 `make kernel` 与终端应用 `make terminal` 均编译通过。
+
+### 新增：应用生命周期与后台管理系统（lifd / pushd / launcher 集成 / 状态持久化）（2026-08-28 轮）
+
+- **生命周期状态机**（`kunxserv/lifd`，init 在 launcher 之前拉起）：Running（前台、
+  nice −3）→ Background（SIGSTOP 冻结、内存保留）→ Suspended（后台超时/内存压力，
+  LMK 首选）→ Terminated（LMK/用户终止）。launcher 以非阻塞 `wait4(WNOHANG)` 轮询 +
+  帧快照/返回与恢复动画配合，切应用不再"杀旧重启"。
+- **控制面**：`/data/life` 文件信箱（`reg_*` 登记 / `cmd_<pid>` 命令 / `evt_<pid>`
+  事件 / `launcher_evt` / `recents`），单行 ASCII、最新覆盖语义，可 cat 调试、可注入。
+- **应用侧 API**（`shared/lifecycle.rs`，经 app_kit 暴露）：`on_pause`/`on_resume`/
+  `on_suspend`/`on_terminate`/`on_notify` 回调、`lc_home`/`lc_go_recents`（后台化并
+  阻塞至恢复）、`lc_request_bg_task`/`lc_end_bg_task`、`lc_save_state`/`lc_restore_state`
+  （/data/state/<app>.bin，SFS 持久）、`lc_notify_local`。应用主循环把
+  `exit(nav_exit_code(ev.nav))` 换成 `lc_handle_nav(ev.nav)` 即获后台化能力。
+- **后台任务白名单**（lifd 审核）：Audio/Location/Voip/Download 四类 + 时长上限
+  （3600/1800/7200/1800s）+ 每应用 2 个 + 全系统 3 个上限；超时发 `BG_TASK_EXPIRED`，
+  持有任务的应用不因超时转入 Suspended。
+- **内存压力 / LMK**：内核 `mem_pressure` 模块（tick 100ms 计算
+  Normal/Moderate/Critical；`/proc/pressure` 支持 `force <0|1|2>`/`clear` 测试注入），
+  lifd 按"状态优先 + LRU 老化 + 后台任务罚分"评分升序击杀；`SYS_LC_MEMPRESSURE(404)`
+  读取等级。
+- **内核配合**（不替换 CFS）：`TaskState::Stopped` + `stop_current`/`cont_pid`，
+  SIGSTOP=停 / SIGCONT=继续（原 SIGSTOP=杀已改）；`setpriority` 真实实现（root 可改
+  任意 pid nice → CFS 权重：前台 −3 / 后台 +2）；`wait4` 支持 WNOHANG。
+- **推送框架**（`kunxserv/pushd`，init 拉起）：本地通知队列（/data/push/in →
+  `DELIVER` → lifd 按状态投递：前台立即、后台/挂起延迟补投并在恢复时随
+  `RESUME+NOTIFY` 合并事件送达、未登记丢弃）；设备 token 注册与远程推送通道接口预留
+  （APNS/FCM 等价物占位）。
+- **演示/测试载体**：`apps/lcapp`（注册全部回调、状态保存/恢复、后台任务与本地通知
+  按钮、串口标记供自动化断言），launcher 桌面页面 0 图标；文档
+  `docs/lifecycle.md`（设计 + 关键问题回答）+ `docs/lifecycle-test.md`（测试方案）；
+  自动化 `tools/lifecycle_test.py`（QEMU，`make lifecycle-test`）。
+- **修复**（本路径联调中发现）：lifd `DELIVER` 载荷解析丢失 id/payload（改从原始串
+  解析）、恢复补投由 append 改为"最新覆盖"写、`lc_poll` 解析 `RESUME+NOTIFY` 合并事件
+  并触发 `on_notify`、lcapp 加入 launcher 页面 0 布局（此前不可达）、`lc_set_name`
+  固定状态文件名。
+
+### 修复：SFS v2 并发缺陷（inode/块串线 + 事务提交除零 panic）（2026-08-27 轮）
+
+- **根因**：SFS v2 的事务状态（`TXN_DEPTH/TXN_MAJOR/PENDING_*`）与 RAM 位图是
+  内核全局静态量；syscall 在 EL1 处理期间放开 IRQ（可被 10ms 定时器抢占），
+  多任务并发进入 FS 时事务被交错污染、分配位图「读-改-写」发生竞态。
+  - 症状 A：多进程并发在 `/var/run` 创建文件时目录项/inode/数据块张冠李戴
+    （camerad.ctl 读到 audiod.ctl 等其它文件的数据，反复出现）。
+  - 症状 B：事务状态被污染为 `major=u32::MAX` 后，`txn_commit` 在 `jlog_place`
+    对未挂载伪设备（`jlog_blocks==0`）取模 → 除零 panic，随机崩溃守护进程。
+- **修复**（`kunxcore/src/fs_simple.rs`）：
+  - 新增**全局递归 SFS 锁** `fs_lock/fs_unlock`（按持有任务递归；等待者让出 CPU、
+    不屏蔽 IRQ、无死锁）；全部 22 个对外接口包锁并拆 `_unlocked` 内部实现，
+    使每个顶层文件系统操作成为原子段 —— inode 唯一、块不重叠、事务独占。
+  - `jlog_place`/`txn_begin`/`commit_inner` 对 `jlog_blocks==0` 防御（返回失败
+    并按「未提交事务整体丢弃」回滚），根除取模除零。
+  - 锁与既有 WAL/掉电保护正交：事务协议、双超级块、恢复重放、fsync 语义不变。
+- **验证**：新增多进程并发回归测试 `apps/sfsrace`（6 子进程在 `/var/run`
+  并发 create→写跨 3 块唯一载荷→读回逐字节校验→truncate→删，任何串线/崩溃即
+  FAIL）；`make test-sfsrace` 无头 QEMU 断言 `SFS-RACE PASS`（init 以
+  `/sfsrace-test` 标记触发并自动关机）。另有**宿主多线程决定性验证**
+  （`tools/sfs_host_test -- race`）：锁桩失效时完整复现串线/截断残留/孤儿块/
+  悬空目录项（fsck ≥10 项错误），锁桩改为全局唯一 tid 后同一负载 0 失败且
+  fsck 全绿、`test_lock_serialization` 测得临界区最大并发 = 1。详细文档见
+  `docs/sfs-v2-concurrency.md`。
+
+### 新增：相机子系统（HAL / camerad / 相机应用 / 纯 Rust JPEG / 3A 框架）（2026-08-27 轮）
+
+- **相机 HAL**（`kunxhal/src/camera.rs`）：`CameraDevice` trait（枚举/开闭/
+  配置/起停采集/单帧拍照/3A/按缓冲索引读帧）、`CaptureRequest`/`CaptureResult`
+  （时间戳与 AE/ISO/AWB/对焦元数据）、`BufferPool<N>`（CPU/DMA 双用缓冲槽，
+  `set_phys` 为 Pi4 Unicam DMA 零拷贝预留）、`PixelFormat`（RAW8/YUV420/RGB888）。
+- **平台后端**：`SimCamera`（QEMU 软件传感器：彩条 + 帧计数条 + 时间戳条 +
+  运动块，帧按 (seq, ts) 确定性渲染，零大缓冲）；`PiCamera`（Pi4 骨架：
+  open/configure/3A 状态机真实生效，采集路径返回 NotImplemented，Unicam/BSC/
+  IMX219 寄存器常量与接线序列已整理在 `kunxhal/src/plat_pi4.rs`）。
+- **3A 框架**：`ThreeA` trait + `FrameStats`（亮度/对焦评价/通道均值），
+  默认 `FixedThreeA`（1/30s、ISO100、5500K、对焦 50）；AE 比例步进、AWB 灰世界、
+  AF 爬山留接口。
+- **相机服务**（`kunxserv/camerad`，init 拉起）：文件命令通道 + 环形预览帧
+  （/tmp/cam 固定 6 文件复用）+ 拍照 JPEG 落盘（/data/photos）+ 录像自描述容器
+  （/data/videos/rec_*.kxv，KXRV 头 + 每帧时间戳；MP4/MOV 预留）。
+- **JPEG 编码器**（`shared/jpeg`，纯 Rust、no_std、零堆）：RGB888 → JFIF
+  baseline 4:2:0，整数 DCT + 标准量化/Huffman 表；7 个宿主单测 + Pillow 视觉
+  校验（`tools/verify_jpeg.py`）。未绑定 libjpeg-turbo（目标无动态链接）。
+- **相机应用**（`apps/camera`）：取景器（YUV→RGB 最近邻缩放 + 三分构图线）、
+  快门闪光 + 处理进度、REC 计时、缩略图、camerad 缺失回退模拟取景器。
+- **测试**：kunxhal 相机 HAL 6 个宿主单测（BufferPool/SimCamera 确定性/3A/
+  枚举/单帧）、`tools/camera_e2e_test.py`（QEMU 端到端）。
+- **已知阻塞**（既有 SFS v2 内核写路径缺陷，非本次引入）：多进程并发在
+  /var/run 创建文件出现 inode 串线、事务写触发 `jlog_place` 除零 panic，
+  QEMU 端到端（含其它守护进程的文件写）需先修复内核 SFS（见
+  `docs/camera.md` §8.2）。已修复本次新增的具体问题：Pi4 构建下
+  `camera_backend()` 双 cfg 块编译错误、录像容器 KXRV 头每帧重复写入。
+
+### 新增：开发者工具链（GDB 调试桩 / tombstone / 结构化日志 / 性能 overlay / 调试 shell 工具）（2025-08-27 轮）
+
+- **GDB 远程调试桩升级**（`kunxcore/src/gdbstub.rs`）：
+  - 真实软件断点 `Z0`/`z0`：写入 BRK #0，命中后「摘除 → 硬件单步跳过 → 静默重插」
+    （标准 gdb 断点舞蹈）；指令缓存维护（dc cvau / ic ivau）。
+  - 真实硬件单步 `s`：MDSCR_EL1.SS，步进异常后停回 GDB；断点处继续 = 摘除→步进→重插。
+  - EL0（BRK64 EC=0x3C / 步进 0x32）与 EL1（内核断点 EC=0x3C / 0x33）均可命中，
+    陷阱帧/PANIC_REGS 与 gdb 寄存器集互拷，`g`/`G`/`p`/`P` 写后继续生效。
+  - 高级功能（线程 `Hc`/`Hg`、watchpoint `Z2`、硬件断点 `Z1`）预留（空响应）。
+- **崩溃报告（tombstone 等价物）**（`kunxcore/src/crash.rs`）：
+  - EL0 用户故障（SIGSEGV/SIGILL/SIGTRAP/SIGBUS，由 ESR.EC 解码）与内核
+    panic/同步异常统一生成结构化报告：时间/进程/信号、寄存器、ESR/FAR 解码、
+    内存映射（`user_pages` 按权限聚合）、用户栈回溯（x29 帧指针链 + 栈转储）、
+    内核日志尾部。
+  - 落盘 `/data/crash/tombstone_<ts>_pid<pid>.txt`（无 /data 回退 /tmp/crash），
+    保留最近 8 份；VFS 不可用（早期 panic）仅输出控制台。
+  - shell 命令：`crash`（列表）/ `crash show <file>` / `crash clear`。
+  - 新增崩溃注入测试程序 `apps/crashme`（segv / ill / div0）。
+- **结构化日志（dmesg / logcat 等价物）**（`kunxcore/src/log.rs`）：
+  - `printk!(LEVEL, tag, ...)`：级别（0-7）+ 模块标签 + 时间戳，写入结构化
+    环形缓冲（256 条）并镜像 UART 控制台；关键启动里程碑已接入。
+  - `/dev/kmsg` 字符设备（major 11, minor 1）：read = 增量取记录；write =
+    注入用户态日志（`<level>[tag] msg`）并镜像控制台 —— 应用日志的 logcat 通道。
+  - `kunxserv/logd` 用户态守护：读 /dev/kmsg 持久化到 `/data/log/logcat`
+    （无 /data 回退 /tmp/log；256KB 环形截断），init 拉起。
+  - shell 命令：`log [-l <level>] [tag]`（过滤视图）；`dmesg` 保持原始控制台缓冲。
+- **性能统计与 overlay**（`kunxcore/src/perf.rs`）：
+  - FPS（合成器 present 计数，1s 窗口）、CPU%（调度 tick idle/忙比例）、
+    MEM%（物理页分配器）。`perf on` 在屏幕右上角绘制统计
+    （8x8 点阵放大 2x + 半透明黑底），随每帧合成上屏，开销 <1ms。
+  - 调度器新增每任务 `cpu_ticks` 记账；`top` 按累计 tick 排序显示
+    PID/TID/状态/nice/tick/CPU 上限。
+  - shell 命令：`perf on|off|stats`、`top [-n 1]`。
+- **调试 shell 工具**：新增 `mount`（列出挂载点 + 块设备，`mount <dev> <point>`
+  尽力挂载）、`ifconfig`（IP/掩码/网关/DNS/MAC）、`log`、`crash`、`perf`、`top`；
+  内置 shell 现随 /init 并行拉起（UART 调试接口始终可用）。
+- **文档**（`docs/DEBUGGING.md`）：QEMU GDB 连接（串口 TCP 转发与 QEMU 内置
+  gdbstub 两路）、用户进程断点/单步流程、Pi4 串口（PL011/miniuart + JTAG 说明）、
+  KVM/HVF 加速的宿主架构约束、tombstone/log/overlay 使用速查。
+- **验证工具**：`tools/devtool_verify.py`（串口 TCP 自动验证 shell 工具 /
+  crash / log / perf）；`make run-debug` 等价 QEMU 命令。
+
+### 新增：OOBE 分步安全设置（用户名 / 锁屏方式 / 密码+确认 / 胁迫密码+确认 / 胁迫动作）（2025-08-26 轮）
+
+- **OOBE 步骤重构（10 步 → 13 步）**（`apps/oobe`）：按用户反馈把「账号 +
+  密码 + 胁迫」混在一页拆成独立步骤：
+  1. 账户步骤只设**用户名**（云服务 / 家长控制复选框保留）
+  2. 「锁屏方式」：PIN / 图案 / 密码单选
+  3. 「锁屏密码」：密码 + 二次确认（掩码，校验 4-16 位且两次一致）
+  4. 「胁迫密码」：胁迫密码 + 二次确认（校验与锁屏密码不同）
+  5. 「胁迫动作」：伪装系统 / 静默擦除 / 发送警报
+  6. 主题 → 完成（完成页摘要显示锁屏方式与胁迫动作）
+- **胁迫密码真正可配置**：此前 `DURESS_PIN` 硬编码 9999、OOBE 没有任何输入
+  框，用户在锁屏填自己的胁迫密码自然无效。现在胁迫密码由用户在 OOBE 设置，
+  `duress_hash` 保存其 FNV-1a 哈希，锁屏输入即触发对应动作。
+- **修复保存时序 bug**：`apply_step_defaults` 在 `save_step` 之前执行，若在
+  其中重置密码缓冲会覆盖用户刚输入的内容（保存错误哈希）；密码/胁迫密码
+  的默认值改为 k_main 预填（1234 / 9999，可编辑），步骤完成时不再重置。
+- **云令牌时序修复**：`cloud_account` 令牌（fnv1a64(用户名:密码:盐)）原在
+  账户步骤生成（此时密码还是默认值），改为密码步骤生成，使用最终密码。
+
+### 修复：锁屏「设完密码填进去提示密码错误」（任意长度密码解锁）（2025-08-26 轮）
+
+- **根因**：锁屏 PIN 校验在输满 4 位即判失败并清空输入 —— OOBE 设置的
+  6 位及以上密码永远输不完（第 4 位就被重置），表现为「填进去提示密码错误」，
+  也导致 OOBE 完成后卡在锁屏无法进入桌面。
+- **修复**（`apps/launcher` `lock_try_unlock`）：移除「PIN 满 4 位自动失败」，
+  改为每输入一位做**哈希匹配即解锁**的增量校验（支持任意长度 PIN/密码），
+  仅在按「确定」键、图案松手或输入满 16 位时才判失败。实测 6 位密码
+  654321 正常解锁，错误输入不再被中途清空。
+- **锁屏首帧提速**：背景由「桌面壁纸 + 双重压暗」（~150 万次混合/查表）
+  改为逐行预计算的垂直渐变直写，OOBE 完成后锁屏更快出现，减少卡顿观感。
+- **转场停滞压缩**：宿主机高负载 / TCG 卡顿下单帧可能耗时数百毫秒，启动/返回
+  转场看起来"卡死"；主循环检测单帧 >250ms 时把转场时钟提前相应时间，使转场在
+  1-2 帧内收敛到完成（应用立即出现），可感知卡顿上界压到约 250ms。
+
+### 新增：系统锁屏模块（PIN / 图案 / 密码 / 滑动 + 远程锁定 + 胁迫 PIN）（2025-08-26 轮）
+
+- **实现此前缺失的锁屏模块**（`apps/launcher`）：OOBE 早已保存安全配置
+  （`security_type` / `security_hash` / `duress_hash` / `duress_action`，
+  见 OOBE `save_security`）但没有任何模块消费它 —— 现在 launcher 启动时
+  `load_security()` 读取并上锁：
+  - **四种解锁方式**：无安全 = 上滑解锁；PIN = 3x4 数字键盘（输满 4 位自动
+    校验）；图案 = 3x3 点阵（连线 ≥4 点松手校验）；密码 = 数字键盘 + 确定键。
+    校验与 OOBE 一致的 FNV-1a 32 位哈希（`/data/oobe/security_hash`）。
+  - **快捷面板「锁屏」行**：状态栏下拉（上滑手势）打开快捷面板，点击
+    「锁屏」行立即上锁（替换原先的假通知占位行）。
+  - **远程锁定**：主循环每秒轮询 `/data/oobe/locked`，云服务下发 lock 命令
+    （cloud 应用写 1）后 1 秒内上锁。
+  - **胁迫 PIN**：输入 duress_hash（默认 9999）触发 `duress_action`：
+    fake_system（伪解锁提示「系统繁忙」）/ wipe（清除配置数据）/ alert（提示已上报）。
+  - **锁屏界面**：压暗壁纸 + 5 倍放大 8x8 大时钟 + 日期（civil_from_days）+
+    锁图标 + 解锁区；密码错误显示红字提示（3 秒自动消失）。
+  - 锁屏通过手势完全旁路桌面逻辑（`handle_lock_input`），解锁后写
+    `/data/oobe/locked=0` 并重绘桌面。
+- 回归测试 `tools/apps_regression.py` 同步适配：OOBE 完成后检测
+  `[lock] screen locked at boot`，用默认 PIN 1234 解锁后再进行应用测试。
+
+### 修复：点击应用图标动画卡顿 / 疑似冻结（转场渲染提速 3-4 倍）（2025-08-26 轮）
+
+- **启动/返回转场启用 2×2 块采样**（`apps/launcher` `ZOOM_BLOCK` 1→2）：
+  此前注释说明块采样已就绪但等调度器 nanosleep 修复；该修复早已合入
+  （`sched_cfs::tick` 到期唤醒 sleeper），现正式启用。`launch_blit` /
+  `zoom_blit` 每帧像素操作从约 110 万次降至约 30 万次。
+- **压暗与白闪改用预计算 LUT**：`darken_px` 用 256 项静态 LUT（每通道一次
+  查表替代乘除），白闪每帧重建 256 项 LUT 后逐像素查表，删除逐像素
+  `blend_white` 函数调用。实测：启动转场 9 帧/340ms → 18 帧/309ms（帧率翻倍），
+  返回转场 6 帧/313ms → 18 帧/295ms（帧率 3 倍）——点击图标后的动画不再
+  表现为「整个系统卡死」。
+
+### 修复：OOBE 与全部应用鼠标移动卡顿（overlay 光标快速路径）（2025-08-26 轮）
+
+- **OOBE**：删除每次 ABS_Y 移动的串口日志（`log_input("move", ...)`，每帧
+  阻塞串口写入是光标严重不跟手的最大元凶）；鼠标移动不再整屏
+  `render()+flip()`（TTF 重新栅格化），改为与 launcher 相同的 overlay 快速
+  路径（`cursor_overlay`：11x11 区域恢复→备份→重绘，直接写显存 FB）。
+  实测 40 帧鼠标扫掠 0 串口字节（此前每帧 ~40 字节）。
+- **13 个 app_kit 应用**（phone/sms/contacts/browser/clock/calendar/camera/
+  gallery/music/mail/map/weather + cloud）：`shared/app_kit.rs` 新增
+  `cursor_overlay_redraw()` / `cursor_overlay_move()`；各应用 render 不再画
+  光标进 back buffer，主循环 `ev.moved → dirty=true` 改为
+  `cursor_overlay_move()`（只更新光标小区域），整屏重绘后调
+  `cursor_overlay_redraw()`。
+- **settings/files/calculator/store/stub**：新增共享模块
+  `shared/cursor_overlay.rs`（参数化 FB 指针/stride/宽高/光标坐标），各应用
+  以 `#[path]` 引入，`if moved { render(); flip(); }` 全部改为 overlay 移动。
+- terminal 本就不渲染光标、不随移动重绘，无需改动。
+
+### 新增：全栈报错处理（错误横幅 + Result/错误码 + 结构化云端错误）（2025-08-26 轮）
+
+- **统一错误提示横幅**（新增 `shared/error_ui.rs`，接入 `shared/app_kit.rs`）：
+  13 个 app_kit 应用经 `draw_sys_nav()` 自动在标题栏下方绘制暗红横幅
+  （`show_error` / `error_banner_hit` 点按清除，4 秒自动消失）；calculator/
+  files/settings/stub/terminal/store/oobe 等内联应用接入各自的
+  `draw_error_banner`。OOBE 无墙钟，用帧计数计时（`err_set_ticks`/`err_tick`）。
+- **输入设备缺失可见提示**：app_kit `poll_input` 在 `/dev/input/event0` 打不开
+  时持续显示「输入设备不可用」横幅，恢复后自动清除（此前静默冻结）。
+- **应用失败点补报错**：cloud 的恢复/ack/写盘失败不再静默（recv 错误与 EOF
+  区分、恢复失败计数、凭证/锁定写失败提示）；launcher 移除应用写盘失败不再
+  假成功、fork/execve 失败弹「应用启动失败」；settings 恢复失败不再假成功
+  （写盘失败返回 -2 并显示失败状态）；oobe 全部配置写失败显示「配置保存失败」；
+  store/terminal 子进程 execve 失败（退出码 127）给出明确提示；calculator
+  加减乘溢出由静默回绕改为置 ERROR。
+- **内核 syscall 错误路径修正**（`linux_compat.rs`）：修复 ~45 个未实现
+  syscall 被误路由到 `sys_statx`（可能向垃圾用户地址写 256 字节、返回误导
+  errno）→ 统一 `ENOSYS`；`getrlimit` 不再假装成功（写入默认
+  `RLIM_INFINITY` 到用户缓冲区）；`sethostname`/`setsockopt`/`getsockopt`/
+  `sigprocmask` 等不再假装成功；信号打断 syscall 返回 `-EINTR` 而非 0。
+- **panic 与异常诊断补强**（`kunxcore/src/main.rs`）：panic handler 输出
+  pid/tid/name/sp、栈回溯与返回地址扫描（与同步异常入口对齐）；异常向量表
+  全部 FIQ/SError/SP0/AArch32 静默 `b .` 项改为打印 ESR/ELR/FAR 后停机。
+- **bootloader/init/networkd**：`kunxboot` DTB fixup 由静默吞错改为返回 bool，
+  失败打印原因并停机（bootargs 缺失内核将无控制台）；`kunxinit` 对
+  networkd/OOBE/launcher 拉起失败与 OOBE 未完成给出明确告警；`networkd`
+  管道创建/打开失败不再静默。
+- **云端结构化错误**（`cloud/gateway/gateway.py`、`cloud/worker/src/worker.js`）：
+  业务错误 `ERR:<code>` 首行保持兼容，同时映射真实 HTTP 状态码
+  （bad_request→400、bad_auth→401、not_found→404、exists→409、
+  internal→500）；内部错误脱敏（不再把异常文本回给设备，只写服务端日志）；
+  Content-Length 畸形解析不再产生裸 HTML 500；Worker 备份整表替换改用
+  D1 `batch` 原子提交；协议语义写入 `cloud/PROTOCOL.md`。
+- **云端错误 detail 与设备端错误区分**：错误响应在 `ERR:<code>` 后追加第二行
+  JSON detail（`code/message/retryable/http_status`，消息脱敏，旧设备只读
+  首行完全兼容）；设备端（`apps/cloud`）新增 `resp_err_hint`，注册/备份/
+  恢复/轮询失败时按错误码区分提示——bad_auth 显示「认证失败（账号或令牌
+  无效）」、internal 显示「服务器内部错误」，不再一律折叠为「服务器不可达」。
+- **剩余静默失败点补报错**：13 个 app_kit 应用 `font_init` 返回值不再忽略
+  （新增 `kit::font_init_checked`，字体缺失显示「字体加载失败」横幅并串口
+  告警，此前全部文字静默消失）；`now_us` 检查 gettimeofday 返回值（失败返回
+  0，clock 显示 `--:--:--`、calendar 不高亮错误日期，此前显示栈垃圾）；
+  map 缩放/gallery 翻页到达边界、browser 地址栏已满均给出横幅提示（此前
+  点击/按键无任何反馈）；cloud `parse_server` 区分「服务器地址无效」与
+  「域名解析失败」（此前 DNS 失败一律误报地址无效）。
+- **本地应用剩余失败点补报错**：launcher `save_number`（WiFi/亮度）与启动
+  门控 `gate_write` 检查写盘结果（失败弹「设置保存失败」/串口告警，此前假
+  成功提示仍弹出），fork 失败时 `cancel_press()` 恢复图标按压态（此前图标
+  永久卡在缩小态）；files 目录/文件打开失败显示「无法打开目录/文件」（此前
+  空列表/无反应）；store fb 初始化失败打印诊断（此前静默退出）、软件目录
+  打不开显示「软件目录加载失败」（此前假"0 packages"）；oobe `mkdir` 检查
+  返回值（EEXIST 视为正常，真实失败告警）、账户表单校验（用户名非空/密码
+  4-16 位（与锁屏 PIN 设计一致）/两次一致，不满足显示横幅并阻止下一步）；
+  calculator 数字输入溢出
+  置 ERROR 并提示（此前静默丢弃按键）；terminal 未知内置命令屏幕横幅提示
+  （此前仅串口打印）。
+- **内核用户可触发 OOM 不再 panic**（`vm.rs`/`sched_cfs.rs`/`elf.rs`/
+  `process.rs`/`linux_compat.rs`/`bionic_shim.rs`）：中间级页表分配失败
+  `map_page_in`/`map_page` 返回 bool、`add_page` 系列传播失败（不记录不一致
+  映射）；任务栈 `alloc_stack` 返回 Option，fork/clone/spawn 失败上抛
+  （-ENOMEM/u32::MAX）；用户栈页 OOM 走既有回滚路径；缺页落地/COW
+  break/mprotect 映射失败归还新页并返回 SIGSEGV/错误，杜绝"记录指向新页而
+  PTE 仍是旧页"的不一致与缺页无限重入。此前用户 mmap/fork/clone/exec 在
+  物理内存耗尽时可直接打挂内核。
+- **errno 粒度补强**（`vfs.rs`）：`mkdir` 区分 -EEXIST/-ENOENT（此前一律
+  -1=EPERM）；`socket.rs` listen/accept 返回 -EBADF/-EINVAL/-ENOMEM（此前
+  一律 -1）；`linux_compat.rs` `umask` 按 POSIX 返回旧值并更新（此前恒返回
+  常量、忽略参数）。
+- **测试稳健性**（`tools/apps_regression.py`）：启动等待从 60s 放宽到 150s，
+  避免宿主机高负载（开发机同时跑 IDE/浏览器）时 QEMU 慢启动误判失败。
+
+### 新增：内核安全硬化（PAN / W^X / ASLR / per-app UID）（2025-08-26 轮）
+
+- **PAN（Privileged Access Never）内存硬化**（`mmu.rs`）：启动时探测
+  SCTLR_EL1.PAN（bit 22，ARMv8.1）并启用（QEMU cortex-a72/max 均支持；
+  ARMv8.0 核自动跳过）。EL1 访问用户内存必须显式进入 uaccess 区
+  （`uaccess_begin`/`uaccess_end`），所有用户指针读写点（copy_from/to_user、
+  read_cstr、futex、信号帧、getdents64/statx/ioctl 等）已逐一包装，杜绝内核
+  绕过 `user_ok` 校验直接越权读写用户数据；EL1 同步异常处理器增加 PAN 故障
+  诊断（漏包装时直接指出）。
+- **W^X 执行防护**：`mmap`/`mprotect` 拒绝"可写+可执行"与任何 `PROT_EXEC`
+  运行时映射（`EPERM`），可执行内存仅来自 ELF 加载（只读共享池页），阻断
+  RWX 堆喷射/代码注入路径；`mprotect` 由 no-op 存根升级为真实实现
+  （COW/共享只读页授予写权限时先 break 出私有副本，防止写穿其它进程）。
+- **ASLR 地址空间布局随机化**（`elf.rs`/`vm.rs`）：每次 exec 随机化用户栈区
+  （16MB 熵窗口）与堆基址（4MB 窗口）；匿名/文件 mmap 游标增设上限
+  `MMAP_CAP`，与随机化栈区之间保留 15MB 隔离带（栈溢出 → 干净 SIGSEGV 而非
+  静默写穿 mmap 区）；信号帧边界校验改用进程实际随机化栈基址；
+  fork 子进程经 `elf::fork_runtime_info` 继承 ASLR 运行时信息。
+- **per-app UID 安全模型**（Android 式沙箱雏形）：PCB 增加 uid/gid，
+  `getuid/geteuid/getgid/getegid` 返回真实值，新增 `setuid/setgid`（仅 root
+  可切换）；`kill` 增加权限检查（仅 root 或目标父进程可发信号）；launcher
+  在 execve 应用前 `setuid(10000)`（与 Android 应用 UID 基址一致），应用进程
+  无法 SIGKILL launcher/init/系统服务或其它应用；shell `ps` 显示 UID，
+  execve 日志打印 uid 便于验证。
+
+### 新增：打断动画（上划取消应用启动）（2025-08-26 轮）
+
+- **应用启动转场（放大+白闪）未播完时上划** → 应用立即**变成图标沿滑动方向飞出**，
+  悬停约 1 秒后用**弹簧飞回桌面原位**（iOS 取消启动风格）：滑动越快飞得越远
+  （距离 = 120px + 速度×200，封顶 540px；实测快划 250px/80ms→540px、
+  中速 120px/150ms→266px、慢划 60px/180ms→185px）。
+- **手势识别使用内核事件时间戳**：`Touch` 记录按下/抬起事件的 `tv_sec+tv_usec`，
+  手势时长不再受「事件成批处理」影响（此前批处理使 dur≈1ms、速度恒封顶）。
+- **与并行启动门控联动**：打断时向启动门控写 `'2'`，已 fork 的应用读到后
+  在绘制前退出，launcher 回收该子进程再播放飞行动画；桌面网格/Dock 中该
+  图标原位在飞行期间隐藏，由飞行动画绘制在当前位置。
+- **修复启动门控值域不匹配**：`gate_write` 此前写裸字节 `0/1/2`，应用侧
+  `wait_launch_gate` 却按 ASCII `b'1'/b'2'` 比较 → 应用永远等满 3s 超时、
+  取消信号不生效。改为写 `b'0'+v`，门控放行/取消即时生效。
+- **修复字形缓存命中路径的堆泄漏**：`rasterize_char` 命中缓存时每字逐字拷贝
+  `Vec`，而 bump 分配器永不回收，反复重绘（水波/飞行动画/分钟刷新）会把
+  launcher 堆撑爆（brk 页表满 → Vec panic）。命中路径改为**借用**缓存槽位图
+  （`Glyph.data: &'static [u8]`），渲染零分配；超大字形用静态备用缓冲兜底。
+- **移除 COW 缺页逐页串口日志**（内核 `process.rs`）：每次 COW break 都做
+  阻塞串口输出，启动动画期间每帧写显存触发数百次缺页 → 动画被拖慢数秒且
+  阻塞 UART RX 导致注入触摸帧丢失；总量由 `COW_BREAKS` 汇总、引导结束统一打印。
+- **修复 Makefile 共享源码依赖缺失**：`shared/ttf_text.rs`、`font_render.rs`、
+  `nav.rs` 未列入各应用构建依赖，改动后 `make` 不触发重编（曾导致门控/字体
+  修复未编进应用）；新增 `SHARED_SRC` 并挂到 launcher / settings / 全部应用规则。
+
+### 新增：全面屏手势 + 三大虚拟按键系统导航（2025-08-26 轮）
+
+- **新增 `shared/nav.rs` 系统导航共享模块**：导航模式（手势/三键）持久化在
+  `/data/oobe/nav_mode`（"gesture"/"buttons"，缺省手势）；提供三键导航栏
+  （返回/桌面/最近任务）与手势指示条绘制（`NavCanvas` 画布抽象，供各进程
+  以单像素写入复用）、导航命中测试与全面屏手势分类：
+  - 底部上滑 = 桌面；上滑悬停（≥450ms）= 最近任务；左右边缘内滑 = 返回
+  - 手势/按钮模式与窗口布局解耦，设置变更即时生效
+- **launcher 桌面**：Dock 上移至导航栏之上；桌面底部绘制导航栏（三键或
+  手势药丸）；新增**最近任务面板**（最近应用 + 可见应用卡片网格，点击卡片
+  启动、点空白关闭）；系统导航动作接入：桌面=回首页、最近任务=开关面板、
+  返回=提示已在桌面；应用退出码约定 0=普通返回 / 1=回桌面首页 / 2=打开
+  最近任务（`spawn_app` 按退出码恢复桌面状态）；鼠标点击导航栏同样生效。
+- **全部 21 个应用接入系统导航**：13 个 `app_kit` 应用（browser/calendar/
+  camera/clock/cloud/contacts/gallery/mail/map/music/phone/sms/weather）
+  在 `render()` 末尾绘制导航栏，`poll_input` 增加手势追踪与 `PollResult.nav`
+  动作，收到导航动作即按退出码退出；calculator/files/store/terminal/stub/
+  settings 各自独立接入（`sys_nav` 模块 + 触摸手势追踪）。files 的返回
+  实现智能回退（查看器 → 上级目录 → 退出应用）；terminal 全屏文本区不受
+  导航栏遮挡；calculator 按键区上移避开导航栏。
+- **OOBE 主题步骤增加「导航方式」选择**：全面屏手势 / 三键导航两个胶囊，
+  选择结果实时预览在壁纸预览区底部；完成时写入 `/data/oobe/nav_mode`。
+- **设置应用增加「导航方式」行**：显示当前模式（手势/三键），点击即切换
+  并持久化；设置页底部绘制真实导航栏，返回/桌面/最近任务按钮可直接使用。
+
+### 修复：TTF 字形垂直偏移 / 协议复选框不可点 / 鼠标卡顿 / launcher 启动崩溃（2025-08-26 轮）
+
+- **修复 TTF 字形整体下移 17px**（10 处拷贝：OOBE、launcher、settings、files、
+  calculator、terminal、stub、store、`shared/app_kit.rs`、内核 `ui_framework.rs`）：
+  `ttf_glyph`/`draw_glyph_ttf` 之前按 `gy = y + ascent + g.ymin` 定位字形，
+  但 fontdue 的 `Metrics.ymin` 是位图**底边**相对基线的偏移，叠加 `ascent`
+  后每个字形都下移约 17px —— 截图对比确认：矩形控件（复选框/按钮）像素级
+  精确，全部文本却整体偏低 17px。改为 `gy = y`（位图顶行对齐调用方 y，
+  与旧点阵字体的「顶部对齐」语义一致），全部界面文字回到设计坐标。
+- **修复 OOBE 协议步骤「我已阅读并同意」复选框钩不上**：复选框实际画在
+  `(40, 228..240)`，而 `tap_agreement` 的命中区却是 `y∈[210,222)`，两者
+  完全不重叠 → 点击复选框无反应。命中区改为覆盖复选框与标签文字
+  `x∈[40,300) && y∈[224,248)`，与渲染位置一致。
+- **修复鼠标不灵敏/指针拖影**：`shared/font_render.rs` 增加字形缓存
+  （256 槽环，key = 码点+字号）。此前每次鼠标移动都会触发整屏重绘，而
+  `rasterize_char`/`advance` 每帧对每个字形重新 fontdue 栅格化（无缓存），
+  QEMU 模拟下帧率骤降、光标严重不跟手；命中缓存后仅做 memcpy。
+- **修复 launcher 启动即 EL0 fault**（内核 `kunxcore/src/bionic_shim.rs` +
+  `process.rs`）：每进程堆断点 `BRK_CUR[pid]` 在进程回收（`reap`/
+  `reap_forced`）时未复位。OOBE（pid 3）加载字体后堆末在未对齐地址
+  `0x39a71b0`，退出后 launcher 复用同一 pid，`brk_init` 因 `BRK_CUR[3] != 0`
+  沿用旧断点 → 首个 `Vec` 分配返回的指针落在内核 `brk_set` 仅从页对齐处
+  开始映射的区间之下，首次写入即触发 Data Abort。回收时复位断点/mmap 游标，
+  launcher 可正常进入桌面并启动应用。
+
+### 云服务：占位功能落地为真实端到端云服务（2025-08-25 轮）
+
+- **服务端（生产）`cloud/worker/`**：Cloudflare Workers + D1 单文件 Worker
+  （409 行，`wrangler.toml` + `schema.sql` + 内嵌管理后台 HTML）：设备注册 /
+  数据备份整快照替换 / 恢复 / 心跳+命令轮询（find-lock-wipe）/ ack / 管理 API
+  （设备列表、下发命令、查看备份）；令牌 FNV-1a 64 hex 存储，不落明文；
+  42 项功能测试（内存 D1 shim）全过，与网关输出逐项比对一致。
+- **明文 HTTP 网关 `cloud/gateway/gateway.py`**（Python 标准库，零依赖）：
+  OS 客户机内核 TCP 栈无 TLS，经网关中转；生产模式反代 Worker（HTTPS），
+  `--local` 模式 JSON 文件存储实现同契约，供 QEMU 内端到端联调；
+  内嵌管理后台单页（设备列表 / 查找 / 远程锁定 / 远程擦除 / 查看备份）。
+- **API 契约 `cloud/PROTOCOL.md`**：三端（客户机/网关/Worker）统一的行式
+  明文协议：`OK/ERR` 响应、`F|<b64 path>|<b64 data>` 文件行、`C|id|type|payload`
+  命令行；管理 API JSON。
+- **客户机 `apps/cloud`「云服务」应用**（EL0，裸 syscall、no_std）：
+  读取 `/data/oobe/cloud_*` 配置；经内核 TCP 栈实现 HTTP/1.0 客户端
+  （socket/connect/sendto/recvfrom 系统调用 + 自研 base64/urlencode/FNV-1a）；
+  注册设备、上传 /data/oobe 快照、云端恢复、轮询并执行命令
+  （find→上报 IP、lock→锁定界面、wipe→擦除数据回首次启动）；GUI 状态界面。
+- **共享框架 `shared/app_kit.rs`**：新增 socket 系统调用封装
+  （`sock_open/connect/send/recv/close`、IPv4 解析）供后续应用复用；
+  修复 `poll_tty_esc` 将 syscall 负错误码按无符号处理导致的越界 panic。
+- **OOBE**：模块表扩至 18 个（新增「云服务」）；启用云服务时写入真实
+  `用户名:<FNV-1a64 token>` 与默认服务器 `10.0.2.2:8080`（原为占位 `user:token`）。
+- **launcher**：应用表扩至 18 个，第 1 页出现「云服务」入口。
+- **内核**：`tcp_connect` 收到 RST（如端口未监听）立即失败返回，不再干等
+  30s 超时（POSIX ECONNREFUSED 语义）。
+- **端到端实测**：QEMU 内驱动 OOBE→桌面→云服务应用→注册→备份→
+  admin 下发 lock/wipe→设备执行并确认，**全部 PASS**（对生产环境
+  Cloudflare Worker+D1 实测）。
+- **生产部署（2025-08-26）**：Worker 绑定自定义域名
+  `kunxoscloud.kuankuantj.com`，明文 HTTP（80 端口）直达 Worker，客户机
+  无需 VPS/网关；D1 建表、`ADMIN_KEY` secret（与 var 同名冲突已规避）、
+  管理后台全部可用。
+- **内核 DNS 系统调用（403）**：EL0 可解析域名（`net_stack::dns_resolve`），
+  客户机服务器地址支持域名直填。
+- **协议 bug 修复清单**：backup 头行 urlencode 解码（网关+Worker 同步）、
+  请求体计数行换行、socket 关闭用 `SYS_SHUTDOWN`（防误关 stdout）、
+  FNV-1a 64 素数常量、backup 文件计数两遍读一致（空文件不发 F 行）、
+  网关反代加 UA 规避 Cloudflare bot 拦截（error 1010）。
+- **联调顺带修复用户 WIP**：`shared/nav.rs` mutable static unsafe、
+  launcher 缺失 `COLOR_DIM` 常量；内核偶发 /init PANIC 经干净重建后稳定
+  （4 次启动 + 多轮 E2E 零崩溃）。
+- **E2E 脚本 `tools/cloud_e2e.py`**：一键验证 注册→备份→服务器侧校验→
+  admin 下发 lock/wipe→设备执行。
+- **部署文档 `cloud/README.md`**：Workers+D1 部署、VPS 网关、cloudflared
+  管理后台隧道、QEMU 联调步骤。
+
+### 应用补全：全部 17 个桌面应用真实实现 + 全量回归实测（2025-08-25 轮）
+
+- **共享应用框架 `shared/app_kit.rs`**：syscall 封装 / framebuffer 双缓冲 /
+  绘制原语（像素/矩形/线/圆）/ ASCII 8x8 + CJK 16x16 字体 / 鼠标触摸键盘输入 /
+  光标 / 标题栏返回键 / 墙钟时间与公历换算（Hinnant 算法），12 个应用经
+  `#[path]` 共用，修复一处即可全量生效。
+- **新建 7 个应用**（此前无二进制，点击会 execve 失败）：
+  - `calendar` 日历：月视图网格、今天高亮、上月/下月翻页；
+  - `camera` 相机：取景器 + 三分构图线 + REC + 快门闪光与缩略图；
+  - `gallery` 图库：程序生成渐变照片网格 + 全屏查看 + 上一张/下一张；
+  - `music` 音乐：专辑封面 + 进度条 + 播放/暂停/上一首/下一首 + 播放列表；
+  - `mail` 邮件：收件箱列表 + 正文折行查看；
+  - `map` 地图：街区/道路/河流网格 + 定位标记 + 缩放 + 罗盘；
+  - `weather` 天气：当前天气卡 + 晴/云/雨图标 + 未来 5 天预报。
+- **5 个占位 stub 升级为真实应用**：`phone` 拨号键盘（触屏+键盘输入、呼叫/挂断）、
+  `sms` 会话列表 + 气泡对话、`contacts` 联系人列表 + 详情 + 呼叫按钮、
+  `browser` 地址栏（virtio-keyboard 键入、退格、回车/前往）+ 书签 + 演示页面、
+  `clock` 数字钟 + 模拟表盘（时针/分针/秒针，每秒刷新）。
+- **全部 17 个应用默认可见**：OOBE 模块默认勾选从 9 个改为全部（含日历/相机/
+  图库/音乐/邮件/地图/天气/终端），launcher 3x4 网格分两页 + Dock 展示。
+- **既有应用 bug 修复**：
+  - `terminal`：补 ESC 退出（此前打开后无法返回桌面）；`run_external` 路径缓冲
+    溢出（`/bin/` + 27 字符以上会越界写 `path[32]`）改为截断到 26 字符；
+  - `calculator`：除零之外补 `i64::MIN / -1` 溢出护栏（此前会 panic）；
+  - `files`（本轮并行新写的真实应用）：`render_list` 的「共 N 项」计数器用 8 字节
+    缓冲但写入 8+位数（根目录 20+ 项即越界 panic）；`poll_input` 非阻塞读返回
+    `-EAGAIN`（转 usize 巨值）未按 isize 判负导致死循环、点击永不返回；
+  - `store`：可用包索引路径 `/var/lib/pkg/available` 从未生成（目录显示 0 个
+    软件包），Makefile 在 rootfs 打包时由 Packages 同步生成。
+- **QEMU 全量回归**（触摸注入 + virtio-keyboard，17/17 通过）：逐个打开全部
+  17 个应用并返回桌面；另抽查 phone 拨号/呼叫/挂断、calendar 翻月、
+  music 播放/暂停、browser 书签页面，均正常；每应用截图存档
+  （`tools/apps_regression.py`）。
+- 说明：本轮验证期间另一并行任务正在重写内核 SMP 调度器，其早期版本在首次
+  fork 处死锁；应用回归先以旧内核（拼接新 ramdisk）完成，调度器修复后已在
+  当前内核复测通过。
+
 ### 五项新功能：符号链接 / virtio-rng / AC97 音频 / 文件管理器 / SMP 调度框架（2025-08-25 轮）
 
 #### 符号链接（SFS + VFS + 系统调用 + shell）
@@ -850,3 +2127,45 @@ KunxOS 首个里程碑版本：一个面向 QEMU `virt`（ARM Cortex-A72）与 R
 
 - 顶层 Makefile：`kernel` / `init` / `networkd` / `rootfs` / `run` / `boot` / `pi4` 等目标
 - QEMU virt 与 Raspberry Pi 4 双平台支持
+
+### 新增：电源与热管理子系统（HAL 抽象 / DVFS / 热节流 / Idle 状态机 / 电池模型 / 后台冻结）（2025-08-27 轮）
+
+- **HAL 电源抽象**（`kunxhal/src/power.rs`）：新增 `PowerControl`（关机/重启/休眠）、
+  `ThermalSensor`（毫摄氏度）、`DvfsController`（按簇频点表 + 频率读写，预留
+  big.LITTLE）、`Battery`（电量/充电）；`Platform` trait 增加 5 个默认 `None`
+  的电源访问器（`power_control` / `thermal_sensor` / `dvfs_controller` /
+  `battery` / `core_voltage_mv`）。
+- **QEMU 后端**（`plat_qemu.rs`）：PSCI `hvc` 关机/重启；虚拟 DVFS 控制器
+  （频点表 600/900/1200/1500 MHz 真实、切换为记账），governor/热节流决策
+  可端到端验证；温度与电池返回 `None`（内核用模拟）。
+- **Pi4 后端**（`plat_pi4.rs`）：PSCI `smc` 关机/重启；mailbox 属性通道
+  `GET_TEMP`（0x00030006，SoC 温度，毫摄氏度）；`GET/SET_CLOCK_RATE`
+  （0x00030002/0x00038002，ARM 时钟 id 0x3）DVFS；`GET_VOLTAGE` 仅读取
+  （v1 不切压，避免真机风险）。
+- **内核策略引擎**（`kunxcore/src/power.rs`，平台无关）：
+  - CPU DVFS：100ms 负载采样（每核 idle 任务 WFI 记账），ondemand /
+    conservative / powersave / performance 四 governor，迟滞 + 100ms 最小
+    切换间隔防抖，切换日志 `[power] dvfs ... Hz (load=..%, governor=..)`。
+  - 热管理：200ms 采样，五级节流（70/80/85/90°C → warm/hot/critical/
+    emergency）；Hot 压到 900MHz、Critical+ 压到最低频（force 绕过切换
+    间隔）；QEMU 软件热模型（满载稳态 85°C，可 `power thermal force` 注入）。
+  - Idle 状态机：每核 active/idle/wfi 阶段 + WFI/唤醒计数（`enter_wfi`/
+    `exit_wfi`），为负载采样与空闲统计提供数据；深空闲为预留接口。
+  - 电池模型框架：充电状态机（discharging/charging/full）+ 事件通知
+    （低电量 ≤15% 迟滞复位 / 充满 / 插拔），虚拟电池供 QEMU 测试，
+    HAL 电池为真机预留。
+  - 后台冻结（Doze）：CFS 每任务 `cpu_cap` 0..100（vruntime ×100/cap
+    限速，linux cpu.max 思路）+ 软冻结（cap=0 不被选中），与既有 SIGSTOP
+    互补。
+- **调度器**（`sched_cfs.rs`）：`Task.cpu_cap` 字段；tick/yield_now 按
+  cap 放大 vruntime；`pick_next` 跳过冻结任务；idle 任务 WFI 记账；
+  `set_task_cpu_cap` / `for_each_task_cap`。
+- **控制面**：shell `power` 命令（status/governor/thermal force/battery/
+  plug/cap/freeze/unfreeze/selftest）；`/proc/power`、`/proc/thermal`
+  （可读 + 可写控制）；syscall 410-413（`kunx_pm_get` 打包状态 /
+  set_governor / set_cpu_cap / freeze）。
+- **测试**：boot 期自动运行电源逻辑自检（QEMU/Pi4 启动即验证 26 项）；
+  `tools/power_test.py` + `make power-test`（QEMU 回归：selftest 0 failure、
+  热注入节流降频、governor 切换、电池状态机、procfs，21/21 通过）。
+  详见 `docs/power_management.md`（含 Pi4 mailbox 协议、QEMU 热模拟方案、
+  DVFS 对 120FPS 影响分析、真机压力测试步骤）。

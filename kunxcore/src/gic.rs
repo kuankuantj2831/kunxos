@@ -69,7 +69,7 @@ pub fn gic_init_secondary() {
 
 /// 使能指定中断号（写入 GICD_ISENABLERn 对应位）。
 pub fn gic_enable_irq(irq: u32) {
-    assert!(irq < 1020, "gic: irq out of range");
+    assert!(irq < 1020, "gic：中断号超出范围");
     let reg = (irq / 32) as usize;
     let bit = irq % 32;
     unsafe {
@@ -79,9 +79,10 @@ pub fn gic_enable_irq(irq: u32) {
 }
 
 /// 禁用指定中断号（写入 GICD_ICENABLERn 对应位）。
-#[allow(dead_code)]
+///
+/// 供中断风暴护栏在冷路径屏蔽风暴源使用（每次风暴只写一次，写完即停）。
 pub fn gic_disable_irq(irq: u32) {
-    assert!(irq < 1020, "gic: irq out of range");
+    assert!(irq < 1020, "gic：中断号超出范围");
     let reg = (irq / 32) as usize;
     let bit = irq % 32;
     unsafe {
@@ -93,7 +94,7 @@ pub fn gic_disable_irq(irq: u32) {
 /// 设置中断优先级（GICD_IPRIORITYR 每字节对应一个中断，低值 = 高优先级）。
 pub fn gic_set_priority(irq: u32, pri: u8) {
     // 越界防护：irq ≥ 1020 时 reg 超出 GICD 寄存器窗（可写穿 4KB bank）
-    assert!(irq < 1020, "gic: irq out of range");
+    assert!(irq < 1020, "gic：中断号超出范围");
     let reg = (irq / 4) as usize;
     let shift = (irq % 4) * 8;
     unsafe {
@@ -109,7 +110,7 @@ pub fn gic_set_priority(irq: u32, pri: u8) {
 /// `cpu` 为位掩码：bit0 表示 CPU0，bit1 表示 CPU1，以此类推。
 pub fn gic_set_target(irq: u32, cpu: u8) {
     // 越界防护：同 gic_set_priority
-    assert!(irq < 1020, "gic: irq out of range");
+    assert!(irq < 1020, "gic：中断号超出范围");
     let reg = (irq / 4) as usize;
     let shift = (irq % 4) * 8;
     unsafe {
@@ -130,4 +131,16 @@ pub fn gic_read_iar() -> u32 {
 /// 应传入 `gic_read_iar` 返回的原始值（含 CPUID 位）。
 pub fn gic_write_eoir(id: u32) {
     unsafe { write_volatile((gicc_base() + GICC_EOIR) as *mut u32, id) }
+}
+
+/// 诊断读取：GICD `gicd_off` 与当前核 GICC `gicc_off` 偏移处的寄存器值。
+///
+/// 供中断风暴探测器转储 GIC 状态（走真实基地址，平台无关）。
+pub fn gic_diag_read(gicd_off: usize, gicc_off: usize) -> (u32, u32) {
+    unsafe {
+        (
+            read_volatile((GICD_BASE + gicd_off) as *const u32),
+            read_volatile((gicc_base() + gicc_off) as *const u32),
+        )
+    }
 }

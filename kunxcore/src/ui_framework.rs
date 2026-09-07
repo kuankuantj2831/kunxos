@@ -4,19 +4,76 @@
 //! `Ui::render` 把控件绘制到窗口表面，`Ui::hit_test`/`tap_at` 完成控件级
 //! 命中与点击回调分发（按钮）。
 //!
-//! 字体为公有领域 8x8 点阵（IBM VGA 风格），见 `FONT8X8`；
-//! 中文为共享 16x16 点阵（GB2312 一级字库，见 `shared/cjk_font.rs`）。
+//! 文本使用平滑字体渲染（见 `font_render`）：常规文字从 rootfs 的
+//! `/fonts/cn.ttf`（uiputong 子集）加载，标题从 `/fonts/bold.ttf`（bold 子集）
+//! 加载；首次绘制前调用 [`font_init`]。
 
-#[path = "../../shared/cjk_font_full.rs"]
-mod cjk_font;
+#[path = "../../shared/font_render.rs"]
+mod font_render;
+
+use alloc::vec::Vec;
 
 use crate::compositor::{Color, Rect, Surface};
 
 /// 单窗口最大控件数。
 pub const MAX_WIDGETS: usize = 64;
-/// 字形尺寸（像素）。
-pub const GLYPH_W: i32 = 8;
-pub const GLYPH_H: i32 = 8;
+/// 字形尺寸（像素）——TTF 渲染下为 16px 字号的行高参考。
+pub const GLYPH_W: i32 = 16;
+pub const GLYPH_H: i32 = 16;
+
+/// 读取 rootfs 中的整个字体文件。失败返回空 Vec。
+fn read_font(path: &str) -> Vec<u8> {
+    let fd = crate::vfs::open(path, 0);
+    if fd < 0 {
+        return Vec::new();
+    }
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = crate::vfs::read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n as usize]);
+    }
+    crate::vfs::close(fd);
+    data
+}
+
+/// 从 rootfs 加载常规字体 `/fonts/cn.ttf`（uiputong 子集）与标题字体
+/// `/fonts/bold.ttf`（bold 子集，幂等）。成功返回 true。
+pub fn font_init() -> bool {
+    let cn_ok = font_render::font_ready();
+    if !cn_ok {
+        let data = read_font("/fonts/cn.ttf");
+        if !data.is_empty() {
+            if let Some(f) = font_render::font_from_bytes(&data) {
+                font_render::font_set(f);
+            }
+        }
+    }
+    if !font_render::font_bold_ready() {
+        let data = read_font("/fonts/bold.ttf");
+        if !data.is_empty() {
+            if let Some(f) = font_render::font_from_bytes(&data) {
+                font_render::font_set_bold(f);
+            }
+        }
+    }
+    // Phosphor 图标字体（icon-fill 实心 / icon-line 粗线 emoji，见
+    // shared/icons.rs）；失败不影响内核文字渲染，仅缺图标/emoji 呈现。
+    if !font_render::icon_ready(true) {
+        if let Some(f) = font_render::font_from_bytes(&read_font("/fonts/icon-fill.ttf")) {
+            font_render::font_set_icon(true, f);
+        }
+    }
+    if !font_render::icon_ready(false) {
+        if let Some(f) = font_render::font_from_bytes(&read_font("/fonts/icon-line.ttf")) {
+            font_render::font_set_icon(false, f);
+        }
+    }
+    font_render::font_ready()
+}
 
 /// 控件点击回调：`(窗口 id, 控件 id, 本地 x, 本地 y)`。
 pub type TapHandler = fn(window: usize, widget: usize, x: i32, y: i32);
@@ -120,7 +177,7 @@ fn render_widget(s: &Surface, w: &Widget) {
         WidgetKind::Button { text, color, text_color, .. } => {
             s.fill_rect(w.rect, *color);
             s.draw_rect(w.rect, Color::GRAY, 1);
-            let tw = text.len() as i32 * GLYPH_W;
+            let tw = font_render::text_width(text.as_bytes(), font_render::FONT_PX);
             let tx = w.rect.x + (w.rect.w as i32 - tw) / 2;
             let ty = w.rect.y + (w.rect.h as i32 - GLYPH_H) / 2;
             draw_text(s, tx, ty, text, *text_color, 1);
@@ -139,15 +196,21 @@ fn render_widget(s: &Surface, w: &Widget) {
         WidgetKind::Image { data, w: iw, h: ih } => {
             // 裸指针 + 尺寸防御：data 为 null 或 w/h 异常（0/巨大）时跳过，
             // 并把源尺寸钳制到目标矩形内，防止 blit 越界读任意内存。
-            if *data as usize == 0 || *iw == 0 || *ih == 0 {
+            // 注意不能用 `*data as usize == 0` 判空——那会先解引用空指针；
+            // 这里用 is_null() 直接检查指针本身。
+            if data.is_null() || *iw == 0 || *ih == 0 {
                 return;
             }
-            let src = Surface {
-                pixels: *data as *mut u32,
-                w: (*iw).min(w.rect.w),
-                h: (*ih).min(w.rect.h),
-            };
-            s.blit(w.rect.x, w.rect.y, &src);
+            // 源行距保持 iw：目标矩形只裁剪拷贝宽高（此前把源宽钳到
+            // rect.w，iw > rect.w 时每行内容整体错位）。
+            s.blit_strided(
+                w.rect.x,
+                w.rect.y,
+                *data as *mut u32,
+                *iw,
+                (*iw).min(w.rect.w),
+                (*ih).min(w.rect.h),
+            );
         }
     }
 }
@@ -185,71 +248,102 @@ pub fn hbox(container: Rect, item_w: u32, gap: u32, out: &mut [Rect]) {
 
 // ==================== 文本绘制 ====================
 
-/// 在 `(x, y)` 绘制字符串（`scale` 为像素放大倍数）。支持 UTF-8：
-/// ASCII 用 8x8 点阵，CJK 用 16x16 点阵（宽度按字形尺寸推进）。
+/// 在 `(x, y)` 绘制字符串（`scale` 为字号放大倍数）。支持 UTF-8，
+/// 全部字形以 cn.ttf 平滑渲染（宽度按字体度量推进）。
 pub fn draw_text(s: &Surface, x: i32, y: i32, text: &str, color: Color, scale: u32) {
+    let px = font_render::FONT_PX * scale.max(1) as f32;
     let bytes = text.as_bytes();
     let mut cx = x;
     let mut i = 0;
     while i < bytes.len() {
-        let (cp, n) = cjk_font::utf8_next(bytes, i);
-        if cp >= 0x80 {
-            if let Some(idx) = cjk_font::cjk_index(cp as u16) {
-                draw_cjk(s, cx, y, idx, color, scale);
-            }
-            cx += cjk_font::CJK_W * scale as i32;
-        } else {
-            draw_glyph(s, cx, y, cp as u8, color, scale);
-            cx += GLYPH_W * scale as i32;
-        }
+        let (cp, n) = font_render::utf8_next(bytes, i);
+        cx += draw_glyph_ttf(s, cx, y, cp, color, px);
         i += n;
     }
 }
 
-/// 绘制单个 16x16 中文字形（`idx` 为 `cjk_font::cjk_index` 返回的索引）。
-fn draw_cjk(s: &Surface, x: i32, y: i32, idx: usize, color: Color, scale: u32) {
-    let px = color.pixel();
-    let base = idx * 32;
-    for row in 0..16i32 {
-        let b0 = cjk_font::CJK_BITMAPS[base + row as usize * 2];
-        let b1 = cjk_font::CJK_BITMAPS[base + row as usize * 2 + 1];
-        let bits = ((b0 as u16) << 8) | b1 as u16;
-        for col in 0..16i32 {
-            if bits & (0x8000u16 >> col) != 0 {
-                for sy in 0..scale as i32 {
-                    for sx in 0..scale as i32 {
-                        s.set(
-                            x + col * scale as i32 + sx,
-                            y + row * scale as i32 + sy,
-                            px,
-                        );
-                    }
-                }
-            }
-        }
-    }
+/// 文本宽度（像素，cn.ttf 字体度量）。
+pub fn text_width(text: &str) -> i32 {
+    font_render::text_width(text.as_bytes(), font_render::FONT_PX)
 }
 
-/// 绘制单个字形。
-fn draw_glyph(s: &Surface, x: i32, y: i32, ch: u8, color: Color, scale: u32) {
-    let idx = if (0x20..=0x7E).contains(&ch) {
-        (ch - 0x20) as usize
-    } else {
-        0 // 空格
-    };
-    let glyph = FONT8X8[idx];
-    let px = color.pixel();
-    for row in 0..8i32 {
-        let bits = glyph[row as usize];
-        for col in 0..8i32 {
-            if bits & (1 << col) != 0 {
-                for sy in 0..scale as i32 {
-                    for sx in 0..scale as i32 {
-                        s.set(x + col * scale as i32 + sx, y + row * scale as i32 + sy, px);
+/// 文本宽度（像素，bold.ttf 标题字体度量）。
+pub fn text_width_bold(text: &str) -> i32 {
+    font_render::text_width_bold(text.as_bytes(), font_render::FONT_PX)
+}
+
+/// 把单个码点以 cn.ttf 平滑字形绘制到 `(x, y)`（y 为字形顶部），返回推进宽度。
+/// 字体未就绪时退回固定宽度（CJK 16 / ASCII 8）且不绘制。
+fn draw_glyph_ttf(s: &Surface, x: i32, y: i32, cp: u32, color: Color, px: f32) -> i32 {
+    if !font_render::font_ready() {
+        return if cp >= 0x80 { 16 } else { 8 };
+    }
+    let ch = core::char::from_u32(cp).unwrap_or(' ');
+    if let Some(g) = font_render::rasterize_char(ch, px) {
+        let gx = x + g.xmin;
+        let gy = font_render::glyph_draw_top(y, g.ymin, g.height, px);
+        let fg = color.pixel();
+        for row in 0..g.height {
+            for col in 0..g.width {
+                let a = g.data[row * g.width + col];
+                if a != 0 {
+                    let px_ = gx + col as i32;
+                    let py_ = gy + row as i32;
+                    if px_ >= 0 && py_ >= 0 && (px_ as u32) < s.w && (py_ as u32) < s.h {
+                        let bg = unsafe {
+                            *s.pixels.add(py_ as usize * s.w as usize + px_ as usize)
+                        };
+                        s.set(px_, py_, font_render::blend(bg, fg, a));
                     }
                 }
             }
         }
+        return g.advance;
+    }
+    0
+}
+
+/// 以 bold.ttf 标题字体把单个码点绘制到 `(x, y)`，返回推进宽度。
+/// 标题字体未就绪或缺少该字形时退回常规字体。
+fn draw_glyph_ttf_bold(s: &Surface, x: i32, y: i32, cp: u32, color: Color, px: f32) -> i32 {
+    if !font_render::font_bold_ready() || !font_render::has_glyph_bold(cp) {
+        return draw_glyph_ttf(s, x, y, cp, color, px);
+    }
+    let ch = core::char::from_u32(cp).unwrap_or(' ');
+    if let Some(g) = font_render::rasterize_char_bold(ch, px) {
+        let gx = x + g.xmin;
+        let gy = font_render::glyph_draw_top_bold(y, g.ymin, g.height, px);
+        let fg = color.pixel();
+        for row in 0..g.height {
+            for col in 0..g.width {
+                let a = g.data[row * g.width + col];
+                if a != 0 {
+                    let px_ = gx + col as i32;
+                    let py_ = gy + row as i32;
+                    if px_ >= 0 && py_ >= 0 && (px_ as u32) < s.w && (py_ as u32) < s.h {
+                        let bg = unsafe {
+                            *s.pixels.add(py_ as usize * s.w as usize + px_ as usize)
+                        };
+                        s.set(px_, py_, font_render::blend(bg, fg, a));
+                    }
+                }
+            }
+        }
+        return g.advance;
+    }
+    0
+}
+
+/// 以 bold.ttf 标题字体绘制字符串（标题）。
+pub fn draw_text_bold(s: &Surface, x: i32, y: i32, text: &str, color: Color, scale: u32) {
+    let px = font_render::FONT_PX * scale.max(1) as f32;
+    let bytes = text.as_bytes();
+    let mut cx = x;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (cp, n) = font_render::utf8_next(bytes, i);
+        cx += draw_glyph_ttf_bold(s, cx, y, cp, color, px);
+        i += n;
     }
 }
 
@@ -316,7 +410,7 @@ static FONT8X8: [[u8; 8]; 95] = [
     [0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00], // Y
     [0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00], // Z
     [0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00], // [
-    [0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00], // backslash
+    [0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00], // 反斜杠
     [0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00], // ]
     [0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00], // ^
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], // _
@@ -352,3 +446,38 @@ static FONT8X8: [[u8; 8]; 95] = [
     [0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00], // }
     [0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ~
 ];
+
+// ==================== 8x8 点阵文本（无 TTF 依赖，供性能 overlay 等） ====================
+
+/// 以 8x8 点阵字体绘制 ASCII 文本（`FONT8X8`，U+0020..U+007E），
+/// `scale` 为整数放大倍数。供内核侧 overlay（性能统计等）在不加载
+/// cn.ttf 的情况下绘制文本。
+pub fn draw_text_8x8(s: &Surface, x: i32, y: i32, text: &str, color: Color, scale: u32) {
+    let sc = scale.max(1) as i32;
+    let mut cx = x;
+    for &c in text.as_bytes() {
+        let idx = (c as usize).wrapping_sub(0x20);
+        let glyph = if idx < FONT8X8.len() { &FONT8X8[idx] } else { &FONT8X8[0] };
+        for row in 0..8usize {
+            for col in 0..8usize {
+                if glyph[row] & (1 << (7 - col)) != 0 {
+                    for sy in 0..sc {
+                        for sx in 0..sc {
+                            let px = cx + (col as i32) * sc + sx;
+                            let py = y + (row as i32) * sc + sy;
+                            if px >= 0 && py >= 0 && (px as u32) < s.w && (py as u32) < s.h {
+                                s.set(px, py, color.pixel());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += 8 * sc;
+    }
+}
+
+/// 8x8 点阵文本宽度（像素）。
+pub fn text_width_8x8(text: &str, scale: u32) -> i32 {
+    (text.len() as i32) * 8 * (scale.max(1) as i32)
+}

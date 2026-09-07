@@ -24,7 +24,7 @@
  │   挂载 FAT32 分区                              │
  │   加载 KERNEL.IMG   @ 0x40080000              │
  │   加载 KUNXOS.DTB   @ 0x44000000              │
- │   加载 RAMDISK.IMG  @ 0x45000000              │
+ │   加载 RAMDISK.IMG  @ 0x47000000              │
  │   DTB fixup（memory 大小修正）                 │
  └──────────────────────┬────────────────────────┘
                         │ jump_to_kernel()
@@ -198,7 +198,7 @@ RAM 由 `kunxhal` 平台后端报告：基址 `0x40000000`，大小 `0x20000000`
  0x40080000 ─ _kernel_end │ .text → .rodata → .data → .bss（4KB 对齐）
  _kernel_end ─ 0x44000000 │ 物理页分配器可用内存（4KB 页位图管理）
  0x44000000            │ DTB（bootloader 载入 KUNXOS.DTB）
- 0x45000000            │ RAMDISK（bootloader 载入 RAMDISK.IMG，rootfs SFS）
+ 0x47000000            │ RAMDISK（bootloader 载入 RAMDISK.IMG，rootfs SFS）
  0x48000000            │ ramfb 帧缓冲（540×960×32bpp ≈ 2MB，/dev/fb0）
  0x48000000 ─ 0x60000000 │ 其余可用内存（页分配器 / 用户地址空间）
  0x60000000 ───────────┼────────── RAM 末尾（512MB 结束）──────────
@@ -213,7 +213,7 @@ RAM 由 `kunxhal` 平台后端报告：基址 `0x40000000`，大小 `0x20000000`
 | 内核镜像 | `0x40080000` | QEMU 加载 raw 内核（链接脚本入口），含 `.text/.rodata/.data/.bss` |
 | 页分配器 | `_kernel_end` 起 | 位图管理 4KB 物理页（`alloc_page`/`free_page`） |
 | DTB | `0x44000000` | bootloader 载入设备树，内核经 `x0` 获取其地址 |
-| RAMDISK | `0x45000000` | bootloader 载入 rootfs（SFS），内核内嵌副本挂载为 `/` |
+| RAMDISK | `0x47000000` | bootloader 载入 rootfs（SFS），内核内嵌副本挂载为 `/` |
 | 帧缓冲 | `0x48000000` | ramfb，540×960×32bpp，`/dev/fb0` 可 `mmap` |
 | RAM 末尾 | `0x60000000` | 512MB 结束 |
 

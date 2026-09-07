@@ -104,6 +104,7 @@ const ST_FEATURES_OK: u32 = 8;
 // virtio-blk 请求类型
 const VBLK_T_IN: u32 = 0; // 读
 const VBLK_T_OUT: u32 = 1; // 写
+const VBLK_T_FLUSH: u32 = 4; // 冲刷（把设备写缓冲落盘）
 
 /// virtqueue 大小。
 const QUEUE_SIZE: usize = 8;
@@ -124,6 +125,10 @@ const USED_OFF: usize = allocator::PAGE_SIZE;
 /// 描述符 flags：NEXT 表示还有后续描述符，WRITE 表示设备写入该缓冲。
 const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
+
+/// 单请求超时（µs）：请求完成/陈旧完成消费的等待上限。
+/// 此前是 100M 次无时钟自旋（数十秒级挂起系统），改用单调时钟 deadline。
+const VBLK_TIMEOUT_US: u64 = 1_000_000;
 
 /// 设备 MMIO 基地址（0 表示未初始化）。
 static mut BASE: usize = 0;
@@ -262,7 +267,7 @@ pub fn init(devs: &[MmioDev]) -> bool {
 
         // 建立队列 0
         if !setup_queue() {
-            crate::uart_send_str("[vblk] virtio-blk: queue depth < 8 unsupported\n");
+            crate::uart_send_str("[vblk] virtio-blk: 队列深度 < 8 不支持\n");
             return false;
         }
 
@@ -282,6 +287,7 @@ pub fn init(devs: &[MmioDev]) -> bool {
             start_lba: 0,
             read: vblk_read,
             write: vblk_write,
+            flush: Some(vblk_flush),
         },
     );
     true
@@ -324,6 +330,40 @@ fn capacity() -> u64 {
     }
 }
 
+/// 设备超时后复位 virtqueue 与**设备本身**：完整走 status=0 → ACK → DRIVER →
+/// 特性协商 → DRIVER_OK 重初始化，丢弃设备侧 in-flight 请求并让其 used 游标
+/// 归零。旧请求的 req 仍按 M-25 保持泄漏（复位前设备可能仍在对其 DMA）。
+///
+/// 此前只重写队列寄存器/清驱动侧游标、不复位设备：设备内部 used idx 与旧
+/// 描述链原样存活，其迟到完成会让下一次请求把「旧 used 项」误判为本次成功
+/// （读请求返回预清零缓冲 = 假成功 / 脏数据），正是 TIMEOUT_PENDING 要防的
+/// 失效模式被 reset 路径重新放行。
+unsafe fn reset_ring() {
+    w32(reg_status(), 0);
+    w32(reg_status(), ST_ACK);
+    w32(reg_status(), ST_ACK | ST_DRIVER);
+    w32(reg_drv_features_sel(), 0);
+    w32(reg_drv_features(), 0);
+    if !MODERN {
+        w32(reg_guest_page_size(), allocator::PAGE_SIZE as u32);
+    }
+    setup_queue();
+    w32(reg_status(), ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+    set_avail_idx(0);
+    (*((RING + USED_OFF + 2) as *mut u16)) = 0;
+    for i in 0..QUEUE_SIZE {
+        *avail_ring(i) = 0;
+    }
+    // ★ 复位写入的 used/avail 区域必须 clean 到内存：后续 blk_io 轮询前的
+    // dcache_invalidate 会把这批脏行直接丢弃，CPU 读回的仍是复位前的陈旧
+    // used idx ≠ LAST_USED=0 → 新请求未及处理即被判"完成"（假成功/脏数据），
+    // 正是 reset_ring 要消除的失效模式。
+    dcache_clean(RING + USED_OFF, 64);
+    dcache_clean(RING + AVAIL_OFF, 4 + QUEUE_SIZE * 2 + 2);
+    LAST_USED = 0;
+    TIMEOUT_PENDING = false;
+}
+
 // ==================== 读写接口 ====================
 
 fn vblk_read(_base: usize, sector: usize, count: usize, buf: &mut [u8]) -> i32 {
@@ -332,6 +372,101 @@ fn vblk_read(_base: usize, sector: usize, count: usize, buf: &mut [u8]) -> i32 {
 
 fn vblk_write(_base: usize, sector: usize, count: usize, buf: &[u8]) -> i32 {
     blk_io(true, sector, count, buf.as_ptr() as *mut u8)
+}
+
+/// 冲刷设备写缓冲（VIRTIO_BLK_T_FLUSH）：无数据区，头 + 状态两个描述符。
+/// 返回 0 成功；失败 -1（设备不支持时也按成功处理，冲刷为尽力而为）。
+fn vblk_flush(_major: u32) -> i32 {
+    if unsafe { BASE == 0 } {
+        return 0;
+    }
+    unsafe {
+        let total = 16 + 1;
+        let req = heap::kmalloc(total);
+        if req.is_null() {
+            return -1;
+        }
+        let req = req as usize;
+        let hdr = req as *mut u8;
+        *(hdr.add(0) as *mut u32) = VBLK_T_FLUSH;
+        *(hdr.add(4) as *mut u32) = 0;
+        *(hdr.add(8) as *mut u64) = 0;
+        *hdr.add(16) = 0;
+        dcache_clean(req, total);
+
+        if TIMEOUT_PENDING {
+            let start = crate::timer::now_us();
+            loop {
+                dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
+                if used_idx() != LAST_USED {
+                    LAST_USED = used_idx();
+                    TIMEOUT_PENDING = false;
+                    crate::uart_send_str("[vblk] 已消费陈旧完成项\n");
+                    break;
+                }
+                // 有界等待：陈旧完成迟迟未到（设备假死）时不再 100M 次自旋挂死
+                // 系统，到期复位环（丢旧描述符，旧 req 按 M-25 保持泄漏）。
+                if crate::timer::now_us() - start >= VBLK_TIMEOUT_US {
+                    crate::uart_send_str("[vblk] 陈旧完成项超时, 正在复位环\n");
+                    reset_ring();
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        let ai = avail_idx();
+        let slot = (ai % QUEUE_SIZE as u16) as usize;
+
+        // 两个链式描述符：头（设备读）→ 状态（设备写）
+        *desc_addr(0) = req as u64;
+        *desc_len(0) = 16;
+        *desc_flags(0) = DESC_F_NEXT;
+        *desc_next(0) = 1;
+
+        *desc_addr(1) = (req + 16) as u64;
+        *desc_len(1) = 1;
+        *desc_flags(1) = DESC_F_WRITE;
+        *desc_next(1) = 0;
+        dcache_clean(RING + DESC_OFF, 16 * 3);
+
+        *avail_ring(slot) = 0;
+        mb();
+        set_avail_idx(ai.wrapping_add(1));
+        dcache_clean(RING + AVAIL_OFF, 4 + 2 * QUEUE_SIZE);
+
+        dsb();
+        w32(reg_queue_notify(), 0);
+
+        // 有界等待：设备假死时不再 100M 次自旋挂死系统。超时保持 M-25 语义
+        // （req 仍在设备 DMA 视野内，不 kfree），由下一次调用消费/复位环。
+        let start = crate::timer::now_us();
+        loop {
+            dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
+            let ui = used_idx();
+            if ui != LAST_USED {
+                LAST_USED = ui;
+                break;
+            }
+            if crate::timer::now_us() - start >= VBLK_TIMEOUT_US {
+                LAST_USED = used_idx();
+                TIMEOUT_PENDING = true;
+                return -1;
+            }
+            core::hint::spin_loop();
+        }
+
+        dcache_invalidate(req, total);
+        let status = *hdr.add(16);
+        heap::kfree(req as *mut u8);
+
+        if status != 0 {
+            // 设备不支持/失败：降级为成功（冲刷尽力而为）
+            0
+        } else {
+            0
+        }
+    }
 }
 
 /// 提交一个同步扇区读写请求，返回成功传输的字节数；失败 -1。
@@ -363,19 +498,22 @@ fn blk_io(write: bool, sector: usize, count: usize, data: *mut u8) -> i32 {
 
         // 提交前先消费上一次超时请求的陈旧完成（见 TIMEOUT_PENDING 注释）。
         if TIMEOUT_PENDING {
-            let mut tries = 0usize;
+            let start = crate::timer::now_us();
             loop {
                 dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
                 if used_idx() != LAST_USED {
                     LAST_USED = used_idx();
                     TIMEOUT_PENDING = false;
-                    crate::uart_send_str("[vblk] consumed stale completion\n");
+                    crate::uart_send_str("[vblk] 已消费陈旧完成项\n");
                     break;
                 }
-                tries += 1;
-                if tries > 100_000_000 {
-                    // 陈旧完成迟迟未到（设备可能已死）：保持置位，拒绝新请求
-                    return -1;
+                // 有界等待：陈旧完成迟迟未到（设备可能已死）时不再 100M 次自旋
+                // 拒绝新请求——到期复位环（丢旧描述符，旧 req 按 M-25 泄漏），
+                // 本请求可继续提交。
+                if crate::timer::now_us() - start >= VBLK_TIMEOUT_US {
+                    crate::uart_send_str("[vblk] 陈旧完成项超时, 正在复位环\n");
+                    reset_ring();
+                    break;
                 }
                 core::hint::spin_loop();
             }
@@ -411,8 +549,9 @@ fn blk_io(write: bool, sector: usize, count: usize, data: *mut u8) -> i32 {
         dsb();
         w32(reg_queue_notify(), 0);
 
-        // 轮询 used ring 直到本次请求完成
-        let mut tries = 0usize;
+        // 轮询 used ring 直到本次请求完成（有界等待，替换 100M 次无时钟自旋。
+        // 超时后仍按 M-25 不 kfree、置位门控；下一次调用对陈旧完成做有界消费）
+        let start = crate::timer::now_us();
         loop {
             // 让设备写入的 used ring 对 CPU 可见（KVM/真机有真实缓存时必需）
             dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
@@ -421,15 +560,14 @@ fn blk_io(write: bool, sector: usize, count: usize, data: *mut u8) -> i32 {
                 LAST_USED = ui;
                 break;
             }
-            tries += 1;
-            if tries > 100_000_000 {
+            if crate::timer::now_us() - start >= VBLK_TIMEOUT_US {
                 // 超时：设备仍可能对 req DMA 写入，此时 kfree 会造成 use-after-free；
                 // 改为泄漏该缓冲（失败路径，可接受），同步游标并置位门控 ——
                 // 下次提交前先消费陈旧完成，防止误判。
                 let cur = used_idx();
                 LAST_USED = cur;
                 TIMEOUT_PENDING = true;
-                crate::uart_send_str("[vblk] timeout sector=");
+                crate::uart_send_str("[vblk] 超时 sector=");
                 crate::print_dec(sector as u64);
                 crate::uart_send_str(" count=");
                 crate::print_dec(count as u64);

@@ -1,14 +1,16 @@
 // KunxOS 文件管理器应用（EL0 用户态，裸 syscall、no_std、无堆）。
 //
 // 由 launcher 经 fork + execve 拉起（/bin/files）。职责：
-//   1. 打开 /dev/fb0（openat）并 mmap 到用户空间，直接写入 RGBA8888 像素
-//   2. 浏览模式：getdents64 列出目录项 + newfstatat 获取大小，
-//      点击目录进入、点击 ".." 返回上级、点击文件打开查看器
-//   3. 查看模式：打开文件读取前 5KB，按文本渲染，点击上下半屏翻页
-//   4. 点击左上角「返回」或按 ESC 逐级退出（查看器 → 浏览 → 退出应用）
+//   1. 目录浏览：列出文件/文件夹（文件夹优先 + 字母序），图标区分类型，
+//      路径栏显示当前路径、点击分段可跳转上级
+//   2. 基础操作：新建文件夹、重命名、删除、复制、移动（对话框确认 +
+//      错误提示）；大文件/目录复制在子进程中执行并显示进度条（不阻塞 UI）
+//   3. 文件打开：按扩展名映射关联应用（.wav/.mp3 → /bin/music，
+//      .jpg/.png → /bin/gallery，文本 → 内置查看器）
+//   4. 存储显示：当前文件系统总空间 / 已用 / 剩余（statfs syscall）
 //
 // 说明：framebuffer 由内核启动时初始化，应用直接 open/mmap /dev/fb0 覆盖桌面
-// 全屏绘制；无窗口管理器，退出后桌面由 launcher 重绘。
+// 全屏绘制；退出后桌面由 launcher 重绘。
 
 #![no_std]
 #![no_main]
@@ -18,263 +20,150 @@
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
+#[path = "../../../shared/app_kit.rs"]
+mod kit;
+
+use kit::*;
+
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
-const SYS_READ: usize = 63;
-const SYS_WRITE: usize = 64;
-const SYS_OPENAT: usize = 56;
-const SYS_CLOSE: usize = 57;
-const SYS_IOCTL: usize = 29;
-const SYS_EXIT: usize = 93;
-const SYS_NANOSLEEP: usize = 101;
-const SYS_MMAP: usize = 222;
+const SYS_CLONE: usize = 220;
+const SYS_EXECVE: usize = 221;
+const SYS_WAIT4: usize = 260;
+const SYS_GETPID: usize = 172;
+const SYS_KILL: usize = 129;
+const SYS_MKDIRAT: usize = 34;
+const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
+const SYS_STATFS: usize = 43;
 const SYS_GETDENTS64: usize = 61;
+const SYS_LSEEK: usize = 62;
 const SYS_NEWFSTATAT: usize = 79;
+
+const SIGCHLD: usize = 17;
 
 // ==================== 常量 ====================
 
-const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
-const O_RDONLY: usize = 0;
-const O_RDWR: usize = 2;
-const O_NONBLOCK: usize = 0x800;
-
-/// mmap 保护位与标志。
-const PROT_READ: usize = 1;
-const PROT_WRITE: usize = 2;
-const MAP_SHARED: usize = 1;
-
-/// FBIOGET_VSCREENINFO 请求码（与内核 devfs 约定一致）。
-const FBIOGET_VSCREENINFO: usize = 0x4600;
-
-const FB_PATH: &str = "/dev/fb0";
-const INPUT_PATH: &str = "/dev/input/event0";
-
-/// linux input_event 事件类型 / 码。
-const EV_KEY: u16 = 0x01;
-const EV_REL: u16 = 0x02;
-const EV_ABS: u16 = 0x03;
-const ABS_X: u16 = 0x00;
-const ABS_Y: u16 = 0x01;
-const REL_X: u16 = 0x00;
-const REL_Y: u16 = 0x01;
-const BTN_TOUCH: u16 = 0x14a; // 330
-const BTN_LEFT: u16 = 0x110; // 272
-
-/// dirent64 d_type 值（DT_*，与内核 dt_of 一致）。
+/// getdents64 d_type 值。
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
-// ==================== 显示参数 ====================
-
-const DISPLAY_W: usize = 540;
-const DISPLAY_H: usize = 960;
-const TITLE_H: i32 = 44;
-const ROW_H: i32 = 36;
-const LIST_TOP: i32 = TITLE_H + 4;
 const MAX_ENTRIES: usize = 96;
-const PATH_STACK_DEPTH: usize = 8;
+const MAX_NAME: usize = 31;
+const MAX_PATH: usize = 160;
 const VIEW_CAP: usize = 5120;
+
+const ROW_H: i32 = 40;
+const PATH_BAR_Y: i32 = TITLE_H + 2;
+const PATH_BAR_H: i32 = 28;
+const STORE_Y: i32 = PATH_BAR_Y + PATH_BAR_H + 4;
+const STORE_H: i32 = 22;
+const LIST_TOP: i32 = STORE_Y + STORE_H + 4;
+const TOOL_H: i32 = 58;
+const TOOL_Y: i32 = NAV_Y - TOOL_H - 4;
+const LIST_BOTTOM: i32 = TOOL_Y - 6;
+
+/// 界面模式。
+const MODE_BROWSE: u8 = 0;
+const MODE_VIEW: u8 = 1;
+const MODE_INPUT: u8 = 2;
+const MODE_CONFIRM: u8 = 3;
+const MODE_PROGRESS: u8 = 4;
+
+/// 对话框动作。
+const ACT_NEW_FOLDER: u8 = 0;
+const ACT_RENAME: u8 = 1;
+const ACT_DELETE: u8 = 2;
+
+/// 剪贴板操作类型。
+const CLIP_NONE: u8 = 0;
+const CLIP_COPY: u8 = 1;
+const CLIP_MOVE: u8 = 2;
+
+const PROG_COPY: u8 = 0;
+const PROG_MOVE: u8 = 1;
+
+/// 后台复制进度文件（子进程写，父进程轮询）。
+const CP_STATE: &[u8] = b"/var/run/files_cp.st\0";
 
 // ==================== 颜色 ====================
 
-const C_BG: u32 = 0x00_10_18_28;
-const C_ROW: u32 = 0x00_1B_2B_4A;
-const C_ROW_BORDER: u32 = 0x00_3A_4A_6A;
-const C_TITLE: u32 = 0x00_16_22_38;
-const C_ACCENT: u32 = 0x00_22_C5_5E;
-const C_BACK: u32 = 0x00_35_B0_E6;
-const C_TEXT: u32 = 0xFF_EC_F0_F1;
-const C_DIM: u32 = 0x00_9A_A5_B5;
-const C_SYM: u32 = 0x00_E8_A0_4C;
-
-// ==================== 8x8 位图字体（公有领域 IBM VGA 风格，取自内核 ui_framework） ====================
-
-static FONT8X8: [[u8; 8]; 95] = [
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ' '
-    [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00], // !
-    [0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // "
-    [0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00], // #
-    [0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00], // $
-    [0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00], // %
-    [0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00], // &
-    [0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00], // '
-    [0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00], // (
-    [0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00], // )
-    [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00], // *
-    [0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00], // +
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06], // ,
-    [0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00], // -
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00], // .
-    [0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00], // /
-    [0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00], // 0
-    [0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00], // 1
-    [0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00], // 2
-    [0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00], // 3
-    [0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00], // 4
-    [0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00], // 5
-    [0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00], // 6
-    [0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00], // 7
-    [0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00], // 8
-    [0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00], // 9
-    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00], // :
-    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06], // ;
-    [0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00], // <
-    [0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00], // =
-    [0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00], // >
-    [0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00], // ?
-    [0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00], // @
-    [0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00], // A
-    [0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00], // B
-    [0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00], // C
-    [0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00], // D
-    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00], // E
-    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00], // F
-    [0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00], // G
-    [0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00], // H
-    [0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // I
-    [0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00], // J
-    [0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00], // K
-    [0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00], // L
-    [0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00], // M
-    [0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00], // N
-    [0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00], // O
-    [0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00], // P
-    [0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00], // Q
-    [0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00], // R
-    [0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00], // S
-    [0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // T
-    [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00], // U
-    [0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00], // V
-    [0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00], // W
-    [0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00], // X
-    [0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00], // Y
-    [0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00], // Z
-    [0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00], // [
-    [0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00], // backslash
-    [0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00], // ]
-    [0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00], // ^
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], // _
-    [0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00], // `
-    [0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00], // a
-    [0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00], // b
-    [0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00], // c
-    [0x38, 0x30, 0x30, 0x3E, 0x33, 0x33, 0x6E, 0x00], // d
-    [0x00, 0x00, 0x1E, 0x33, 0x3F, 0x03, 0x1E, 0x00], // e
-    [0x1C, 0x36, 0x06, 0x0F, 0x06, 0x06, 0x0F, 0x00], // f
-    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F], // g
-    [0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00], // h
-    [0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // i
-    [0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E], // j
-    [0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00], // k
-    [0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // l
-    [0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00], // m
-    [0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00], // n
-    [0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00], // o
-    [0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F], // p
-    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78], // q
-    [0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00], // r
-    [0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00], // s
-    [0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00], // t
-    [0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00], // u
-    [0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00], // v
-    [0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00], // w
-    [0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00], // x
-    [0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F], // y
-    [0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00], // z
-    [0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00], // {
-    [0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00], // |
-    [0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00], // }
-    [0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ~
-];
-
-// ==================== 共享 CJK 16x16 点阵字库（由 tools/gen_cjk_font.py 生成子集） ====================
-
-#[path = "../../../shared/cjk_font_files.rs"]
-mod cjk_font;
+/// 页面基底背景（浅色渐变：顶部白 → 底部极浅灰）；也被图标镂空与
+/// 选中勾复用（作为“透明底”色）。
+const C_BG: u32 = 0x00_F7_F8_FA;
+const C_FOLDER: u32 = 0x00_E8_A0_4C;
+const C_FILE: u32 = 0x00_5B_9B_D5;
+const C_LINK: u32 = 0x00_C9_5C_EF;
+const C_SEL: u32 = 0x00_35_B0_E6;
+const C_DANGER: u32 = 0x00_E0_4A_3A;
+/// 彩色玻璃（强调绿/危险红）表面上的文字保持白色。
+const C_ON_ACCENT: u32 = 0x00_FF_FF_FF;
 
 // ==================== 状态 ====================
 
-static mut FB_PTR: *mut u32 = core::ptr::null_mut();
-static mut FB_W: usize = DISPLAY_W;
-static mut FB_H: usize = DISPLAY_H;
-static mut FB_STRIDE_PX: usize = DISPLAY_W;
-static mut BACK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
-
-static mut INPUT_FD: isize = -1;
-static mut CUR_X: i32 = DISPLAY_W as i32 / 2;
-static mut CUR_Y: i32 = DISPLAY_H as i32 / 2;
-static mut TOUCH_DOWN: bool = false;
-static mut MOUSE_DOWN: bool = false;
-
-/// 鼠标指针位图（9x9）：经典箭头，黑描边 + 白填充。
-static CURSOR_BITS: [u16; 9] = [
-    0b100000000,
-    0b110000000,
-    0b101000000,
-    0b100100000,
-    0b100010000,
-    0b100001000,
-    0b111111100,
-    0b100010100,
-    0b100010010,
-];
-
-// ---- 浏览状态 ----
-
-/// 当前目录（绝对路径，以 '\0' 结尾）。初始值在 k_main 中置为 "/"。
+/// 当前目录（绝对路径，NUL 结尾）。
 static mut CWD: [u8; 128] = [0; 128];
-/// 返回路径栈（进入子目录时压入；".." / 返回键弹出）。
-static mut PATH_STACK: [[u8; 128]; PATH_STACK_DEPTH] = [[0; 128]; PATH_STACK_DEPTH];
-static mut STACK_DEPTH: usize = 0;
-/// 列表滚动偏移（条目下标）。
-static mut LIST_SCROLL: usize = 0;
+static mut UI_MODE: u8 = MODE_BROWSE;
 
-/// 目录项缓冲（最多 96 项）。
-static mut ENT_NAMES: [[u8; 32]; MAX_ENTRIES] = [[0; 32]; MAX_ENTRIES];
+// ---- 目录列表 ----
+static mut ENT_NAMES: [[u8; MAX_NAME]; MAX_ENTRIES] = [[0; MAX_NAME]; MAX_ENTRIES];
 static mut ENT_LEN: [usize; MAX_ENTRIES] = [0; MAX_ENTRIES];
 static mut ENT_TYPE: [u8; MAX_ENTRIES] = [0; MAX_ENTRIES];
-static mut ENT_SIZE: [u32; MAX_ENTRIES] = [0; MAX_ENTRIES];
+static mut ENT_SIZE: [u64; MAX_ENTRIES] = [0; MAX_ENTRIES];
 static mut ENT_COUNT: usize = 0;
+static mut LIST_SCROLL: usize = 0;
+/// 当前选中项下标（usize::MAX = 无）。
+static mut SEL_IDX: usize = usize::MAX;
 
-// ---- 查看状态 ----
+// ---- 剪贴板 ----
+static mut CLIP_OP: u8 = CLIP_NONE;
+static mut CLIP_PATH: [u8; MAX_PATH] = [0; MAX_PATH];
+static mut CLIP_LEN: usize = 0;
+static mut CLIP_NAME: [u8; MAX_NAME] = [0; MAX_NAME];
+static mut CLIP_NAME_LEN: usize = 0;
 
-static mut VIEW_MODE: bool = false;
-static mut VIEW_PATH: [u8; 128] = [0; 128];
-static mut VIEW_BUF: [u8; VIEW_CAP] = [0; VIEW_CAP];
+// ---- 路径栏分段 ----
+static mut SEG_X: [usize; 8] = [0; 8];
+static mut SEG_W: [usize; 8] = [0; 8];
+static mut SEG_OFF: [usize; 8] = [0; 8]; // 段在 CWD 中的起始字节
+static mut SEG_N: usize = 0;
+
+// ---- 输入对话框 ----
+static mut INPUT_ACTION: u8 = ACT_NEW_FOLDER;
+static mut INPUT_TARG: [u8; MAX_PATH] = [0; MAX_PATH];
+static mut INPUT_TARG_LEN: usize = 0;
+static mut INPUT_BUF: [u8; MAX_NAME] = [0; MAX_NAME];
+static mut INPUT_LEN: usize = 0;
+
+// ---- 确认对话框 ----
+static mut CONFIRM_ACTION: u8 = ACT_DELETE;
+static mut CONFIRM_PATH: [u8; MAX_PATH] = [0; MAX_PATH];
+static mut CONFIRM_PATH_LEN: usize = 0;
+
+// ---- 查看器 ----
+static mut VIEW_PATH: [u8; MAX_PATH] = [0; MAX_PATH];
 static mut VIEW_LEN: usize = 0;
-/// 查看器行滚动（行号偏移）。
+static mut VIEW_BUF: [u8; VIEW_CAP] = [0; VIEW_CAP];
 static mut VIEW_SCROLL: usize = 0;
 
+// ---- 后台操作（进度） ----
+static mut PROG_KIND: u8 = PROG_COPY;
+static mut PROG_PID: i32 = -1;
+static mut PROG_START_US: u64 = 0;
+static mut PROG_LABEL: [u8; 32] = [0; 32];
+static mut PROG_LABEL_LEN: usize = 0;
+
+// ---- 复制执行缓冲 ----
+static mut CP_BUF: [u8; 4096] = [0; 4096];
+static mut OP_SRC: [u8; MAX_PATH] = [0; MAX_PATH];
+static mut OP_SRC_LEN: usize = 0;
+static mut OP_DST: [u8; MAX_PATH] = [0; MAX_PATH];
+static mut OP_DST_LEN: usize = 0;
+static mut OP_NAME: [u8; MAX_NAME] = [0; MAX_NAME];
+static mut OP_NAME_LEN: usize = 0;
+
 // ==================== 系统调用封装 ====================
-
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
-    ret
-}
-
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, in("x1") a2, options(nostack));
-    ret
-}
-
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
-        options(nostack)
-    );
-    ret
-}
 
 #[inline(always)]
 unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
@@ -292,7 +181,7 @@ unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usiz
 }
 
 #[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
+unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
     let ret: usize;
     asm!(
         "svc #0",
@@ -302,246 +191,25 @@ unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usi
         in("x2") a3,
         in("x3") a4,
         in("x4") a5,
-        in("x5") a6,
         options(nostack)
     );
     ret
 }
 
-// ==================== 基础 I/O ====================
+// ==================== 路径工具 ====================
 
-unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
-    syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
+fn nul_len(b: &[u8]) -> usize {
+    b.iter().position(|&c| c == 0).unwrap_or(b.len())
 }
 
-fn print(s: &str) {
-    unsafe { write_fd(1, s.as_bytes()); }
+fn cwd_len() -> usize {
+    unsafe { nul_len(&CWD) }
 }
 
-fn print_dec(mut v: u32) {
-    if v == 0 {
-        print("0");
-        return;
-    }
-    let mut buf = [0u8; 12];
-    let mut i = buf.len();
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    unsafe { write_fd(1, &buf[i..]); }
-}
-
-fn sleep_ms(ms: usize) {
-    let mut req = [0u8; 16];
-    let sec = (ms / 1000) as u64;
-    let nsec = ((ms % 1000) * 1_000_000) as u64;
-    req[..8].copy_from_slice(&sec.to_le_bytes());
-    req[8..].copy_from_slice(&nsec.to_le_bytes());
-    unsafe { syscall2(SYS_NANOSLEEP, req.as_ptr() as usize, 0); }
-}
-
-unsafe fn exit(code: usize) -> ! {
-    syscall1(SYS_EXIT, code);
-    loop {}
-}
-
-// ==================== 文件操作 ====================
-
-static mut PATH_BUF: [u8; 128] = [0u8; 128];
-
-/// 把 `path` 拷贝到 PATH_BUF（NUL 结尾）并 openat。
-unsafe fn open(path: &str, flags: usize) -> isize {
-    let n = path.len().min(PATH_BUF.len() - 1);
-    PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
-    PATH_BUF[n] = 0;
-    syscall3(SYS_OPENAT, AT_FDCWD, PATH_BUF.as_ptr() as usize, flags) as isize
-}
-
-/// 统计 `path` 的 (类型码, 大小)。类型码 = 0 表示 stat 失败。
-fn stat_size(path: &str) -> (u8, u32) {
-    unsafe {
-        let mut st = [0u8; 128];
-        let n = path.len().min(PATH_BUF.len() - 1);
-        PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
-        PATH_BUF[n] = 0;
-        let r = syscall4(
-            SYS_NEWFSTATAT,
-            AT_FDCWD,
-            PATH_BUF.as_ptr() as usize,
-            st.as_mut_ptr() as usize,
-            0,
-        );
-        if r != 0 {
-            return (0, 0);
-        }
-        // struct stat：st_mode@16(u32)，st_size@48(i64)
-        let mode = u32::from_le_bytes([st[16], st[17], st[18], st[19]]);
-        let size = i64::from_le_bytes([
-            st[48], st[49], st[50], st[51], st[52], st[53], st[54], st[55],
-        ]);
-        let typ = match mode & 0o170000 {
-            0o040000 => DT_DIR,
-            0o120000 => DT_LNK,
-            0o020000 => 2, // 字符设备
-            0o060000 => 6, // 块设备
-            0o010000 => 1, // FIFO
-            _ => DT_REG,
-        };
-        (typ, size.max(0) as u32)
-    }
-}
-
-/// 读取目录 `path` 的全部条目到 ENT_* 缓冲，按名称字典序排序。
-fn load_dir(path: &str) {
-    unsafe {
-        ENT_COUNT = 0;
-        let fd = open(path, O_RDONLY);
-        if fd < 0 {
-            return;
-        }
-        let mut raw = [0u8; 2048];
-        let mut names: [[u8; 32]; MAX_ENTRIES] = [[0; 32]; MAX_ENTRIES];
-        let mut lens: [usize; MAX_ENTRIES] = [0; MAX_ENTRIES];
-        let mut types: [u8; MAX_ENTRIES] = [0; MAX_ENTRIES];
-        let mut count = 0usize;
-        loop {
-            let n = syscall3(
-                SYS_GETDENTS64,
-                fd as usize,
-                raw.as_mut_ptr() as usize,
-                raw.len(),
-            );
-            if n <= 0 {
-                break;
-            }
-            let mut off = 0usize;
-            while off + 19 <= n as usize {
-                // d_ino u64@0, d_off u64@8, d_reclen u16@16, d_type u8@18, d_name@19
-                let reclen = u16::from_le_bytes([raw[off + 16], raw[off + 17]]) as usize;
-                if reclen < 19 || off + reclen > n as usize {
-                    break;
-                }
-                let dtyp = raw[off + 18];
-                let name = &raw[off + 19..off + reclen];
-                let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-                if count < MAX_ENTRIES {
-                    names[count][..elen.min(31)].copy_from_slice(&name[..elen.min(31)]);
-                    lens[count] = elen.min(31);
-                    types[count] = dtyp;
-                    count += 1;
-                }
-                off += reclen;
-            }
-        }
-        syscall1(SYS_CLOSE, fd as usize);
-
-        // 插入排序（字节字典序；"." / ".." 不参与排序，固定在最前）。
-        // 先抽出 ".."（若有），其余排序后放回。
-        let mut dots: [[u8; 32]; 2] = [[0; 32]; 2];
-        let mut dot_lens = [0usize; 2];
-        let mut dot_count = 0usize;
-        let mut rest: [[u8; 32]; MAX_ENTRIES] = [[0; 32]; MAX_ENTRIES];
-        let mut rest_len = [0usize; MAX_ENTRIES];
-        let mut rest_typ = [0u8; MAX_ENTRIES];
-        let mut rest_n = 0usize;
-        for i in 0..count {
-            let nm = &names[i][..lens[i]];
-            if nm == b".." || nm == b"." {
-                if dot_count < 2 {
-                    dots[dot_count][..lens[i]].copy_from_slice(nm);
-                    dot_lens[dot_count] = lens[i];
-                    dot_count += 1;
-                }
-            } else {
-                rest[rest_n][..lens[i]].copy_from_slice(nm);
-                rest_len[rest_n] = lens[i];
-                rest_typ[rest_n] = types[i];
-                rest_n += 1;
-            }
-        }
-        for i in 1..rest_n {
-            let mut j = i;
-            while j > 0 {
-                let a = &rest[j - 1][..rest_len[j - 1]];
-                let b = &rest[j][..rest_len[j]];
-                if a <= b {
-                    break;
-                }
-                // 交换 j-1 与 j（先拷贝到临时缓冲，避免数组元素借用冲突）
-                let al = rest_len[j - 1];
-                let bl = rest_len[j];
-                let mut ta = [0u8; 32];
-                let mut tb = [0u8; 32];
-                ta[..al].copy_from_slice(&rest[j - 1][..al]);
-                tb[..bl].copy_from_slice(&rest[j][..bl]);
-                rest[j - 1][..bl].copy_from_slice(&tb[..bl]);
-                rest_len[j - 1] = bl;
-                let tt = rest_typ[j - 1];
-                rest_typ[j - 1] = rest_typ[j];
-                rest_typ[j] = tt;
-                rest[j][..al].copy_from_slice(&ta[..al]);
-                rest_len[j] = al;
-                j -= 1;
-            }
-        }
-        // 合并：.. / . 在最前，其余跟随
-        count = 0;
-        for d in 0..dot_count {
-            ENT_NAMES[count][..dot_lens[d]].copy_from_slice(&dots[d][..dot_lens[d]]);
-            ENT_LEN[count] = dot_lens[d];
-            ENT_TYPE[count] = DT_DIR;
-            ENT_SIZE[count] = 0;
-            count += 1;
-        }
-        for i in 0..rest_n {
-            ENT_NAMES[count][..rest_len[i]].copy_from_slice(&rest[i][..rest_len[i]]);
-            ENT_LEN[count] = rest_len[i];
-            ENT_TYPE[count] = rest_typ[i];
-            ENT_SIZE[count] = 0;
-            count += 1;
-        }
-        ENT_COUNT = count;
-        // 逐项 stat 取大小（跳过 ".." / "."）
-        for i in 0..ENT_COUNT {
-            let nm = &ENT_NAMES[i][..ENT_LEN[i]];
-            if nm == b".." || nm == b"." {
-                continue;
-            }
-            let mut full = [0u8; 160];
-            let mut off = 0usize;
-            for &c in path.as_bytes() {
-                if off + 1 >= full.len() {
-                    break;
-                }
-                full[off] = c;
-                off += 1;
-            }
-            if off > 0 && full[off - 1] != b'/' && off + 1 < full.len() {
-                full[off] = b'/';
-                off += 1;
-            }
-            for &c in nm {
-                if off + 1 >= full.len() {
-                    break;
-                }
-                full[off] = c;
-                off += 1;
-            }
-            full[off] = 0;
-            let fs = core::str::from_utf8(&full[..off]).unwrap_or("");
-            let (t, sz) = stat_size(fs);
-            ENT_TYPE[i] = t;
-            ENT_SIZE[i] = sz;
-        }
-    }
-}
-
-/// 拼接 cwd + "/" + name 到 `out`（NUL 结尾），返回字节数；放不下返回 0。
-fn join_path(cwd: &[u8], name: &[u8], out: &mut [u8]) -> usize {
+/// 把 `base` + "/" + `name` 拼接进 `out`（NUL 结尾），返回长度；过长返回 0。
+fn join_into(base: &[u8], name: &[u8], out: &mut [u8]) -> usize {
     let mut off = 0usize;
-    for &c in cwd {
+    for &c in base {
         if off + 1 >= out.len() {
             return 0;
         }
@@ -563,625 +231,652 @@ fn join_path(cwd: &[u8], name: &[u8], out: &mut [u8]) -> usize {
     off
 }
 
-/// 取 cwd 的父目录写入 `out`（NUL 结尾），返回长度。
-fn parent_of(cwd: &[u8], out: &mut [u8]) -> usize {
-    let mut end = cwd.len();
-    while end > 0 && cwd[end - 1] == 0 {
-        end -= 1;
-    }
-    while end > 0 && cwd[end - 1] == b'/' {
-        end -= 1;
-    }
-    let mut slash = end;
-    while slash > 0 && cwd[slash - 1] != b'/' {
-        slash -= 1;
-    }
-    if slash == 0 {
-        out[0] = b'/';
-        out[1] = 0;
-        1
-    } else {
-        let n = slash.min(out.len() - 1);
-        out[..n].copy_from_slice(&cwd[..n]);
-        out[n] = 0;
-        n
+/// 绝对路径字符串（CWD 前缀，NUL 结尾于静态缓冲）。
+fn cwd_nul() -> &'static [u8] {
+    unsafe {
+        let mut n = 0usize;
+        while n < CWD.len() && CWD[n] != 0 {
+            n += 1;
+        }
+        &CWD[..(n + 1).min(CWD.len())]
     }
 }
 
-// ==================== 帧缓冲 ====================
+/// 打开路径（NUL 结尾于 OP_SRC 缓冲；注意会覆盖 OP_SRC）。
+unsafe fn open_path(p: &[u8], flags: usize) -> isize {
+    let n = p.len().min(OP_SRC.len() - 1);
+    OP_SRC[..n].copy_from_slice(&p[..n]);
+    OP_SRC[n] = 0;
+    syscall3(SYS_OPENAT, AT_FDCWD, OP_SRC.as_ptr() as usize, flags) as isize
+}
 
-/// 打开 /dev/fb0、查询分辨率并 mmap 到用户空间；成功返回 true。
-fn fb_init() -> bool {
+fn mkdir_path(p: &[u8]) -> usize {
     unsafe {
-        let fd = open(FB_PATH, O_RDWR);
-        if fd < 0 {
-            return false;
-        }
-        let mut info = [0u8; 24];
-        let r = syscall3(SYS_IOCTL, fd as usize, FBIOGET_VSCREENINFO, info.as_mut_ptr() as usize);
-        if r == 0 {
-            let w = u32::from_le_bytes([info[0], info[1], info[2], info[3]]) as usize;
-            let h = u32::from_le_bytes([info[4], info[5], info[6], info[7]]) as usize;
-            let stride = u32::from_le_bytes([info[20], info[21], info[22], info[23]]) as usize;
-            if w > 0 && h > 0 {
-                FB_W = w;
-                FB_H = h;
-                FB_STRIDE_PX = if stride >= w * 4 { stride / 4 } else { w };
-            }
-        }
-        let len = FB_W * FB_H * 4;
-        let base = syscall6(
-            SYS_MMAP,
-            0,
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            fd as usize,
+        let n = p.len().min(OP_SRC.len() - 1);
+        OP_SRC[..n].copy_from_slice(&p[..n]);
+        OP_SRC[n] = 0;
+        syscall3(SYS_MKDIRAT, AT_FDCWD, OP_SRC.as_ptr() as usize, 0o777)
+    }
+}
+
+fn unlink_path(p: &[u8]) -> usize {
+    unsafe {
+        let n = p.len().min(OP_SRC.len() - 1);
+        OP_SRC[..n].copy_from_slice(&p[..n]);
+        OP_SRC[n] = 0;
+        syscall3(SYS_UNLINKAT, AT_FDCWD, OP_SRC.as_ptr() as usize, 0)
+    }
+}
+
+fn rename_path(old: &[u8], new: &[u8]) -> usize {
+    unsafe {
+        let n = old.len().min(OP_SRC.len() - 1);
+        OP_SRC[..n].copy_from_slice(&old[..n]);
+        OP_SRC[n] = 0;
+        let m = new.len().min(OP_DST.len() - 1);
+        OP_DST[..m].copy_from_slice(&new[..m]);
+        OP_DST[m] = 0;
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            OP_SRC.as_ptr() as usize,
+            AT_FDCWD,
+            OP_DST.as_ptr() as usize,
+        )
+    }
+}
+
+/// stat：返回 (类型码, 大小)。类型码 0 = 失败。
+fn stat_path(p: &[u8]) -> (u8, u64) {
+    unsafe {
+        let n = p.len().min(OP_SRC.len() - 1);
+        OP_SRC[..n].copy_from_slice(&p[..n]);
+        OP_SRC[n] = 0;
+        let mut st = [0u8; 128];
+        let r = syscall4(
+            SYS_NEWFSTATAT,
+            AT_FDCWD,
+            OP_SRC.as_ptr() as usize,
+            st.as_mut_ptr() as usize,
             0,
         );
-        if (base as isize) < 0 {
-            syscall1(SYS_CLOSE, fd as usize);
-            return false;
+        if r != 0 {
+            return (0, 0);
         }
-        FB_PTR = base as *mut u32;
-        syscall1(SYS_CLOSE, fd as usize);
-        true
+        let mode = u32::from_le_bytes([st[16], st[17], st[18], st[19]]);
+        let size = i64::from_le_bytes([
+            st[48], st[49], st[50], st[51], st[52], st[53], st[54], st[55],
+        ]);
+        let typ = match mode & 0o170000 {
+            0o040000 => DT_DIR,
+            0o120000 => DT_LNK,
+            0o020000 => 2,
+            0o060000 => 6,
+            0o010000 => 1,
+            _ => DT_REG,
+        };
+        (typ, size.max(0) as u64)
     }
 }
 
-/// 把 back buffer 一次性拷贝到显存。
-fn flip() {
+/// statfs：返回 (总字节, 空闲字节)；失败返回 (0,0)。
+fn statfs_bytes(p: &[u8]) -> (u64, u64) {
     unsafe {
-        if FB_PTR.is_null() {
+        let n = p.len().min(OP_SRC.len() - 1);
+        OP_SRC[..n].copy_from_slice(&p[..n]);
+        OP_SRC[n] = 0;
+        let mut st = [0u8; 120];
+        let r = syscall2(SYS_STATFS, OP_SRC.as_ptr() as usize, st.as_mut_ptr() as usize);
+        if r != 0 {
+            return (0, 0);
+        }
+        let bsize = i64::from_le_bytes([
+            st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15],
+        ]) as u64;
+        let blocks = i64::from_le_bytes([
+            st[16], st[17], st[18], st[19], st[20], st[21], st[22], st[23],
+        ]) as u64;
+        let bfree = i64::from_le_bytes([
+            st[24], st[25], st[26], st[27], st[28], st[29], st[30], st[31],
+        ]) as u64;
+        (blocks.saturating_mul(bsize), bfree.saturating_mul(bsize))
+    }
+}
+
+// ==================== 目录加载 ====================
+
+/// 读取目录到 ENT_*：文件夹优先，组内按字节字典序；"." / ".." 固定最前。
+fn load_dir(path: &[u8]) {
+    unsafe {
+        ENT_COUNT = 0;
+        LIST_SCROLL = 0;
+        let fd = open_path(path, O_RDONLY);
+        if fd < 0 {
+            show_error("无法打开目录".as_bytes());
             return;
         }
-        if FB_W == DISPLAY_W && FB_H == DISPLAY_H && FB_STRIDE_PX == DISPLAY_W {
-            core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB_PTR, DISPLAY_W * DISPLAY_H);
-        } else {
-            let w = FB_W.min(DISPLAY_W);
-            let h = FB_H.min(DISPLAY_H);
-            for y in 0..h {
-                core::ptr::copy_nonoverlapping(
-                    BACK_BUF.as_ptr().add(y * DISPLAY_W),
-                    FB_PTR.add(y * FB_STRIDE_PX),
-                    w,
-                );
+        let mut raw = [0u8; 2048];
+        let mut names: [[u8; MAX_NAME]; MAX_ENTRIES] = [[0; MAX_NAME]; MAX_ENTRIES];
+        let mut lens: [usize; MAX_ENTRIES] = [0; MAX_ENTRIES];
+        let mut types: [u8; MAX_ENTRIES] = [0; MAX_ENTRIES];
+        let mut count = 0usize;
+        loop {
+            let n = syscall3(
+                SYS_GETDENTS64,
+                fd as usize,
+                raw.as_mut_ptr() as usize,
+                raw.len(),
+            );
+            if n as isize <= 0 {
+                break;
             }
+            let mut off = 0usize;
+            while off + 19 <= n as usize {
+                let reclen =
+                    u16::from_le_bytes([raw[off + 16], raw[off + 17]]) as usize;
+                if reclen < 19 || off + reclen > n as usize {
+                    break;
+                }
+                let dtyp = raw[off + 18];
+                let name = &raw[off + 19..off + reclen];
+                let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                if count < MAX_ENTRIES {
+                    names[count][..elen.min(MAX_NAME)].copy_from_slice(&name[..elen.min(MAX_NAME)]);
+                    lens[count] = elen.min(MAX_NAME);
+                    types[count] = dtyp;
+                    count += 1;
+                }
+                off += reclen;
+            }
+        }
+        syscall1(SYS_CLOSE, fd as usize);
+
+        // 抽出 ".." / "."；其余先文件夹优先排序（同类型内字母序）。
+        let mut dots: [[u8; MAX_NAME]; 2] = [[0; MAX_NAME]; 2];
+        let mut dot_lens = [0usize; 2];
+        let mut dot_count = 0usize;
+        let mut rest: [[u8; MAX_NAME]; MAX_ENTRIES] = [[0; MAX_NAME]; MAX_ENTRIES];
+        let mut rest_len = [0usize; MAX_ENTRIES];
+        let mut rest_typ = [0u8; MAX_ENTRIES];
+        let mut rest_n = 0usize;
+        for i in 0..count {
+            let nm = &names[i][..lens[i]];
+            if nm == b".." || nm == b"." {
+                if dot_count < 2 {
+                    dots[dot_count][..lens[i]].copy_from_slice(nm);
+                    dot_lens[dot_count] = lens[i];
+                    dot_count += 1;
+                }
+            } else {
+                rest[rest_n][..lens[i]].copy_from_slice(nm);
+                rest_len[rest_n] = lens[i];
+                rest_typ[rest_n] = types[i];
+                rest_n += 1;
+            }
+        }
+        // 插入排序：文件夹优先，同类型按字节序。
+        for i in 1..rest_n {
+            let mut j = i;
+            while j > 0 {
+                let a_is_dir = rest_typ[j - 1] == DT_DIR;
+                let b_is_dir = rest_typ[j] == DT_DIR;
+                let a = &rest[j - 1][..rest_len[j - 1]];
+                let b = &rest[j][..rest_len[j]];
+                let earlier = if a_is_dir != b_is_dir {
+                    a_is_dir
+                } else {
+                    a <= b
+                };
+                if earlier {
+                    break;
+                }
+                let al = rest_len[j - 1];
+                let bl = rest_len[j];
+                let mut ta = [0u8; MAX_NAME];
+                let mut tb = [0u8; MAX_NAME];
+                ta[..al].copy_from_slice(&rest[j - 1][..al]);
+                tb[..bl].copy_from_slice(&rest[j][..bl]);
+                rest[j - 1][..bl].copy_from_slice(&tb[..bl]);
+                rest_len[j - 1] = bl;
+                let tt = rest_typ[j - 1];
+                rest_typ[j - 1] = rest_typ[j];
+                rest_typ[j] = tt;
+                rest[j][..al].copy_from_slice(&ta[..al]);
+                rest_len[j] = al;
+                j -= 1;
+            }
+        }
+        // 合并。
+        count = 0;
+        for d in 0..dot_count {
+            ENT_NAMES[count][..dot_lens[d]].copy_from_slice(&dots[d][..dot_lens[d]]);
+            ENT_LEN[count] = dot_lens[d];
+            ENT_TYPE[count] = DT_DIR;
+            ENT_SIZE[count] = 0;
+            count += 1;
+        }
+        for i in 0..rest_n {
+            ENT_NAMES[count][..rest_len[i]].copy_from_slice(&rest[i][..rest_len[i]]);
+            ENT_LEN[count] = rest_len[i];
+            ENT_TYPE[count] = rest_typ[i];
+            ENT_SIZE[count] = 0;
+            count += 1;
+        }
+        ENT_COUNT = count;
+        // 取大小。
+        for i in 0..ENT_COUNT {
+            let nm = &ENT_NAMES[i][..ENT_LEN[i]];
+            if nm == b".." || nm == b"." {
+                continue;
+            }
+            let mut full = [0u8; MAX_PATH];
+            let fl = join_into(path, nm, &mut full);
+            if fl == 0 {
+                continue;
+            }
+            let (t, sz) = stat_path(&full[..fl]);
+            ENT_TYPE[i] = t;
+            ENT_SIZE[i] = sz;
+        }
+        if SEL_IDX >= ENT_COUNT {
+            SEL_IDX = usize::MAX;
         }
     }
 }
 
-// ==================== 绘制原语 ====================
+// ==================== 复制 / 移动（子进程执行 + 进度文件） ====================
 
-fn put_pixel(x: i32, y: i32, color: u32) {
-    if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+/// 目录递归总字节数（预统计，供进度条）。
+unsafe fn dir_total(dir: &[u8], depth: usize) -> u64 {
+    if depth > 10 {
+        return 0;
+    }
+    let fd = open_path(dir, O_RDONLY);
+    if fd < 0 {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut raw = [0u8; 2048];
+    loop {
+        let n = syscall3(SYS_GETDENTS64, fd as usize, raw.as_mut_ptr() as usize, raw.len());
+        if n as isize <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off + 19 <= n as usize {
+            let reclen = u16::from_le_bytes([raw[off + 16], raw[off + 17]]) as usize;
+            if reclen < 19 || off + reclen > n as usize {
+                break;
+            }
+            let dtyp = raw[off + 18];
+            let name = &raw[off + 19..off + reclen];
+            let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            if elen > 0 && name[0] != b'.' {
+                let mut child = [0u8; MAX_PATH];
+                let cl = join_into(dir, &name[..elen], &mut child);
+                if cl > 0 {
+                    if dtyp == DT_DIR {
+                        total += dir_total(&child[..cl], depth + 1);
+                    } else {
+                        total += stat_path(&child[..cl]).1;
+                    }
+                }
+            }
+            off += reclen;
+        }
+    }
+    syscall1(SYS_CLOSE, fd as usize);
+    total
+}
+
+/// 写进度文件："<stage> <done> <total>"。
+unsafe fn write_progress(stage: u8, done: u64, total: u64) {
+    let fd = syscall3(
+        SYS_OPENAT,
+        AT_FDCWD,
+        CP_STATE.as_ptr() as usize,
+        2 | 0x40 | 0x200, // O_RDWR | O_CREAT | O_TRUNC
+    ) as isize;
+    if fd < 0 {
         return;
     }
-    unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] = color; }
+    let mut line = [0u8; 48];
+    let mut n = 0usize;
+    line[n] = b'0' + stage;
+    n += 1;
+    line[n] = b' ';
+    n += 1;
+    n = push_u64(&mut line, n, done);
+    line[n] = b' ';
+    n += 1;
+    n = push_u64(&mut line, n, total);
+    line[n] = b'\n';
+    n += 1;
+    syscall3(SYS_WRITE, fd as usize, line.as_ptr() as usize, n);
+    syscall1(SYS_CLOSE, fd as usize);
 }
 
-fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
-    for dy in 0..h {
-        for dx in 0..w {
-            put_pixel(x + dx, y + dy, color);
-        }
-    }
-}
-
-fn fill_screen(color: u32) {
-    for y in 0..DISPLAY_H as i32 {
-        for x in 0..DISPLAY_W as i32 {
-            put_pixel(x, y, color);
-        }
-    }
-}
-
-fn draw_char(x: i32, y: i32, c: u8, color: u32) {
-    if c < 0x20 || c > 0x7E {
-        return; // 控制字符 / 非 ASCII 不画（由 CJK 路径处理）
-    }
-    let glyph = FONT8X8[(c - 0x20) as usize];
-    for (ry, bits) in glyph.iter().enumerate() {
-        for rx in 0..8 {
-            if bits & (1 << (7 - rx)) != 0 {
-                put_pixel(x + rx as i32, y + ry as i32, color);
-            }
-        }
-    }
-}
-
-/// 绘制 UTF-8 文本：ASCII 用 8x8，CJK 用 16x16 点阵。返回绘制后的 x 位置。
-fn draw_text(x: i32, y: i32, s: &[u8], color: u32) -> i32 {
-    let mut cx = x;
-    let mut i = 0usize;
-    while i < s.len() {
-        let (cp, n) = cjk_font::utf8_next(s, i);
-        if cp >= 0x80 {
-            if let Some(idx) = cjk_font::cjk_index(cp as u16) {
-                for row in 0..cjk_font::CJK_H {
-                    let b0 = cjk_font::CJK_BITMAPS[idx * 32 + row as usize * 2];
-                    let b1 = cjk_font::CJK_BITMAPS[idx * 32 + row as usize * 2 + 1];
-                    for rx in 0..8 {
-                        if b0 & (1 << (7 - rx)) != 0 {
-                            put_pixel(cx + rx, y + row, color);
-                        }
-                        if b1 & (1 << (7 - rx)) != 0 {
-                            put_pixel(cx + 8 + rx, y + row, color);
-                        }
-                    }
-                }
-            }
-            cx += cjk_font::CJK_W;
-        } else {
-            if cp == b'\t' as u32 {
-                cx += 8 * 4;
-            } else if cp != b'\r' as u32 && cp != b'\n' as u32 {
-                draw_char(cx, y, cp as u8, color);
-                cx += 8;
-            }
-        }
-        i += n;
-    }
-    cx
-}
-
-fn draw_cursor() {
-    unsafe {
-        let (cx, cy) = (CUR_X, CUR_Y);
-        for (ry, bits) in CURSOR_BITS.iter().enumerate() {
-            for rx in 0..9 {
-                if bits & (1 << (8 - rx)) != 0 {
-                    put_pixel(cx + rx as i32, cy + ry as i32, 0xFF_00_00_00);
-                }
-            }
-        }
-        for (ry, bits) in CURSOR_BITS.iter().enumerate() {
-            for rx in 0..9 {
-                if bits & (1 << (8 - rx)) != 0 {
-                    put_pixel(cx + rx as i32 + 1, cy + ry as i32 + 1, 0xFF_FF_FF_FF);
-                }
-            }
-        }
-    }
-}
-
-// ==================== 渲染 ====================
-
-/// 标题栏：返回按钮 + 应用名 + 当前路径。
-fn render_title() {
-    unsafe {
-        fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_TITLE);
-        // 返回按钮
-        fill_rect(4, 4, 36, TITLE_H - 8, C_BACK);
-        draw_text(12, 10, b"<", C_TEXT);
-        draw_text(48, 10, "文件管理器".as_bytes(), C_TEXT);
-        // 路径（右侧，截断显示）
-        let mut plen = 0usize;
-        while plen < CWD.len() && CWD[plen] != 0 {
-            plen += 1;
-        }
-        if plen > 0 {
-            let p = &CWD[..plen];
-            // 计算宽度，超宽从右侧截断
-            let maxw = DISPLAY_W as i32 - 48 - 170;
-            let mut w = 0i32;
-            let mut cut = plen;
-            for i in (0..plen).rev() {
-                let (cp, n) = cjk_font::utf8_next(p, i);
-                let cw = if cp >= 0x80 { cjk_font::CJK_W } else { 8 };
-                if w + cw > maxw {
-                    cut = i + n;
-                    break;
-                }
-                w += cw;
-            }
-            if cut < plen {
-                draw_text(DISPLAY_W as i32 - 8 - w, 12, b"...", C_DIM);
-            }
-            draw_text(DISPLAY_W as i32 - 8 - w, 12, &p[cut..], C_DIM);
-        }
-    }
-}
-
-fn format_size(v: u32, out: &mut [u8]) -> usize {
-    // 输出形如 " 12KB" / " 3MB" / " 512B"
-    let mut off = 0usize;
-    out[off] = b' ';
-    off += 1;
-    let mut tmp = [0u8; 8];
+fn push_u64(buf: &mut [u8], mut n: usize, mut v: u64) -> usize {
+    let mut tmp = [0u8; 20];
     let mut i = tmp.len();
-    let mut n = v;
-    if n >= 1024 * 1024 {
-        n /= 1024 * 1024;
-        while n > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-        }
-        let len = tmp.len() - i;
-        out[off..off + len].copy_from_slice(&tmp[i..]);
-        off += len;
-        out[off] = b'M';
-        out[off + 1] = b'B';
-        off + 2
-    } else if n >= 1024 {
-        n /= 1024;
-        while n > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-        }
-        let len = tmp.len() - i;
-        out[off..off + len].copy_from_slice(&tmp[i..]);
-        off += len;
-        out[off] = b'K';
-        out[off + 1] = b'B';
-        off + 2
-    } else {
-        // 0 字节显示 "0B"
-        if n == 0 {
-            tmp[tmp.len() - 1] = b'0';
-            i = tmp.len() - 1;
-        } else {
-            while n > 0 {
-                i -= 1;
-                tmp[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-        }
-        let len = tmp.len() - i;
-        out[off..off + len].copy_from_slice(&tmp[i..]);
-        off += len;
-        out[off] = b'B';
-        off + 1
+    if v == 0 {
+        buf[n] = b'0';
+        return n + 1;
     }
+    while v > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    while i < tmp.len() {
+        buf[n] = tmp[i];
+        n += 1;
+        i += 1;
+    }
+    n
 }
 
-fn render_list() {
-    unsafe {
-        // 列表区域背景
-        fill_rect(0, LIST_TOP, DISPLAY_W as i32, DISPLAY_H as i32 - LIST_TOP, C_BG);
-        let rows_visible = ((DISPLAY_H as i32 - LIST_TOP) / ROW_H) as usize;
-        let scroll = LIST_SCROLL.min(ENT_COUNT.saturating_sub(rows_visible));
-        for r in 0..rows_visible {
-            let idx = scroll + r;
-            if idx >= ENT_COUNT {
-                break;
-            }
-            let y = LIST_TOP + r as i32 * ROW_H;
-            fill_rect(0, y, DISPLAY_W as i32, ROW_H - 2, C_ROW);
-            let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
-            // 类型标记
-            let (tag, tag_color, name_color) = match ENT_TYPE[idx] {
-                DT_DIR => (b"D", C_ACCENT, C_TEXT),
-                DT_LNK => (b"L", C_SYM, C_SYM),
-                2 => (b"C", C_BACK, C_TEXT),
-                _ => (b"R", C_DIM, C_TEXT),
-            };
-            draw_char(12, y + (ROW_H - 8) / 2, tag[0], tag_color);
-            // 名称（超宽截断）
-            let namew = DISPLAY_W as i32 - 24 - 100;
-            let mut w = 0i32;
-            let mut cut = ENT_LEN[idx];
-            for i in (0..ENT_LEN[idx]).rev() {
-                let (cp, n) = cjk_font::utf8_next(nm, i);
-                let cw = if cp >= 0x80 { cjk_font::CJK_W } else { 8 };
-                if w + cw > namew {
-                    cut = i + n;
-                    break;
-                }
-                w += cw;
-            }
-            draw_text(28, y + (ROW_H - 8) / 2, &nm[..cut], name_color);
-            if ENT_TYPE[idx] == DT_LNK {
-                draw_text(28 + w, y + (ROW_H - 8) / 2, b" ->", C_SYM);
-            }
-            // 大小（右对齐）
-            if ENT_TYPE[idx] != DT_DIR && ENT_TYPE[idx] != DT_LNK && ENT_TYPE[idx] != 2 {
-                let mut szb = [0u8; 16];
-                let sl = format_size(ENT_SIZE[idx], &mut szb);
-                draw_text(DISPLAY_W as i32 - 12 - cjk_font::text_width(&szb[..sl]), y + (ROW_H - 8) / 2, &szb[..sl], C_DIM);
-            }
-            // 行分隔线
-            fill_rect(0, y + ROW_H - 2, DISPLAY_W as i32, 2, C_ROW_BORDER);
-        }
-        // 底部提示
-        draw_text(12, DISPLAY_H as i32 - 20, "点击进入 / 返回上级".as_bytes(), C_DIM);
-        let mut cnt = [0u8; 32];
-        let mut off = 0usize;
-        for &c in "共 ".as_bytes() {
-            cnt[off] = c;
-            off += 1;
-        }
-        let mut v = ENT_COUNT as u32;
-        let mut tmp = [0u8; 8];
-        let mut i = tmp.len();
-        while v > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-        for &c in &tmp[i..] {
-            cnt[off] = c;
-            off += 1;
-        }
-        for &c in " 项".as_bytes() {
-            cnt[off] = c;
-            off += 1;
-        }
-        draw_text(DISPLAY_W as i32 - 12 - cjk_font::text_width(&cnt[..off]), DISPLAY_H as i32 - 20, &cnt[..off], C_DIM);
-    }
-}
-
-/// 计算查看器可见行数与当前行数。
-fn viewer_lines() -> (usize, usize) {
-    let mut lines = 1usize;
-    unsafe {
-        for i in 0..VIEW_LEN {
-            if VIEW_BUF[i] == b'\n' {
-                lines += 1;
-            }
-        }
-    }
-    let rows = ((DISPLAY_H as i32 - TITLE_H - 24) / 20) as usize;
-    (lines, rows.max(1))
-}
-
-fn render_viewer() {
-    unsafe {
-        fill_rect(0, TITLE_H, DISPLAY_W as i32, DISPLAY_H as i32 - TITLE_H, C_BG);
-        let (total_lines, rows) = viewer_lines();
-        let max_scroll = total_lines.saturating_sub(rows);
-        if VIEW_SCROLL > max_scroll {
-            VIEW_SCROLL = max_scroll;
-        }
-        // 逐行渲染（按 '\n' 切行，跳过 \r）
-        let mut line = 0usize;
-        let mut start = 0usize;
-        let mut y = TITLE_H + 6;
-        let first = VIEW_SCROLL;
-        let last = (VIEW_SCROLL + rows).min(total_lines);
-        let mut idx = 0usize;
-        while idx <= VIEW_LEN {
-            if idx == VIEW_LEN || VIEW_BUF[idx] == b'\n' {
-                if line >= first && line < last {
-                    let mut seg = [0u8; 512];
-                    let mut n = 0usize;
-                    let mut k = start;
-                    while k < idx && n + 1 < seg.len() {
-                        let c = VIEW_BUF[k];
-                        if c != b'\r' {
-                            seg[n] = c;
-                            n += 1;
-                        }
-                        k += 1;
-                    }
-                    draw_text(8, y, &seg[..n], C_TEXT);
-                    y += 20;
-                }
-                line += 1;
-                start = idx + 1;
-                idx += 1;
-            } else {
-                idx += 1;
-            }
-        }
-        // 底部状态：文件路径 + 行数
-        let mut vp = [0u8; 128];
-        let mut vl = 0usize;
-        while vl < VIEW_PATH.len() && VIEW_PATH[vl] != 0 {
-            vp[vl] = VIEW_PATH[vl];
-            vl += 1;
-        }
-        draw_text(8, DISPLAY_H as i32 - 18, &vp[..vl], C_DIM);
-        let mut st = [0u8; 32];
-        let mut off = 0usize;
-        for &c in "第 ".as_bytes() {
-            st[off] = c;
-            off += 1;
-        }
-        let mut tmp = [0u8; 8];
-        let mut i = tmp.len();
-        let mut v = (VIEW_SCROLL + 1) as u32;
-        while v > 0 {
-            i -= 1;
-            tmp[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-        }
-        for &c in &tmp[i..] {
-            st[off] = c;
-            off += 1;
-        }
-        for &c in "/共".as_bytes() {
-            st[off] = c;
-            off += 1;
-        }
-        let mut i2 = tmp.len();
-        let mut v2 = total_lines as u32;
-        while v2 > 0 {
-            i2 -= 1;
-            tmp[i2] = b'0' + (v2 % 10) as u8;
-            v2 /= 10;
-        }
-        for &c in &tmp[i2..] {
-            st[off] = c;
-            off += 1;
-        }
-        for &c in " 行".as_bytes() {
-            st[off] = c;
-            off += 1;
-        }
-        draw_text(DISPLAY_W as i32 - 8 - cjk_font::text_width(&st[..off]), DISPLAY_H as i32 - 18, &st[..off], C_DIM);
-    }
-}
-
-fn render() {
-    unsafe {
-        if VIEW_MODE {
-            render_viewer();
-        } else {
-            render_title();
-            render_list();
-        }
-        draw_cursor();
-    }
-}
-
-// ==================== 输入 ====================
-
-/// 轮询触摸 / 鼠标事件；返回 (点击坐标, 指针是否移动)。
-fn poll_input() -> (Option<(i32, i32)>, bool) {
-    unsafe {
-        if INPUT_FD < 0 {
-            let fd = open(INPUT_PATH, O_RDONLY | O_NONBLOCK);
-            if fd < 0 {
-                return (None, false);
-            }
-            INPUT_FD = fd;
-        }
-        let mut buf = [0u8; 24];
-        let mut click: Option<(i32, i32)> = None;
-        let mut moved = false;
-        loop {
-            let n = syscall3(SYS_READ, INPUT_FD as usize, buf.as_mut_ptr() as usize, buf.len());
-            if n < 24 {
-                break;
-            }
-            let etype = u16::from_le_bytes([buf[16], buf[17]]);
-            let code = u16::from_le_bytes([buf[18], buf[19]]);
-            let value = i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
-            match etype {
-                EV_REL => {
-                    if code == REL_X {
-                        CUR_X = (CUR_X + value).clamp(0, DISPLAY_W as i32 - 1);
-                        moved = true;
-                    } else if code == REL_Y {
-                        CUR_Y = (CUR_Y + value).clamp(0, DISPLAY_H as i32 - 1);
-                        moved = true;
-                    }
-                }
-                EV_ABS => {
-                    if code == ABS_X {
-                        CUR_X = value.clamp(0, DISPLAY_W as i32 - 1);
-                        moved = true;
-                    } else if code == ABS_Y {
-                        CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
-                        moved = true;
-                    }
-                }
-                EV_KEY => {
-                    if code == BTN_TOUCH {
-                        if value == 1 {
-                            TOUCH_DOWN = true;
-                        } else if value == 0 && TOUCH_DOWN {
-                            TOUCH_DOWN = false;
-                            click = Some((CUR_X, CUR_Y));
-                        }
-                    } else if code == BTN_LEFT {
-                        if value == 1 {
-                            MOUSE_DOWN = true;
-                        } else if value == 0 && MOUSE_DOWN {
-                            MOUSE_DOWN = false;
-                            click = Some((CUR_X, CUR_Y));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        (click, moved)
-    }
-}
-
-/// 轮询 /dev/tty（fd 0）：检测 ESC 按键。
-fn poll_key() -> bool {
-    let mut buf = [0u8; 8];
-    let n = unsafe { syscall3(SYS_READ, 0, buf.as_mut_ptr() as usize, buf.len()) };
-    if n <= 0 {
+/// 复制单个文件 src → dst。
+unsafe fn copy_one(src: &[u8], dst: &[u8], counter: &mut u64, last_report: &mut u64) -> bool {
+    let s = open_path(src, O_RDONLY);
+    if s < 0 {
         return false;
     }
-    for i in 0..(n as usize) {
-        if buf[i] == 0x1b {
-            return true;
+    let d = open_path(dst, 1 | 0x40 | 0x200); // O_WRONLY|O_CREAT|O_TRUNC
+    if d < 0 {
+        syscall1(SYS_CLOSE, s as usize);
+        return false;
+    }
+    let mut ok = true;
+    loop {
+        let nr = syscall3(SYS_READ, s as usize, CP_BUF.as_mut_ptr() as usize, CP_BUF.len());
+        if nr as isize <= 0 {
+            break;
+        }
+        let nw = syscall3(SYS_WRITE, d as usize, CP_BUF.as_ptr() as usize, nr);
+        if nw != nr {
+            ok = false;
+            break;
+        }
+        *counter += nr as u64;
+        if counter.wrapping_sub(*last_report) >= 262144 {
+            *last_report = *counter;
+            write_progress(0, *counter, *counter);
         }
     }
-    false
+    syscall1(SYS_CLOSE, s as usize);
+    syscall1(SYS_CLOSE, d as usize);
+    ok
 }
 
-// ==================== 导航 ====================
-
-fn back_hit(x: i32, y: i32) -> bool {
-    x >= 4 && x < 40 && y >= 4 && y < TITLE_H - 4
-}
-
-/// 进入目录 `name`（压栈 + 更新 CWD + 重载列表）。
-fn enter_dir(name: &[u8]) {
-    unsafe {
-        if STACK_DEPTH < PATH_STACK_DEPTH {
-            PATH_STACK[STACK_DEPTH][..].fill(0);
-            let mut plen = 0usize;
-            while plen < CWD.len() && CWD[plen] != 0 {
-                plen += 1;
-            }
-            let n = plen.min(127);
-            PATH_STACK[STACK_DEPTH][..n].copy_from_slice(&CWD[..n]);
-            STACK_DEPTH += 1;
-        }
-        let mut nb = [0u8; 128];
-        if join_path(&CWD[..], name, &mut nb) > 0 {
-            CWD.fill(0);
-            let mut n = 0usize;
-            while n < nb.len() && nb[n] != 0 {
-                CWD[n] = nb[n];
-                n += 1;
-            }
-        }
-        LIST_SCROLL = 0;
+/// 递归复制目录树 src_dir → dst_dir。
+unsafe fn copy_tree(src_dir: &[u8], dst_dir: &[u8], depth: usize, counter: &mut u64, total: u64, last_report: &mut u64) -> bool {
+    if depth > 10 {
+        return false;
     }
-    let cwd = unsafe { &CWD[..] };
-    let cl = unsafe { CWD.iter().position(|&c| c == 0).unwrap_or(CWD.len()) };
-    let s = core::str::from_utf8(&cwd[..cl]).unwrap_or("/");
-    load_dir(s);
+    if mkdir_path(dst_dir) != 0 && stat_path(dst_dir).0 != DT_DIR {
+        return false;
+    }
+    let fd = open_path(src_dir, O_RDONLY);
+    if fd < 0 {
+        return false;
+    }
+    let mut ok = true;
+    let mut raw = [0u8; 2048];
+    loop {
+        if !ok {
+            break;
+        }
+        let n = syscall3(SYS_GETDENTS64, fd as usize, raw.as_mut_ptr() as usize, raw.len());
+        if n as isize <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off + 19 <= n as usize {
+            let reclen = u16::from_le_bytes([raw[off + 16], raw[off + 17]]) as usize;
+            if reclen < 19 || off + reclen > n as usize {
+                break;
+            }
+            let dtyp = raw[off + 18];
+            let name = &raw[off + 19..off + reclen];
+            let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            if elen > 0 && name[0] != b'.' {
+                let mut cs = [0u8; MAX_PATH];
+                let mut cd = [0u8; MAX_PATH];
+                let csl = join_into(src_dir, &name[..elen], &mut cs);
+                let cdl = join_into(dst_dir, &name[..elen], &mut cd);
+                if csl > 0 && cdl > 0 {
+                    if dtyp == DT_DIR {
+                        if !copy_tree(&cs[..csl], &cd[..cdl], depth + 1, counter, total, last_report) {
+                            ok = false;
+                            break;
+                        }
+                    } else if !copy_one(&cs[..csl], &cd[..cdl], counter, last_report) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            off += reclen;
+            if counter.wrapping_sub(*last_report) >= 524288 {
+                *last_report = *counter;
+                write_progress(0, *counter, total);
+            }
+        }
+    }
+    syscall1(SYS_CLOSE, fd as usize);
+    ok
 }
 
-/// 返回上级（栈非空则弹栈，否则直接取父目录）。
-fn go_up() {
+/// 子进程：复制/移动 OP_SRC → OP_DST（OP_DST 为完整目标路径）。
+fn child_run_copy() -> usize {
     unsafe {
-        if STACK_DEPTH > 0 {
-            STACK_DEPTH -= 1;
-            CWD.fill(0);
-            let mut n = 0usize;
-            while n < PATH_STACK[STACK_DEPTH].len() && PATH_STACK[STACK_DEPTH][n] != 0 {
-                CWD[n] = PATH_STACK[STACK_DEPTH][n];
-                n += 1;
-            }
+        let src = &OP_SRC[..OP_SRC_LEN];
+        let dst = &OP_DST[..OP_DST_LEN];
+        let (ty, sz) = stat_path(src);
+        if ty == DT_DIR {
+            let total = dir_total(src, 0);
+            write_progress(0, 0, total);
+            let mut counter = 0u64;
+            let mut last_report = 0u64;
+            copy_tree(src, dst, 0, &mut counter, total, &mut last_report);
         } else {
-            let mut pb = [0u8; 128];
-            let mut plen = 0usize;
-            while plen < CWD.len() && CWD[plen] != 0 {
-                plen += 1;
-            }
-            let n = parent_of(&CWD[..plen], &mut pb);
-            CWD.fill(0);
-            CWD[..n].copy_from_slice(&pb[..n]);
+            write_progress(0, 0, sz);
+            let mut counter = 0u64;
+            let mut last_report = 0u64;
+            copy_one(src, dst, &mut counter, &mut last_report);
         }
-        LIST_SCROLL = 0;
+        write_progress(1, 0, 0);
     }
-    let cwd = unsafe { &CWD[..] };
-    let cl = unsafe { CWD.iter().position(|&c| c == 0).unwrap_or(CWD.len()) };
-    let s = core::str::from_utf8(&cwd[..cl]).unwrap_or("/");
-    load_dir(s);
+    0
 }
 
-/// 打开文件 `path` 到查看器。
-fn open_viewer(path: &str) {
+/// 子进程：移动（跨文件系统回退）= 复制后删除源。
+fn child_run_move() -> usize {
     unsafe {
-        let mut pbuf = [0u8; 160];
-        let n = path.len().min(pbuf.len() - 1);
-        pbuf[..n].copy_from_slice(&path.as_bytes()[..n]);
-        pbuf[n] = 0;
-        let fd = open(path, O_RDONLY);
+        let src = &OP_SRC[..OP_SRC_LEN];
+        let dst = &OP_DST[..OP_DST_LEN];
+        let (ty, sz) = stat_path(src);
+        if ty == DT_DIR {
+            write_progress(2, 0, 0);
+            return 0;
+        }
+        write_progress(0, 0, sz);
+        let mut counter = 0u64;
+        let mut last_report = 0u64;
+        if copy_one(src, dst, &mut counter, &mut last_report) {
+            unlink_path(src);
+            write_progress(1, 0, 0);
+        } else {
+            write_progress(2, 0, 0);
+        }
+    }
+    0
+}
+
+fn fork_child(f: fn() -> usize) -> i32 {
+    unsafe {
+        let pid = syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as isize;
+        if pid == 0 {
+            let _ = f();
+            syscall1(SYS_EXIT, 0);
+            loop {}
+        }
+        pid as i32
+    }
+}
+
+/// 读取进度文件，解析 (stage, done, total)。
+fn read_progress() -> (u8, u64, u64) {
+    unsafe {
+        let fd = syscall3(
+            SYS_OPENAT,
+            AT_FDCWD,
+            CP_STATE.as_ptr() as usize,
+            0, // O_RDONLY
+        ) as isize;
         if fd < 0 {
+            return (0, 0, 0);
+        }
+        let mut buf = [0u8; 48];
+        let n = syscall3(SYS_READ, fd as usize, buf.as_mut_ptr() as usize, buf.len()) as isize;
+        syscall1(SYS_CLOSE, fd as usize);
+        if n < 3 {
+            return (0, 0, 0);
+        }
+        let mut stage = 0u8;
+        let mut i = 0usize;
+        if buf[0].is_ascii_digit() {
+            stage = buf[0] - b'0';
+        }
+        while i < n as usize && buf[i] != b' ' {
+            i += 1;
+        }
+        while i < n as usize && buf[i] == b' ' {
+            i += 1;
+        }
+        let mut done = 0u64;
+        while i < n as usize && buf[i].is_ascii_digit() {
+            done = done * 10 + (buf[i] - b'0') as u64;
+            i += 1;
+        }
+        while i < n as usize && buf[i] == b' ' {
+            i += 1;
+        }
+        let mut total = 0u64;
+        while i < n as usize && buf[i].is_ascii_digit() {
+            total = total * 10 + (buf[i] - b'0') as u64;
+            i += 1;
+        }
+        (stage, done, total)
+    }
+}
+
+// ==================== 关联应用 ====================
+
+/// 取扩展名（最后一个 '.' 之后，小写写进 out，NUL 结尾），返回元组 (out, len)。
+fn ext_of(name: &[u8], out: &mut [u8; 8]) -> usize {
+    let mut dot = 0usize;
+    for (i, &c) in name.iter().enumerate() {
+        if c == b'.' {
+            dot = i + 1;
+        }
+    }
+    let mut n = 0usize;
+    for &c in &name[dot..] {
+        if n + 1 >= out.len() {
+            break;
+        }
+        out[n] = if c >= b'A' && c <= b'Z' { c + 32 } else { c };
+        n += 1;
+    }
+    n
+}
+
+fn ext_eq(ext: &[u8], n: usize, want: &[u8]) -> bool {
+    n == want.len() && &ext[..n] == want
+}
+
+/// 扩展名 → 关联应用；None = 内置文本查看器。
+fn app_for(ext: &[u8], n: usize) -> Option<&'static [u8]> {
+    if ext_eq(ext, n, b"wav")
+        || ext_eq(ext, n, b"mp3")
+        || ext_eq(ext, n, b"ogg")
+        || ext_eq(ext, n, b"flac")
+        || ext_eq(ext, n, b"aac")
+        || ext_eq(ext, n, b"m4a")
+    {
+        Some(b"/bin/music")
+    } else if ext_eq(ext, n, b"jpg")
+        || ext_eq(ext, n, b"jpeg")
+        || ext_eq(ext, n, b"png")
+        || ext_eq(ext, n, b"gif")
+        || ext_eq(ext, n, b"bmp")
+        || ext_eq(ext, n, b"webp")
+    {
+        Some(b"/bin/gallery")
+    } else {
+        None
+    }
+}
+
+/// 打开文件：文本进内置查看器；音/图启动关联应用（fork + execve，等待其退出）。
+fn open_file(full: &[u8], name: &[u8]) {
+    let mut ext = [0u8; 8];
+    let n = ext_of(name, &mut ext);
+    match app_for(&ext, n) {
+        Some(exe) => {
+            let pid = unsafe {
+                static mut A0: [u8; 32] = [0; 32];
+                static mut A1: [u8; MAX_PATH] = [0; MAX_PATH];
+                static mut ARGV: [usize; 3] = [0; 3];
+                let a0 = &mut *core::ptr::addr_of_mut!(A0);
+                let a1 = &mut *core::ptr::addr_of_mut!(A1);
+                let argv = &mut *core::ptr::addr_of_mut!(ARGV);
+                let el = exe.len().min(a0.len() - 1);
+                a0[..el].copy_from_slice(&exe[..el]);
+                a0[el] = 0;
+                let fl = full.len().min(a1.len() - 1);
+                a1[..fl].copy_from_slice(&full[..fl]);
+                a1[fl] = 0;
+                argv[0] = a0.as_ptr() as usize;
+                argv[1] = a1.as_ptr() as usize;
+                argv[2] = 0;
+                let pid = syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as i32;
+                if pid == 0 {
+                    syscall3(SYS_EXECVE, a0.as_ptr() as usize, argv.as_ptr() as usize, 0);
+                    syscall1(SYS_EXIT, 127);
+                    loop {}
+                }
+                pid
+            };
+            if pid > 0 {
+                let mut status = 0i32;
+                unsafe {
+                    syscall4(SYS_WAIT4, pid as usize, &mut status as *mut i32 as usize, 0, 0);
+                }
+                print("[files] 应用已退出\n");
+            }
+            show_error(b"");
+            load_dir(cwd_nul());
+            redraw();
+        }
+        None => {
+            open_viewer(full);
+        }
+    }
+}
+
+// ==================== 查看器 ====================
+
+fn open_viewer(full: &[u8]) {
+    unsafe {
+        let n = full.len().min(VIEW_PATH.len() - 1);
+        VIEW_PATH[..n].copy_from_slice(&full[..n]);
+        VIEW_PATH[n] = 0;
+        let fd = open_path(full, O_RDONLY);
+        if fd < 0 {
+            show_error("无法打开文件".as_bytes());
             return;
         }
         let mut total = 0usize;
@@ -1200,70 +895,1281 @@ fn open_viewer(path: &str) {
         syscall1(SYS_CLOSE, fd as usize);
         VIEW_LEN = total;
         VIEW_SCROLL = 0;
-        VIEW_PATH.fill(0);
-        let m = n.min(VIEW_PATH.len() - 1);
-        VIEW_PATH[..m].copy_from_slice(&pbuf[..m]);
-        VIEW_MODE = true;
+        UI_MODE = MODE_VIEW;
+        VIEW_PATH[n] = 0;
     }
 }
 
-/// 处理浏览模式点击。
-fn handle_browse_click(x: i32, y: i32) -> bool {
-    if back_hit(x, y) {
-        // 返回键：栈非空则回退一级，否则退出应用
-        if unsafe { STACK_DEPTH > 0 } {
-            go_up();
-        } else {
-            return true; // 退出
-        }
-        return false;
-    }
-    if y < LIST_TOP {
-        return false;
-    }
-    let row = ((y - LIST_TOP) / ROW_H) as usize;
-    let rows_visible = ((DISPLAY_H as i32 - LIST_TOP) / ROW_H) as usize;
-    let idx = unsafe { LIST_SCROLL.min(ENT_COUNT.saturating_sub(rows_visible)) } + row;
+/// 查看器行数统计。
+fn viewer_lines() -> (usize, usize) {
+    let mut lines = 1usize;
     unsafe {
+        for i in 0..VIEW_LEN {
+            if VIEW_BUF[i] == b'\n' {
+                lines += 1;
+            }
+        }
+    }
+    let rows = ((NAV_Y - TITLE_H - 24) / 20) as usize;
+    (lines, rows.max(1))
+}
+
+// ==================== 绘制 ====================
+
+fn fill_screen(color: u32) {
+    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, color);
+}
+
+/// 尺寸格式化："512B" / "3KB" / "1.2MB" / "4.5GB"，返回长度。
+fn fmt_size(v: u64, out: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    let gb = 1024u64 * 1024 * 1024;
+    let mb = 1024 * 1024;
+    let kb = 1024;
+    if v >= gb {
+        let w = (v * 10 / gb) as u32;
+        // 整数部分逐位写出：原实现假设只有一位数字 —— 512GB 卷的 w/10=512
+        // 经 `as u8` 截断为 0（显示成「0.0GB」），≥100 单位还会产出非 ASCII
+        // 字节喂给文本渲染器
+        n = push_dec_u32(out, n, w / 10);
+        out[n] = b'.';
+        n += 1;
+        out[n] = b'0' + (w % 10) as u8;
+        n += 1;
+        out[n] = b'G';
+        out[n + 1] = b'B';
+        n += 2;
+    } else if v >= mb {
+        let w = (v * 10 / mb) as u32;
+        n = push_dec_u32(out, n, w / 10);
+        out[n] = b'.';
+        n += 1;
+        out[n] = b'0' + (w % 10) as u8;
+        n += 1;
+        out[n] = b'M';
+        out[n + 1] = b'B';
+        n += 2;
+    } else if v >= kb {
+        let w = (v / kb) as u32;
+        n = push_dec_u32(out, n, w);
+        out[n] = b'K';
+        out[n + 1] = b'B';
+        n += 2;
+    } else {
+        n = push_dec_u32(out, n, v as u32);
+        out[n] = b'B';
+        n += 1;
+    }
+    n
+}
+
+fn push_dec_u32(out: &mut [u8], mut n: usize, mut v: u32) -> usize {
+    let mut tmp = [0u8; 12];
+    let mut i = tmp.len();
+    if v == 0 {
+        tmp[i - 1] = b'0';
+        i -= 1;
+    } else {
+        while v > 0 {
+            i -= 1;
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    while i < tmp.len() {
+        out[n] = tmp[i];
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+/// 文件夹图标（小）。
+fn draw_folder_icon(x: i32, y: i32, color: u32) {
+    fill_rect(x, y + 1, 6, 3, color);
+    fill_rect(x + 1, y + 3, 18, 13, color);
+    fill_rect(x + 3, y + 4, 14, 10, C_BG);
+}
+
+/// 文件图标（小）。
+fn draw_file_icon(x: i32, y: i32, color: u32) {
+    fill_rect(x + 3, y, 12, 16, color);
+    fill_rect(x + 6, y + 3, 6, 1, C_BG);
+    fill_rect(x + 6, y + 7, 6, 1, C_BG);
+    fill_rect(x + 6, y + 11, 6, 1, C_BG);
+}
+
+/// 视图：图标 + 选中圈。
+fn draw_list() {
+    unsafe {
+        let rows_visible = ((LIST_BOTTOM - LIST_TOP) / ROW_H) as usize;
+        let max_scroll = ENT_COUNT.saturating_sub(rows_visible);
+        if LIST_SCROLL > max_scroll {
+            LIST_SCROLL = max_scroll;
+        }
+        for r in 0..rows_visible {
+            let idx = LIST_SCROLL + r;
+            if idx >= ENT_COUNT {
+                break;
+            }
+            let y = LIST_TOP + r as i32 * ROW_H;
+            draw_glass(8, y + 3, DISPLAY_W as i32 - 16, ROW_H - 6, 12);
+            let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
+            let t = ENT_TYPE[idx];
+            // 图标 + 名称颜色。
+            let (icon_color, name_color) = match t {
+                DT_DIR => (C_FOLDER, if idx == SEL_IDX { C_SEL } else { C_TEXT }),
+                DT_LNK => (C_LINK, if idx == SEL_IDX { C_SEL } else { C_TEXT }),
+                2 | 6 => (C_SEL, C_TEXT),
+                _ => (C_FILE, if idx == SEL_IDX { C_SEL } else { C_TEXT }),
+            };
+            if idx == SEL_IDX {
+                // 选中：左侧高亮条。
+                fill_rect(8, y + 6, 4, ROW_H - 12, C_ACCENT);
+            }
+            if t == DT_DIR {
+                draw_folder_icon(20, y + (ROW_H - 16) / 2, icon_color);
+            } else {
+                draw_file_icon(20, y + (ROW_H - 16) / 2, icon_color);
+            }
+            // 名称。
+            let namew = DISPLAY_W as i32 - 24 - 96;
+            let mut w = 0i32;
+            let mut cut = ENT_LEN[idx];
+            for i in (0..ENT_LEN[idx]).rev() {
+                let (cp, n2) = ttf_text::font_render::utf8_next(nm, i);
+                let cw = if cp >= 0x80 { 16 } else { 8 };
+                if w + cw > namew {
+                    cut = i + n2;
+                    break;
+                }
+                w += cw;
+            }
+            draw_text(48, y + (ROW_H - 8) / 2, &nm[..cut], name_color);
+            if t == DT_LNK {
+                draw_text(48 + w, y + (ROW_H - 8) / 2, b" ->", C_LINK);
+            }
+            // 大小。
+            if t != DT_DIR && t != DT_LNK && t != 2 && t != 6 {
+                let mut szb = [0u8; 16];
+                let sl = fmt_size(ENT_SIZE[idx], &mut szb);
+                draw_text(
+                    DISPLAY_W as i32 - 12 - 54 - text_width(&szb[..sl]),
+                    y + (ROW_H - 8) / 2,
+                    &szb[..sl],
+                    C_DIM,
+                );
+            }
+            // 选中圈（右侧）。
+            let cx = DISPLAY_W as i32 - 34;
+            let cy = y + ROW_H / 2 - 8;
+            draw_circle(cx, cy, 8, if idx == SEL_IDX { C_ACCENT } else { C_DIM });
+            if idx == SEL_IDX {
+                draw_disc(cx, cy, 6, C_ACCENT);
+                // 强调绿圆盘上的选中勾保持白色。
+                fill_rect(cx - 3, cy, 2, 6, C_ON_ACCENT);
+                fill_rect(cx, cy + 1, 2, 4, C_ON_ACCENT);
+            }
+        }
+    }
+}
+
+/// 路径栏：分段 chip，点击跳转。
+fn render_path_bar() {
+    unsafe {
+        let mut plen = cwd_len();
+        if plen == 0 {
+            plen = 1;
+        }
+        let path = &CWD[..plen];
+        // 收集段起点。
+        let mut offs = [0usize; 8];
+        offs[0] = 0; // "/"（根）
+        let mut seg = 1usize;
+        for i in 1..plen {
+            if path[i] == b'/' && i + 1 < plen {
+                offs[seg] = i + 1;
+                seg += 1;
+                if seg >= 8 {
+                    break;
+                }
+            }
+        }
+        let seg_n = seg;
+        let mut x = 10i32;
+        // 段过多时：显示根 + 末尾 6 段。
+        let first = if seg_n > 7 { seg_n - 6 - 1 } else { 0 };
+        let mut seg_i = first;
+        let mut xi = 0usize;
+        while seg_i < seg_n {
+            let start = offs[seg_i];
+            let end = if seg_i + 1 < seg_n {
+                let mut e = offs[seg_i + 1];
+                while path[e - 1] == b'/' {
+                    e -= 1;
+                }
+                e
+            } else {
+                plen
+            };
+            let comp = &path[start..end];
+            let label: &[u8] = if seg_i == 0 {
+                b"/"
+            } else if first > 0 && seg_i == first {
+                b".."
+            } else {
+                comp
+            };
+            let w = text_width(label) + 14;
+            let mut tw = if seg_i == 0 {
+                w.max(26)
+            } else {
+                w
+            };
+            if x + tw > DISPLAY_W as i32 - 10 {
+                tw = (DISPLAY_W as i32 - 10 - x).max(16);
+                if tw < w {
+                    // 截断：省略尾部。
+                    let _ = tw;
+                    SEG_X[xi] = x as usize;
+                    SEG_W[xi] = 16;
+                    SEG_OFF[xi] = start;
+                    draw_glass(x, PATH_BAR_Y + 2, 16, PATH_BAR_H - 4, 8);
+                    draw_text(x, PATH_BAR_Y + 6, b"..", C_DIM);
+                    xi += 1;
+                    break;
+                }
+            }
+            let is_cur = seg_i == seg_n - 1;
+            if is_cur {
+                draw_glass_style(x, PATH_BAR_Y + 2, tw, PATH_BAR_H - 4, 8, &STYLE_ACCENT);
+            } else {
+                draw_glass(x, PATH_BAR_Y + 2, tw, PATH_BAR_H - 4, 8);
+            }
+            draw_text(
+                x + 7,
+                PATH_BAR_Y + 6,
+                label,
+                if is_cur { C_ON_ACCENT } else { C_DIM },
+            );
+            SEG_X[xi] = x as usize;
+            SEG_W[xi] = tw as usize;
+            SEG_OFF[xi] = start;
+            xi += 1;
+            x += tw + 10;
+            seg_i += 1;
+        }
+        SEG_N = xi;
+        // 右端提示：当前路径太长时省略。
+        if x >= DISPLAY_W as i32 - 40 {
+            // 已截断处理。
+        }
+    }
+}
+
+/// 路径栏命中：返回要跳转到的目录（NUL 结尾于 OP_DST），None 无命中。
+fn path_bar_hit(tx: i32) -> Option<usize> {
+    unsafe {
+        let mut target = [0u8; 128];
+        for i in 0..SEG_N {
+            let sx = SEG_X[i] as i32;
+            let sw = SEG_W[i] as i32;
+            if tx >= sx && tx < sx + sw {
+                let off = SEG_OFF[i];
+                // 跳转到 CWD[..off]（不含末尾 /）。
+                let mut n = 0usize;
+                for &c in CWD.iter().take(off) {
+                    target[n] = c;
+                    n += 1;
+                    if n + 1 >= target.len() {
+                        break;
+                    }
+                }
+                while n > 1 && target[n - 1] == b'/' {
+                    n -= 1;
+                }
+                if n == 0 {
+                    target[0] = b'/';
+                    n = 1;
+                }
+                target[n] = 0;
+                CWD.fill(0);
+                CWD[..n].copy_from_slice(&target[..n]);
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// 存储条：总 / 已用 / 剩余 + 使用率条。
+fn render_storage() {
+    let (total, free) = statfs_bytes(cwd_nul());
+    let used = total.saturating_sub(free);
+    // 96 字节：固定文案 26B + 三段 fmt_size（每段最长 "1023.9MB" 8B），
+    // 48B 在 GB 级卷（如 1GB 盘 used/free 各 "1023.9MB"）会越界 panic。
+    let mut line = [0u8; 96];
+    let mut n = 0usize;
+    for &c in "存储 ".as_bytes() {
+        line[n] = c;
+        n += 1;
+    }
+    n = push_fmt(&mut line, n, used);
+    line[n] = b' ';
+    n += 1;
+    line[n] = b'/';
+    n += 1;
+    line[n] = b' ';
+    n += 1;
+    n = push_fmt(&mut line, n, total);
+    line[n] = b' ';
+    n += 1;
+    for &c in "已用".as_bytes() {
+        line[n] = c;
+        n += 1;
+    }
+    for &c in " · 剩".as_bytes() {
+        line[n] = c;
+        n += 1;
+    }
+    for &c in "余 ".as_bytes() {
+        line[n] = c;
+        n += 1;
+    }
+    n = push_fmt(&mut line, n, free);
+    draw_text(12, STORE_Y, &line[..n], C_DIM);
+    // 使用率条。
+    let bw = DISPLAY_W as i32 - 24 - 8 * text_width("剩余 ".as_bytes()) - 100;
+    let bw = bw.max(120);
+    let bar_x = DISPLAY_W as i32 - 12 - bw;
+    let frac = if total > 0 {
+        ((used as u64 * bw as u64 / total as u64) as i32).min(bw)
+    } else {
+        0
+    };
+    draw_glass(bar_x, STORE_Y + 6, bw, 10, 5);
+    if frac > 0 {
+        fill_rect(bar_x + 2, STORE_Y + 8, frac - 2, 6, C_ACCENT);
+    }
+}
+
+fn push_fmt(out: &mut [u8], n: usize, v: u64) -> usize {
+    let mut tmp = [0u8; 16];
+    let l = fmt_size(v, &mut tmp);
+    // 有界追加：n 越界时截断而不是越界写（fmt_size 输出最长 14B）。
+    if n >= out.len() {
+        return n;
+    }
+    let l = l.min(out.len() - n);
+    out[n..n + l].copy_from_slice(&tmp[..l]);
+    n + l
+}
+
+/// 底部工具栏（5 个按钮；剪贴板挂起时前两格变 粘贴/取消）。
+fn render_toolbar() {
+    unsafe {
+        let pending = CLIP_OP != CLIP_NONE;
+        let labels: [&[u8]; 5] = if pending {
+            ["粘贴".as_bytes(), "取消".as_bytes(), "新建".as_bytes(), "复制".as_bytes(), "移动".as_bytes()]
+        } else {
+            ["新建".as_bytes(), "复制".as_bytes(), "移动".as_bytes(), "重命名".as_bytes(), "删除".as_bytes()]
+        };
+        let gap = 8i32;
+        let n = 5i32;
+        let sw = (DISPLAY_W as i32 - 16 - gap * (n - 1)) / n;
+        for i in 0..5i32 {
+            let x = 8 + i * (sw + gap);
+            let accent = (pending && i == 0) || (!pending && i == 0);
+            let danger = !pending && i == 4;
+            if danger {
+                draw_glass_style(x, TOOL_Y, sw, TOOL_H - 6, 12, &STYLE_DANGER);
+            } else if accent {
+                draw_glass_style(x, TOOL_Y, sw, TOOL_H - 6, 12, &STYLE_ACCENT);
+            } else {
+                draw_glass(x, TOOL_Y, sw, TOOL_H - 6, 12);
+            }
+            let w = text_width(labels[i as usize]);
+            // 彩色玻璃（强调绿/危险红）上保持白字，浅玻璃上用深色文字。
+            let tc = if danger || accent { C_ON_ACCENT } else { C_TEXT };
+            draw_text(x + (sw - w) / 2, TOOL_Y + (TOOL_H - 6 - 20) / 2, labels[i as usize], tc);
+        }
+        // 剪贴板状态提示。
+        if pending {
+            let mut hint = [0u8; 96];
+            let mut n2 = 0usize;
+            for &c in (if CLIP_OP == CLIP_COPY { "已复制：" } else { "已剪切：" }).as_bytes() {
+                hint[n2] = c;
+                n2 += 1;
+            }
+            for &c in &CLIP_NAME[..CLIP_NAME_LEN] {
+                hint[n2] = c;
+                n2 += 1;
+            }
+            for &c in " → 去目标目录点粘贴".as_bytes() {
+                hint[n2] = c;
+                n2 += 1;
+            }
+            draw_text(12, TOOL_Y - 20, &hint[..n2], C_SEL);
+        } else {
+            draw_text(12, TOOL_Y - 20, "点右侧圆点选择项目".as_bytes(), C_DIM);
+        }
+    }
+}
+
+fn draw_browse() {
+    let dark = glass_dark();
+    draw_gradient_bg(C_BG, dark);
+    draw_title_bar("文件管理器".as_bytes());
+    render_path_bar();
+    render_storage();
+    draw_list();
+    render_toolbar();
+    draw_sys_nav();
+}
+
+fn draw_viewer() {
+    unsafe {
+        let dark = glass_dark();
+        draw_gradient_bg(C_BG, dark);
+        draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+        draw_glass(4, 4, 36, TITLE_H - 8, 10);
+        draw_text(12, 10, b"<", C_TEXT);
+        draw_text(48, 10, "查看文件".as_bytes(), C_TEXT);
+        let (total_lines, rows) = viewer_lines();
+        let max_scroll = total_lines.saturating_sub(rows);
+        if VIEW_SCROLL > max_scroll {
+            VIEW_SCROLL = max_scroll;
+        }
+        let mut line = 0usize;
+        let mut start = 0usize;
+        let mut y = TITLE_H + 6;
+        let first = VIEW_SCROLL;
+        let last = (VIEW_SCROLL + rows).min(total_lines);
+        let mut idx = 0usize;
+        while idx <= VIEW_LEN {
+            if idx == VIEW_LEN || VIEW_BUF[idx] == b'\n' {
+                if line >= first && line < last {
+                    let mut seg = [0u8; 512];
+                    let mut k = 0usize;
+                    let mut kk = start;
+                    while kk < idx && k + 1 < seg.len() {
+                        let c = VIEW_BUF[kk];
+                        if c != b'\r' {
+                            seg[k] = c;
+                            k += 1;
+                        }
+                        kk += 1;
+                    }
+                    draw_text(8, y, &seg[..k], C_TEXT);
+                    y += 20;
+                }
+                line += 1;
+                start = idx + 1;
+                idx += 1;
+            } else {
+                idx += 1;
+            }
+        }
+        // 底部状态。
+        let mut vp = [0u8; MAX_PATH];
+        let mut vl = 0usize;
+        while vl < VIEW_PATH.len() && VIEW_PATH[vl] != 0 {
+            vp[vl] = VIEW_PATH[vl];
+            vl += 1;
+        }
+        draw_text(8, NAV_Y - 18, &vp[..vl], C_DIM);
+        let mut st = [0u8; 32];
+        let mut off = 0usize;
+        for &c in "第 ".as_bytes() {
+            st[off] = c;
+            off += 1;
+        }
+        off = push_dec_u32(&mut st, off, (VIEW_SCROLL + 1) as u32);
+        for &c in "/共".as_bytes() {
+            st[off] = c;
+            off += 1;
+        }
+        off = push_dec_u32(&mut st, off, total_lines as u32);
+        for &c in " 行".as_bytes() {
+            st[off] = c;
+            off += 1;
+        }
+        draw_text(DISPLAY_W as i32 - 8 - text_width(&st[..off]), NAV_Y - 18, &st[..off], C_DIM);
+        draw_sys_nav();
+    }
+}
+
+fn dim_overlay() {
+    // 半透明遮罩。
+    for y in 0..DISPLAY_H as i32 {
+        for x in 0..DISPLAY_W as i32 {
+            let bg = unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] };
+            let r = ((bg >> 16) & 0xFF) * 96 / 255;
+            let g = ((bg >> 8) & 0xFF) * 96 / 255;
+            let b = (bg & 0xFF) * 96 / 255;
+            put_pixel(x, y, 0x00_00_00_00 | (r << 16) | (g << 8) | b);
+        }
+    }
+}
+
+/// 对话框面板（居中）。
+fn dlg_panel(w: i32, h: i32) -> (i32, i32) {
+    let x = (DISPLAY_W as i32 - w) / 2;
+    let y = (DISPLAY_H as i32 - h) / 2;
+    draw_glass(x, y, w, h, 20);
+    (x, y)
+}
+
+fn draw_input_dialog() {
+    unsafe {
+        dim_overlay();
+        let w = 420i32;
+        let h = 250i32;
+        let (x, y) = dlg_panel(w, h);
+        let title: &[u8] = if INPUT_ACTION == ACT_NEW_FOLDER {
+            "新建文件夹".as_bytes()
+        } else {
+            "重命名".as_bytes()
+        };
+        draw_center(y + 16, title, C_TEXT);
+        draw_text(x + 24, y + 60, "名称：".as_bytes(), C_DIM);
+        draw_glass(x + 24, y + 86, w - 48, 40, 10);
+        draw_text(x + 34, y + 98, &INPUT_BUF[..INPUT_LEN], C_TEXT);
+        // 光标。
+        let cw = text_width(&INPUT_BUF[..INPUT_LEN]);
+        fill_rect(x + 34 + cw, y + 98, 2, 16, C_ACCENT);
+        draw_text(x + 24, y + 140, "使用键盘输入名称".as_bytes(), C_DIM);
+        // 取消 / 确定。
+        let bw = 140i32;
+        let bx2 = x + w - 24 - bw;
+        let by = y + h - 52;
+        draw_glass(x + 24, by, bw, 40, 10);
+        draw_center_y(x + 24, by, bw, "取消".as_bytes(), C_DIM);
+        draw_glass_style(bx2, by, bw, 40, 10, &STYLE_ACCENT);
+        draw_center_y(bx2, by, bw, "确定".as_bytes(), C_ON_ACCENT);
+    }
+}
+
+fn draw_confirm_dialog() {
+    unsafe {
+        dim_overlay();
+        let w = 440i32;
+        let h = 230i32;
+        let (x, y) = dlg_panel(w, h);
+        draw_center(y + 18, "确认删除".as_bytes(), C_TEXT);
+        let mut msg = [0u8; 96];
+        let mut n = 0usize;
+        for &c in "将删除：".as_bytes() {
+            msg[n] = c;
+            n += 1;
+        }
+        let plen = nul_len(&CONFIRM_PATH);
+        let mut off = 0usize;
+        while off < plen {
+            let (_, step) = ttf_text::font_render::utf8_next(&CONFIRM_PATH[..plen], off);
+            off += step;
+        }
+        let name_start = CONFIRM_PATH[..plen]
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // 显示短名。
+        let nm = &CONFIRM_PATH[name_start..plen];
+        for &c in nm.iter().take(24) {
+            msg[n] = c;
+            n += 1;
+        }
+        draw_center(y + 56, &msg[..n], C_TEXT);
+        draw_center(y + 86, "此操作不可恢复".as_bytes(), C_DIM);
+        let bw = 140i32;
+        let by = y + h - 56;
+        draw_glass(x + 24, by, bw, 40, 10);
+        draw_center_y(x + 24, by, bw, "取消".as_bytes(), C_DIM);
+        draw_glass_style(x + w - 24 - bw, by, bw, 40, 10, &STYLE_DANGER);
+        draw_center_y(x + w - 24 - bw, by, bw, "删除".as_bytes(), C_ON_ACCENT);
+    }
+}
+
+fn draw_center_y(x: i32, y: i32, w: i32, s: &[u8], color: u32) {
+    let tw = text_width(s);
+    draw_text(x + (w - tw) / 2, y + (40 - 20) / 2, s, color);
+}
+
+fn draw_progress_dialog() {
+    unsafe {
+        dim_overlay();
+        let w = 440i32;
+        let h = 260i32;
+        let (x, y) = dlg_panel(w, h);
+        let (stage, done, total) = read_progress();
+        let label: &[u8] = match PROG_KIND {
+            PROG_MOVE => "正在移动".as_bytes(),
+            _ => "正在复制".as_bytes(),
+        };
+        draw_center(y + 18, label, C_TEXT);
+        // 文件名。
+        let mut nm = [0u8; 48];
+        let mut n = 0usize;
+        for &c in OP_NAME[..OP_NAME_LEN].iter() {
+            nm[n] = c;
+            n += 1;
+        }
+        draw_center(y + 48, &nm[..n], C_DIM);
+        // 进度条。
+        let bw = w - 64;
+        let bx = x + 32;
+        let by = y + 84;
+        draw_glass(bx, by, bw, 16, 8);
+        let frac = if total > 0 && stage == 0 {
+            ((done * bw as u64 / total) as i32).min(bw)
+        } else if stage == 0 {
+            0
+        } else {
+            bw
+        };
+        if frac > 0 {
+            fill_rect(bx + 2, by + 2, frac - 2, 12, C_ACCENT);
+        }
+        if stage == 2 {
+            draw_center(y + 118, "操作失败".as_bytes(), C_DANGER);
+        } else {
+            let mut pct = [0u8; 24];
+            let mut pn = 0usize;
+            pn = push_dec_u32(&mut pct, pn, if total > 0 { (done * 100 / total) as u32 } else { 0 });
+            pct[pn] = b'%';
+            pn += 1;
+            draw_center(y + 118, &pct[..pn], if stage == 1 { C_ACCENT } else { C_TEXT });
+        }
+        // 取消按钮。
+        let bw2 = 140i32;
+        let by2 = y + h - 56;
+        draw_glass(x + w / 2 - bw2 / 2, by2, bw2, 40, 10);
+        draw_center_y(x + w / 2 - bw2 / 2, by2, bw2, "取消".as_bytes(), C_TEXT);
+    }
+}
+
+fn render() {
+    unsafe {
+        match UI_MODE {
+            MODE_VIEW => draw_viewer(),
+            MODE_INPUT => {
+                draw_browse();
+                draw_input_dialog();
+            }
+            MODE_CONFIRM => {
+                draw_browse();
+                draw_confirm_dialog();
+            }
+            MODE_PROGRESS => {
+                draw_browse();
+                draw_progress_dialog();
+            }
+            _ => draw_browse(),
+        }
+    }
+}
+
+fn redraw() {
+    render();
+    flip();
+    cursor_overlay_redraw();
+}
+
+// ==================== 导航 ====================
+
+fn enter_dir(name: &[u8]) {
+    let mut nb = [0u8; 128];
+    unsafe {
+        let cwd = &CWD[..nul_len(&CWD)];
+        if join_into(cwd, name, &mut nb) > 0 && nb[0] != 0 {
+            CWD.fill(0);
+            let mut n = 0usize;
+            while n < nb.len() && nb[n] != 0 {
+                CWD[n] = nb[n];
+                n += 1;
+            }
+        }
+    }
+    load_dir(cwd_nul());
+}
+
+fn go_up() {
+    unsafe {
+        let mut plen = nul_len(&CWD);
+        while plen > 1 && CWD[plen - 1] == b'/' {
+            plen -= 1;
+        }
+        let mut slash = plen;
+        while slash > 1 && CWD[slash - 1] != b'/' {
+            slash -= 1;
+        }
+        if slash <= 1 {
+            CWD.fill(0);
+            CWD[0] = b'/';
+        } else {
+            CWD[slash - 1] = 0;
+        }
+    }
+    load_dir(cwd_nul());
+}
+
+/// 项全路径写入 OP_SRC，返回长度。
+fn sel_full_path(out: &mut [u8; MAX_PATH]) -> usize {
+    unsafe {
+        let idx = SEL_IDX;
+        let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
+        join_into(&CWD[..nul_len(&CWD)], nm, out)
+    }
+}
+
+// ==================== 操作 ====================
+
+/// 输入对话框确认动作。
+fn do_input_action() {
+    unsafe {
+        let name_len = INPUT_LEN;
+        if name_len == 0 {
+            show_error("名称不能为空".as_bytes());
+            return;
+        }
+        match INPUT_ACTION {
+            ACT_NEW_FOLDER => {
+                let mut full = [0u8; MAX_PATH];
+                let fl = join_into(&CWD[..nul_len(&CWD)], &INPUT_BUF[..name_len], &mut full);
+                if fl == 0 {
+                    show_error("路径过长".as_bytes());
+                    return;
+                }
+                if mkdir_path(&full[..fl]) != 0 {
+                    show_error("无法创建（已存在或无权限）".as_bytes());
+                }
+            }
+            ACT_RENAME => {
+                let old = &INPUT_TARG[..INPUT_TARG_LEN];
+                let old_plen = nul_len(old);
+                let old_name_start = old[..old_plen]
+                    .iter()
+                    .rposition(|&c| c == b'/')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let mut new_full = [0u8; MAX_PATH];
+                let nfl = join_into(&old[..old_name_start], &INPUT_BUF[..name_len], &mut new_full);
+                if nfl == 0 {
+                    show_error("路径过长".as_bytes());
+                    return;
+                }
+                if rename_path(&old[..old_plen], &new_full[..nfl]) != 0 {
+                    show_error("重命名失败（同名或受限）".as_bytes());
+                }
+            }
+            _ => {}
+        }
+        UI_MODE = MODE_BROWSE;
+    }
+    load_dir(cwd_nul());
+}
+
+/// 删除确认执行。
+fn do_delete() {
+    unsafe {
+        let path = &CONFIRM_PATH[..CONFIRM_PATH_LEN];
+        let (ty, _) = stat_path(path);
+        if ty == DT_DIR {
+            // 递归删除子项后删除目录（SFS 不支持删目录 → 报错）。
+            let ok = del_tree(path);
+            if !ok {
+                show_error("无法删除文件夹（系统限制）".as_bytes());
+            }
+        } else {
+            if unlink_path(path) != 0 {
+                show_error("无法删除（文件被占用）".as_bytes());
+            }
+        }
+        UI_MODE = MODE_BROWSE;
+    }
+    load_dir(cwd_nul());
+}
+
+/// 递归删除：文件直接删；目录先递归删子项再删自己。
+fn del_tree(path: &[u8]) -> bool {
+    unsafe {
+        let fd = open_path(path, O_RDONLY);
+        if fd < 0 {
+            return unlink_path(path) == 0;
+        }
+        let mut raw = [0u8; 2048];
+        loop {
+            let n = syscall3(SYS_GETDENTS64, fd as usize, raw.as_mut_ptr() as usize, raw.len());
+            if n as isize <= 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off + 19 <= n as usize {
+                let reclen = u16::from_le_bytes([raw[off + 16], raw[off + 17]]) as usize;
+                if reclen < 19 || off + reclen > n as usize {
+                    break;
+                }
+                let name = &raw[off + 19..off + reclen];
+                let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                if elen > 0 && name[0] != b'.' {
+                    let mut child = [0u8; MAX_PATH];
+                    let cl = join_into(path, &name[..elen], &mut child);
+                    if cl > 0 {
+                        del_tree(&child[..cl]);
+                    }
+                }
+                off += reclen;
+            }
+        }
+        syscall1(SYS_CLOSE, fd as usize);
+        unlink_path(path) == 0
+    }
+}
+
+/// 复制/移动剪贴板 → 当前目录。
+fn do_paste() {
+    unsafe {
+        if CLIP_OP == CLIP_NONE {
+            return;
+        }
+        let src = &CLIP_PATH[..CLIP_LEN];
+        let src_plen = nul_len(src);
+        let src_parent_end = src[..src_plen]
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map(|i| i)
+            .unwrap_or(0);
+        let src_name = &src[src_parent_end + 1..src_plen];
+        let cwd = &CWD[..nul_len(&CWD)];
+        let same_dir = cwd == &src[..src_parent_end]
+            || (cwd == b"/" && src_parent_end == 0);
+
+        if CLIP_OP == CLIP_MOVE {
+            if same_dir {
+                show_error("目标与来源相同".as_bytes());
+                return;
+            }
+            // 先试 rename（同文件系统内任意位置移动）。
+            let mut dest = [0u8; MAX_PATH];
+            let dl = join_into(cwd, src_name, &mut dest);
+            if dl == 0 {
+                show_error("路径过长".as_bytes());
+                return;
+            }
+            if rename_path(&src[..src_plen], &dest[..dl]) == 0 {
+                CLIP_OP = CLIP_NONE;
+                show_error(b"");
+                return;
+            }
+            // 跨文件系统：仅文件可复制后删除。
+            let (ty, _) = stat_path(&src[..src_plen]);
+            if ty == DT_DIR {
+                show_error("无法跨区移动文件夹".as_bytes());
+                return;
+            }
+            spawn_bg(PROG_MOVE, &src[..src_plen], &dest[..dl], src_name);
+        } else {
+            // 复制：目的名自动去重。
+            let mut dest_name = [0u8; MAX_NAME];
+            let mut dn = 0usize;
+            for &c in src_name.iter() {
+                if dn + 1 >= MAX_NAME {
+                    break;
+                }
+                dest_name[dn] = c;
+                dn += 1;
+            }
+            // 去重。
+            let mut cand = [0u8; MAX_NAME];
+            let mut cn = 0usize;
+            for &c in dest_name[..dn].iter() {
+                cand[cn] = c;
+                cn += 1;
+            }
+            let stem_end = cand[..cn]
+                .iter()
+                .rposition(|&c| c == b'.')
+                .unwrap_or(cn);
+            let mut attempt = 0usize;
+            let mut dnm = [0u8; MAX_NAME];
+            let mut dnl;
+            loop {
+                dnm.fill(0);
+                dnl = 0usize;
+                for &c in cand[..stem_end].iter() {
+                    dnm[dnl] = c;
+                    dnl += 1;
+                }
+                for &c in "_copy".as_bytes() {
+                    if dnl + 1 < MAX_NAME {
+                        dnm[dnl] = c;
+                        dnl += 1;
+                    }
+                }
+                if attempt > 0 {
+                    let mut tmp = [0u8; 12];
+                    let mut ti = tmp.len();
+                    let mut v = (attempt + 1) as u32;
+                    while v > 0 {
+                        ti -= 1;
+                        tmp[ti] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                    }
+                    while ti < tmp.len() {
+                        if dnl + 1 < MAX_NAME {
+                            dnm[dnl] = tmp[ti];
+                            dnl += 1;
+                        }
+                        ti += 1;
+                    }
+                }
+                for &c in cand[stem_end..cn].iter() {
+                    if dnl + 1 < MAX_NAME {
+                        dnm[dnl] = c;
+                        dnl += 1;
+                    }
+                }
+                let mut probe = [0u8; MAX_PATH];
+                if join_into(cwd, &dnm[..dnl], &mut probe) > 0 && stat_path(&probe[..nul_len(&probe)]).0 == 0 {
+                    break;
+                }
+                attempt += 1;
+                if attempt > 64 {
+                    show_error("无法生成唯一名称".as_bytes());
+                    return;
+                }
+            }
+            let mut dest = [0u8; MAX_PATH];
+            let dl = join_into(cwd, &dnm[..dnl], &mut dest);
+            if dl == 0 {
+                show_error("路径过长".as_bytes());
+                return;
+            }
+            let (ty, sz) = stat_path(&src[..src_plen]);
+            // 小文件（≤ 64KB）同步复制；目录或大文件走后端子进程。
+            if ty != DT_DIR && sz <= 65536 {
+                let mut counter = 0u64;
+                let mut last_report = 0u64;
+                if !copy_one(&src[..src_plen], &dest[..dl], &mut counter, &mut last_report) {
+                    show_error("复制失败".as_bytes());
+                }
+                CLIP_OP = CLIP_NONE;
+                show_error(b"");
+                load_dir(cwd_nul());
+                redraw();
+                return;
+            }
+            spawn_bg(PROG_COPY, &src[..src_plen], &dest[..dl], src_name);
+        }
+    }
+}
+
+/// 启动后台子进程执行复制/移动，进入进度模式。
+fn spawn_bg(kind: u8, src: &[u8], dst: &[u8], name: &[u8]) {
+    unsafe {
+        OP_SRC.fill(0);
+        OP_DST.fill(0);
+        OP_NAME.fill(0);
+        OP_SRC_LEN = src.len().min(MAX_PATH - 1);
+        OP_SRC[..OP_SRC_LEN].copy_from_slice(src);
+        OP_SRC[OP_SRC_LEN] = 0;
+        OP_DST_LEN = dst.len().min(MAX_PATH - 1);
+        OP_DST[..OP_DST_LEN].copy_from_slice(dst);
+        OP_DST[OP_DST_LEN] = 0;
+        OP_NAME_LEN = name.len().min(MAX_NAME);
+        OP_NAME[..OP_NAME_LEN].copy_from_slice(&name[..OP_NAME_LEN]);
+        PROG_KIND = kind;
+        let run: fn() -> usize = if kind == PROG_MOVE {
+            child_run_move
+        } else {
+            child_run_copy
+        };
+        let pid = fork_child(run);
+        if pid <= 0 {
+            show_error("无法启动后台任务".as_bytes());
+            return;
+        }
+        PROG_PID = pid;
+        PROG_START_US = now_us();
+        UI_MODE = MODE_PROGRESS;
+        redraw();
+    }
+}
+
+/// 刷新进度模式：轮询进度文件，结束则回收子进程并返回。
+fn progress_tick() {
+    unsafe {
+        // 看门狗：后台任务超时（120s 无进展）自动取消，防止永久卡死。
+        if now_us().saturating_sub(PROG_START_US) > 120_000_000 {
+            progress_cancel();
+            return;
+        }
+        let (stage, _done, _total) = read_progress();
+        if stage == 1 || stage == 2 {
+            // 等待子进程退出。
+            let mut status = 0i32;
+            syscall4(SYS_WAIT4, PROG_PID as usize, &mut status as *mut i32 as usize, 0, 0);
+            PROG_PID = -1;
+            UI_MODE = MODE_BROWSE;
+            if stage == 2 {
+                show_error("操作失败".as_bytes());
+            } else {
+                show_error(b"");
+            }
+            CLIP_OP = CLIP_NONE;
+            load_dir(cwd_nul());
+            redraw();
+        }
+    }
+}
+
+/// 取消后台任务。
+fn progress_cancel() {
+    unsafe {
+        if PROG_PID > 0 {
+            syscall2(SYS_KILL, PROG_PID as usize, 9);
+            let mut status = 0i32;
+            syscall4(SYS_WAIT4, PROG_PID as usize, &mut status as *mut i32 as usize, 0, 0);
+            PROG_PID = -1;
+        }
+        UI_MODE = MODE_BROWSE;
+        CLIP_OP = CLIP_NONE;
+        show_error("已取消（目标可能留有部分内容）".as_bytes());
+        load_dir(cwd_nul());
+        redraw();
+    }
+}
+
+// ==================== 点击处理 ====================
+
+/// 工具栏命中：返回操作 id（0=粘贴/新建，1=取消/复制，2=新建/移动，3=复制/重命名，4=移动/删除）。
+fn toolbar_hit(x: i32, y: i32) -> Option<usize> {
+    unsafe {
+        if y < TOOL_Y || y >= TOOL_Y + TOOL_H {
+            return None;
+        }
+        let pending = CLIP_OP != CLIP_NONE;
+        let gap = 8i32;
+        let n = 5i32;
+        let sw = (DISPLAY_W as i32 - 16 - gap * (n - 1)) / n;
+        for i in 0..5i32 {
+            let bx = 8 + i * (sw + gap);
+            if x >= bx && x < bx + sw {
+                let slot = i as usize;
+                let act = if pending {
+                    match slot {
+                        0 => 10, // 粘贴
+                        1 => 11, // 取消剪贴板
+                        2 => 0,  // 新建
+                        3 => 4,  // 复制（设置剪贴板）
+                        4 => 5,  // 移动
+                        _ => 99,
+                    }
+                } else {
+                    match slot {
+                        0 => 0, // 新建
+                        1 => 4, // 复制
+                        2 => 5, // 移动
+                        3 => 6, // 重命名
+                        4 => 7, // 删除
+                        _ => 99,
+                    }
+                };
+                return Some(act);
+            }
+        }
+    }
+    None
+}
+
+/// 选中项存在性检查（"." / ".." / 无选择）。
+fn sel_ok() -> bool {
+    unsafe {
+        if SEL_IDX == usize::MAX || SEL_IDX >= ENT_COUNT {
+            return false;
+        }
+        let nm = &ENT_NAMES[SEL_IDX][..ENT_LEN[SEL_IDX]];
+        nm != b"." && nm != b".."
+    }
+}
+
+fn handle_browse_click(x: i32, y: i32) -> bool {
+    unsafe {
+        // 返回键：根目录退出，否则上级。
+        if back_hit(x, y) {
+            if nul_len(&CWD) > 1 {
+                go_up();
+                redraw();
+                return false;
+            }
+            return true;
+        }
+        // 路径栏跳转。
+        if y >= PATH_BAR_Y && y < PATH_BAR_Y + PATH_BAR_H {
+            if let Some(_) = path_bar_hit(x) {
+                load_dir(cwd_nul());
+                redraw();
+            }
+            return false;
+        }
+        // 工具栏。
+        if y >= TOOL_Y && y < TOOL_Y + TOOL_H {
+            if let Some(act) = toolbar_hit(x, y) {
+                match act {
+                    10 => {
+                        do_paste();
+                        redraw();
+                    }
+                    11 => {
+                        CLIP_OP = CLIP_NONE;
+                        show_error(b"");
+                        redraw();
+                    }
+                    0 => {
+                        INPUT_ACTION = ACT_NEW_FOLDER;
+                        INPUT_BUF.fill(0);
+                        INPUT_LEN = 0;
+                        UI_MODE = MODE_INPUT;
+                        redraw();
+                    }
+                    4 => {
+                        if !sel_ok() {
+                            show_error("请先选择项目".as_bytes());
+                            redraw();
+                            return false;
+                        }
+                        let mut full = [0u8; MAX_PATH];
+                        let fl = sel_full_path(&mut full);
+                        CLIP_OP = CLIP_COPY;
+                        CLIP_LEN = fl;
+                        CLIP_PATH.fill(0);
+                        let mut n = 0usize;
+                        while n < fl && n + 1 < CLIP_PATH.len() {
+                            CLIP_PATH[n] = full[n];
+                            n += 1;
+                        }
+                        CLIP_PATH[n] = 0;
+                        CLIP_NAME_LEN = ENT_LEN[SEL_IDX];
+                        CLIP_NAME[..CLIP_NAME_LEN]
+                            .copy_from_slice(&ENT_NAMES[SEL_IDX][..ENT_LEN[SEL_IDX]]);
+                        show_error(b"");
+                        CLIP_OP = CLIP_COPY; // 保持操作类型（show_error 不动）。
+                        redraw();
+                    }
+                    5 => {
+                        if !sel_ok() {
+                            show_error("请先选择项目".as_bytes());
+                            redraw();
+                            return false;
+                        }
+                        let mut full = [0u8; MAX_PATH];
+                        let fl = sel_full_path(&mut full);
+                        CLIP_OP = CLIP_MOVE;
+                        CLIP_LEN = fl;
+                        CLIP_PATH.fill(0);
+                        let mut n = 0usize;
+                        while n < fl && n + 1 < CLIP_PATH.len() {
+                            CLIP_PATH[n] = full[n];
+                            n += 1;
+                        }
+                        CLIP_PATH[n] = 0;
+                        CLIP_NAME_LEN = ENT_LEN[SEL_IDX];
+                        CLIP_NAME[..CLIP_NAME_LEN]
+                            .copy_from_slice(&ENT_NAMES[SEL_IDX][..ENT_LEN[SEL_IDX]]);
+                        show_error(b"");
+                        CLIP_OP = CLIP_MOVE;
+                        redraw();
+                    }
+                    6 => {
+                        if !sel_ok() {
+                            show_error("请先选择项目".as_bytes());
+                            redraw();
+                            return false;
+                        }
+                        INPUT_ACTION = ACT_RENAME;
+                        INPUT_BUF.fill(0);
+                        let n = ENT_LEN[SEL_IDX];
+                        INPUT_BUF[..n].copy_from_slice(&ENT_NAMES[SEL_IDX][..n]);
+                        INPUT_LEN = n;
+                        INPUT_TARG_LEN = sel_full_path(&mut INPUT_TARG);
+                        UI_MODE = MODE_INPUT;
+                        redraw();
+                    }
+                    7 => {
+                        if !sel_ok() {
+                            show_error("请先选择项目".as_bytes());
+                            redraw();
+                            return false;
+                        }
+                        CONFIRM_ACTION = ACT_DELETE;
+                        CONFIRM_PATH_LEN = sel_full_path(&mut CONFIRM_PATH);
+                        UI_MODE = MODE_CONFIRM;
+                        redraw();
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        // 列表。
+        if y < LIST_TOP || y >= LIST_BOTTOM {
+            return false;
+        }
+        let row = ((y - LIST_TOP) / ROW_H) as usize;
+        let rows_visible = ((LIST_BOTTOM - LIST_TOP) / ROW_H) as usize;
+        let idx = LIST_SCROLL.min(ENT_COUNT.saturating_sub(rows_visible)) + row;
         if idx >= ENT_COUNT {
             return false;
         }
         let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
+        // 右侧选中圈。
+        let cx = DISPLAY_W as i32 - 34;
+        if x >= cx - 12 && x <= cx + 12 {
+            SEL_IDX = if SEL_IDX == idx { usize::MAX } else { idx };
+            redraw();
+            return false;
+        }
         if nm == b"." {
             return false;
         }
         if nm == b".." {
             go_up();
+            redraw();
             return false;
         }
         let t = ENT_TYPE[idx];
         if t == DT_DIR {
             enter_dir(nm);
+            redraw();
             return false;
         }
-        // 普通文件 / 符号链接 / 设备：打开查看器
-        let mut full = [0u8; 160];
-        if join_path(&CWD[..], nm, &mut full) == 0 {
+        // 设备/管道/块设备：打开查看器会阻塞在读上，拒绝并提示。
+        if t != DT_REG && t != DT_LNK {
+            show_error("设备/管道文件无法打开".as_bytes());
+            redraw();
             return false;
         }
-        let fl = full.iter().position(|&c| c == 0).unwrap_or(full.len());
-        let s = core::str::from_utf8(&full[..fl]).unwrap_or("");
-        open_viewer(s);
+        // 文件：文本查看 / 关联应用。
+        let mut full = [0u8; MAX_PATH];
+        let fl = join_into(&CWD[..nul_len(&CWD)], nm, &mut full);
+        if fl > 0 {
+            open_file(&full[..fl], nm);
+        }
+        false
     }
-    false
 }
 
-/// 处理查看模式点击：上半屏上翻页，下半屏下翻页，返回键退出查看器。
-fn handle_viewer_click(x: i32, y: i32) -> bool {
-    if back_hit(x, y) {
-        unsafe { VIEW_MODE = false; }
-        return false;
-    }
-    let (total_lines, rows) = viewer_lines();
-    let max_scroll = total_lines.saturating_sub(rows);
+fn handle_viewer_click(x: i32, y: i32) {
     unsafe {
+        if back_hit(x, y) {
+            UI_MODE = MODE_BROWSE;
+            return;
+        }
+        let (total_lines, rows) = viewer_lines();
+        let max_scroll = total_lines.saturating_sub(rows);
         if y < TITLE_H {
-            return false;
+            return;
         }
         if y < DISPLAY_H as i32 / 2 {
             VIEW_SCROLL = VIEW_SCROLL.saturating_sub(rows / 2);
@@ -1271,74 +2177,237 @@ fn handle_viewer_click(x: i32, y: i32) -> bool {
             VIEW_SCROLL = (VIEW_SCROLL + rows / 2).min(max_scroll);
         }
     }
-    false
+}
+
+fn handle_input_click(x: i32, y: i32) {
+    unsafe {
+        // 对话框按钮：取消 / 确定。
+        let w = 420i32;
+        let h = 250i32;
+        let px = (DISPLAY_W as i32 - w) / 2;
+        let py = (DISPLAY_H as i32 - h) / 2;
+        let bw = 140i32;
+        let by = py + h - 52;
+        if y >= by && y < by + 40 {
+            if x >= px + 24 && x < px + 24 + bw {
+                UI_MODE = MODE_BROWSE;
+                // 取消。
+                redraw();
+                return;
+            }
+            let bx2 = px + w - 24 - bw;
+            if x >= bx2 && x < bx2 + bw {
+                // 确定。
+                do_input_action();
+                redraw();
+                return;
+            }
+        }
+        // 点面板外 = 取消。
+        if x < px || x >= px + w || y < py || y >= py + h {
+            UI_MODE = MODE_BROWSE;
+            redraw();
+        }
+    }
+}
+
+fn handle_confirm_click(x: i32, y: i32) {
+    unsafe {
+        let w = 440i32;
+        let h = 230i32;
+        let px = (DISPLAY_W as i32 - w) / 2;
+        let py = (DISPLAY_H as i32 - h) / 2;
+        let bw = 140i32;
+        let by = py + h - 56;
+        if y >= by && y < by + 40 {
+            if x >= px + 24 && x < px + 24 + bw {
+                UI_MODE = MODE_BROWSE;
+                redraw();
+                return;
+            }
+            let bx2 = px + w - 24 - bw;
+            if x >= bx2 && x < bx2 + bw {
+                do_delete();
+                redraw();
+                return;
+            }
+        }
+        if x < px || x >= px + w || y < py || y >= py + h {
+            UI_MODE = MODE_BROWSE;
+            redraw();
+        }
+    }
+}
+
+fn handle_progress_click(x: i32, y: i32) {
+    unsafe {
+        let w = 440i32;
+        let h = 260i32;
+        let px = (DISPLAY_W as i32 - w) / 2;
+        let py = (DISPLAY_H as i32 - h) / 2;
+        let bw = 140i32;
+        let by2 = py + h - 56;
+        if x >= px + w / 2 - bw / 2 && x < px + w / 2 + bw / 2 && y >= by2 && y < by2 + 40 {
+            progress_cancel();
+        }
+    }
+}
+
+// ==================== 键盘 ====================
+
+/// 输入对话框按键。
+fn handle_input_key(k: KeyAction) {
+    unsafe {
+        match k {
+            KeyAction::Char(c) => {
+                if c >= 0x20 && c < 0x7f && INPUT_LEN + 1 < MAX_NAME {
+                    INPUT_BUF[INPUT_LEN] = c;
+                    INPUT_LEN += 1;
+                    redraw();
+                }
+            }
+            KeyAction::Backspace => {
+                if INPUT_LEN > 0 {
+                    INPUT_LEN -= 1;
+                    redraw();
+                }
+            }
+            KeyAction::Enter => {
+                do_input_action();
+                redraw();
+            }
+            KeyAction::Esc => {
+                UI_MODE = MODE_BROWSE;
+                redraw();
+            }
+            _ => {}
+        }
+    }
 }
 
 // ==================== 主流程 ====================
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[files] starting\n");
+    print("[files] 启动中\n");
 
     if !fb_init() {
-        print("[files] /dev/fb0 mmap failed, no framebuffer\n");
+        print("[files] /dev/fb0 内存映射失败，无帧缓冲\n");
         unsafe { exit(1); }
     }
-    print("[files] framebuffer ");
-    print_dec(unsafe { FB_W } as u32);
-    print("x");
-    print_dec(unsafe { FB_H } as u32);
-    print(" mapped\n");
+    print("[files] 帧缓冲已映射\n");
 
     unsafe { CWD[0] = b'/'; }
-    load_dir("/");
-    render();
-    flip();
-    print("[files] ready\n");
+    load_dir(cwd_nul());
+    redraw();
+    ttf_text::font_init();
+    redraw();
+    print("[files] 就绪\n");
 
     loop {
-        let (click, moved) = poll_input();
-        if moved {
-            render();
-            flip();
+        let ev = poll_input();
+        if ev.moved {
+            cursor_overlay_move();
         }
-        if let Some((x, y)) = click {
-            print("[files] tap (");
-            print_dec(x as u32);
-            print(",");
-            print_dec(y as u32);
-            print(")\n");
-            let exit_app = if unsafe { VIEW_MODE } {
-                handle_viewer_click(x, y)
-            } else {
-                handle_browse_click(x, y)
-            };
+        if ev.nav != NavAction::None {
+            let code = nav_exit_code(ev.nav);
+            if ui_mode_back(ev.nav) {
+                redraw();
+                sleep_ms(16);
+                continue;
+            }
+            unsafe { exit(code); }
+        }
+
+        if unsafe { UI_MODE } == MODE_PROGRESS {
+            progress_tick();
+            if let Some((x, y)) = ev.tap {
+                handle_progress_click(x, y);
+            }
+            match ev.key {
+                KeyAction::Esc => progress_cancel(),
+                _ => {}
+            }
+            redraw();
+            sleep_ms(32);
+            continue;
+        }
+
+        let mut exit_app = false;
+        if let Some((x, y)) = ev.tap {
+            match unsafe { UI_MODE } {
+                MODE_VIEW => handle_viewer_click(x, y),
+                MODE_INPUT => handle_input_click(x, y),
+                MODE_CONFIRM => handle_confirm_click(x, y),
+                _ => exit_app = handle_browse_click(x, y),
+            }
             if exit_app {
-                print("[files] back at root -> exit\n");
                 break;
             }
-            render();
-            flip();
+            redraw();
         }
-        if poll_key() {
-            print("[files] ESC -> back/exit\n");
-            if unsafe { VIEW_MODE } {
-                unsafe { VIEW_MODE = false; }
-                render();
-                flip();
-            } else if unsafe { STACK_DEPTH > 0 } {
-                go_up();
-                render();
-                flip();
-            } else {
-                break;
+        match ev.key {
+            KeyAction::Esc => {
+                match unsafe { UI_MODE } {
+                    MODE_VIEW => {
+                        unsafe { UI_MODE = MODE_BROWSE; }
+                        redraw();
+                    }
+                    MODE_INPUT | MODE_CONFIRM => {
+                        unsafe { UI_MODE = MODE_BROWSE; }
+                        redraw();
+                    }
+                    _ => {
+                        if unsafe { nul_len(&CWD) > 1 } {
+                            go_up();
+                            redraw();
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
+            KeyAction::Enter | KeyAction::Char(_) | KeyAction::Backspace => {
+                if unsafe { UI_MODE } == MODE_INPUT {
+                    handle_input_key(ev.key);
+                }
+            }
+            _ => {}
         }
         sleep_ms(16);
     }
 
-    print("[files] exiting\n");
+    print("[files] 正在退出\n");
     unsafe { exit(0); }
+}
+
+/// 系统 Nav 返回：查看器/对话框逐级退出；浏览则上级目录/退出。
+fn ui_mode_back(nav: NavAction) -> bool {
+    if nav != NavAction::Back {
+        return false;
+    }
+    unsafe {
+        match UI_MODE {
+            MODE_VIEW => {
+                UI_MODE = MODE_BROWSE;
+            }
+            MODE_INPUT | MODE_CONFIRM => {
+                UI_MODE = MODE_BROWSE;
+            }
+            MODE_PROGRESS => {
+                progress_cancel();
+            }
+            _ => {
+                if nul_len(&CWD) > 1 {
+                    go_up();
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+    redraw();
+    true
 }
 
 // ==================== 入口 ====================

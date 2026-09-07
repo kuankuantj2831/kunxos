@@ -6,7 +6,7 @@ use core::arch::asm;
 /// clean+invalidate 数据缓存（`dc civac`），确保内核取指/读数据拿到的是
 /// 设备 DMA 写入后的最新内容（真机加固：KVM/物理硬件上必需，TCG 下无害）。
 ///
-/// # Safety
+/// # 安全
 /// `regions` 必须指向合法可读的 (地址, 长度) 数组。
 unsafe fn cache_maintenance(regions: &[(usize, usize)]) {
     // 指令缓存整条作废（内核代码将由 icache 重新填充）
@@ -35,7 +35,7 @@ unsafe fn cache_maintenance(regions: &[(usize, usize)]) {
 /// `regions` 为已加载镜像的 (地址, 长度) 列表（内核/DTB/ramdisk），跳转前
 /// 对其做缓存维护，保证真机上 CPU 看到的是最新数据。
 ///
-/// # Safety
+/// # 安全
 /// 该函数不返回；调用后 CPU 控制权交给内核。
 pub fn jump_to_kernel(dtb_addr: u64, entry: u64, regions: &[(usize, usize)]) -> ! {
     unsafe {

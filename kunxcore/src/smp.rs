@@ -21,7 +21,7 @@ const MAX_SECONDARY: usize = 3;
 #[no_mangle]
 pub static SECONDARY_STACKS: [u8; STACK_SIZE * MAX_SECONDARY] = [0; STACK_SIZE * MAX_SECONDARY];
 
-/// secondary 汇编入口（global_asm 定义；QEMU loader 把对应核引导至此）。
+// secondary 汇编入口（global_asm 定义；QEMU loader 把对应核引导至此）。
 unsafe extern "C" {
     fn secondary_entry();
 }
@@ -87,12 +87,14 @@ fn psci_cpu_on(cpu: u32, entry: u64) -> u64 {
 pub fn smp_init() {
     let total = cpu_count();
     if total <= 1 {
-        crate::uart_send_str("[smp] cpus=1\n");
+        crate::kinfo! { crate::uart_send_str("[smp] cpus=1\n"); }
         return;
     }
-    crate::uart_send_str("[smp] cpus=");
-    crate::print_dec(total as u64);
-    crate::uart_send_str(" (secondary wake needs PSCI firmware)\n");
+    crate::kinfo! {
+        crate::uart_send_str("[smp] cpus=");
+        crate::print_dec(total as u64);
+        crate::uart_send_str(" (secondary 唤醒需 PSCI 固件)\n");
+    }
     // 在此插入 psci_cpu_on(cpu, secondary_entry) 循环即可在多核环境唤醒
     // secondary；QEMU -kernel 直载模式无 PSCI（见模块注释），故默认不调用。
 }
@@ -103,9 +105,11 @@ pub fn smp_init() {
 /// 接口与虚拟定时器，再进入调度器运行本核 idle 任务。
 #[no_mangle]
 pub extern "C" fn smp_secondary_main(cpu: u32) -> ! {
-    crate::uart_send_str("[smp] cpu");
-    crate::print_dec(cpu as u64);
-    crate::uart_send_str(" waiting for scheduler\n");
+    crate::kinfo! {
+        crate::uart_send_str("[smp] cpu");
+        crate::print_dec(cpu as u64);
+        crate::uart_send_str(" 等待调度器就绪\n");
+    }
 
     // 等待主核就绪（IRQ 此时被 DAIF 屏蔽，纯自旋）
     while !SCHED_READY.load(Ordering::Acquire) {
@@ -121,9 +125,11 @@ pub extern "C" fn smp_secondary_main(cpu: u32) -> ! {
     crate::gic::gic_enable_irq(crate::timer::TIMER_IRQ);
     crate::gic::gic_set_priority(crate::timer::TIMER_IRQ, 0x80);
 
-    crate::uart_send_str("[smp] cpu");
-    crate::print_dec(cpu as u64);
-    crate::uart_send_str(" online\n");
+    crate::kinfo! {
+        crate::uart_send_str("[smp] cpu");
+        crate::print_dec(cpu as u64);
+        crate::uart_send_str(" 已上线\n");
+    }
 
     // 进入调度器（运行本核 idle 任务；此后由 tick 取全局就绪队列任务）
     crate::sched_cfs::start_secondary(cpu);

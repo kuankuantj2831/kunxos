@@ -1,0 +1,35 @@
+//! 系统信任锚与 API 版本定义。
+//!
+//! - `ROOT_ANCHOR`：KunxOS 根 CA 公钥（内嵌）。开发者证书链的顶点由此验证。
+//! - `REPO_ANCHOR`：软件源索引签名密钥公钥（内嵌）。`pkg update` 用它验证
+//!   远程索引 / 增量补丁的 Ed25519 签名。
+//! - `API_LEVEL`：当前系统 API 级别。KunxOS 1.0 = API Level 1。
+//!
+//! 说明：这两把公钥对应 `tools/kunxrepo/keys/` 下 DEMO 密钥的公开部分。
+//! 生产环境下根私钥应离线保管，且公钥随系统镜像发布（不内置私钥）。
+
+use crate::sha512;
+
+/// 根 CA 公钥（Ed25519，32 字节）。
+pub const ROOT_ANCHOR: [u8; 32] = [
+    0xad, 0x1e, 0xec, 0x87, 0x46, 0x3a, 0x7d, 0xf3, 0xdf, 0xdc, 0x79, 0xfb, 0x6d, 0x58, 0x51, 0x7c,
+    0x0f, 0x01, 0x28, 0xef, 0xf1, 0x65, 0x90, 0x79, 0x95, 0x7e, 0xcd, 0x61, 0xda, 0x95, 0x9a, 0x94,
+];
+
+/// 软件源索引签名公钥（Ed25519，32 字节）。
+pub const REPO_ANCHOR: [u8; 32] = [
+    0xd0, 0x02, 0x6e, 0xf7, 0x71, 0x3f, 0x54, 0x24, 0xfc, 0xa6, 0xdc, 0x4a, 0x2a, 0xe0, 0x69, 0xf1,
+    0x79, 0x30, 0xe4, 0xb8, 0x12, 0x6e, 0xa7, 0x52, 0xe1, 0xb6, 0x5e, 0xbd, 0xf6, 0x33, 0xe5, 0x40,
+];
+
+/// KunxOS 系统 API 级别：KunxOS 1.0 = API Level 1。
+pub const API_LEVEL: u32 = 1;
+/// 系统提供的库版本（依赖解析用）。随 API 级别演进。
+pub const SYSTEM_LIBC: &[u8] = b"1.0.0";
+pub const SYSTEM_LIBM: &[u8] = b"1.0.0";
+
+/// 计算公钥指纹（hex，SHA-512 前 8 字节），写入 out，返回长度。
+pub fn fingerprint(pk: &[u8; 32], out: &mut [u8]) -> usize {
+    let d = sha512::sha512(pk);
+    crate::hex::encode(&d[..8], out)
+}

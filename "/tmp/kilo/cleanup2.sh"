@@ -1,0 +1,6 @@
+#!/bin/bash
+cd /home/kuankuantj/桌面/kunxos || exit 1
+find . -maxdepth 1 -name '*filePath*' -exec rm -rf {} + 2>/dev/null
+ls -d ./*filePath* 2>/dev/null
+echo done
+ls docs/terminal.md

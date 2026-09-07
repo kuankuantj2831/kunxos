@@ -9,7 +9,10 @@ qemu = ["kunxhal/qemu"]
 pi4 = ["kunxhal/pi4"]
 
 [dependencies]
+fontdue = "0.9.4"
 kunxhal = { path = "../kunxhal", default-features = false }
+kunxwireless = { path = "../wireless" }
+kunxsec = { path = "../kunxsec" }
 
 # 裸机环境：panic 直接中止，不展开栈（无 unwinding 支持）
 [profile.dev]
@@ -19,3 +22,7 @@ panic = "abort"
 panic = "abort"
 opt-level = 2
 lto = true
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

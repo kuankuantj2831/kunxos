@@ -1,1 +1,3 @@
 file:///var/lib/pkg/repo/main
+file:///var/lib/pkg/repo/bad
+# https://repo.kunxos.example/kunx   # 内核无 TLS，https 源当前会被明确拒绝

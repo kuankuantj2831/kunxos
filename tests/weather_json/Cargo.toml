@@ -1,0 +1,13 @@
+[package]
+name = "weather_json_host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

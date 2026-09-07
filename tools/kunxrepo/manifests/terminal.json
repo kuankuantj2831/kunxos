@@ -1,0 +1,12 @@
+{
+  "name": "terminal",
+  "version": "1.1.0",
+  "api_level": 1,
+  "description": "系统终端模拟器",
+  "author": "KunxOS Team",
+  "main": "bin/terminal",
+  "permissions": ["INTERNET"],
+  "dependencies": {"libc": ">=1.0.0"},
+  "provides": ["term"],
+  "conflicts": []
+}

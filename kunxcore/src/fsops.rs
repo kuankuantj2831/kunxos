@@ -192,6 +192,14 @@ pub fn fs_total_blocks(dev: u32) -> u32 {
     }
 }
 
+/// 块大小（字节）：fs_total_blocks / fs_free_blocks 的计数单位。
+pub fn fs_block_size(dev: u32) -> u32 {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::fs_block_size(dev),
+        FsKind::Fat32 => fat32::fs_block_size(dev),
+    }
+}
+
 /// 类型码。
 pub fn fs_type(dev: u32, ino: u32) -> u16 {
     match kind_of(dev) {
@@ -201,10 +209,10 @@ pub fn fs_type(dev: u32, ino: u32) -> u16 {
 }
 
 /// 文件大小。
-pub fn fs_size(dev: u32, ino: u32) -> u32 {
+pub fn fs_size(dev: u32, ino: u32) -> u64 {
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_size(dev, ino),
-        FsKind::Fat32 => fat32::fs_size(dev, ino),
+        FsKind::Fat32 => fat32::fs_size(dev, ino) as u64,
     }
 }
 
@@ -213,5 +221,21 @@ pub fn fs_rdev(dev: u32, ino: u32) -> u32 {
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_rdev(dev, ino),
         FsKind::Fat32 => fat32::fs_rdev(dev, ino),
+    }
+}
+
+/// fsync：把 `dev` 上未落盘的元数据刷盘并冲刷设备（SFS 检查点；FAT32 no-op）。
+pub fn fs_fsync(dev: u32) -> i32 {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::fs_checkpoint(dev),
+        FsKind::Fat32 => 0,
+    }
+}
+
+/// fsck 语义一致性检查（仅 SFS；FAT32 返回 0 未实现）。
+pub fn fs_check(dev: u32) -> i32 {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::sfs_check(dev),
+        FsKind::Fat32 => 0,
     }
 }

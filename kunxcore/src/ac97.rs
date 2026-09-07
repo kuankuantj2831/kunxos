@@ -173,11 +173,13 @@ pub fn init(fdt: &fdt::Fdt) -> bool {
         build_sine_table();
         READY = true;
     }
-    crate::uart_send_str("[ac97] AC97 audio ready (NAM=");
-    crate::print_hex(unsafe { NAM } as u64);
-    crate::uart_send_str(" NABM=");
-    crate::print_hex(unsafe { NABM } as u64);
-    crate::uart_send_str(")\n");
+    crate::kinfo! {
+        crate::uart_send_str("[ac97] AC97 音频就绪 (NAM=");
+        crate::print_hex(unsafe { NAM } as u64);
+        crate::uart_send_str(" NABM=");
+        crate::print_hex(unsafe { NABM } as u64);
+        crate::uart_send_str(")\n");
+    }
     true
 }
 
@@ -299,7 +301,7 @@ pub fn play_tone(freq: u32, dur_ms: u32) -> i32 {
         free_pages(bd_list, bd_pages);
     }
     if !done {
-        crate::uart_send_str("[ac97] play timeout (device may be missing backend)\n");
+        crate::uart_send_str("[ac97] 播放超时 (设备可能缺少后端)\n");
         return -1;
     }
     0

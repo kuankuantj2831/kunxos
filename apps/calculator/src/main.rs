@@ -17,6 +17,21 @@
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+#[path = "../../../shared/ttf_text.rs"]
+mod ttf_text;
+
+// 共享系统导航（底部导航栏 / 全面屏手势）。
+#[path = "../../../shared/nav.rs"]
+mod sys_nav;
+
+// 共享错误提示状态（横幅绘制见 draw_error_banner）。
+#[path = "../../../shared/error_ui.rs"]
+mod err_ui;
+
+// 共享光标 overlay 快速路径（鼠标移动不整屏重绘）。
+#[path = "../../../shared/cursor_overlay.rs"]
+mod cursor_overlay;
+
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -43,6 +58,8 @@ const MAP_SHARED: usize = 1;
 
 /// FBIOGET_VSCREENINFO 请求码（与内核 devfs 约定一致）。
 const FBIOGET_VSCREENINFO: usize = 0x4600;
+/// FBIO_PRESENT 请求码：把 canvas 脏区拷入扫描缓冲并翻页（应用驱动显示节奏）。
+const FBIO_PRESENT: usize = 0x4603;
 
 const FB_PATH: &str = "/dev/fb0";
 const INPUT_PATH: &str = "/dev/input/event0";
@@ -71,7 +88,8 @@ const BTN_ROWS: i32 = 5;
 const BTN_GAP: i32 = 8;
 const BTN_MARGIN: i32 = 10;
 const BTN_W: i32 = (DISPLAY_W as i32 - 2 * BTN_MARGIN - (BTN_COLS - 1) * BTN_GAP) / BTN_COLS;
-const BTN_H: i32 = 145;
+/// 按键高度：5 行按键区整体位于系统导航栏（NAV_Y）之上。
+const BTN_H: i32 = 130;
 
 /// 返回键命中区（标题栏左上角）。
 const BACK_X: i32 = 4;
@@ -80,13 +98,13 @@ const BACK_SZ: i32 = 36;
 
 // ==================== 颜色（0x00RRGGBB） ====================
 
-const C_BG: u32 = 0x00_0F_17_2A;
-const C_TITLE_BG: u32 = 0x00_0C_1A_36;
-const C_TEXT: u32 = 0x00_FF_FF_FF;
-const C_DIM: u32 = 0x00_9A_A8_C0;
-const C_DISPLAY_BG: u32 = 0x00_1A_1A_2E;
-const C_BTN: u32 = 0x00_1B_2B_4A;
-const C_BTN_BORDER: u32 = 0x00_3A_4A_6A;
+const C_BG: u32 = 0x00_F7_F8_FA;
+const C_TITLE_BG: u32 = 0x00_F2_F4_F8;
+const C_TEXT: u32 = 0x00_1A_1C_22;
+const C_DIM: u32 = 0x00_6B_72_80;
+const C_DISPLAY_BG: u32 = 0x00_FF_FF_FF;
+const C_BTN: u32 = 0x00_FF_FF_FF;
+const C_BTN_BORDER: u32 = 0x00_D9_DE_E6;
 const C_OP: u32 = 0x00_EA_B3_08;
 const C_CLEAR: u32 = 0x00_E7_4C_3C;
 
@@ -161,6 +179,8 @@ fn glyph(c: u8) -> &'static [u8; 8] {
 // ==================== 状态 ====================
 
 static mut FB_PTR: *mut u32 = core::ptr::null_mut();
+/// 保留的 /dev/fb0 fd：FBIO_PRESENT 提交脏区需要（mmap 后页表已指向画布，fd 仅用于 ioctl）。
+static mut FB_FD: isize = -1;
 static mut FB_W: usize = DISPLAY_W;
 static mut FB_H: usize = DISPLAY_H;
 static mut FB_STRIDE_PX: usize = DISPLAY_W;
@@ -180,19 +200,10 @@ static mut CUR_X: i32 = DISPLAY_W as i32 / 2;
 static mut CUR_Y: i32 = DISPLAY_H as i32 / 2;
 static mut TOUCH_DOWN: bool = false;
 static mut MOUSE_DOWN: bool = false;
-
-/// 鼠标指针位图（9x9，'1' 为实心像素）：经典箭头，黑描边 + 白填充。
-static CURSOR_BITS: [u16; 9] = [
-    0b100000000,
-    0b110000000,
-    0b101000000,
-    0b100100000,
-    0b100010000,
-    0b100001000,
-    0b111111100,
-    0b100010100,
-    0b100010010,
-];
+/// 触摸手势追踪（按下点/时刻，用于系统导航手势分类）。
+static mut TOUCH_PX: i32 = 0;
+static mut TOUCH_PY: i32 = 0;
+static mut TOUCH_US: u64 = 0;
 
 /// 按键标签（4 列 x 5 行，行优先）。
 static BTNS: [&[u8]; 20] = [
@@ -284,6 +295,21 @@ fn sleep_ms(ms: usize) {
     unsafe { syscall2(SYS_NANOSLEEP, req.as_ptr() as usize, 0); }
 }
 
+/// 当前时间（微秒，自启动）。
+fn now_us() -> u64 {
+    let mut tv = [0u8; 16];
+    unsafe {
+        syscall2(169, tv.as_mut_ptr() as usize, 0); // SYS_GETTIMEOFDAY
+        let sec = u64::from_le_bytes([
+            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7],
+        ]);
+        let usec = u64::from_le_bytes([
+            tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
+        ]);
+        sec * 1_000_000 + usec
+    }
+}
+
 unsafe fn exit(code: usize) -> ! {
     syscall1(SYS_EXIT, code);
     loop {}
@@ -334,12 +360,14 @@ fn fb_init() -> bool {
             return false;
         }
         FB_PTR = base as *mut u32;
-        syscall1(SYS_CLOSE, fd as usize);
+        // 保留 fd：FBIO_PRESENT / FBIO_PUT_DAMAGE 依赖它提交脏区（mmap 后
+        // 页表已指向画布，fd 仅用于 ioctl）。
+        FB_FD = fd as isize;
         true
     }
 }
 
-/// 把 back buffer 一次性拷贝到显存。
+/// 把 back buffer 一次性拷贝到显存，并提交整屏 FBIO_PRESENT 让内核翻页上屏。
 fn flip() {
     unsafe {
         if FB_PTR.is_null() {
@@ -358,6 +386,52 @@ fn flip() {
                 );
             }
         }
+        fb_present();
+    }
+}
+
+/// 提交整屏脏区并请求呈现（FBIO_PRESENT，单矩形 (0,0,FB_W,FB_H)）。
+///
+/// 内核在首次 FBIO_PRESENT 后进入应用驱动模式：不再由定时器自动翻页，
+/// 显示节奏完全由本调用驱动（与 terminal 的 present_frame 同一最小实现）。
+fn fb_present() {
+    unsafe {
+        if FB_FD < 0 || FB_PTR.is_null() {
+            return;
+        }
+        let mut dbuf = [0u8; 4 + 16];
+        // 缓冲布局：[count:u32][{x:i32, y:i32, w:u32, h:u32}]，全部小端。
+        dbuf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        dbuf[4..8].copy_from_slice(&0i32.to_le_bytes());
+        dbuf[8..12].copy_from_slice(&0i32.to_le_bytes());
+        dbuf[12..16].copy_from_slice(&(FB_W as u32).to_le_bytes());
+        dbuf[16..20].copy_from_slice(&(FB_H as u32).to_le_bytes());
+        // 忽略返回值：内核在应用接管模式下始终呈现（无脏区时为 no-op）。
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, dbuf.as_ptr() as usize);
+    }
+}
+
+/// 提交任意小脏矩形并请求呈现（FBIO_PRESENT，光标移动快速路径）。
+///
+/// 光标移动只提交 ~26x26 矩形：内核脏区拷贝与翻页微秒级完成，替代整屏
+/// 2MB 提交（QEMU 软件渲染下整屏提交是移动卡顿的直接原因）。
+fn fb_present_rects(rects: &[(i32, i32, u32, u32)]) {
+    unsafe {
+        if FB_FD < 0 || FB_PTR.is_null() || rects.is_empty() {
+            return;
+        }
+        let n = rects.len().min(8);
+        let mut dbuf = [0u8; 4 + 8 * 16];
+        dbuf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        for i in 0..n {
+            let r = rects[i];
+            let off = 4 + i * 16;
+            dbuf[off..off + 4].copy_from_slice(&r.0.to_le_bytes());
+            dbuf[off + 4..off + 8].copy_from_slice(&r.1.to_le_bytes());
+            dbuf[off + 8..off + 12].copy_from_slice(&r.2.to_le_bytes());
+            dbuf[off + 12..off + 16].copy_from_slice(&r.3.to_le_bytes());
+        }
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, dbuf.as_ptr() as usize);
     }
 }
 
@@ -369,6 +443,55 @@ fn put_pixel(x: i32, y: i32, color: u32) {
     }
     unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] = color; }
 }
+
+// ==================== 毛玻璃 / 液态玻璃（计算器） ====================
+
+use sys_nav::glass::{GlassStyle, GlassTarget, STYLE_DANGER, glass_rect_style};
+
+/// 毛玻璃目标：背景取自 BACK_BUF，像素经 put_pixel 写入。
+struct CalcGlass;
+impl GlassTarget for CalcGlass {
+    fn backdrop(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+}
+
+/// 毛玻璃面板（浅色玻璃：白色磨砂 + 浅灰描边）。
+fn draw_glass(x: i32, y: i32, w: i32, h: i32, r: i32) {
+    glass_rect_style(&mut CalcGlass, x, y, w, h, r, &STYLE_PANEL, true);
+}
+
+/// 自定义样式液态玻璃面板。
+fn draw_glass_style(x: i32, y: i32, w: i32, h: i32, r: i32, st: &GlassStyle) {
+    glass_rect_style(&mut CalcGlass, x, y, w, h, r, st, true);
+}
+
+/// 运算符按钮玻璃样式（琥珀色）。
+static STYLE_OP: GlassStyle = GlassStyle {
+    tint: 0x00_E2_96_06,
+    alpha: 232,
+    spec: 46,
+    sheen: 22,
+    border: 0x00_F5_C2_6B,
+    border_a: 160,
+};
+
+/// 浅色面板玻璃：白色着色 + 浅灰描边（白色背景上仍可辨识的卡片/按钮）。
+static STYLE_PANEL: GlassStyle = GlassStyle {
+    tint: 0x00_FF_FF_FF,
+    alpha: 225,
+    spec: 60,
+    sheen: 18,
+    border: 0x00_D9_DE_E6,
+    border_a: 220,
+};
 
 fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     for dy in 0..h {
@@ -389,27 +512,52 @@ fn draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     }
 }
 
-fn draw_char(x: i32, y: i32, c: u8, color: u32) {
-    let g = glyph(c);
-    for (row, bits) in g.iter().enumerate() {
-        for col in 0..8 {
-            if bits & (0x80 >> col) != 0 {
-                put_pixel(x + col as i32, y + row as i32, color);
+// ==================== TTF 平滑字体（cn.ttf） ====================
+
+/// 把单个码点以 cn.ttf 平滑字形绘制到 (x, y)（y 为字形顶部），返回推进宽度。
+fn ttf_glyph(x: i32, y: i32, cp: u32, color: u32) -> i32 {
+    if !ttf_text::font_render::font_ready() {
+        return if cp >= 0x80 { 16 } else { 8 };
+    }
+    let px = ttf_text::font_render::FONT_PX;
+    let ch = core::char::from_u32(cp).unwrap_or(' ');
+    if let Some(g) = ttf_text::font_render::rasterize_char(ch, px) {
+        let gx = x + g.xmin;
+        let gy = ttf_text::font_render::glyph_draw_top(y, g.ymin, g.height, px);
+        for row in 0..g.height {
+            for col in 0..g.width {
+                let a = g.data[row * g.width + col];
+                if a != 0 {
+                    let px_ = gx + col as i32;
+                    let py_ = gy + row as i32;
+                    let in_b = px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32;
+                    if in_b {
+                        let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                        put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
+                    }
+                }
             }
         }
+        return g.advance;
     }
+    0
 }
 
-fn draw_text(x: i32, y: i32, s: &[u8], color: u32) {
-    let mut cx = x;
-    for &c in s {
-        draw_char(cx, y, c, color);
-        cx += 8;
+fn draw_char(x: i32, y: i32, c: u8, color: u32) {
+    ttf_glyph(x, y, c as u32, color);
+}
+
+fn draw_text(x: i32, y: i32, s: &[u8], color: u32) {    let mut cx = x;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        cx += ttf_glyph(cx, y, cp, color);
+        i += n;
     }
 }
 
 fn text_width(s: &[u8]) -> i32 {
-    s.len() as i32 * 8
+    ttf_text::font_render::text_width(s, ttf_text::font_render::FONT_PX)
 }
 
 /// 把 i64 格式化为十进制 ASCII，返回长度（含负号）。
@@ -467,19 +615,41 @@ fn press_digit(d: u8) {
         }
         if let Some(v) = CUR.checked_mul(10).and_then(|x| x.checked_add(d as i64)) {
             CUR = v;
+        } else {
+            // 输入溢出：此前静默丢弃按键，屏幕无反应。
+            ERROR = true;
+            show_error("数字超出范围".as_bytes());
         }
     }
 }
 
-/// 应用挂起的运算符：ACC = ACC OP CUR，结果写回 CUR；除零返回 false 并置 ERROR。
+/// 应用挂起的运算符：ACC = ACC OP CUR，结果写回 CUR；除零/溢出置 ERROR 并返回 false。
 fn apply_op() -> bool {
     unsafe {
         let a = ACC;
         let b = CUR;
         let r = match OP {
-            b'+' => a.wrapping_add(b),
-            b'-' => a.wrapping_sub(b),
-            b'*' => a.wrapping_mul(b),
+            b'+' => match a.checked_add(b) {
+                Some(v) => v,
+                None => {
+                    ERROR = true;
+                    return false;
+                }
+            },
+            b'-' => match a.checked_sub(b) {
+                Some(v) => v,
+                None => {
+                    ERROR = true;
+                    return false;
+                }
+            },
+            b'*' => match a.checked_mul(b) {
+                Some(v) => v,
+                None => {
+                    ERROR = true;
+                    return false;
+                }
+            },
             b'/' => {
                 if b == 0 || (a == i64::MIN && b == -1) {
                     ERROR = true;
@@ -626,13 +796,149 @@ fn button_color(idx: usize) -> u32 {
     }
 }
 
+// ==================== 动画（按压反馈 / 结果弹出）====================
+// 规格对齐 docs/animations.md 3.1（图标按压反馈）：按住下沉变暗（即时），
+// 松开闪光自最强线性衰减（FastOutSlowIn 节奏）；"=" 结果 ease-out 滑入。
+// 全部整数运算，无堆、无浮点。
+
+/// 按住的按钮槽号（-1 = 无）；按下即视觉反馈，抬起转闪光。
+static mut HOLD_BTN: isize = -1;
+/// 按下状态发生变化（主循环需重绘一次）。
+static mut HOLD_CHANGED: bool = false;
+/// 松开闪光：按钮槽号（-1 = 空闲）与起始时刻（µs）。
+static mut FLASH_BTN: isize = -1;
+static mut FLASH_START: u64 = 0;
+/// 闪光时长（ms）。
+const FLASH_MS: u64 = 150;
+/// "=" 结果弹出起始时刻（µs，0 = 空闲）与时长（ms）。
+static mut RESULT_START: u64 = 0;
+const RESULT_MS: u64 = 180;
+
+/// FastOutSlowIn 风格 ease-out（0..255 → 0..255，二次曲线近似）。
+fn ease_out8(t: u32) -> u32 {
+    let inv = 255 - t.min(255);
+    255 - (inv * inv + 127) / 255
+}
+
+/// 像素向黑色压暗（a: 0..255）。
+fn darken_px(bg: u32, a: u32) -> u32 {
+    let (r, g, b) = ((bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF);
+    let k = 255 - a.min(255);
+    (((r * k / 255) << 16) | ((g * k / 255) << 8) | (b * k / 255)) & 0xFF_FF_FF
+}
+
+/// 在按钮圆角矩形范围内把像素压暗（按压/闪光叠加层）。
+fn flash_overlay(i: usize, a: u32) {
+    if a == 0 {
+        return;
+    }
+    let (x, y, w, h) = btn_rect(i);
+    let r = (h * 22 / 100).min(22);
+    let x1 = x + w - 1;
+    let y1 = y + h - 1;
+    for yy in y..y + h {
+        for xx in x..x + w {
+            // 圆角覆盖测试：四个角按 1/4 圆判定，其余全覆盖
+            let inside = if xx < x + r && yy < y + r {
+                let dx = xx - (x + r);
+                let dy = yy - (y + r);
+                dx * dx + dy * dy <= r * r
+            } else if xx > x1 - r && yy < y + r {
+                let dx = xx - (x1 - r);
+                let dy = yy - (y + r);
+                dx * dx + dy * dy <= r * r
+            } else if xx < x + r && yy > y1 - r {
+                let dx = xx - (x + r);
+                let dy = yy - (y1 - r);
+                dx * dx + dy * dy <= r * r
+            } else if xx > x1 - r && yy > y1 - r {
+                let dx = xx - (x1 - r);
+                let dy = yy - (y1 - r);
+                dx * dx + dy * dy <= r * r
+            } else {
+                true
+            };
+            if inside {
+                let idx = yy as usize * DISPLAY_W + xx as usize;
+                let bg = unsafe { BACK_BUF[idx] };
+                unsafe {
+                    BACK_BUF[idx] = darken_px(bg, a);
+                }
+            }
+        }
+    }
+}
+
+/// 按钮当前的闪光叠加强度（0 = 无）。
+fn flash_alpha(i: usize) -> u32 {
+    unsafe {
+        if FLASH_BTN != i as isize {
+            return 0;
+        }
+        let el = now_us().saturating_sub(FLASH_START) / 1000;
+        if el >= FLASH_MS {
+            return 0;
+        }
+        let t = (el * 255 / FLASH_MS) as u32;
+        200 * (255 - ease_out8(t)) / 255
+    }
+}
+
+/// 渲染单个按钮（常态 / 按住下沉 / 松开闪光自动叠加）。
+fn render_button(i: usize) {
+    let (x, y, w, h) = btn_rect(i);
+    let r = (h * 22 / 100).min(22);
+    match button_color(i) {
+        C_CLEAR => draw_glass_style(x, y, w, h, r, &STYLE_DANGER),
+        C_OP => draw_glass_style(x, y, w, h, r, &STYLE_OP),
+        _ => draw_glass(x, y, w, h, r),
+    }
+    let label = BTNS[i];
+    let tx = x + (w - text_width(label)) / 2;
+    // 红色删除键玻璃上用白字，其余浅色玻璃用深色字。
+    let label_col = if button_color(i) == C_CLEAR { 0x00_FF_FF_FF } else { C_TEXT };
+    // 按住：内容下沉 1px + 恒定压暗（按压态）；松开：闪光衰减叠加。
+    let held = unsafe { HOLD_BTN == i as isize };
+    let ty = y + (h - 8) / 2 + if held { 1 } else { 0 };
+    draw_text(tx, ty, label, label_col);
+    let fa = flash_alpha(i);
+    if held {
+        flash_overlay(i, 90);
+    }
+    if fa > 0 {
+        flash_overlay(i, fa);
+    }
+}
+
+/// 推进动画状态：返回是否仍有动画在播（主循环需逐帧重绘）。
+/// 到期时清除状态，末次调用返回 false（caller 重绘一次恢复常态）。
+fn advance_anim() -> bool {
+    let mut active = false;
+    unsafe {
+        let now = now_us();
+        if FLASH_BTN >= 0 {
+            active = true;
+            if now.saturating_sub(FLASH_START) / 1000 >= FLASH_MS {
+                FLASH_BTN = -1;
+            }
+        }
+        if RESULT_START != 0 {
+            active = true;
+            if now.saturating_sub(RESULT_START) / 1000 >= RESULT_MS {
+                RESULT_START = 0;
+            }
+        }
+    }
+    active
+}
+
 // ==================== 渲染 ====================
 
 fn render_title() {
-    fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_TITLE_BG);
-    // 返回键
-    fill_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN);
-    draw_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN_BORDER);
+    // 液态玻璃标题栏（模糊背景 + 深色着色 + 高光描边）。
+    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    // 返回键：玻璃圆角方块。
+    draw_glass(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
     // 标题
     let s = b"CALCULATOR";
@@ -641,8 +947,8 @@ fn render_title() {
 }
 
 fn render_display() {
-    fill_rect(0, DISPLAY_Y, DISPLAY_W as i32, DISPLAY_HGT, C_DISPLAY_BG);
-    draw_rect(0, DISPLAY_Y, DISPLAY_W as i32, DISPLAY_HGT, C_DIM);
+    // 液态玻璃显示面板（圆角，模糊按钮区背景）。
+    draw_glass(8, DISPLAY_Y, DISPLAY_W as i32 - 16, DISPLAY_HGT, 20);
     let mut buf = [0u8; 24];
     let (acc, cur, op, error, just_eq) = unsafe { (ACC, CUR, OP, ERROR, JUST_EQ) };
     if error {
@@ -659,53 +965,127 @@ fn render_display() {
     } else if just_eq {
         draw_text(16, DISPLAY_Y + 12, b"=", C_DIM);
     }
-    // 当前值
+    // 当前值；"=" 结果弹出：ease-out 自下 8px 滑入（动画期内主循环逐帧重绘）
     let n = fmt_i64(&mut buf, cur);
     let tx = DISPLAY_W as i32 - 16 - n as i32 * 8;
-    draw_text(tx, DISPLAY_Y + DISPLAY_HGT - 28, &buf[..n], C_TEXT);
+    let mut dy = 0i32;
+    unsafe {
+        if RESULT_START != 0 {
+            let el = now_us().saturating_sub(RESULT_START) / 1000;
+            if el < RESULT_MS {
+                let t = ((el * 255) / RESULT_MS) as u32;
+                let e = ease_out8(t);
+                dy = (((255 - e) * 8) / 255) as i32;
+            }
+        }
+    }
+    draw_text(tx, DISPLAY_Y + DISPLAY_HGT - 28 + dy, &buf[..n], C_TEXT);
 }
 
 fn render_buttons() {
     for i in 0..BTNS.len() {
-        let (x, y, w, h) = btn_rect(i);
-        fill_rect(x, y, w, h, button_color(i));
-        draw_rect(x, y, w, h, C_BTN_BORDER);
-        let label = BTNS[i];
-        let tx = x + (w - text_width(label)) / 2;
-        let ty = y + (h - 8) / 2;
-        draw_text(tx, ty, label, C_TEXT);
+        render_button(i);
     }
 }
 
 fn render() {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_BG);
-    render_title();
-    render_display();
-    render_buttons();
-    // 鼠标指针：始终绘制在最上层
-    draw_cursor();
-}
-
-/// 鼠标指针：先画黑色描边（8 邻域），再画白色实心，保证深浅背景下都可见。
-fn draw_cursor() {
-    let (x, y) = unsafe { (CUR_X, CUR_Y) };
-    const OUTLINE: [(i32, i32); 8] =
-        [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)];
-    for (ox, oy) in OUTLINE {
-        draw_cursor_bits(x + ox, y + oy, 0x00_00_00_00);
-    }
-    draw_cursor_bits(x, y, 0x00_FF_FF_FF);
-}
-
-/// 把 9x9 指针位图画到 (x, y)。
-fn draw_cursor_bits(x: i32, y: i32, color: u32) {
-    for (row, bits) in CURSOR_BITS.iter().enumerate() {
-        for col in 0..9 {
-            if bits & (0x100 >> col) != 0 {
-                put_pixel(x + col as i32, y + row as i32, color);
+    // 液态玻璃基底：白色背景打底（顶部纯白 → 底部极淡冷灰的浅色渐变）。
+    let (tr, tg, tb) = (0xFFu32, 0xFFu32, 0xFFu32);
+    let (br, bg, bb) = (0xE9u32, 0xEDu32, 0xF3u32);
+    for y in 0..DISPLAY_H as i32 {
+        let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
+        let inv = 255 - t;
+        let r = (tr * inv + br * t) / 255;
+        let g = (tg * inv + bg * t) / 255;
+        let b = (tb * inv + bb * t) / 255;
+        let row = (r << 16) | (g << 8) | b;
+        let iy = y as usize * DISPLAY_W;
+        unsafe {
+            for x in 0..DISPLAY_W {
+                BACK_BUF[iy + x] = row;
             }
         }
     }
+    render_title();
+    render_display();
+    render_buttons();
+    draw_sys_nav();
+    // 注意：光标不画进 back buffer —— overlay 快速路径直接写显存。
+}
+
+/// 整屏重绘 + 光标 overlay（render/flip 的替代入口）。
+fn redraw() {
+    render();
+    flip();
+    cursor_overlay::overlay_redraw(
+        unsafe { FB_PTR },
+        unsafe { FB_STRIDE_PX },
+        unsafe { FB_W } as i32,
+        unsafe { FB_H } as i32,
+        unsafe { CUR_X },
+        unsafe { CUR_Y },
+    );
+    // overlay 直接写画布，flip 的整屏提交不含光标像素；补光标小矩形呈现
+    // 上屏即可（不再整屏重复提交）。
+    fb_present_rects(&[cursor_overlay::under_rect(
+        unsafe { CUR_X },
+        unsafe { CUR_Y },
+    )]);
+}
+
+/// 光标移动快速路径：只更新光标小区域，不重绘整屏。
+fn cursor_move() {
+    // 移动光标并把新旧位置区以小脏矩形提交呈现（不再整屏提交）。
+    let rects = cursor_overlay::overlay_move_rects(
+        unsafe { FB_PTR },
+        unsafe { FB_STRIDE_PX },
+        unsafe { FB_W } as i32,
+        unsafe { FB_H } as i32,
+        unsafe { CUR_X },
+        unsafe { CUR_Y },
+    );
+    fb_present_rects(&rects);
+}
+
+/// 系统导航栏（三键 / 手势指示条，按当前模式绘制在屏幕底部，液态玻璃底）。
+/// 同时把未过期的错误提示横幅画在最上层。
+fn draw_sys_nav() {
+    draw_error_banner();
+    struct CalcCanvas;
+    impl sys_nav::NavCanvas for CalcCanvas {
+        fn put(&mut self, x: i32, y: i32, color: u32) {
+            put_pixel(x, y, color);
+        }
+        fn backdrop(&self, x: i32, y: i32) -> u32 {
+            if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+                unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+            } else {
+                0
+            }
+        }
+    }
+    let mut cv = CalcCanvas;
+    sys_nav::draw_nav_bar(&mut cv, sys_nav::nav_mode());
+}
+
+/// 设置一条用户可见的错误提示（自动消失）。
+fn show_error(msg: &[u8]) {
+    err_ui::err_set(msg, now_us());
+}
+
+/// 若存在未过期的错误提示，在标题栏下方绘制横幅。
+fn draw_error_banner() {
+    if !err_ui::err_active(now_us()) {
+        return;
+    }
+    let msg = err_ui::err_msg();
+    if msg.is_empty() {
+        return;
+    }
+    fill_rect(0, 48, DISPLAY_W as i32, 44, 0x00_7A_1F_1F);
+    draw_rect(0, 48, DISPLAY_W as i32, 44, 0x00_C0_40_40);
+    let tx = (DISPLAY_W as i32 - text_width(msg)) / 2;
+    draw_text(tx, 62, msg, 0x00_FF_FF_FF);
 }
 
 // ==================== 输入 ====================
@@ -713,21 +1093,22 @@ fn draw_cursor_bits(x: i32, y: i32, color: u32) {
 /// 轮询 /dev/input/event0，检测一次完整点击（按下并抬起）并跟踪鼠标指针。
 ///
 /// 返回 `(点击坐标, 指针是否移动)`：指针移动时上层需重绘以更新光标位置。
-fn poll_input() -> (Option<(i32, i32)>, bool) {
+fn poll_input() -> (Option<(i32, i32)>, sys_nav::NavAction, bool) {
     unsafe {
         if INPUT_FD < 0 {
             INPUT_FD = open(INPUT_PATH, O_RDONLY | O_NONBLOCK);
         }
         if INPUT_FD < 0 {
-            return (None, false);
+            return (None, sys_nav::NavAction::None, false);
         }
         let mut click = None;
+        let mut nav = sys_nav::NavAction::None;
         let mut moved = false;
         loop {
             let mut buf = [0u8; 24];
             let n = syscall3(SYS_READ, INPUT_FD as usize, buf.as_mut_ptr() as usize, 24);
             if (n as isize) <= 0 || n < 24 {
-                return (click, moved);
+                return (click, nav, moved);
             }
             let etype = u16::from_le_bytes([buf[16], buf[17]]);
             let code = u16::from_le_bytes([buf[18], buf[19]]);
@@ -756,16 +1137,38 @@ fn poll_input() -> (Option<(i32, i32)>, bool) {
                     if code == BTN_TOUCH {
                         if value == 1 {
                             TOUCH_DOWN = true;
+                            TOUCH_PX = CUR_X;
+                            TOUCH_PY = CUR_Y;
+                            TOUCH_US = now_us();
+                            press_feedback_begin();
                         } else if value == 0 && TOUCH_DOWN {
                             TOUCH_DOWN = false;
-                            click = Some((CUR_X, CUR_Y));
+                            let mode = sys_nav::nav_mode();
+                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, mode);
+                            if a != sys_nav::NavAction::None {
+                                nav = a;
+                            } else {
+                                let dur = now_us().saturating_sub(TOUCH_US) / 1000;
+                                let g = sys_nav::classify_swipe(TOUCH_PX, TOUCH_PY, CUR_X, CUR_Y, dur, mode);
+                                if g != sys_nav::NavAction::None {
+                                    nav = g;
+                                } else {
+                                    click = Some((CUR_X, CUR_Y));
+                                }
+                            }
                         }
                     } else if code == BTN_LEFT {
                         if value == 1 {
                             MOUSE_DOWN = true;
+                            press_feedback_begin();
                         } else if value == 0 && MOUSE_DOWN {
                             MOUSE_DOWN = false;
-                            click = Some((CUR_X, CUR_Y));
+                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, sys_nav::nav_mode());
+                            if a != sys_nav::NavAction::None {
+                                nav = a;
+                            } else {
+                                click = Some((CUR_X, CUR_Y));
+                            }
                         }
                     }
                 }
@@ -779,10 +1182,12 @@ fn poll_input() -> (Option<(i32, i32)>, bool) {
 fn poll_key() -> bool {
     let mut buf = [0u8; 8];
     let n = unsafe { syscall3(SYS_READ, 0, buf.as_mut_ptr() as usize, buf.len()) };
+    // 读失败 -1（usize 天文数字）按 isize 判负，否则越界 panic
+    let n = n as isize;
     if n <= 0 {
         return false;
     }
-    for i in 0..(n as usize) {
+    for i in 0..(n.min(buf.len() as isize) as usize) {
         if buf[i] == 0x1b {
             return true;
         }
@@ -790,57 +1195,104 @@ fn poll_key() -> bool {
     false
 }
 
+/// 按下瞬间记录按压目标按钮（导航区除外）：按住显示下沉态。
+/// 由 poll_input 在 EV_KEY 按下事件调用。
+fn press_feedback_begin() {
+    unsafe {
+        let b = if sys_nav::nav_hit(CUR_X, CUR_Y, sys_nav::nav_mode())
+            != sys_nav::NavAction::None
+        {
+            -1
+        } else {
+            button_at(CUR_X, CUR_Y).map_or(-1, |i| i as isize)
+        };
+        if b != HOLD_BTN {
+            HOLD_BTN = b;
+            HOLD_CHANGED = true;
+        }
+    }
+}
+
 // ==================== 主流程 ====================
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[calculator] starting\n");
+    print("[calculator] 正在启动\n");
 
     if !fb_init() {
-        print("[calculator] /dev/fb0 mmap failed, no framebuffer\n");
+        print("[calculator] /dev/fb0 mmap 失败，无帧缓冲\n");
         unsafe { exit(1); }
     }
-    print("[calculator] framebuffer ");
+    print("[calculator] 帧缓冲 ");
     print_dec(unsafe { FB_W } as u32);
     print("x");
     print_dec(unsafe { FB_H } as u32);
-    print(" mapped\n");
+    print(" 已映射\n");
 
-    render();
-    flip();
-    print("[calculator] ready\n");
+    redraw();
+    ttf_text::font_init();
+    redraw();
+    print("[calculator] 就绪\n");
 
     loop {
-        let (click, moved) = poll_input();
+        let (click, nav, moved) = poll_input();
         if moved {
-            // 指针移动：重绘以更新光标位置。
-            render();
-            flip();
+            // 指针移动：overlay 快速路径，不重绘整屏。
+            cursor_move();
+        }
+        // 系统导航动作优先：返回=退出(0)，桌面=退出(1)，最近任务=退出(2)。
+        if nav != sys_nav::NavAction::None {
+            print("[calculator] 导航 -> 退出\n");
+            let code = sys_nav::nav_exit_code(nav);
+            unsafe { exit(code); }
+        }
+        // 按压态开始/结束：重绘一次显示下沉反馈
+        unsafe {
+            if HOLD_CHANGED {
+                HOLD_CHANGED = false;
+                redraw();
+            }
         }
         if let Some((x, y)) = click {
-            print("[calculator] tap (");
+            print("[calculator] 点击 (");
             print_dec(x as u32);
             print(",");
             print_dec(y as u32);
             print(")\n");
             if back_hit(x, y) {
-                print("[calculator] back -> exit\n");
+                print("[calculator] 返回 -> 退出\n");
                 break;
             }
             if let Some(i) = button_at(x, y) {
                 press_button(i);
-                render();
-                flip();
+                unsafe {
+                    // 松开：按压态转闪光衰减；"=" 触发结果弹出
+                    FLASH_BTN = i as isize;
+                    FLASH_START = now_us();
+                    HOLD_BTN = -1;
+                    if i == 19 && !ERROR {
+                        RESULT_START = now_us();
+                    }
+                }
+                redraw();
+            } else {
+                unsafe {
+                    HOLD_BTN = -1;
+                }
             }
         }
+        // 动画推进：闪光/结果弹出期间逐帧重绘（主循环节奏 16ms ≈ 60fps）
+        if advance_anim() {
+            redraw();
+        }
         if poll_key() {
-            print("[calculator] ESC -> exit\n");
+            print("[calculator] ESC -> 退出\n");
             break;
         }
         sleep_ms(16);
     }
 
-    print("[calculator] exiting\n");
+    print("[calculator] 正在退出\n");
     unsafe { exit(0); }
 }
 
@@ -861,9 +1313,26 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
+    struct BufWriter {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
     unsafe {
         write_fd(2, b"PANIC: calculator\n");
+        write_fd(2, &w.buf[..w.len]);
         syscall1(SYS_EXIT, 1);
     }
     loop {}

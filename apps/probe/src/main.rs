@@ -12,6 +12,9 @@
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+#[path = "../../../shared/ttf_text.rs"]
+mod ttf_text;
+
 
 const SYS_WRITE: usize = 64;
 const SYS_READ: usize = 63;
@@ -79,7 +82,7 @@ const SYS_GETPID: usize = 172;
 
 /// SIGTERM handler：打印标记后返回（经蹦床 rt_sigreturn 恢复）。
 extern "C" fn handler_fn(_sig: usize) {
-    print_str("[signal-handler] SIGTERM caught!\n");
+    print_str("[signal-handler] SIGTERM 已捕获\n");
 }
 
 fn print_str(s: &str) {
@@ -100,7 +103,7 @@ fn cstr(path: &str) -> usize {
 }
 
 fn fail(msg: &str) -> ! {
-    print_str("[syscall-test] FAIL: ");
+    print_str("[syscall-test] 失败：");
     print_str(msg);
     print_str("\n");
     unsafe { syscall1(SYS_EXIT, 1) };
@@ -109,7 +112,8 @@ fn fail(msg: &str) -> ! {
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print_str("[syscall-test] starting\n");
+    ttf_text::font_init();
+    print_str("[syscall-test] 开始\n");
 
     // 1. socketpair
     let mut sv = [0i32; 2];
@@ -135,42 +139,42 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut out = [0u8; 4];
     let w = unsafe { syscall3(SYS_WRITE, fd1 as usize, b"hi".as_ptr() as usize, 2) };
     if w != 2 {
-        fail("socketpair write");
+        fail("socketpair 写入");
     }
     let n = unsafe { syscall3(SYS_READ, fd0 as usize, out.as_mut_ptr() as usize, 4) };
     if n != 2 || out[0] != b'h' || out[1] != b'i' {
-        fail("socketpair readback");
+        fail("socketpair 读回");
     }
     // 反向：fd0 写，fd1 读
     let w2 = unsafe { syscall3(SYS_WRITE, fd0 as usize, b"yo".as_ptr() as usize, 2) };
     if w2 != 2 {
-        fail("socketpair write2");
+        fail("socketpair 写入2");
     }
     let n2 = unsafe { syscall3(SYS_READ, fd1 as usize, out.as_mut_ptr() as usize, 4) };
     if n2 != 2 || out[0] != b'y' || out[1] != b'o' {
-        fail("socketpair readback2");
+        fail("socketpair 读回2");
     }
-    print_str("[syscall-test] socketpair duplex OK\n");
+    print_str("[syscall-test] socketpair 双向通信通过\n");
 
     // 5. COW 引用计数泄漏测试：反复 fork + exit（不 exec），验证共享页
     //    引用计数正确增减，物理内存不泄漏。
-    print_str("[syscall-test] COW fork-loop test\n");
+    print_str("[syscall-test] COW fork 循环测试\n");
     for i in 0..8 {
-        let p2 = unsafe { syscall1(SYS_CLONE, SIGCHLD) } as i64;
-        if p2 < 0 {
-            fail("clone loop");
+        let p = unsafe { syscall1(SYS_CLONE, SIGCHLD) } as i64;
+        if p < 0 {
+            fail("克隆循环");
         }
-        if p2 == 0 {
+        if p == 0 {
             unsafe { syscall1(SYS_EXIT, 0) };
             loop {}
         }
         let mut st = 0u32;
-        let r2 = unsafe { syscall3(SYS_WAIT4, p2 as usize, (&mut st) as *mut u32 as usize, 0) };
+        let r2 = unsafe { syscall3(SYS_WAIT4, p as usize, (&mut st) as *mut u32 as usize, 0) };
         if r2 < 0 || ((st >> 8) & 0xFF) != 0 {
-            fail("clone loop wait");
+            fail("克隆循环等待");
         }
     }
-    print_str("[syscall-test] COW fork-loop PASS (8 forks, 0 leaks)\n");
+    print_str("[syscall-test] COW fork 循环通过（8 次 fork，0 泄漏）\n");
 
     unsafe {
         syscall1(SYS_CLOSE, fd0 as usize);
@@ -179,7 +183,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     // 2. truncate：创建空文件
     let r = unsafe { syscall2(SYS_TRUNCATE, cstr("/tmp/trunc_test"), 0) };
-    print_str("[syscall-test] truncate ret=");
+    print_str("[syscall-test] truncate 返回=");
     print_hex(r as u64);
     print_str("\n");
     if r != 0 {
@@ -187,10 +191,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     }
     let fd = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/trunc_test"), O_RDONLY) };
     if fd < 0 {
-        fail("truncate open");
+        fail("truncate 打开");
     }
     unsafe { syscall1(SYS_CLOSE, fd as usize) };
-    print_str("[syscall-test] truncate OK\n");
+    print_str("[syscall-test] truncate 通过\n");
 
     // 3. statx
     let mut stx = [0u8; 256];
@@ -205,7 +209,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             256,
         )
     };
-    print_str("[syscall-test] statx ret=");
+    print_str("[syscall-test] statx 返回=");
     print_hex(r2 as u64);
     print_str("\n");
     if r2 != 0 {
@@ -213,13 +217,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     }
     let size = u64::from_le_bytes([stx[40], stx[41], stx[42], stx[43], stx[44], stx[45], stx[46], stx[47]]);
     let mode = u16::from_le_bytes([stx[28], stx[29]]);
-    print_str("[syscall-test] statx inittab size=");
+    print_str("[syscall-test] inittab 大小（statx）=");
     print_dec(size as u32);
     print_str(" mode=0o");
     print_hex(mode as u64);
     print_str("\n");
     if size == 0 {
-        fail("statx size");
+        fail("statx 大小");
     }
 
 
@@ -230,32 +234,32 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             let mut b = [0u8; 128];
             let n = unsafe { syscall3(SYS_READ, fd as usize, b.as_mut_ptr() as usize, 128) };
             print_str("[syscall-test] /proc/version: ");
-            if n > 0 {
-                print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
+            if (n as isize) > 0 {
+                print_str(core::str::from_utf8(&b[..(n as isize).min(b.len() as isize) as usize]).unwrap_or("?"));
             }
             unsafe { syscall1(SYS_CLOSE, fd as usize) };
         } else {
-            print_str("[syscall-test] /proc/version open failed\n");
+            print_str("[syscall-test] 打开 /proc/version 失败\n");
         }
         let fd2 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/proc/meminfo"), O_RDONLY) };
         if fd2 >= 0 {
             let mut b = [0u8; 256];
             let n = unsafe { syscall3(SYS_READ, fd2 as usize, b.as_mut_ptr() as usize, 256) };
             print_str("[syscall-test] /proc/meminfo: ");
-            if n > 0 {
-                print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
+            if (n as isize) > 0 {
+                print_str(core::str::from_utf8(&b[..(n as isize).min(b.len() as isize) as usize]).unwrap_or("?"));
             }
             unsafe { syscall1(SYS_CLOSE, fd2 as usize) };
         } else {
-            print_str("[syscall-test] /proc/meminfo open failed\n");
+            print_str("[syscall-test] 打开 /proc/meminfo 失败\n");
         }
         let fd3 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/proc/processes"), O_RDONLY) };
         if fd3 >= 0 {
             let mut b = [0u8; 256];
             let n = unsafe { syscall3(SYS_READ, fd3 as usize, b.as_mut_ptr() as usize, 256) };
             print_str("[syscall-test] /proc/processes:\n");
-            if n > 0 {
-                print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
+            if (n as isize) > 0 {
+                print_str(core::str::from_utf8(&b[..(n as isize).min(b.len() as isize) as usize]).unwrap_or("?"));
             }
             unsafe { syscall1(SYS_CLOSE, fd3 as usize) };
         }
@@ -272,30 +276,30 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             let fd2 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/tmpfs_test"), O_RDONLY) };
             let mut b = [0u8; 16];
             let n = unsafe { syscall3(SYS_READ, fd2 as usize, b.as_mut_ptr() as usize, 16) };
-            print_str("[syscall-test] tmpfs readback: ");
-            if n > 0 {
-                print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
+            print_str("[syscall-test] tmpfs 读回: ");
+            if (n as isize) > 0 {
+                print_str(core::str::from_utf8(&b[..(n as isize).min(b.len() as isize) as usize]).unwrap_or("?"));
             }
             unsafe { syscall1(SYS_CLOSE, fd2 as usize) };
             if n == 9 && &b[..9] == b"TMPFS-OK\n" {
-                print_str("[syscall-test] tmpfs PASS\n");
+                print_str("[syscall-test] tmpfs 通过\n");
             } else {
-                print_str("[syscall-test] tmpfs FAIL\n");
+                print_str("[syscall-test] tmpfs 失败\n");
             }
         } else {
-            print_str("[syscall-test] tmpfs open failed\n");
+            print_str("[syscall-test] 打开 tmpfs 失败\n");
         }
     }
 
     // 9. 用户态 nanosleep：睡 100ms 后继续（验证用户态阻塞睡眠）
     {
-        print_str("[syscall-test] user nanosleep test\n");
+        print_str("[syscall-test] 用户态纳米睡眠测试\n");
         let mut req = [0u8; 16];
         req[8..].copy_from_slice(&100_000_000u64.to_le_bytes()); // nsec = 100ms
         let r = unsafe { syscall2(SYS_NANOSLEEP, req.as_mut_ptr() as usize, 0) };
-        print_str("[syscall-test] nanosleep ret=");
+        print_str("[syscall-test] 纳米睡眠返回=");
         print_hex(r as u64);
-        print_str(" (slept if continuing)\n");
+        print_str("（若继续运行即已睡眠）\n");
     }
 
     // 10. 剪贴板：写入后读回
@@ -303,28 +307,28 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         let wr = unsafe { syscall2(SYS_CLIPBOARD_SET, b"clipboard-data".as_ptr() as usize, 14) };
         let mut cb = [0u8; 64];
         let rd = unsafe { syscall2(SYS_CLIPBOARD_GET, cb.as_mut_ptr() as usize, 64) };
-        print_str("[syscall-test] clipboard set=");
+        print_str("[syscall-test] 剪贴板 设置=");
         print_hex(wr as u64);
-        print_str(" get=");
+        print_str(" 获取=");
         print_hex(rd as u64);
-        print_str(" data=");
+        print_str(" 数据=");
         if rd > 0 {
             print_str(core::str::from_utf8(&cb[..rd as usize]).unwrap_or("?"));
         }
         print_str("\n");
         if rd == 14 && &cb[..14] == b"clipboard-data" {
-            print_str("[syscall-test] CLIPBOARD PASS\n");
+            print_str("[syscall-test] 剪贴板 通过\n");
         } else {
-            print_str("[syscall-test] CLIPBOARD FAIL\n");
+            print_str("[syscall-test] 剪贴板 失败\n");
         }
     }
 
     // 8. TCP 客户端：连接宿主 echo 服务器（10.0.2.2:38080），发送并读回
     {
-        print_str("[syscall-test] tcp client test\n");
+        print_str("[syscall-test] TCP 客户端测试\n");
         let fd = unsafe { syscall2(SYS_SOCKET, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/) };
         if (fd as i64) < 0 {
-            print_str("[syscall-test] socket failed\n");
+            print_str("[syscall-test] socket 创建失败\n");
         } else {
             // sockaddr_in: family u16(2) + port u16 BE + ip u32 BE
             let mut addr = [0u8; 16];
@@ -332,28 +336,28 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             addr[2] = (38080 >> 8) as u8; addr[3] = (38080 & 0xFF) as u8;
             addr[4] = 10; addr[5] = 0; addr[6] = 2; addr[7] = 2;
             let cr = unsafe { syscall3(SYS_CONNECT, fd as usize, addr.as_mut_ptr() as usize, 16) };
-            print_str("[syscall-test] connect ret=");
+            print_str("[syscall-test] connect 返回=");
             print_hex(cr as u64);
             print_str("\n");
             if cr == 0 {
                 // socket I/O 走 sendto/recvfrom（Linux 语义）
                 let w = unsafe { syscall6(SYS_SENDTO, fd as usize, b"hello-kunxos".as_ptr() as usize, 12, 0, 0, 0) };
-                print_str("[syscall-test] tcp send ret=");
+                print_str("[syscall-test] TCP 发送返回=");
                 print_hex(w as u64);
                 print_str("\n");
                 let mut b = [0u8; 64];
                 let n = unsafe { syscall6(SYS_RECVFROM, fd as usize, b.as_mut_ptr() as usize, 64, 0, 0, 0) };
-                print_str("[syscall-test] tcp recv ret=");
+                print_str("[syscall-test] TCP 接收返回=");
                 print_hex(n as u64);
-                print_str(" data=");
+                print_str(" 数据=");
                 if n > 0 {
                     print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
                 }
                 print_str("\n");
                 if n == 12 && &b[..12] == b"hello-kunxos" {
-                    print_str("[syscall-test] TCP PASS\n");
+                    print_str("[syscall-test] TCP 通过\n");
                 } else {
-                    print_str("[syscall-test] TCP FAIL\n");
+                    print_str("[syscall-test] TCP 失败\n");
                 }
             }
             unsafe { syscall1(SYS_CLOSE, fd as usize) };
@@ -362,7 +366,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 
 
-    print_str("[syscall-test] PASS\n");
+    print_str("[syscall-test] 通过\n");
     unsafe { syscall1(SYS_EXIT, 0) };
     loop {}
 }
@@ -412,8 +416,26 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 1（无堆，固定缓冲）。
+    struct BufWriter {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
     print_str("PANIC: syscall-test\n");
+    // PanicInfo 仅由 str/数字拼成，输出缓冲必为合法 UTF-8。
+    print_str(unsafe { core::str::from_utf8(&w.buf[..w.len]) }.unwrap_or(""));
     unsafe { syscall1(SYS_EXIT, 1) };
     loop {}
 }

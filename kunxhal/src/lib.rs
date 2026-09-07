@@ -12,24 +12,43 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod audio;
+pub mod camera;
 pub mod display;
+pub mod fusion;
+pub mod gps;
 pub mod input;
+pub mod math;
+pub mod motion;
 pub mod net;
 pub mod plat;
 pub mod power;
+pub mod sensor;
 pub mod storage;
+pub mod wifi;
 
 #[cfg(feature = "qemu")]
 mod plat_qemu;
 #[cfg(feature = "pi4")]
 mod plat_pi4;
 
+// 相机后端窄接口：平台模块保持私有，仅导出相机所需的注入入口。
+#[cfg(feature = "qemu")]
+pub use plat_qemu::sim_camera_set_clock;
+
 pub use display::DisplayInfo;
+pub use fusion::{Euler, Quat, RotationVector, Vec3};
 pub use input::InputInfo;
 pub use net::NetInfo;
 pub use plat::Platform;
+pub use sensor::{SensorConfig, SensorDevice, SensorInfo, SensorSample, SensorSource};
 pub use storage::StorageInfo;
+pub use wifi::{
+    WifiAuth, WifiDevice, WifiError, WifiLinkState, WifiScanPoll, WifiScanResult, WifiStatus,
+};
 
 /// 返回当前平台的实现（由 Cargo feature 在编译期选定）。
 ///
@@ -63,4 +82,14 @@ pub fn storage_init() -> Option<StorageInfo> {
 /// 便捷入口：等价于 `current_platform().input_init()`。
 pub fn input_init() -> Option<InputInfo> {
     current_platform().input_init()
+}
+
+/// 便捷入口：等价于 `current_platform().sensor_init()`。
+pub fn sensor_init() -> Option<SensorInfo> {
+    current_platform().sensor_init()
+}
+
+/// 便捷入口：等价于 `current_platform().wifi_init()`。
+pub fn wifi_init() -> Option<&'static mut dyn WifiDevice> {
+    current_platform().wifi_init()
 }

@@ -9,6 +9,19 @@ use crate::devfs;
 use crate::fsops::{self, T_CHR, T_DIR, T_REG, T_SYM};
 use crate::process::{self, FdKind};
 
+/// 保存 DAIF 并屏蔽 IRQ（嵌套安全：恢复的是调用前的完整 DAIF 值）。
+/// 供打开文件表引用计数/偏移等共享状态的短临界区使用。
+unsafe fn irq_save() -> u64 {
+    let d: u64;
+    core::arch::asm!("mrs {}, daif", out(reg) d);
+    core::arch::asm!("msr daifset, #2");
+    d
+}
+
+unsafe fn irq_restore(saved: u64) {
+    core::arch::asm!("msr daif, {}", in(reg) saved);
+}
+
 // ==================== 打开标志 ====================
 
 pub const O_RDONLY: u32 = 0;
@@ -74,7 +87,11 @@ impl FileType {
 // ==================== 打开文件表 ====================
 
 /// 打开文件表容量。
-const MAX_OPEN: usize = 32;
+///
+/// 256 项 × 40 字节 ≈ 10KB BSS（可接受）：32 项时 GUI 系统服务（displayd/
+/// audiod/rild 等各持 fd）+ 应用同时打开极易耗尽，表满后所有进程 open 全部
+/// 失败（表现为「无法打开应用」类故障）。
+const MAX_OPEN: usize = 256;
 
 /// 一个已打开的文件。
 #[derive(Clone, Copy)]
@@ -113,7 +130,7 @@ static mut OPEN_FILES: [OpenFile; MAX_OPEN] = [EMPTY_OPEN; MAX_OPEN];
 // ==================== 挂载表 ====================
 
 /// 挂载表容量。
-const MAX_MOUNT: usize = 8;
+pub const MAX_MOUNT: usize = 8;
 
 /// 一个挂载点。
 #[derive(Clone, Copy)]
@@ -199,7 +216,7 @@ pub fn print_mounts() {
         for i in 0..MAX_MOUNT {
             let m = MOUNTS[i];
             if m.used {
-                crate::uart_send_str("[vfs] mount ");
+                crate::uart_send_str("[vfs] 已挂载 ");
                 crate::uart_send_str(m.mount_point);
                 crate::uart_send_str(" -> major=");
                 crate::print_dec(m.dev as u64);
@@ -289,6 +306,16 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
         }
         let next = fsops::fs_lookup(d, cur, comp);
         if next < 0 {
+            // 临时诊断：定位失败的分量
+            if comp.starts_with("Packages") {
+                crate::uart_send_str("[lookup-dbg] 失败 comp=");
+                crate::uart_send_str(comp);
+                crate::uart_send_str(" dir_ino=");
+                crate::print_dec(cur as u64);
+                crate::uart_send_str(" dev=");
+                crate::print_dec(d as u64);
+                crate::uart_send_str("\n");
+            }
             return None;
         }
         // 判断本分量是否为最后一段（其后只剩分隔符）
@@ -376,6 +403,13 @@ fn alloc_openfile() -> usize {
 fn open_file(dev: u32, ino: u32, typ: u16, rdev: u32, flags: u32) -> i32 {
     let slot = alloc_openfile();
     if slot >= MAX_OPEN {
+        // 冷路径：表满诊断（含调用方无 path 的场景，如 O_CREAT 分支）。
+        // 表满 = 有 fd 未释放（泄漏）或容量确实不足，必须能在串口上看见。
+        crate::uart_send_str("[vfs] 打开文件表已满 used=");
+        crate::print_dec(MAX_OPEN as u64);
+        crate::uart_send_str("/");
+        crate::print_dec(MAX_OPEN as u64);
+        crate::uart_send_str("\n");
         return -1;
     }
     unsafe {
@@ -385,7 +419,7 @@ fn open_file(dev: u32, ino: u32, typ: u16, rdev: u32, flags: u32) -> i32 {
     let fd = process::alloc_fd(FdKind::File, slot, flags);
     if fd < 0 {
         // fd 表满：回滚已占用的打开文件表槽位，避免每次失败 open 永久泄漏槽位
-        // （32 槽耗尽后所有进程 open 全部失败）
+        // （槽位耗尽后所有进程 open 全部失败）
         close_ref(slot);
         return -1;
     }
@@ -395,12 +429,17 @@ fn open_file(dev: u32, ino: u32, typ: u16, rdev: u32, flags: u32) -> i32 {
 /// 增加打开文件表项的引用计数（fork 复制 fd 时调用）。
 pub fn open_ref(index: usize) {
     if index < MAX_OPEN {
+        // 引用计数 RMW 期间屏蔽 IRQ：syscall 上下文 IRQ 是放开的，定时器
+        // 抢占可在读-改-写中间切换任务，父子并发 close 同一槽位会丢一次
+        // 递减 → 槽位永不释放（256 槽耗尽后全系统 open 失败）。
+        let saved = unsafe { irq_save() };
         unsafe {
             let of = &mut OPEN_FILES[index];
             if of.used {
                 of.refs = of.refs.saturating_add(1);
             }
         }
+        unsafe { irq_restore(saved) };
     }
 }
 
@@ -409,9 +448,12 @@ pub fn close_ref(index: usize) {
     if index >= MAX_OPEN {
         return;
     }
+    // 同 open_ref：RMW 屏蔽 IRQ，防并发丢减
+    let saved = unsafe { irq_save() };
     unsafe {
         let of = &mut OPEN_FILES[index];
         if !of.used {
+            irq_restore(saved);
             return;
         }
         if of.refs > 0 {
@@ -421,6 +463,7 @@ pub fn close_ref(index: usize) {
             *of = EMPTY_OPEN;
         }
     }
+    unsafe { irq_restore(saved) };
 }
 
 /// 检查 `(dev, ino)` 是否仍被任何打开文件表项引用。
@@ -439,12 +482,58 @@ pub fn is_open(dev: u32, ino: u32) -> bool {
     false
 }
 
+/// 统计当前已占用的打开文件表槽位数。
+///
+/// 诊断用：`open` 失败时配合打印，区分「表满」（used == MAX_OPEN，fd 泄漏
+/// 或容量不足）与「文件不存在 / 设备错误」。
+pub fn open_files_used() -> usize {
+    let mut n = 0;
+    unsafe {
+        for i in 0..MAX_OPEN {
+            if OPEN_FILES[i].used {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 // ==================== 系统调用 ====================
 
 /// 打开文件，返回 fd；失败 -1。
 ///
 /// 不存在且带 `O_CREAT` 时创建普通文件；带 `O_TRUNC` 时先截断。
+///
+/// 失败时在冷路径打印一行 `[vfs] open 失败 path=... err=... used=n/max`
+/// （成功路径零输出）：此前失败静默透传，无法区分「打开文件表满」
+/// 「文件不存在」「设备错误」，用户侧只能看到「无法打开应用」。
+///
+/// 限流：服务主循环会以 2ms 级轮询彼此尚未创建的 ctl 文件（每次失败一行
+/// 会把串口刷满 1 万+ 行，反而淹没有效信息），故前 24 次全量打印，之后
+/// 每 4096 次失败采样打印一行。
 pub fn open(path: &str, flags: u32) -> i32 {
+    let fd = open_impl(path, flags);
+    if fd < 0 {
+        static mut OPEN_FAILS: u64 = 0;
+        let n = unsafe { OPEN_FAILS };
+        unsafe { OPEN_FAILS = n.wrapping_add(1) };
+        if n < 24 || n % 4096 == 0 {
+            crate::uart_send_str("[vfs] open 失败 path=");
+            crate::uart_send_str(path);
+            crate::uart_send_str(" err=-");
+            crate::print_dec((-(fd as i64)) as u64);
+            crate::uart_send_str(" used=");
+            crate::print_dec(open_files_used() as u64);
+            crate::uart_send_str("/");
+            crate::print_dec(MAX_OPEN as u64);
+            crate::uart_send_str("\n");
+        }
+    }
+    fd
+}
+
+/// `open` 的实现体（失败由 [`open`] 统一记日志）。
+fn open_impl(path: &str, flags: u32) -> i32 {
     let mut dev = 0u32;
     let mut ino = 0u32;
     if resolve(path, &mut dev, &mut ino) == 0 {
@@ -452,10 +541,31 @@ pub fn open(path: &str, flags: u32) -> i32 {
         if typ == T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
             return -1; // 目录不可写
         }
+        // ★ 先占打开文件表/进程 fd 槽位、再执行 O_TRUNC：若 fd 表或打开
+        // 文件表已满，open 会返回 -1，此时不得先截断——否则文件内容已被
+        // 销毁而调用方拿到的是失败返回值。
+        let fd = open_file(dev, ino, typ, fsops::fs_rdev(dev, ino), flags);
+        if fd < 0 {
+            // 临时诊断：区分 resolve 成功但 open_file 失败
+            if path.starts_with("/var/lib/pkg") {
+                crate::uart_send_str("[vfs-dbg] open_file 失败 path=");
+                crate::uart_send_str(path);
+                crate::uart_send_str(" typ=");
+                crate::print_dec(typ as u64);
+                crate::uart_send_str("\n");
+            }
+            return -1;
+        }
         if typ == T_REG && (flags & O_TRUNC) != 0 {
             fsops::fs_truncate(dev, ino);
         }
-        return open_file(dev, ino, typ, fsops::fs_rdev(dev, ino), flags);
+        return fd;
+    }
+    // 临时诊断：resolve 阶段失败
+    if path.starts_with("/var/lib/pkg") {
+        crate::uart_send_str("[vfs-dbg] resolve 失败 path=");
+        crate::uart_send_str(path);
+        crate::uart_send_str("\n");
     }
     if flags & O_CREAT != 0 {
         if let Some((d, pino, name)) = resolve_parent(path) {
@@ -488,7 +598,13 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
     };
     if n > 0 {
         unsafe {
-            OPEN_FILES[entry.index].offset += n as usize;
+            // 长操作（fs_read 在 fs_lock 退避中可睡眠）期间本槽位可能被
+            // close 释放并被新 open 复用：身份不符时不得把偏移加到别人的
+            // 文件上（fd 别名/偏移污染）。
+            let cur = &mut OPEN_FILES[entry.index];
+            if cur.used && cur.dev == of.dev && cur.ino == of.ino && cur.typ == of.typ {
+                cur.offset += n as usize;
+            }
         }
     }
     n
@@ -514,7 +630,11 @@ pub fn write(fd: i32, buf: &[u8]) -> i32 {
     };
     if n > 0 {
         unsafe {
-            OPEN_FILES[entry.index].offset += n as usize;
+            // 同 read：写回偏移前重验槽位身份（防 close/复用竞态）
+            let cur = &mut OPEN_FILES[entry.index];
+            if cur.used && cur.dev == of.dev && cur.ino == of.ino && cur.typ == of.typ {
+                cur.offset += n as usize;
+            }
         }
     }
     n
@@ -604,10 +724,16 @@ pub fn unlink(path: &str) -> i32 {
 }
 
 /// 重命名（移动）文件：`old_path` → `new_path`，可跨目录（SFS 迁移同一 inode）。
-/// 目标已存在或源为目录时失败。返回 0；失败 -1。
+/// 目标已存在或源为目录时失败。返回 0；失败 -1；跨文件系统 -EXDEV(-18)。
 pub fn rename(old_path: &str, new_path: &str) -> i32 {
     let Some((od, oi, on)) = resolve_parent(old_path) else { return -1 };
-    let Some((_nd, ni, nn)) = resolve_parent(new_path) else { return -1 };
+    let Some((nd, ni, nn)) = resolve_parent(new_path) else { return -1 };
+    // ★ 跨文件系统拒绝：fs_rename 只按源目录的 FS 类型分派，目标 inode 号会
+    // 被当作源卷 inode 使用（如 `mv /data/a /tmp/a` 把目录项移进源卷上恰好
+    // 同号的无关目录）——同 inode 号跨卷没有迁移语义，必须返回 EXDEV。
+    if od != nd {
+        return -18;
+    }
     fsops::fs_rename(od, oi, on, ni, nn)
 }
 
@@ -651,9 +777,15 @@ pub fn readlink(path: &str, buf: &mut [u8]) -> i32 {
     fsops::fs_readlink(d, ino, buf)
 }
 
-/// 创建目录，返回 0；失败 -1。
+/// 创建目录，返回 0；失败返回负 errno（此前一律 -1=EPERM，
+/// EEXIST/ENOENT 等无法区分）。
 pub fn mkdir(path: &str) -> i32 {
-    let Some((d, pino, name)) = resolve_parent(path) else { return -1 };
+    let Some((d, pino, name)) = resolve_parent(path) else { return -2 }; // -ENOENT
+    // 已存在：先查目录项，避免把 EEXIST 折叠成通用 -1（OOBE 据此判断
+    // "/data" 已存在是否正常）。
+    if fsops::fs_lookup(d, pino, name) >= 0 {
+        return -17; // -EEXIST
+    }
     let ino = fsops::fs_mkdir(d, pino, name);
     if ino < 0 {
         -1
@@ -695,7 +827,7 @@ pub fn readdir_next(fd: i32, name: &mut [u8]) -> (i32, u16) {
         Some(e) if e.kind == FdKind::File => e,
         _ => return (-1, 0),
     };
-    let mut of = unsafe { OPEN_FILES[entry.index] };
+    let of = unsafe { OPEN_FILES[entry.index] };
     if !of.used || of.typ != T_DIR {
         return (-1, 0);
     }
@@ -704,15 +836,20 @@ pub fn readdir_next(fd: i32, name: &mut [u8]) -> (i32, u16) {
     if ino < 0 {
         return (-1, 0);
     }
-    of.offset = idx + 1;
-    unsafe { OPEN_FILES[entry.index] = of };
+    // fs_readdir 在 fs_lock 退避中可睡眠：期间本槽位可能被 close 并复用。
+    // 此前把整个旧 OpenFile 结构写回（含 dev/ino/typ），可把 fd 别名到
+    // 错误文件 —— 身份不符时只放弃本次偏移推进。
+    let cur = unsafe { &mut OPEN_FILES[entry.index] };
+    if cur.used && cur.dev == of.dev && cur.ino == of.ino && cur.typ == of.typ {
+        cur.offset = idx + 1;
+    }
     (ino, fsops::fs_type(of.dev, ino as u32))
 }
 
 /// 返回已打开文件的 (类型码, 大小)，失败返回 None。
 ///
 /// 类型码为 `fs_simple` 的 T_REG/T_DIR/T_CHR/T_BLK/T_FIFO，供 `fstat` 翻译。
-pub fn fstat(fd: i32) -> Option<(u16, u32)> {
+pub fn fstat(fd: i32) -> Option<(u16, u64)> {
     let entry = process::get_fd(fd)?;
     if entry.kind != FdKind::File {
         return None;
@@ -727,7 +864,7 @@ pub fn fstat(fd: i32) -> Option<(u16, u32)> {
 /// 由路径直接获取 (类型码, 大小)，不建立打开文件表项，失败返回 None。
 ///
 /// 供 `newfstatat` 翻译使用（无需真正 open/close）。
-pub fn stat_path(path: &str) -> Option<(u16, u32)> {
+pub fn stat_path(path: &str) -> Option<(u16, u64)> {
     let mut dev = 0u32;
     let mut ino = 0u32;
     if resolve(path, &mut dev, &mut ino) != 0 {
@@ -739,14 +876,48 @@ pub fn stat_path(path: &str) -> Option<(u16, u32)> {
 /// 由路径直接获取 (类型码, 大小)，**不跟随最后分量**（`lstat` 语义）。
 ///
 /// 供 `ls -l` 显示符号链接自身及其目标。
-pub fn lstat_path(path: &str) -> Option<(u16, u32)> {
-    let Some((d, pino, name)) = resolve_parent(path) else { return None };
+pub fn lstat_path(path: &str) -> Option<(u16, u64)> {
+    let Some((d, pino, name)) = resolve_parent(path) else {
+        // 纯 "/"（或全斜杠路径）没有"父目录 + 名字"拆分：直接解析到挂载
+        // 根 inode —— 此前返回 None，shell `ls /` 报"无法访问"。
+        let mut d = 0u32;
+        let mut ino = 0u32;
+        if resolve(path, &mut d, &mut ino) != 0 {
+            return None;
+        }
+        return Some((fsops::fs_type(d, ino), fsops::fs_size(d, ino)));
+    };
     let ino = fsops::fs_lookup(d, pino, name);
     if ino < 0 {
         return None;
     }
     let ino = ino as u32;
     Some((fsops::fs_type(d, ino), fsops::fs_size(d, ino)))
+}
+
+/// fsync：把已打开文件所在文件系统（SFS）的未落盘元数据刷盘并冲刷设备。
+/// 返回 0；失败 -1。
+pub fn fsync(fd: i32) -> i32 {
+    let entry = match process::get_fd(fd) {
+        Some(e) if e.kind == FdKind::File => e,
+        _ => return -1,
+    };
+    let of = unsafe { OPEN_FILES[entry.index] };
+    if !of.used {
+        return -1;
+    }
+    fsops::fs_fsync(of.dev)
+}
+
+/// sync：对所有已挂载文件系统执行 fsync。
+pub fn sync_all() -> i32 {
+    let mut rc = 0;
+    for_each_mount(&mut |_mp, dev| {
+        if fsops::fs_fsync(dev) != 0 {
+            rc = -1;
+        }
+    });
+    rc
 }
 
 /// 返回已打开文件的设备号 `rdev`（编码 `(major<<16)|minor`）；非设备返回 None。

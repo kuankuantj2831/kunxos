@@ -1,9 +1,12 @@
 //! 进程模型：进程控制块（PCB）、`fork`、`execve`、`exit`、`wait`、信号与 fd 表。
 //!
 //! - PCB：`pid`、状态、地址空间（私有页表 [`vm::ProcPageTable`]）、fd 表、
-//!   信号位图、父子关系、进程名。
-//! - `fork()`：完整复制父进程地址空间（为每条用户映射分配新物理页并逐字节拷贝，
-//!   不做写时复制）、复制 fd 表，并创建子线程。父进程返回子 pid，子进程返回 0。
+//!   信号位图、父子关系、进程名、uid/gid（安全模型）。
+//! - `fork()`：**写时复制**（COW）复制父进程地址空间 —— 只读共享池页引用
+//!   +1 直接复用；RW 数据页父进程页表降级只读并标记 `FLAG_COW`、子进程复用
+//!   同一物理页，任一进程首次写入触发 permission fault 由 `cow_break`
+//!   复制出私有页（见 [`vm::FLAG_COW`] 与 `copy_address_space`）。同时复制
+//!   fd 表、信号位图、uid/gid 与 ASLR 运行时信息。
 //! - `exit(code)`：进程退出，唤醒等待它的父进程；`wait(pid)`：阻塞等待子进程退出
 //!   （`pid = -1` 等待任意子进程），回收其地址空间与 fd 表。
 //!
@@ -22,9 +25,19 @@ use crate::vm;
 /// 每个进程 fd 表上限。
 pub const FD_MAX: usize = 16;
 /// 进程数上限。
-pub const MAX_PROC: usize = 16;
+///
+/// 原为 16：系统常驻进程（kernel 0 + wifi worker 2 + init 1 + 11 个守护进程
+/// 3..13）已占 15 槽，sfsrace 测试本身（pid 14）再 fork 6 个子进程共需 22 槽，
+/// 16 槽必然「fork 失败」（alloc_pid 返回上限）—— 这是 2026-08-28 复现
+/// `make test-sfsrace` 一直 FAIL、且遗留 `/sfsrace-test` 标记导致 `make run-gui`
+/// 一启动就进测试模式并自动关机的直接原因。扩到 24：常驻 15 + sfsrace 6 子进程
+/// + 余量，fork 不再因进程表满而失败。
+pub const MAX_PROC: usize = 24;
 /// 进程名上限。
 const MAX_NAME: usize = 16;
+/// 每个进程可登记的等待线程数（`wait(pid)` 多等待者：并发 wait 各自登记，
+/// 防止单槽位被覆盖导致先等待的线程永不唤醒）。
+const WAIT_WAITERS: usize = 4;
 
 // ==================== 文件描述符 ====================
 
@@ -96,8 +109,10 @@ pub struct Process {
     pub parent: i32,
     /// 退出码
     pub exit_code: i32,
-    /// 正在 `wait` 本进程的线程（tid）
-    pub waiter: Option<u32>,
+    /// 正在 `wait` 本进程的线程（tid，多等待者槽位：ipc.rs WAITERS 同构，
+    /// 防单槽被并发 wait 覆写——先前只登记一个 tid，第二个等待线程会覆盖
+    /// 第一个，后者在退出唤醒时被漏掉、永久阻塞）。
+    pub waiters: [Option<u32>; WAIT_WAITERS],
     /// 进程名（供 `ps` 等工具显示）
     pub name: [u8; MAX_NAME],
     /// 进程名长度
@@ -106,6 +121,12 @@ pub struct Process {
     pub cwd: [u8; CWD_MAX],
     /// 工作目录长度（不含 NUL）。
     pub cwd_len: usize,
+    /// 用户 ID（安全模型：per-process 身份，Android 式 per-app UID 的地基）。
+    /// 0 = root（init / 系统服务 / 内置 shell）；应用进程由 launcher 在
+    /// execve 前 setuid 到非零 UID（如 10000+），从而受 kill 权限等检查约束。
+    pub uid: u32,
+    /// 组 ID（与 uid 配套，当前未参与文件权限判定——VFS 尚无 mode/owner）。
+    pub gid: u32,
 }
 
 impl Process {
@@ -118,11 +139,13 @@ impl Process {
             signals: 0,
             parent: -1,
             exit_code: 0,
-            waiter: None,
+            waiters: [None; WAIT_WAITERS],
             name: [0; MAX_NAME],
             name_len: 0,
             cwd: [0; CWD_MAX],
             cwd_len: 0,
+            uid: 0,
+            gid: 0,
         }
     }
 }
@@ -259,6 +282,95 @@ pub fn current_parent() -> i32 {
     unsafe { PROCESSES[pid as usize].parent }
 }
 
+/// 指定进程的父进程 pid（不存在返回 -1；供 kill 权限检查等）。
+pub fn parent_of(pid: u32) -> i32 {
+    if (pid as usize) >= MAX_PROC {
+        return -1;
+    }
+    unsafe {
+        let p = &PROCESSES[pid as usize];
+        if p.state == ProcessState::Free {
+            return -1;
+        }
+        p.parent
+    }
+}
+
+/// 当前进程用户 ID（Android 式 per-app UID 的读取端）。
+pub fn current_uid() -> u32 {
+    let pid = current_pid();
+    if (pid as usize) >= MAX_PROC {
+        return 0;
+    }
+    unsafe { PROCESSES[pid as usize].uid }
+}
+
+/// 指定进程的用户 ID（不存在/空闲槽位返回 0；供 ps/kill 权限展示）。
+pub fn uid_of(pid: u32) -> u32 {
+    if (pid as usize) >= MAX_PROC {
+        return 0;
+    }
+    unsafe {
+        let p = &PROCESSES[pid as usize];
+        if p.state == ProcessState::Free {
+            return 0;
+        }
+        p.uid
+    }
+}
+
+/// 当前进程组 ID。
+pub fn current_gid() -> u32 {
+    let pid = current_pid();
+    if (pid as usize) >= MAX_PROC {
+        return 0;
+    }
+    unsafe { PROCESSES[pid as usize].gid }
+}
+
+/// 设置当前进程 uid（调用方须已在 syscall 层完成权限校验：仅 root 可改）。
+pub fn set_uid(uid: u32) {
+    let pid = current_pid();
+    if (pid as usize) < MAX_PROC {
+        unsafe { PROCESSES[pid as usize].uid = uid };
+    }
+}
+
+/// 设置当前进程 gid（同上，权限校验在 syscall 层）。
+pub fn set_gid(gid: u32) {
+    let pid = current_pid();
+    if (pid as usize) < MAX_PROC {
+        unsafe { PROCESSES[pid as usize].gid = gid };
+    }
+}
+
+// ==================== ASLR 熵源 ====================
+
+/// ASLR 熵：从 virtio-rng 取 4 字节（无 RNG 时回退到计时器混合伪随机，
+/// 与 `sys_getrandom` 的降级路径一致）。演示用途，非密码学安全。
+pub fn aslr_rand() -> u32 {
+    let mut buf = [0u8; 4];
+    let r = crate::virtio_rng::get_random(&mut buf);
+    if r > 0 {
+        return u32::from_le_bytes(buf);
+    }
+    let now = crate::timer::now_us();
+    let seed = now
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+        ^ ((sched_cfs::current_tid() as u64) << 32)
+        ^ 0xC0FF_EE00;
+    (seed >> 16) as u32
+}
+
+/// 返回 `[0, max)` 范围内的页对齐随机偏移（max 为页数）。
+pub fn aslr_pages(max_pages: u32) -> usize {
+    if max_pages == 0 {
+        return 0;
+    }
+    (aslr_rand() % max_pages) as usize * vm::PAGE_SIZE
+}
+
 // ==================== fork ====================
 
 /// fork 时复制父进程地址空间到子页表（写时复制）。
@@ -304,7 +416,12 @@ fn copy_address_space(parent_pid: u32, child_pt: &mut vm::ProcPageTable) -> (usi
             let rec = &mut parent.pt.user_pages[i];
             if !vm::is_cow(rec.flags) {
                 let cow_flags = rec.flags | vm::FLAG_COW;
-                vm::map_page_in(parent.pt.ttbr0, rec.vaddr, rec.paddr, vm::cow_pte_flags(cow_flags));
+                // 父页降级失败（页表 OOM）：保持父页 RW，子进程该页的
+                // COW 映射也会失败并被跳过 → 子进程访问时 SIGSEGV，
+                // 不会出现父子权限不一致的共享写穿。
+                if !vm::map_page_in(parent.pt.ttbr0, rec.vaddr, rec.paddr, vm::cow_pte_flags(cow_flags)) {
+                    continue;
+                }
                 rec.flags = cow_flags;
             }
         }
@@ -363,28 +480,47 @@ fn create_child_process(
         match e.kind {
             FdKind::File => crate::vfs::open_ref(e.index),
             FdKind::Shm => crate::ipc::shm_add_ref(e.index),
-            FdKind::Pipe => crate::ipc::pipe_add_ref(e.index),
+            FdKind::Pipe => crate::ipc::pipe_add_ref(e.index, e.flags & crate::ipc::FD_WRITE != 0),
             FdKind::MsgQueue => crate::ipc::msgq_add_ref(e.index),
+            FdKind::Pair => crate::ipc::pair_add_ref(e.index, e.flags as u32),
             _ => {}
         }
     }
 
     let ttbr0 = child_pt.ttbr0;
     unsafe {
-        PROCESSES[pid as usize] = Process {
-            pid,
-            state: ProcessState::Running,
-            pt: core::mem::replace(child_pt, vm::ProcPageTable::empty()),
-            fds,
-            signals,
-            parent: parent_pid as i32,
-            exit_code: 0,
-            waiter: None,
-            name,
-            name_len,
-            cwd,
-            cwd_len,
-        };
+        // 逐字段写入 + 直接 memcpy 页表：避免 `Process { pt: ... }` 结构体
+        // 构造在栈上产生 96KB+ 临时（叠加 fork 深调用链会溢出内核任务栈）。
+        let dst = &mut PROCESSES[pid as usize] as *mut Process;
+        {
+            let proc_q = core::mem::size_of::<Process>() / 8;
+            let dstq = dst as *mut u64;
+            for i in 0..proc_q {
+                core::ptr::write_volatile(dstq.add(i), 0u64);
+            }
+        }
+        (*dst).pid = pid;
+        (*dst).state = ProcessState::Running;
+        (*dst).parent = parent_pid as i32;
+        (*dst).exit_code = 0;
+        (*dst).waiters = [None; WAIT_WAITERS];
+        (*dst).signals = signals;
+        (*dst).name = name;
+        (*dst).name_len = name_len;
+        (*dst).cwd = cwd;
+        (*dst).cwd_len = cwd_len;
+        (*dst).fds = fds;
+        // 安全模型：子进程继承父进程身份（uid/gid 随 fork 传递，随 exec 保持）
+        (*dst).uid = PROCESSES[parent_pid as usize].uid;
+        (*dst).gid = PROCESSES[parent_pid as usize].gid;
+        {
+            let dstq = &mut (*dst).pt as *mut vm::ProcPageTable as *mut u64;
+            let srcq = child_pt as *const vm::ProcPageTable as *const u64;
+            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
+            for i in 0..n {
+                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
+            }
+        }
     }
     (pid, ttbr0)
 }
@@ -407,7 +543,13 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
     // 子进程内核栈布局与父进程完全一致（含 do_fork 保存现场与陷阱帧），
     // 子栈在拷贝区之下仍有 ~256KB 可用栈（拷走的只是活动区），
     // execve（argv/envp + setup_stack 等大栈帧）不会溢出。
-    let child_stack_top = sched_cfs::alloc_stack();
+    // 子进程内核栈：分配失败（OOM）时本次 fork 明确失败（此前 panic，
+    // fork/clone 风暴可打挂内核）。
+    let Some(child_stack_top) = sched_cfs::alloc_stack() else {
+        unsafe { asm!("msr daifclr, #2") };
+        crate::uart_send_str("[fork] 子进程栈分配失败（OOM）\n");
+        return -12; // -ENOMEM
+    };
     let child_stack_base = child_stack_top - stack_size;
     let copy_len = stack_top - saved_sp;
     let child_sp = child_stack_top - copy_len;
@@ -445,23 +587,42 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
         if c_elr == 0
             || c_elr >= crate::vm::USER_VA_TOP as u64
             || c_sp >= crate::vm::USER_STACK_TOP as u64
+            || c_sp == 0
             || c_spsr & 0xF != 0
         {
+            // 陷阱帧护栏失败：归还已分配的子栈（此前 fork 失败路径漏释放，
+            // 反复失败 fork 会永久泄漏 256KB/次）。
+            let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
+            unsafe {
+                for p in 0..pages {
+                    allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
+                }
+            }
             unsafe { asm!("msr daifclr, #2") };
             return -1;
         }
         // [诊断] 记录每次 fork 子进程的恢复现场，用于核对 PC=0 残余故障是否
         // 源自 fork 陷阱帧拷贝损坏（elr=0 / x30=0 应立即暴露）
-        crate::uart_send_str("[fork-frame] elr=");
-        crate::print_hex(c_elr);
-        crate::uart_send_str(" sp=");
-        crate::print_hex(c_sp);
-        crate::uart_send_str(" x30=");
-        crate::print_hex(c_x30);
-        crate::uart_send_str(" spsr=");
-        crate::print_hex(c_spsr);
-        crate::uart_send_str("\n");
+        crate::kinfo! {
+            crate::uart_send_str("[fork-frame] elr=");
+            crate::print_hex(c_elr);
+            crate::uart_send_str(" sp=");
+            crate::print_hex(c_sp);
+            crate::uart_send_str(" x30=");
+            crate::print_hex(c_x30);
+            crate::uart_send_str(" spsr=");
+            crate::print_hex(c_spsr);
+            crate::uart_send_str("\n");
+        }
     } else {
+        // 陷阱帧不在父栈活动区：归还已分配的子栈（与护栏失败路径一致，
+        // 此前该路径漏释放，反复失败 fork 按 256KB/次泄漏内核物理页）。
+        let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
+        unsafe {
+            for p in 0..pages {
+                allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
+            }
+        }
         unsafe { asm!("msr daifclr, #2") };
         return -1;
     }
@@ -470,28 +631,68 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
     let parent_pid = sched_cfs::current_pid();
     let pid = alloc_pid();
     if pid == u32::MAX {
+        // 进程表满：归还已分配的子栈（此前失败路径漏释放，反复失败 fork
+        // 会按 256KB/次永久泄漏内核物理页）。
+        let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
+        unsafe {
+            for p in 0..pages {
+                allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
+            }
+        }
         unsafe { asm!("msr daifclr, #2") };
         return -1;
     }
-    let mut child_pt = vm::ProcPageTable::new();
+    // 根页表 OOM：物理内存可被用户 brk/文件 mmap 耗尽后 fork 触发，必须
+    // 干净失败（归还子栈）而非 panic。
+    let mut child_pt = match vm::ProcPageTable::try_new_boxed() {
+        Some(pt) => pt,
+        None => {
+            let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
+            unsafe {
+                for p in 0..pages {
+                    allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
+                }
+            }
+            unsafe { asm!("msr daifclr, #2") };
+            return -1;
+        }
+    };
     let (total_pages, copied_pages) = copy_address_space(parent_pid, &mut child_pt);
     let (child_pid, child_ttbr0) = create_child_process(parent_pid, pid, &mut child_pt);
     if child_pid == u32::MAX {
+        // 子进程创建失败：回收已复制的子地址空间（用户数据页 + 私有页表
+        // 结构）与子栈——此前漏释放，一次失败就泄漏整个地址空间。
+        unsafe {
+            child_pt.free_user_pages();
+            vm::free_process_tables(child_pt.ttbr0);
+        }
+        let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
+        unsafe {
+            for p in 0..pages {
+                allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
+            }
+        }
         unsafe { asm!("msr daifclr, #2") };
         return -1;
     }
+    // 子进程继承父进程的 ELF 运行时信息（ASLR 栈基址/初始 sp/堆基址）：
+    // 子进程地址空间是父进程的 COW 副本，用户栈布局与堆基址与父进程一致，
+    // 信号帧边界校验/brk 初始化才能使用正确的随机化值。
+    crate::elf::fork_runtime_info(parent_pid, child_pid);
 
     // 启动计时（诊断）：fork 总耗时（含地址空间复制与任务插入）
     let t1 = timer::now_us();
-    crate::uart_send_str("[perf] fork pid=");
-    crate::print_dec(child_pid as u64);
-    crate::uart_send_str(" pages(total=");
-    crate::print_dec(total_pages as u64);
-    crate::uart_send_str(",copied=");
-    crate::print_dec(copied_pages as u64);
-    crate::uart_send_str(") took=");
-    crate::print_dec((t1 - t0) as u64);
-    crate::uart_send_str("us\n");
+    crate::kinfo! {
+        crate::uart_send_str("[perf] fork pid=");
+        crate::print_dec(child_pid as u64);
+        crate::uart_send_str(" 页数(total=");
+        crate::print_dec(total_pages as u64);
+        crate::uart_send_str(",拷贝=");
+        crate::print_dec(copied_pages as u64);
+        crate::uart_send_str(") 耗时=");
+        crate::print_dec((t1 - t0) as u64);
+        crate::uart_send_str("us\n");
+    }
 
     // 子进程上下文：首次调度直接进入 syscall_return_restore，sp 指向子进程
     // **拷贝的陷阱帧**（x0 已置 0，elr/spsr/sp_el0 均为子进程自身副本值）。
@@ -527,11 +728,31 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
         nice,
     );
     if tid == u32::MAX {
-        // 任务槽位不足：回收子进程（地址空间/栈），返回失败
+        // 任务槽位不足：回收子进程（地址空间/栈），返回失败。
+        // ★ create_child_process 已对继承 fd 做引用 +1，必须先逐项释放再清
+        // PCB，否则表满 fork 风暴下管道/队列/shm/文件引用永久泄漏（对象池
+        // 耗尽、"文件仍打开"误报）。
         unsafe {
+            for fd in 0..FD_MAX {
+                let e = PROCESSES[child_pid as usize].fds[fd];
+                match e.kind {
+                    FdKind::File => crate::vfs::close_ref(e.index),
+                    FdKind::Pipe => crate::ipc::pipe_drop_ref(e.index, e.flags & crate::ipc::FD_WRITE != 0),
+                    FdKind::MsgQueue => crate::ipc::msgq_drop_ref(e.index),
+                    FdKind::Shm => crate::ipc::shm_close_index(child_pid, e.index),
+                    FdKind::Pair => crate::ipc::pair_drop_ref(e.index, e.flags as u32),
+                    _ => {}
+                }
+            }
             PROCESSES[child_pid as usize].pt.free_user_pages();
             vm::free_process_tables(PROCESSES[child_pid as usize].pt.ttbr0);
-            PROCESSES[child_pid as usize] = Process::empty();
+                    {
+            let n = core::mem::size_of::<Process>() / 8;
+            let p = &mut PROCESSES[child_pid as usize] as *mut Process as *mut u64;
+            for j in 0..n {
+                core::ptr::write_volatile(p.add(j), 0u64);
+            }
+        }
             let pages = stack_size.div_ceil(crate::allocator::PAGE_SIZE);
             for p in 0..pages {
                 allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
@@ -549,32 +770,58 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
 
 /// 初始化进程表：创建 pid 0（内核引导/init 父进程）并启动 init 线程。
 pub fn init(init_entry: fn(usize) -> !) {
+    crate::kinfo! { crate::uart_send_str("[pinit] A\n"); }
     unsafe {
+        // 直接 u64 清零，避免 384KB×16 的 memcpy（TCG 下极慢）
+        let n = core::mem::size_of::<Process>() / 8;
         for i in 0..MAX_PROC {
-            PROCESSES[i] = Process::empty();
+            let p = &mut PROCESSES[i] as *mut Process as *mut u64;
+            for j in 0..n {
+                core::ptr::write_volatile(p.add(j), 0u64);
+            }
         }
     }
-    let pt = vm::ProcPageTable::new();
+    crate::kinfo! { crate::uart_send_str("[pinit] B\n"); }
+    let pt = vm::ProcPageTable::new_boxed();
     let ttbr0 = pt.ttbr0;
+    crate::kinfo! { crate::uart_send_str("[pinit] C\n"); }
     unsafe {
-        PROCESSES[0] = Process {
-            pid: 0,
-            state: ProcessState::Running,
-            pt,
-            fds: [EMPTY_FD; FD_MAX],
-            signals: 0,
-            parent: -1,
-            exit_code: 0,
-            waiter: None,
-            name: [0; MAX_NAME],
-            name_len: 0,
-            cwd: DEFAULT_CWD,
-            cwd_len: 1,
-        };
+        let dst = &mut PROCESSES[0] as *mut Process;
+        crate::kinfo! {
+            crate::uart_send_str("[pinit] dst\n");
+            crate::uart_send_str("[pinit] dstaddr=");
+            crate::print_hex(dst as u64);
+            crate::uart_send_str(" sz=");
+            crate::print_dec(core::mem::size_of::<Process>() as u64);
+            crate::uart_send_str("\n");
+        }
+        let proc_bytes = core::mem::size_of::<Process>();
+        let dstb = dst as *mut u8;
+        for b in 0..proc_bytes {
+            core::ptr::write_volatile(dstb.add(b), 0u8);
+        }
+        crate::kinfo! { crate::uart_send_str("[pinit] wb\n"); }
+        (*dst).pid = 0;
+        (*dst).state = ProcessState::Running;
+        (*dst).parent = -1;
+        (*dst).exit_code = 0;
+        (*dst).waiters = [None; WAIT_WAITERS];
+        (*dst).signals = 0;
+        (*dst).name = [0; MAX_NAME];
+        (*dst).name_len = 0;
+        (*dst).cwd = DEFAULT_CWD;
+        (*dst).cwd_len = 1;
+        (*dst).fds = [EMPTY_FD; FD_MAX];
+        crate::kinfo! { crate::uart_send_str("[pinit] fields\n"); }
+        core::ptr::copy_nonoverlapping(&*pt as *const vm::ProcPageTable, &mut (*dst).pt, 1);
+        crate::kinfo! { crate::uart_send_str("[pinit] ptcopy\n"); }
     }
+    crate::kinfo! { crate::uart_send_str("[pinit] D\n"); }
     set_name(0, "kernel");
+    crate::kinfo! { crate::uart_send_str("[pinit] E\n"); }
     // init 线程：pid 0，普通优先级，地址空间为内核恒等映射
     sched_cfs::spawn(0, "kernel", init_entry, 0, PriorityClass::Normal, 0, ttbr0);
+    crate::kinfo! { crate::uart_send_str("[pinit] F\n"); }
 }
 
 /// 创建新进程（新地址空间 + 新线程），返回 pid。
@@ -591,30 +838,47 @@ pub fn spawn(
     if pid == u32::MAX {
         return u32::MAX;
     }
-    let pt = vm::ProcPageTable::new();
+    // pid 槽位只有写回 PROCESSES 后才占用（state 仍为 Free），此处失败直接
+    // 返回即可，槽位可复用。
+    let pt = match vm::ProcPageTable::try_new_boxed() {
+        Some(pt) => pt,
+        None => return u32::MAX,
+    };
     let ttbr0 = pt.ttbr0;
     unsafe {
-        PROCESSES[pid as usize] = Process {
-            pid,
-            state: ProcessState::Running,
-            pt,
-            fds: [EMPTY_FD; FD_MAX],
-            signals: 0,
-            parent: current_pid() as i32,
-            exit_code: 0,
-            waiter: None,
-            name: [0; MAX_NAME],
-            name_len: 0,
-            cwd: DEFAULT_CWD,
-            cwd_len: 1,
-        };
+        let dst = &mut PROCESSES[pid as usize] as *mut Process;
+        {
+            let proc_q = core::mem::size_of::<Process>() / 8;
+            let dstq = dst as *mut u64;
+            for i in 0..proc_q {
+                core::ptr::write_volatile(dstq.add(i), 0u64);
+            }
+        }
+        (*dst).pid = pid;
+        (*dst).state = ProcessState::Running;
+        (*dst).parent = current_pid() as i32;
+        (*dst).exit_code = 0;
+        (*dst).waiters = [None; WAIT_WAITERS];
+        (*dst).signals = 0;
+        (*dst).name = [0; MAX_NAME];
+        (*dst).name_len = 0;
+        (*dst).cwd = DEFAULT_CWD;
+        (*dst).cwd_len = 1;
+        (*dst).fds = [EMPTY_FD; FD_MAX];
+        core::ptr::copy_nonoverlapping(&*pt as *const vm::ProcPageTable, &mut (*dst).pt, 1);
     }
     set_name(pid, name);
     if sched_cfs::spawn(pid, name, entry, arg, class, nice, ttbr0) == u32::MAX {
         // 任务槽位耗尽：回收该进程的页表后返回失败（不泄漏）
         unsafe {
             vm::free_process_tables(ttbr0);
-            PROCESSES[pid as usize] = Process::empty();
+                    {
+            let n = core::mem::size_of::<Process>() / 8;
+            let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
+            for j in 0..n {
+                core::ptr::write_volatile(p.add(j), 0u64);
+            }
+        }
         }
         return u32::MAX;
     }
@@ -625,26 +889,46 @@ pub fn spawn(
 ///
 /// 供 ELF 加载器使用：先构建好用户地址空间（代码 + 栈 + 数据映射），
 /// 再注册进程并自行 spawn 用户线程。
-pub fn create_process(pt: vm::ProcPageTable, name: &str) -> u32 {
+pub fn create_process(mut pt: alloc::boxed::Box<vm::ProcPageTable>, name: &str) -> u32 {
     let pid = alloc_pid();
     if pid == u32::MAX {
+        // ★ 进程表满：Box 只会被 drop 释放 24KB 结构体本身——已加载的用户
+        // 页与派生页表（可达数 MB）全部泄漏，进程表反复打满即 OOM。这里
+        // 显式回收整个新地址空间后再返回。
+        pt.free_user_pages();
+        vm::free_process_tables(pt.ttbr0);
         return u32::MAX;
     }
     unsafe {
-        PROCESSES[pid as usize] = Process {
-            pid,
-            state: ProcessState::Running,
-            pt,
-            fds: [EMPTY_FD; FD_MAX],
-            signals: 0,
-            parent: current_pid() as i32,
-            exit_code: 0,
-            waiter: None,
-            name: [0; MAX_NAME],
-            name_len: 0,
-            cwd: DEFAULT_CWD,
-            cwd_len: 1,
-        };
+        // 逐字段写入 + 直接 memcpy 页表：避免 Process 结构体构造在栈上
+        // 产生 96KB+ 临时（叠加 execve/spawn 深调用链会溢出内核任务栈）。
+        let dst = &mut PROCESSES[pid as usize] as *mut Process;
+        {
+            let proc_q = core::mem::size_of::<Process>() / 8;
+            let dstq = dst as *mut u64;
+            for i in 0..proc_q {
+                core::ptr::write_volatile(dstq.add(i), 0u64);
+            }
+        }
+        (*dst).pid = pid;
+        (*dst).state = ProcessState::Running;
+        (*dst).parent = current_pid() as i32;
+        (*dst).exit_code = 0;
+        (*dst).waiters = [None; WAIT_WAITERS];
+        (*dst).signals = 0;
+        (*dst).name = [0; MAX_NAME];
+        (*dst).name_len = 0;
+        (*dst).cwd = DEFAULT_CWD;
+        (*dst).cwd_len = 1;
+        (*dst).fds = [EMPTY_FD; FD_MAX];
+        {
+            let dstq = &mut (*dst).pt as *mut vm::ProcPageTable as *mut u64;
+            let srcq = &*pt as *const vm::ProcPageTable as *const u64;
+            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
+            for i in 0..n {
+                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
+            }
+        }
     }
     set_name(pid, name);
     pid
@@ -668,6 +952,10 @@ pub fn assign_fd(pid: u32, fd: usize, entry: FdEntry) -> i32 {
 
 /// [诊断] 跨进程物理页重复分配检查：除共享 RO / COW 外的私有页若与其它
 /// 进程的任意页共享同一物理地址，说明分配器双重分配（系统级损坏根源）。
+///
+/// 同进程同 VA 的重复记录（同一映射被多次登记）不属于双重分配，只做一次
+/// 汇总提示（安静模式不上串口）；重复登记本身意味着该页退出时会被
+/// `free_user_pages` 释放两次，需排查登记来源。
 pub fn check_double_allocations() {
     // 1) 全进程对（含自身）私有页重复物理地址检查
     for a in 0..MAX_PROC {
@@ -675,6 +963,8 @@ pub fn check_double_allocations() {
         if pa.pt.ttbr0 == 0 {
             continue;
         }
+        // 同进程内同 VA 重复登记计数（同一映射多条记录 → 退出时双重释放隐患）
+        let mut dup_records = 0usize;
         for i in 0..pa.pt.count {
             let p = pa.pt.user_pages[i];
             if p.paddr == 0 || p.paddr == vm::LAZY_PAGE {
@@ -691,7 +981,7 @@ pub fn check_double_allocations() {
                 for j in 0..pb.pt.count {
                     let q = pb.pt.user_pages[j];
                     if q.paddr == p.paddr
-                        && !(a == b && i == j)
+                        && !(a == b && q.vaddr == p.vaddr)
                         && !(vm::is_user_ro(q.flags) && !vm::is_cow(q.flags))
                     {
                         crate::uart_send_str("\n[DOUBLE-ALLOC] paddr=");
@@ -700,13 +990,36 @@ pub fn check_double_allocations() {
                         crate::print_dec(a as u64);
                         crate::uart_send_str(" va=");
                         crate::print_hex(p.vaddr as u64);
-                        crate::uart_send_str(" vs proc ");
+                        crate::uart_send_str(" 与 proc ");
                         crate::print_dec(b as u64);
                         crate::uart_send_str(" va=");
                         crate::print_hex(q.vaddr as u64);
                         crate::uart_send_str("\n");
                     }
                 }
+            }
+        }
+        // 同 VA 重复登记：只汇总一条（安静模式不上串口），避免刷屏
+        for i in 0..pa.pt.count {
+            let p = pa.pt.user_pages[i];
+            if p.paddr == 0 || p.paddr == vm::LAZY_PAGE {
+                continue;
+            }
+            for j in 0..i {
+                let q = pa.pt.user_pages[j];
+                if q.vaddr == p.vaddr && q.paddr != vm::LAZY_PAGE {
+                    dup_records += 1;
+                    break;
+                }
+            }
+        }
+        if dup_records > 0 {
+            crate::kinfo! {
+                crate::uart_send_str("[dbl-track] proc ");
+                crate::print_dec(a as u64);
+                crate::uart_send_str(" 存在 ");
+                crate::print_dec(dup_records as u64);
+                crate::uart_send_str(" 条同 VA 重复页记录（退出时会双重释放，需排查登记来源）\n");
             }
         }
     }
@@ -727,7 +1040,7 @@ pub fn check_double_allocations() {
                 crate::print_hex(p.vaddr as u64);
                 crate::uart_send_str(" paddr=");
                 crate::print_hex(p.paddr as u64);
-                crate::uart_send_str(" in kernel [");
+                crate::uart_send_str(" 在内核区 [");
                 crate::print_hex(kstart as u64);
                 crate::uart_send_str(",");
                 crate::print_hex(kend as u64);
@@ -735,6 +1048,41 @@ pub fn check_double_allocations() {
             }
         }
     }
+}
+
+/// 按根表物理地址反查进程（供 vm 层做记录级映射校验）。
+///
+/// 用户映射的权威来源是 `ProcPageTable::user_pages` 记录表：所有用户页表
+/// 继承内核 L1[0] 的 1GB 设备块，纯页表漫游会把任意低地址（含设备区）误判
+/// 为已映射。`user_range_mapped` 等校验改为先由本函数定位进程，再查记录。
+fn pid_by_root(root: usize) -> i32 {
+    unsafe {
+        for i in 0..MAX_PROC {
+            if PROCESSES[i].state != ProcessState::Free && PROCESSES[i].pt.ttbr0 == root {
+                return i as i32;
+            }
+        }
+    }
+    -1
+}
+
+/// 校验根表 `root` 对应进程的记录表中 `page` 页已建立真实映射
+/// （有记录且物理页已分配：`paddr != 0` 且非 `LAZY_PAGE` 预留）。
+pub fn root_page_recorded(root: usize, page: usize) -> bool {
+    let pid = pid_by_root(root);
+    if pid < 0 {
+        return false;
+    }
+    unsafe {
+        let pt = &PROCESSES[pid as usize].pt;
+        for i in 0..pt.count {
+            let r = pt.user_pages[i];
+            if r.vaddr == page && r.paddr != 0 && r.paddr != vm::LAZY_PAGE {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 当前进程的地址空间根表（物理地址）。
@@ -751,18 +1099,35 @@ pub fn current_root() -> usize {
 /// 先安装新页表并把 TTBR0_EL1 切换到新根表（此时内核恒等映射在新根表中依然
 /// 有效），随后释放旧地址空间（用户数据页 + 私有页表），避免「先释放仍被
 /// TTBR0 引用的页表」造成的悬空。
-pub fn replace_address_space(pid: u32, new_pt: vm::ProcPageTable) {
+pub fn replace_address_space(pid: u32, new_pt: alloc::boxed::Box<vm::ProcPageTable>) {
     let new_ttbr0 = new_pt.ttbr0;
-    let old_pt = unsafe {
+    unsafe {
         let p = &mut PROCESSES[pid as usize];
-        core::mem::replace(&mut p.pt, new_pt)
-    };
-    // 切到新根表（TTBR0 + tlbi vmalle1）
-    sched_cfs::set_current_ttbr0(new_ttbr0);
-    // 释放旧地址空间
-    let mut old = old_pt;
-    old.free_user_pages();
-    vm::free_process_tables(old.ttbr0);
+        let old_ttbr0 = p.pt.ttbr0;
+        // 1) 先释放旧地址空间的**用户数据页**（物理页归还）。
+        //    此刻仍运行在旧/新根表共有的内核恒等映射上，不触碰用户区，安全。
+        p.pt.free_user_pages();
+        // 2) 把新页表记录整体覆盖进进程表（含新 ttbr0）。新页表已转移给进程，
+        //    Box 用 forget 防二次释放。
+        {
+            let dstq = &mut p.pt as *mut vm::ProcPageTable as *mut u64;
+            let srcq = &*new_pt as *const vm::ProcPageTable as *const u64;
+            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
+            for i in 0..n {
+                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
+            }
+        }
+        core::mem::forget(new_pt);
+        // 3) **先把硬件 TTBR0 切到新根表**（新根表同样继承内核恒等映射，指令
+        //    取指/数据访问在新根表上继续成立），再做 TLB 全清。此后内核不再
+        //    通过旧根表做任何翻译。
+        sched_cfs::set_current_ttbr0(new_ttbr0);
+        // 4) 最后释放旧地址空间的**私有页表结构**（旧 L2/L3/根表）。
+        //    ★顺序修正：此前先释放旧根表再切 TTBR0，窗口内 TTBR0 仍指向已
+        //    归还的页表页——任何 IRQ/内存分配都会让翻译命中已复用内存（悬空
+        //    页表 → data abort / 随机翻译错误）。先切后释放消除该窗口。
+        vm::free_process_tables(old_ttbr0);
+    }
 }
 
 /// 复制当前进程：父进程返回子 pid，子进程返回 0。
@@ -772,6 +1137,32 @@ pub fn fork(frame: usize) -> i32 {
     let pid = unsafe { do_fork(frame) };
     // black_box 阻止尾调用优化，保证 do_fork 的返回地址存在（子进程在此返回 0）
     core::hint::black_box(pid)
+}
+
+/// 诊断：在用户页表记录中查找 `va` 页（供故障定位）。
+pub fn processes_pub_find(pid: u32, va: usize) -> i64 {
+    if (pid as usize) >= MAX_PROC {
+        return -1;
+    }
+    let page = va & !(vm::PAGE_SIZE - 1);
+    unsafe {
+        let p = &PROCESSES[pid as usize];
+        for i in 0..p.pt.count {
+            if p.pt.user_pages[i].vaddr == page {
+                return p.pt.user_pages[i].paddr as i64;
+            }
+        }
+    }
+    -1
+}
+
+/// 公开指定进程的页表根（供故障诊断使用）。
+pub fn processes_pub_ttbr0(pid: u32) -> usize {
+    if (pid as usize) < MAX_PROC {
+        unsafe { PROCESSES[pid as usize].pt.ttbr0 }
+    } else {
+        0
+    }
 }
 
 /// 强制回收一个「刚创建即失败」的进程（如任务槽位耗尽）：释放地址空间、
@@ -786,15 +1177,28 @@ pub fn reap_forced(pid: u32) {
             let e = PROCESSES[pid as usize].fds[fd];
             match e.kind {
                 FdKind::File => crate::vfs::close_ref(e.index),
-                FdKind::Pipe => crate::ipc::pipe_drop_ref(e.index),
+                FdKind::Pipe => crate::ipc::pipe_drop_ref(e.index, e.flags & crate::ipc::FD_WRITE != 0),
                 FdKind::MsgQueue => crate::ipc::msgq_drop_ref(e.index),
                 FdKind::Shm => crate::ipc::shm_close_index(pid, e.index),
+                FdKind::Pair => crate::ipc::pair_drop_ref(e.index, e.flags as u32),
                 _ => {}
             }
         }
         PROCESSES[pid as usize].pt.free_user_pages();
         vm::free_process_tables(ttbr0);
-        PROCESSES[pid as usize] = Process::empty();
+        // 复位该 pid 槽位的用户堆断点/mmap 游标：槽位会被复用（如 OOBE 退出后
+        // launcher 复用同一 pid），遗留的未对齐断点会让新进程堆分配写越界。
+        crate::bionic_shim::reset_brk_state(pid as usize);
+        // 清 ELF 运行时信息：pid 复用给非 ELF 进程时，陈旧的 ASLR 栈基址/brk
+        // 会被 current_stack_base()/current_brk() 当作新进程的值使用。
+        crate::elf::release(pid);
+        {
+            let n = core::mem::size_of::<Process>() / 8;
+            let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
+            for j in 0..n {
+                core::ptr::write_volatile(p.add(j), 0u64);
+            }
+        }
     }
 }
 
@@ -805,24 +1209,71 @@ fn reap(pid: u32) -> i32 {
     unsafe {
         let code = PROCESSES[pid as usize].exit_code;
         let ttbr0 = PROCESSES[pid as usize].pt.ttbr0;
-        // 释放该进程全部 fd 资源（文件引用计数 -1、管道/队列/共享内存槽位释放），
-        // 防止对象池耗尽 panic 与文件表项泄漏
+        crate::kinfo! {
+            crate::uart_send_str("[reap] pid=");
+            crate::print_dec(pid as u64);
+            crate::uart_send_str(" slot.pid=");
+            crate::print_dec(PROCESSES[pid as usize].pid as u64);
+            crate::uart_send_str(" ttbr0=");
+            crate::print_hex(ttbr0 as u64);
+            crate::uart_send_str(" st=");
+            crate::print_dec(PROCESSES[pid as usize].state as u64);
+            crate::uart_send_str("\n");
+        }
+        // 释放该进程全部 fd 资源（文件引用计数 -1、管道/队列/共享内存/套接字对
+        // 槽位释放），防止对象池耗尽 panic 与文件表项泄漏。
+        // ★ SMP 护栏必须先行：目标仍有存活任务（他核 kill_req 待兑现）时其
+        // 地址空间正在被使用，先释放页表/fd = use-after-free。此时放弃释放
+        // （槽位留待后续 wait 重试），只返回退出码。
+        if crate::sched_cfs::has_live_tasks(pid) {
+            return PROCESSES[pid as usize].exit_code;
+        }
         for fd in 0..FD_MAX {
             let e = PROCESSES[pid as usize].fds[fd];
             match e.kind {
-                FdKind::File => crate::vfs::close_ref(e.index),
-                FdKind::Pipe => crate::ipc::pipe_drop_ref(e.index),
+FdKind::File => crate::vfs::close_ref(e.index),
+                FdKind::Pipe => crate::ipc::pipe_drop_ref(e.index, e.flags & crate::ipc::FD_WRITE != 0),
                 FdKind::MsgQueue => crate::ipc::msgq_drop_ref(e.index),
                 FdKind::Shm => crate::ipc::shm_close_index(pid, e.index),
+                FdKind::Pair => crate::ipc::pair_drop_ref(e.index, e.flags as u32),
                 _ => {}
             }
         }
         PROCESSES[pid as usize].pt.free_user_pages();
         vm::free_process_tables(ttbr0);
-        // 回收该进程全部已退出线程的内核栈与 TCB 槽位（防 alloc_tid 耗尽 panic）
-        sched_cfs::reap_pid(pid);
-        PROCESSES[pid as usize] = Process::empty();
+        // 回收该进程全部已退出线程的内核栈与 TCB 槽位（防 alloc_tid 耗尽）
+        crate::sched_cfs::reap_pid(pid);
+        // 复位该 pid 槽位的用户堆断点/mmap 游标：槽位会被复用（如 OOBE 退出后
+        // launcher 复用同一 pid），遗留的未对齐断点会让新进程堆分配写越界。
+        crate::bionic_shim::reset_brk_state(pid as usize);
+                {
+            let n = core::mem::size_of::<Process>() / 8;
+            let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
+            for j in 0..n {
+                core::ptr::write_volatile(p.add(j), 0u64);
+            }
+        }
         code
+    }
+}
+
+/// 孤儿收养：`pid` 进程退出时，将其全部存活子进程重新挂到 init（pid 1）名下。
+///
+/// 此前无收养逻辑：父退出后子进程的 `parent` 仍指向已回收的槽位，任何进程
+/// （包括 init）的 `wait(-1)` 都扫描不到它们 —— 子进程退出后成为无人收割的
+/// 僵尸，永久占用 `MAX_PROC` 槽位（反复 fork/退出的服务会慢慢耗尽进程表）。
+/// 收养后子进程退出时 `exit` 会唤醒 init（parent = 1），init 的 wait 循环可
+/// 正常收割。
+fn adopt_orphans(pid: u32) {
+    unsafe {
+        for i in 0..MAX_PROC {
+            if i == pid as usize {
+                continue;
+            }
+            if PROCESSES[i].state != ProcessState::Free && PROCESSES[i].parent == pid as i32 {
+                PROCESSES[i].parent = 1;
+            }
+        }
     }
 }
 
@@ -831,14 +1282,35 @@ pub fn exit(code: i32) -> ! {
     // 屏蔽 IRQ，保证「终止兄弟线程 → 标记僵尸 → 唤醒等待者 → 切走」整个过程原子。
     unsafe { asm!("msr daifset, #2") };
     let pid = current_pid();
+    unsafe {
+        let ttbr: u64;
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr);
+        crate::kinfo! {
+            crate::uart_send_str("[exit] pid=");
+            crate::print_dec(pid as u64);
+            crate::uart_send_str(" pt.ttbr0=");
+            crate::print_hex(PROCESSES[pid as usize].pt.ttbr0 as u64);
+            crate::uart_send_str(" reg=");
+            crate::print_hex(ttbr);
+            crate::uart_send_str("\n");
+        }
+    }
     // 终止同进程的所有线程：多线程进程退出时，兄弟线程必须在此之前停止，
     // 否则父进程 reap 释放页表后它们会以悬空 TTBR0 继续运行。
     sched_cfs::kill_pid(pid);
+    // 孤儿收养：本进程退出后其子进程改挂到 init（pid 1）下。否则这些子进程
+    // 保持孤儿身份：父槽位被回收后无人能 wait 它们，僵尸永占 MAX_PROC 槽位。
+    adopt_orphans(pid);
     unsafe {
         PROCESSES[pid as usize].state = ProcessState::Zombie;
         PROCESSES[pid as usize].exit_code = code;
-        if let Some(wt) = PROCESSES[pid as usize].waiter {
-            sched_cfs::wake_irq(wt);
+        // 唤醒全部等待本进程的线程（多等待者：并发 wait 各自登记，逐个唤醒
+        // 并清槽——防止只唤醒一个，其余等待线程永久阻塞）
+        for i in 0..WAIT_WAITERS {
+            if let Some(wt) = PROCESSES[pid as usize].waiters[i] {
+                PROCESSES[pid as usize].waiters[i] = None;
+                sched_cfs::wake_irq(wt);
+            }
         }
     }
     // 唤醒父进程（若其正阻塞于 wait_any）；仅当父进程注册了 SIGCHLD handler
@@ -852,6 +1324,90 @@ pub fn exit(code: i32) -> ! {
         }
     }
     sched_cfs::exit_current()
+}
+
+/// 线程级退出（Linux `exit(93)` 语义）：仅退出当前线程；只有当本线程是
+/// 进程最后一个存活任务时才升级为完整进程退出。CLONE_THREAD 工作线程的
+/// 收尾（pthread_exit / 线程函数返回）走此处 —— 若误走 [`exit`]，任一线程
+/// 结束都会 kill_pid 整个线程组，pthread_join 永远等不到、主线程被杀。
+pub fn exit_thread(code: i32) -> ! {
+    if !sched_cfs::exit_thread_current() {
+        exit(code);
+    }
+    // exit_thread_current 返回 true 时已切换走，不会到达
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// 强制终止任意进程（SIGKILL 语义，供 lifd/LMK 使用）。
+///
+/// 与 `exit`（仅当前进程）不同：本函数在**发送方上下文**执行，可终止
+/// 任意 pid 的进程——包括 SIGSTOP 停止（后台/挂起）的进程。停止态进程
+/// 不会再次进入内核处理待处理信号，因此 SIGKILL 不能走"置位+唤醒"路径，
+/// 必须在此直接终止其全部任务、标记僵尸并唤醒父进程/等待者。
+///
+/// 调用方须已屏蔽 IRQ 或处于 syscall 上下文（`sys_kill` 路径）。
+pub fn terminate(pid: u32) {
+    if (pid as usize) >= MAX_PROC {
+        return;
+    }
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        if p.state == ProcessState::Free || p.state == ProcessState::Zombie {
+            return;
+        }
+    }
+    sched_cfs::kill_pid(pid);
+    adopt_orphans(pid);
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        p.state = ProcessState::Zombie;
+        p.exit_code = 137; // 128 + SIGKILL(9)
+        // 唤醒全部等待本进程的线程（多等待者：并发 wait 各自登记，逐个唤醒）
+        for i in 0..WAIT_WAITERS {
+            if let Some(wt) = p.waiters[i] {
+                p.waiters[i] = None;
+                sched_cfs::wake_irq(wt);
+            }
+        }
+        let parent = p.parent;
+        if parent >= 0 {
+            sched_cfs::wake_pid(parent as u32);
+            if parent < MAX_PROC as i32 && sig_handler(parent as u32, 17) != 0 {
+                signal_send(parent as u32, 17);
+            }
+        }
+    }
+    // 终止目标包含当前任务（kill(getpid(), SIGKILL) 自杀路径）：立即走
+    // exit_current 等价路径（置 Exited 并切走），不等下一 tick 兑现 kill_req，
+    // 消除「已标记 Zombie 的进程仍运行至多 10ms」的窗口。父进程随后 reap 时
+    // 目标任务必然已切走（单核安全，reap_pid 另有存活任务护栏兜底 SMP）。
+    if sched_cfs::current_pid() == pid {
+        sched_cfs::exit_current();
+    }
+}
+
+/// 判断当前进程是否存在已退出的子进程（Zombie，等待回收）。
+///
+/// 供 `wait4(WNOHANG)` 使用：存在则 `wait` 可立即回收，否则调用方
+/// 不阻塞直接返回 0。`pid = -1`/`0` 查任意子进程，`pid > 0` 查指定子进程。
+pub fn has_zombie_child(pid: i32) -> bool {
+    let cur = current_pid();
+    unsafe {
+        for i in 0..MAX_PROC {
+            if PROCESSES[i].state != ProcessState::Zombie {
+                continue;
+            }
+            if PROCESSES[i].parent != cur as i32 {
+                continue;
+            }
+            if pid == -1 || pid == 0 || pid as usize == i {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 等待子进程退出。
@@ -894,26 +1450,80 @@ pub fn wait(pid: i32) -> (i32, i32) {
             if !any_child {
                 return (-1, 0);
             }
-            sched_cfs::block_current();
+            // ★ 丢唤醒修复：「查无僵尸」与 block_current 之间被 tick 抢占时，
+            // 子进程 exit 的 wake_pid 只唤醒 Blocked 任务（此时父进程是 Ready）
+            // → 父进程随后阻塞且再无人唤醒。把检查到阻塞包进 IRQ 屏蔽窗口。
+            let saved = unsafe { sched_cfs::read_daif() };
+            unsafe { core::arch::asm!("msr daifset, #2") };
+            let mut zombie2 = None;
+            unsafe {
+                for i in 0..MAX_PROC {
+                    if PROCESSES[i].state == ProcessState::Zombie
+                        && PROCESSES[i].parent == cur as i32
+                    {
+                        zombie2 = Some(i as u32);
+                        break;
+                    }
+                }
+            }
+            match zombie2 {
+                Some(z) => {
+                    unsafe { sched_cfs::write_daif(saved) };
+                    let code = reap(z);
+                    return (z as i32, code);
+                }
+                None => {
+                    sched_cfs::block_current();
+                    unsafe { sched_cfs::write_daif(saved) };
+                }
+            }
         }
     } else if pid > 0 && (pid as usize) < MAX_PROC {
         loop {
+            // ★ 丢唤醒修复：登记 waiter 与 block_current 之间被 tick 抢占时，
+            // 子进程 exit 会清掉 waiter 槽且 wake_irq 只唤醒 Blocked 任务
+            //（此时父进程是 Ready）→ 父进程随后阻塞且再无人唤醒。
+            // 把「状态检查 + 登记 + 阻塞」包进 IRQ 屏蔽窗口。
+            let saved = unsafe { sched_cfs::read_daif() };
+            unsafe { core::arch::asm!("msr daifset, #2") };
             let action = unsafe {
                 let p = &mut PROCESSES[pid as usize];
-                match p.state {
-                    ProcessState::Free => return (-1, 0),
+                if p.state == ProcessState::Free {
+                    unsafe { sched_cfs::write_daif(saved) };
+                    return (-1, 0);
+                }
+                // ★ wait(pid) 只允许等待**自己的子进程**：pid 不是当前进程的子进程
+                // （别人的兄弟/祖先/其它进程）立即 ECHILD，不阻塞等待、不收割他人
+                // 僵尸——此前缺失亲子校验，任意进程可永久阻塞在别人的进程上或
+                // 抢先回收他人已退出子进程（wait() 与真正父进程的 reap 竞态）。
+                if p.parent != cur as i32 {
+                    unsafe { sched_cfs::write_daif(saved) };
+                    return (-1, 0);
+                }
+match p.state {
                     ProcessState::Zombie => Some(()),
-                    ProcessState::Running => {
-                        p.waiter = Some(sched_cfs::current_tid());
+                    _ => {
+                        // 多等待者：登记到第一个空闲槽位（防并发 wait 覆写单槽
+                        // 导致先等待的线程在退出唤醒时被漏掉、永久阻塞）。槽位
+                        // 满的极端场景（多线程并发 wait 同一子进程）不登记直接
+                        // 阻塞——唤醒由 wait(-1) 路径的 wake_pid 兜底覆盖。
+                        for w in p.waiters.iter_mut() {
+                            if w.is_none() {
+                                *w = Some(sched_cfs::current_tid());
+                                break;
+                            }
+                        }
                         None
                     }
                 }
             };
             if action.is_some() {
+                unsafe { sched_cfs::write_daif(saved) };
                 let code = reap(pid as u32);
                 return (pid, code);
             }
             sched_cfs::block_current();
+            unsafe { sched_cfs::write_daif(saved) };
         }
     } else {
         (-1, 0)
@@ -929,6 +1539,26 @@ pub fn ps(f: &mut dyn FnMut(u32, &str)) {
                     .unwrap_or("?");
                 f(PROCESSES[i].pid, name);
             }
+        }
+    }
+}
+
+/// 进程级统计（LMK / procfs 用）：对每个存活进程调用
+/// `f(pid, 进程名, 用户物理页数, 是否 SIGSTOP 停止)`。
+///
+/// 用户页数来自地址空间映射记录（`pt.count`），是 LMK 评分的内存口径；
+/// 停止态供诊断显示（/proc/processes 的 T 标记）。
+pub fn proc_stats(f: &mut dyn FnMut(u32, &str, usize, bool)) {
+    unsafe {
+        for i in 0..MAX_PROC {
+            if PROCESSES[i].state == ProcessState::Free {
+                continue;
+            }
+            let name = core::str::from_utf8(&PROCESSES[i].name[..PROCESSES[i].name_len])
+                .unwrap_or("?");
+            let pages = PROCESSES[i].pt.count;
+            let stopped = crate::sched_cfs::process_stopped(PROCESSES[i].pid);
+            f(PROCESSES[i].pid, name, pages, stopped);
         }
     }
 }
@@ -1074,7 +1704,12 @@ pub fn map_user_page(vaddr: usize, paddr: usize) {
     let pid = current_pid();
     unsafe {
         let root = PROCESSES[pid as usize].pt.ttbr0;
-        vm::map_page_in(root, vaddr, paddr, vm::FLAG_USER_DATA);
+        if !vm::map_page_in(root, vaddr, paddr, vm::FLAG_USER_DATA) {
+            // 页表 OOM：映射缺失，进程访问该页将 SIGSEGV（比内核 panic 好）。
+            crate::uart_send_str("[map] map_user_page OOM vaddr=");
+            crate::print_hex(vaddr as u64);
+            crate::uart_send_str("\n");
+        }
     }
 }
 
@@ -1120,7 +1755,13 @@ pub fn page_fault_resolve(vaddr: usize) -> bool {
                 // 落地：分配物理页 + 清零 + 建立映射 + 更新记录
                 let Some(pa) = allocator::alloc_page() else { return false };
                 core::ptr::write_bytes(pa as *mut u8, 0, vm::PAGE_SIZE);
-                vm::map_page_in(p.pt.ttbr0, page, pa, rec.flags);
+                // 页表 OOM：归还物理页并返回 false（SIGSEGV），
+                // 避免映射缺失却更新记录导致缺页无限重入。
+                if !vm::map_page_in(p.pt.ttbr0, page, pa, rec.flags) {
+                    allocator::free_page(pa);
+                    crate::uart_send_str("[fault] 页表 OOM\n");
+                    return false;
+                }
                 p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: pa, flags: rec.flags };
                 PAGE_FAULTS_RESOLVED += 1;
                 return true;
@@ -1176,9 +1817,19 @@ pub fn cow_break(vaddr: usize) -> bool {
                 // 2) 本进程映射切到新页（RW，清 COW）；map_page_in 覆盖已有
                 //    映射会做 TLB 失效，之后 eret 重试的写指令命中新页
                 let new_flags = rec.flags & !vm::FLAG_COW;
-                vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags));
+                // 页表 OOM：归还新页并返回 false（SIGSEGV），
+                // 避免记录指向新页而 PTE 仍是旧共享页的不一致状态。
+                if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
+                    allocator::free_page(new_pa);
+                    crate::uart_send_str("[cow] 页表 OOM\n");
+                    return false;
+                }
                 p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: new_pa, flags: new_flags };
                 // 3) 共享页引用 -1，归零释放旧页
+                // 注意：不在此处逐页打印 —— 每次 COW break 都做阻塞串口输出
+                // 会让启动动画期间每帧写显存/back buffer 被串口拖慢数秒，且
+                // 阻塞 UART RX 导致注入的触摸帧丢失；总量由 COW_BREAKS 汇总，
+                // 引导结束时统一打印。
                 if allocator::unshare_page(rec.paddr) {
                     allocator::free_page(rec.paddr);
                 }
@@ -1216,14 +1867,15 @@ pub fn ensure_user_range_mapped(va: usize, len: usize) -> bool {
 }
 
 /// 确保 `[va, va+len)` 范围内所有页均已落地**且可写**：LAZY 页落地、
-/// COW 共享页 break 出私有副本。
+/// COW 共享页 break 出私有副本、共享只读页（ELF 代码/rodata、信号蹦床，
+/// `AP_USER_RO`=0b11 在 **EL1 同样只读**）复制出私有可写副本。
 ///
-/// 供内核态**写入**用户缓冲区前调用（`copy_to_user` 等路径）：COW 页在页表
-/// 中映射为只读（`AP_USER_RO`），但该只读只约束 EL0 —— EL1 内核写共享页
-/// 不会触发 fault，会直接污染其它进程的数据。因此内核写用户内存前必须先
-/// 把范围内的 COW 页全部 break 成本进程私有可写页。
+/// 供内核态**写入**用户缓冲区前调用（`copy_to_user` 等路径）。COW 页在页表
+/// 中映射为只读，EL1 直接写会触发 permission fault → 同步异常处理器 panic
+/// （整机挂死）；共享只读池页同理。因此写前必须把两类页全部处理为私有可写。
 ///
-/// 返回是否成功；范围非法或任一页处理失败返回 `false`。
+/// 返回是否成功；范围非法、任一页落地失败或复制失败（OOM）返回 `false`
+/// （调用方按 EFAULT/SIGSEGV 语义处理，**绝不能**带着只读映射继续写）。
 pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
     if !vm::user_va_range_ok(va, len) {
         return false;
@@ -1237,13 +1889,114 @@ pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
                 return false;
             }
         }
-        // COW 共享页 → break 出私有可写副本
-        if !cow_break(cur) {
-            // 非 COW 页：无需处理（已映射即可写）
+        // 查记录权限：COW 共享页 → break；AP_USER_RO 页（ELF text/rodata、
+        // 蹦床）→ 复制私有副本。两者都走 mprotect_page（其内部对 COW/共享
+        // 只读/普通页分支处理完备，OOM 返回 false）。
+        // 注意：无记录的共享映射（SHM/framebuffer，经页表漫游放行）无法在
+        // 此处理——它们映射为 RW，EL1 写安全，跳过即可。
+        if let Some(fl) = current_page_flags(cur) {
+            if vm::is_cow(fl) || vm::is_user_ro(fl) {
+                if !mprotect_page(cur, vm::AP_USER_RW) {
+                    return false;
+                }
+            }
         }
         cur += vm::PAGE_SIZE;
     }
     true
+}
+
+/// 查询当前进程 `vaddr` 所在页的记录 flags；不在记录表返回 `None`。
+fn current_page_flags(vaddr: usize) -> Option<vm::MapFlags> {
+    let page = vaddr & !(vm::PAGE_SIZE - 1);
+    let pid = current_pid();
+    unsafe {
+        let p = &PROCESSES[pid as usize];
+        for i in 0..p.pt.count {
+            if p.pt.user_pages[i].vaddr == page {
+                return Some(p.pt.user_pages[i].flags);
+            }
+        }
+    }
+    None
+}
+
+/// `mprotect` 单页实现：修改 `vaddr` 所在页的访问权限为 `ap`
+/// （`vm::AP_USER_RW` 或 `vm::AP_USER_RO`），同步页表与地址空间记录。
+///
+/// 语义（与 syscall 层 W^X 策略配套）：
+/// - LAZY 预留页：仅更新记录权限，落地时按新权限建映射（`page_fault_resolve`
+///   用记录 flags 映射）；
+/// - COW 共享页授予写权限：先 `cow_break` 出本进程私有副本（否则 EL1/EL0
+///   写入会穿透只读页表污染其它进程）；
+/// - 共享只读池页（ELF 代码/rodata，`AP_USER_RO` 无 COW）授予写权限：
+///   复制出私有页并解除共享（`unshare_page` 引用 -1），防止写穿其它进程；
+/// - 授予只读：清除 COW 标记、保持共享语义（退出时按共享池引用释放）。
+///
+/// 返回是否成功（页不在记录表中 / 内存不足返回 `false`）。
+pub fn mprotect_page(vaddr: usize, ap: vm::MapFlags) -> bool {
+    if !vm::user_va_range_ok(vaddr, vm::PAGE_SIZE) {
+        return false;
+    }
+    let page = vaddr & !(vm::PAGE_SIZE - 1);
+    let pid = current_pid();
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        for i in 0..p.pt.count {
+            if p.pt.user_pages[i].vaddr != page {
+                continue;
+            }
+            // LAZY 预留页：只改记录，落地时生效
+            if p.pt.user_pages[i].paddr == vm::LAZY_PAGE {
+                let rec = &mut p.pt.user_pages[i];
+                rec.flags = (rec.flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+                return true;
+            }
+            let wants_rw = ap == vm::AP_USER_RW;
+            if wants_rw && (vm::is_cow(p.pt.user_pages[i].flags) || vm::is_user_ro(p.pt.user_pages[i].flags))
+            {
+                // COW 页：break 出私有副本（记录被更新为私有 RW）
+                if vm::is_cow(p.pt.user_pages[i].flags) {
+                    if !cow_break(page) {
+                        return false;
+                    }
+                    // cow_break 后记录已是私有 RW，权限目标即达成
+                    if ap == vm::AP_USER_RW {
+                        return true;
+                    }
+                } else {
+                    // 共享只读池页：手动复制出私有页并解除共享
+                    let old_pa = p.pt.user_pages[i].paddr;
+                    let Some(new_pa) = allocator::alloc_page() else { return false };
+                    core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, vm::PAGE_SIZE);
+                    let new_flags = (p.pt.user_pages[i].flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+                    // 先映射新页（覆盖旧 PTE），成功后再解除旧页共享：
+                    // 映射失败时旧页仍完好，不会留下指向已释放页的 PTE。
+                    if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
+                        allocator::free_page(new_pa);
+                        crate::uart_send_str("[mprotect] 页表 OOM\n");
+                        return false;
+                    }
+                    if allocator::unshare_page(old_pa) {
+                        allocator::free_page(old_pa);
+                    }
+                    p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: new_pa, flags: new_flags };
+                    return true;
+                }
+            }
+            // 普通路径：更新 AP（清除 COW 标记；只读页保持共享池语义）
+            let rec = p.pt.user_pages[i];
+            let new_flags = (rec.flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+            // 页表 OOM：保持旧映射与记录一致，mprotect 失败返回 false。
+            if !vm::map_page_in(p.pt.ttbr0, page, rec.paddr, vm::cow_pte_flags(new_flags)) {
+                crate::uart_send_str("[mprotect] 页表 OOM\n");
+                return false;
+            }
+            p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: rec.paddr, flags: new_flags };
+            return true;
+        }
+    }
+    false
 }
 
 /// 回滚最近 `n` 个用户页映射（mmap/brk 分配中途失败时调用）：
@@ -1318,4 +2071,22 @@ pub fn unmap_user_range(va: usize, len: usize) -> usize {
         }
     }
     freed
+}
+
+/// 读取进程 `pid` 的第 `index` 条用户映射记录，返回 `(vaddr, paddr, flags)`。
+///
+/// 越界或进程无效时返回 `(u64::MAX, u64::MAX, u64::MAX)` 哨兵（供
+/// crash tombstone 的内存映射转储与调试工具迭代）。只读，无需屏蔽 IRQ。
+pub fn user_map_at(pid: u32, index: usize) -> (u64, u64, u64) {
+    if (pid as usize) >= MAX_PROC {
+        return (u64::MAX, u64::MAX, u64::MAX);
+    }
+    unsafe {
+        let p = &PROCESSES[pid as usize];
+        if p.state == ProcessState::Free || index >= p.pt.count {
+            return (u64::MAX, u64::MAX, u64::MAX);
+        }
+        let pg = p.pt.user_pages[index];
+        (pg.vaddr as u64, pg.paddr as u64, pg.flags as u64)
+    }
 }

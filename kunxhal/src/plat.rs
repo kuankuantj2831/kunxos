@@ -3,7 +3,10 @@
 use crate::display::DisplayInfo;
 use crate::input::InputInfo;
 use crate::net::NetInfo;
+use crate::power::{Battery, DvfsController, PowerControl, ThermalSensor};
+use crate::sensor::SensorInfo;
 use crate::storage::StorageInfo;
+use crate::wifi::WifiDevice;
 
 /// 硬件平台抽象。
 ///
@@ -40,4 +43,54 @@ pub trait Platform {
     fn storage_init(&self) -> Option<StorageInfo>;
     /// 输入设备信息（无输入设备返回 `None`）。
     fn input_init(&self) -> Option<InputInfo>;
+
+    // ==================== Wi-Fi ====================
+
+    /// Wi-Fi 网卡后端（无 Wi-Fi 硬件返回 `None`）。
+    /// QEMU 返回软件模拟后端（真实 4-way handshake 密码学链路，见 `plat_qemu`）；
+    /// Pi4 返回 CYW43455 SDIO 后端骨架（见 `plat_pi4`，硬件接线待真机验证）。
+    /// 默认 `None`：未实现 Wi-Fi 的平台只失去无线能力，不影响编译。
+    /// 返回 `&'static mut`：后端的扫描 / 关联 / EAPOL 中继均为变更接口。
+    fn wifi_init(&self) -> Option<&'static mut dyn WifiDevice> {
+        None
+    }
+
+    // ==================== 传感器 ====================
+
+    /// 传感器信息（无传感器总线返回 `None`）。QEMU 返回软件模拟传感器；
+    /// Pi4 返回 BSC1 + MPU6050/9250 参数（真实探测在驱动层完成，探测失败
+    /// 回退到模拟器）。默认 `None`。
+    fn sensor_init(&self) -> Option<SensorInfo> {
+        None
+    }
+
+    // ==================== 电源 / 热 / DVFS / 电池 ====================
+    //
+    // 默认返回 `None`：未实现电源后端的平台只失去对应能力，不影响编译。
+
+    /// 电源控制（关机 / 重启 / 休眠）；无实现返回 `None`。
+    fn power_control(&self) -> Option<&'static dyn PowerControl> {
+        None
+    }
+
+    /// 热传感器（SoC 温度）；无实现返回 `None`。
+    fn thermal_sensor(&self) -> Option<&'static dyn ThermalSensor> {
+        None
+    }
+
+    /// DVFS 控制器（频点表 / 频率读写）；无实现返回 `None`。
+    fn dvfs_controller(&self) -> Option<&'static dyn DvfsController> {
+        None
+    }
+
+    /// 核心电压（mV）；无电压读取能力返回 `None`（Pi4 经 mailbox
+    /// `GET_VOLTAGE` 读取，QEMU 无电压概念）。
+    fn core_voltage_mv(&self) -> Option<u32> {
+        None
+    }
+
+    /// 电池 / 充电器；无电池平台返回 `None`。
+    fn battery(&self) -> Option<&'static dyn Battery> {
+        None
+    }
 }

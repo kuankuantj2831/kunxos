@@ -12,6 +12,8 @@
 //! - 扇区大小固定 512；每簇扇区数取自 BPB（须为 2 的幂）。
 
 use crate::blkdev::{self, SECTOR_SIZE};
+use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// FAT 链结束标记（>= 0x0FFFFFF8 均视为结束）。
 const EOC: u32 = 0x0FFF_FFF8;
@@ -86,6 +88,67 @@ static mut ENTRIES: [FatEntry; MAX_ENTRIES] = [FatEntry {
 /// 全表扫描（cp 大文件时 O(n²) → 数十秒；游标化后接近 O(n)）。
 static mut NEXT_FREE: [u32; MAX_VOLUMES] = [2; MAX_VOLUMES];
 
+// ==================== 全局互斥 ====================
+
+/// FAT32 全局互斥：所有公开入口（`fs_*`）先取锁再执行，防止 SMP/抢占下
+/// FAT 表/FAT2 同步写、簇链分配/释放、空闲游标与打开文件表（`ENTRIES`）
+/// 的读-改-写交错损坏元数据（此前无任何并发保护：两个任务交错 alloc 可
+/// 产生重复簇分配、半链接链与条目表撕裂）。
+///
+/// - **可重入**：同 CPU 嵌套调用（如 `fs_mkdir` 内部再调 `fs_lookup`）只需
+///   递增深度即可放行；不同 CPU 自旋等待持有者完成。
+/// - **不死锁**：块 I/O（virtio-blk）是忙等轮询，不依赖他核/中断；持锁期间
+///   IRQ 屏蔽，持有者不会被本核打断，也不会等待其它 CPU 的资源。
+/// 32 位原子锁字：低 16 位 = 持有 CPU 号（0xFFFF=无），高 16 位 = 重入深度。
+    /// 原子 CAS 获取/释放，杜绝「load 检查 → store 标记」非原子窗口（SMP 下
+    /// 双核可同时读空并进入临界区，撕裂 FAT 链）。
+    static FAT_LOCKED: AtomicU64 = AtomicU64::new(0);
+
+    /// 取 FAT32 全局锁（屏蔽本核 IRQ 并自旋直至获得；可重入）。返回进入前的
+    /// DAIF，调用方须以同一值调用 [`fat_unlock`]。
+    fn fat_lock() -> u64 {
+        let saved: u64;
+        unsafe { asm!("mrs {}, daif", out(reg) saved) };
+        unsafe { asm!("msr daifset, #2") };
+        let cpu = crate::smp::cpu_id();
+        loop {
+            let w = FAT_LOCKED.load(Ordering::Acquire);
+            if w == 0 {
+                // 空闲：CAS 0 → (cpu<<16)|1，成功即取得
+                let want = ((cpu as u64) << 16) | 1;
+                if FAT_LOCKED.compare_exchange_weak(0, want, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    break;
+                }
+            } else if w >> 16 == cpu as u64 {
+                // 本核已持有：重入深度 +1
+                FAT_LOCKED.store(w + 1, Ordering::Relaxed);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        saved
+    }
+
+    /// 释放 FAT32 全局锁（与 [`fat_lock`] 配对；恢复调用前的 DAIF）。
+    fn fat_unlock(saved: u64) {
+        loop {
+            let w = FAT_LOCKED.load(Ordering::Acquire);
+            if w == 0 {
+                break;
+            }
+            let depth = w & 0xFFFF;
+            if depth > 1 {
+                FAT_LOCKED.store(w - 1, Ordering::Relaxed);
+                break;
+            }
+            // 深度 1：释放（CAS 回 0）
+            if FAT_LOCKED.compare_exchange_weak(w, 0, Ordering::Release, Ordering::Relaxed).is_ok() {
+                break;
+            }
+        }
+        unsafe { asm!("msr daif, {}", in(reg) saved) };
+    }
+
 // ==================== 小端辅助 ====================
 
 #[inline]
@@ -127,16 +190,17 @@ fn vol_of(major: u32) -> Option<FatVol> {
     None
 }
 
-fn register_vol(vol: FatVol) -> bool {
+/// 注册卷，返回槽位号（同时用作根目录表项槽：ENTRIES[槽位号]）。
+fn register_vol(vol: FatVol) -> Option<usize> {
     unsafe {
-        for v in VOLS.iter_mut() {
+        for (i, v) in VOLS.iter_mut().enumerate() {
             if v.is_none() {
                 *v = Some(vol);
-                return true;
+                return Some(i);
             }
         }
     }
-    false
+    None
 }
 
 // ==================== 条目表 ====================
@@ -170,7 +234,8 @@ fn entry_for(dev: u32, parent: u32, slot: u32, cluster: u32, size: u32, attr: u8
                 return Some(i as u32 + 1);
             }
         }
-        for (i, e) in ENTRIES.iter_mut().enumerate() {
+        // 常规表项从根槽位之后分配（ENTRIES[0..MAX_VOLUMES] 为各卷根保留）
+        for (i, e) in ENTRIES.iter_mut().enumerate().skip(MAX_VOLUMES) {
             if !e.used {
                 *e = FatEntry {
                     used: true,
@@ -342,6 +407,23 @@ fn alloc_cluster(vol: &FatVol, prev: u32) -> u32 {
     unsafe {
         NEXT_FREE[idx] = found + 1;
     }
+    // ★ 新簇清零：FAT32 没有「空洞零填充」语义，分配出的簇残留上一文件/目录的
+    // 数据。此前 fs_write 跳洞写只分配链不写内容、fs_mkdir 只写首 64 字节——
+    // 空洞读取与新建目录会泄露**跨文件陈旧内容**，新文件首写即含垃圾字节。
+    // 分配即清零（与 SFS 一致），写路径与 mkdir 缺口一并闭合。清零失败回滚：
+    // 簇还原为空闲、前一簇链尾恢复 EOC，不留下「已分配却含旧数据」的块。
+    let secs = vol.sectors_per_cluster;
+    let zero = [0u8; SECTOR_SIZE];
+    let base_sec = vol.data_base + (found as u64 - 2) * secs as u64;
+    for s in 0..secs {
+        if !write_sectors(vol.dev, base_sec + s as u64, 1, &zero) {
+            let _ = set_fat(vol, found, FREE_CLUSTER);
+            if prev >= 2 {
+                let _ = set_fat(vol, prev, EOC);
+            }
+            return 0;
+        }
+    }
     found
 }
 
@@ -360,7 +442,7 @@ fn free_chain(vol: &FatVol, mut c: u32) {
         let _ = set_fat(vol, c, FREE_CLUSTER);
         c = next;
         seen += 1;
-        if seen > 0x10000 {
+        if seen > 0x1_000_000 {
             break; // 防成环死循环
         }
     }
@@ -370,6 +452,11 @@ fn free_chain(vol: &FatVol, mut c: u32) {
 
 /// 读取目录 `dir_cluster` 的第 `slot` 个目录项（跨簇链）。
 fn dir_entry_at(vol: &FatVol, dir_cluster: u32, slot: u32) -> Option<[u8; 32]> {
+    // 初始簇号同样来自磁盘（可损坏/恶意）：0/1 会让 cluster_sector 的
+    // `cluster - 2` u64 下溢回绕，读写落进 FAT 表区破坏元数据。
+    if dir_cluster < 2 {
+        return None;
+    }
     let items_per_cluster = cluster_bytes(vol) / 32;
     let mut cluster = dir_cluster;
     let mut steps = slot / items_per_cluster as u32;
@@ -382,7 +469,7 @@ fn dir_entry_at(vol: &FatVol, dir_cluster: u32, slot: u32) -> Option<[u8; 32]> {
         cluster = next;
         steps -= 1;
         seen += 1;
-        if seen > 0x10000 {
+        if seen > 0x1_000_000 {
             return None;
         }
     }
@@ -405,6 +492,10 @@ fn dir_entry_at(vol: &FatVol, dir_cluster: u32, slot: u32) -> Option<[u8; 32]> {
 
 /// 写目录项：读-改-写所在扇区。
 fn write_dir_entry(vol: &FatVol, dir_cluster: u32, slot: u32, ent: &[u8; 32]) -> bool {
+    // 同 dir_entry_at：拒绝来自磁盘的非法初始簇号（0/1 下溢回绕写坏 FAT）。
+    if dir_cluster < 2 {
+        return false;
+    }
     let items_per_cluster = cluster_bytes(vol) / 32;
     let mut cluster = dir_cluster;
     let mut steps = slot / items_per_cluster as u32;
@@ -417,7 +508,7 @@ fn write_dir_entry(vol: &FatVol, dir_cluster: u32, slot: u32, ent: &[u8; 32]) ->
         cluster = next;
         steps -= 1;
         seen += 1;
-        if seen > 0x10000 {
+        if seen > 0x1_000_000 {
             return false;
         }
     }
@@ -437,24 +528,53 @@ fn write_dir_entry(vol: &FatVol, dir_cluster: u32, slot: u32, ent: &[u8; 32]) ->
     write_sectors(vol.dev, cluster_sector(vol, cluster) + sector_off as u64, 1, &tmp)
 }
 
-/// 在目录里找空闲目录项槽号（0xE5 或 0x00），并返回该槽；目录满返回 None。
-/// 顺带可确认目录未被破坏。
-fn find_free_slot(vol: &FatVol, dir_cluster: u32) -> Option<u32> {
-    let mut slot = 0u32;
+/// 沿簇链走到尾，返回（尾簇，链内簇数）。链中遇到非法项（0/1）返回 None（损坏）。
+fn chain_tail(vol: &FatVol, start: u32) -> Option<(u32, u32)> {
+    if start < 2 {
+        return None;
+    }
+    let mut c = start;
+    let mut n = 1u32;
     loop {
-        match dir_entry_at(vol, dir_cluster, slot) {
-            Some(e) => {
-                if e[0] == 0x00 || e[0] == 0xE5 {
-                    return Some(slot);
-                }
-            }
-            None => return None, // 目录簇链结束（目录满）
+        let next = fat_entry(vol, c);
+        if next >= EOC {
+            return Some((c, n));
         }
-        slot += 1;
-        if slot > 0x10000 {
-            return None;
+        if next < 2 {
+            return None; // 链中段出现空闲/保留簇：目录已损坏
+        }
+        c = next;
+        n += 1;
+        if n > 0x1_0000 {
+            return None; // 防成环死循环
         }
     }
+}
+
+/// 在目录里找空闲目录项槽号（0xE5 或 0x00），并返回该槽。
+/// 目录簇链尾部无空闲项时**追加一个新簇扩容目录**（FAT32 目录是普通簇链，
+/// 根目录同样适用；此前目录满即创建失败，簇链不可增长）。卷满返回 None。
+fn find_free_slot(vol: &FatVol, dir_cluster: u32) -> Option<u32> {
+    let (tail, clusters) = chain_tail(vol, dir_cluster)?;
+    let items_per_cluster = (cluster_bytes(vol) / 32) as u32;
+    let cap = clusters.saturating_mul(items_per_cluster);
+    let mut slot = 0u32;
+    while slot < cap {
+        if let Some(e) = dir_entry_at(vol, dir_cluster, slot) {
+            if e[0] == 0x00 || e[0] == 0xE5 {
+                return Some(slot);
+            }
+        }
+        slot += 1;
+    }
+    // 目录满：分配新簇接到链尾。alloc_cluster 分配即清零，新簇首项
+    // （槽号 = 原容量）即为空闲项；fs_create/fs_mkdir 随后经 write_dir_entry
+    // 走扩容后的链写入。分配失败（卷满）目录保持原大小。
+    let grown = alloc_cluster(vol, tail);
+    if grown == 0 {
+        return None;
+    }
+    Some(cap)
 }
 
 // ==================== 8.3 短名 ====================
@@ -489,6 +609,30 @@ fn short_name(name: &str) -> [u8; 11] {
         }
     }
     out
+}
+
+/// 名字能否无损映射进 8.3 短名（大写归一后与还原名一致）。
+///
+/// 拒绝会**截断/替换**的名字（如 "settings_backup1"/"settings_backup2" 都
+/// 截成 "SETTINGS "、"a*b"/"a#c" 都替换成 "A_B"）——它们别名到同一目录项，
+/// open 打错文件、O_TRUNC 写毁别人的文件。返回 false 的名字在
+/// create/mkdir/rename 路径按 EINVAL 拒绝。
+fn fits_83(name: &str) -> bool {
+    let short = short_name(name);
+    let mut back = [0u8; 32];
+    let n = long_name(&short, &mut back);
+    let bytes = name.as_bytes();
+    if bytes.len() != n {
+        return false;
+    }
+    for i in 0..n {
+        let b = bytes[i];
+        let ub = if (b'a'..=b'z').contains(&b) { b - 32 } else { b };
+        if ub != back[i] {
+            return false;
+        }
+    }
+    true
 }
 
 /// 把 11 字节 FAT 短名还原为 "NAME.EXT" 字符串（去尾空格）。
@@ -559,6 +703,13 @@ pub fn fs_probe(major: u32) -> bool {
 
 /// 挂载 `major` 设备：读 BPB 存卷参数并注册根目录表项，返回 0；失败 -1。
 pub fn mount(major: u32) -> i32 {
+    let _s = fat_lock();
+    let r = mount_unlocked(major);
+    fat_unlock(_s);
+    r
+}
+
+fn mount_unlocked(major: u32) -> i32 {
     if vol_of(major).is_some() {
         return 0; // 已挂载
     }
@@ -595,12 +746,15 @@ pub fn mount(major: u32) -> i32 {
         data_base,
         total_clusters,
     };
-    if !register_vol(vol) {
-        return -1; // 卷表满
-    }
-    // 注册根目录表项（ino = 1）
+    let vidx = match register_vol(vol) {
+        Some(i) => i,
+        None => return -1, // 卷表满
+    };
+    // 注册根目录表项：每个卷独立槽位 ENTRIES[卷槽位]（ino = 卷槽位+1）。
+    // ★ 此前固定写 ENTRIES[0]：第二个 FAT 卷挂载会抢走 ino 1，先挂载卷的
+    // entry_of(major, 1) 因 dev 不匹配而失败 → 整个卷不可访问。
     unsafe {
-        ENTRIES[0] = FatEntry {
+        ENTRIES[vidx] = FatEntry {
             used: true,
             dev: major,
             parent: 0,
@@ -615,13 +769,29 @@ pub fn mount(major: u32) -> i32 {
     0
 }
 
-/// 根 ino（固定 1）。
-pub fn fs_root_ino(_major: u32) -> u32 {
+/// 根 ino（按卷槽位：ino = 卷槽位 + 1；单卷时为 1，与历史行为一致）。
+pub fn fs_root_ino(major: u32) -> u32 {
+    unsafe {
+        for (i, v) in VOLS.iter().enumerate() {
+            if let Some(vol) = v {
+                if vol.dev == major {
+                    return i as u32 + 1;
+                }
+            }
+        }
+    }
     ROOT_INO
 }
 
 /// 在目录 `dir_ino` 中查找 `name`，返回 ino；未找到 -1。
 pub fn fs_lookup(major: u32, dir_ino: u32, name: &str) -> i32 {
+    let _s = fat_lock();
+    let r = fs_lookup_unlocked(major, dir_ino, name);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_lookup_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -635,7 +805,11 @@ pub fn fs_lookup(major: u32, dir_ino: u32, name: &str) -> i32 {
     }
     let short = short_name(name);
     let mut slot = 0u32;
-    loop {
+    // ★ 槽位上限：簇链成环（损坏/恶意镜像）且环内无 0x00 终止项时，本循环
+    // 永不终止 —— dir_entry_at 按步数有界返回 Some，外层 slot 无限递增，
+    // 在 fat_lock（关 IRQ 自旋）内做 O(slot²) 磁盘扫描 → 整机冻结。
+    // 上限与 fs_readdir_unlocked / find_free_slot 对齐。
+    while slot <= 0x1_000_000 {
         match dir_entry_at(&vol, dir.cluster, slot) {
             Some(e) => {
                 if e[0] == 0x00 {
@@ -662,11 +836,19 @@ pub fn fs_lookup(major: u32, dir_ino: u32, name: &str) -> i32 {
             None => return -1, // 目录簇链异常/结束
         }
     }
+    -1
 }
 
 /// 创建文件或设备节点（FAT32 只支持普通文件；设备节点以普通文件创建，
 /// rdev 忽略），返回新文件 ino；失败 -1。
-pub fn fs_create(major: u32, dir_ino: u32, name: &str, _typ: u16, _rdev: u32) -> i32 {
+pub fn fs_create(major: u32, dir_ino: u32, name: &str, typ: u16, rdev: u32) -> i32 {
+    let _s = fat_lock();
+    let r = fs_create_unlocked(major, dir_ino, name, typ, rdev);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_create_unlocked(major: u32, dir_ino: u32, name: &str, _typ: u16, _rdev: u32) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -681,6 +863,10 @@ pub fn fs_create(major: u32, dir_ino: u32, name: &str, _typ: u16, _rdev: u32) ->
     // 重名检查（FAT 不允许同名）
     if fs_lookup(major, dir_ino, name) >= 0 {
         return -1;
+    }
+    // 非 8.3 可表达的名字拒绝（避免短名截断/替换后互相别名）
+    if !fits_83(name) {
+        return -22; // -EINVAL
     }
     let slot = match find_free_slot(&vol, dir.cluster) {
         Some(s) => s,
@@ -703,6 +889,13 @@ pub fn fs_create(major: u32, dir_ino: u32, name: &str, _typ: u16, _rdev: u32) ->
 
 /// 创建子目录，返回 ino；失败 -1。
 pub fn fs_mkdir(major: u32, dir_ino: u32, name: &str) -> i32 {
+    let _s = fat_lock();
+    let r = fs_mkdir_unlocked(major, dir_ino, name);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_mkdir_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -713,6 +906,10 @@ pub fn fs_mkdir(major: u32, dir_ino: u32, name: &str) -> i32 {
     };
     if fs_lookup(major, dir_ino, name) >= 0 {
         return -1;
+    }
+    // 非 8.3 可表达的名字拒绝（与 fs_create 同理）
+    if !fits_83(name) {
+        return -22; // -EINVAL
     }
     let cluster = alloc_cluster(&vol, 0);
     if cluster == 0 {
@@ -790,7 +987,7 @@ fn update_cache(e: &mut FatEntry, cur_off: usize, cur: u32, cb: usize) {
 fn locate_cluster(vol: &FatVol, e: &mut FatEntry, offset: usize) -> Option<u32> {
     let cb = cluster_bytes(vol);
     let base_off = (offset / cb * cb) as u32;
-    let (mut c, mut off) = if e.cache_cluster >= 2
+    let (mut c, off) = if e.cache_cluster >= 2
         && offset >= e.cache_off as usize
         && offset - e.cache_off as usize <= 0x10000
     {
@@ -811,7 +1008,7 @@ fn locate_cluster(vol: &FatVol, e: &mut FatEntry, offset: usize) -> Option<u32> 
         c = next;
         steps -= 1;
         guard += 1;
-        if guard > 0x10000 {
+        if guard > 0x1_000_000 {
             return None;
         }
     }
@@ -822,6 +1019,13 @@ fn locate_cluster(vol: &FatVol, e: &mut FatEntry, offset: usize) -> Option<u32> 
 
 /// 读取文件内容（从 `offset` 开始，至多 `buf.len()` 字节），返回字节数；失败 -1。
 pub fn fs_read(major: u32, ino: u32, offset: usize, buf: &mut [u8]) -> i32 {
+    let _s = fat_lock();
+    let r = fs_read_unlocked(major, ino, offset, buf);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_read_unlocked(major: u32, ino: u32, offset: usize, buf: &mut [u8]) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -869,7 +1073,7 @@ pub fn fs_read(major: u32, ino: u32, offset: usize, buf: &mut [u8]) -> i32 {
             cur = next;
         }
         guard += 1;
-        if guard > 0x10000 {
+        if guard > 0x1_000_000 {
             break;
         }
     }
@@ -880,6 +1084,13 @@ pub fn fs_read(major: u32, ino: u32, offset: usize, buf: &mut [u8]) -> i32 {
 
 /// 写入文件内容（从 `offset` 开始），必要时分配簇并更新大小，返回字节数；失败 -1。
 pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
+    let _s = fat_lock();
+    let r = fs_write_unlocked(major, ino, offset, buf);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_write_unlocked(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -895,7 +1106,14 @@ pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
     if e.attr & ATTR_DIRECTORY != 0 {
         return -1; // 目录不可写
     }
-    let mut cur = 0u32;
+    // ★ 4GiB 上限防护：FAT32 目录项 size 是 u32，offset ≥ 4GiB 时 `cur_off as u32`
+    // 会截断回绕——文件大小错乱、后续读写落到错误簇/错误区域。超限明确拒绝。
+    // 用 offset+len 判定且含等号：恰好写到 0x1_0000_0000 时 cur_off 截断回 0
+    // （size 停留旧值、簇位置缓存错位）。
+    if offset >= 0x1_0000_0000 || buf.len() as u64 + offset as u64 >= 0x1_0000_0000 {
+        return -1;
+    }
+    let mut cur;
     // 定位 / 补足 offset 所在簇（写路径：链断时分配扩展）
     if e.cluster == 0 {
         cur = alloc_cluster(&vol, 0);
@@ -907,6 +1125,32 @@ pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
         e.cache_cluster = cur;
         // 更新目录项首簇（空文件 → 首个簇）
         update_dir_cluster(&vol, e);
+        // ★ 空文件 + 大偏移（offset ≥ 簇大小）：只分配首簇会把字节写到
+        // offset%簇大小的错误位置（字节错位）。与 else 分支同一套走法，
+        // 把簇链补齐到 offset/cb 所在簇，再按簇内偏移落位。
+        // 中途每次 alloc_cluster 都会清零新簇，跳洞部分读回为全零。
+        let base_off = (offset / cb * cb) as u32;
+        let mut steps = base_off / cb as u32;
+        let mut guard = 0u32;
+        while steps > 0 {
+            let next = fat_entry(&vol, cur);
+            if next < 2 || next >= EOC {
+                let nc = alloc_cluster(&vol, cur);
+                if nc == 0 {
+                    return -1;
+                }
+                cur = nc;
+            } else {
+                cur = next;
+            }
+            steps -= 1;
+            guard += 1;
+            if guard > 0x1_000_000 {
+                return -1;
+            }
+        }
+        e.cache_off = base_off;
+        e.cache_cluster = cur;
     } else {
         let mut c = if e.cache_cluster >= 2
             && offset >= e.cache_off as usize
@@ -939,7 +1183,7 @@ pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
             }
             steps -= 1;
             guard += 1;
-            if guard > 0x10000 {
+            if guard > 0x1_000_000 {
                 return -1;
             }
         }
@@ -992,7 +1236,7 @@ pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
             }
         }
         guard += 1;
-        if guard > 0x10000 {
+        if guard > 0x1_000_000 {
             break;
         }
     }
@@ -1032,6 +1276,13 @@ fn update_dir_size(vol: &FatVol, e: &FatEntry) {
 
 /// 截断文件为 0：释放全部簇，更新目录项与上下文。
 pub fn fs_truncate(major: u32, ino: u32) -> i32 {
+    let _s = fat_lock();
+    let r = fs_truncate_unlocked(major, ino);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_truncate_unlocked(major: u32, ino: u32) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -1063,6 +1314,13 @@ pub fn fs_truncate(major: u32, ino: u32) -> i32 {
 
 /// 删除目录（须为空）或文件：释放簇链、标记目录项 0xE5、释放上下文表项。
 pub fn fs_unlink(major: u32, dir_ino: u32, name: &str) -> i32 {
+    let _s = fat_lock();
+    let r = fs_unlink_unlocked(major, dir_ino, name);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_unlink_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -1082,7 +1340,11 @@ pub fn fs_unlink(major: u32, dir_ino: u32, name: &str) -> i32 {
     // 目录非空不可删（不含 . 与 .. 之外的有效项）
     if e.attr & ATTR_DIRECTORY != 0 {
         let mut slot = 2usize; // 跳过 . 和 ..
-        loop {
+        // ★ 槽位上限：簇链成环（损坏/恶意镜像）时 dir_entry_at 按步数有界
+        // 返回 Some，本循环永不终止 —— 在 fat_lock（关 IRQ 自旋）内无限
+        // 磁盘扫描 → 整机冻结。上限与 fs_lookup_unlocked / fs_readdir_unlocked
+        // / find_free_slot 对齐。
+        while slot <= 0x1_000_000 {
             match dir_entry_at(&vol, e.cluster, slot as u32) {
                 Some(ent) => {
                     if ent[0] == 0x00 {
@@ -1111,6 +1373,13 @@ pub fn fs_unlink(major: u32, dir_ino: u32, name: &str) -> i32 {
 
 /// 重命名（可跨目录）：复制目录项到新目录后删除旧目录项。
 pub fn fs_rename(major: u32, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> i32 {
+    let _s = fat_lock();
+    let r = fs_rename_unlocked(major, old_dir, old_name, new_dir, new_name);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_rename_unlocked(major: u32, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -1130,10 +1399,21 @@ pub fn fs_rename(major: u32, old_dir: u32, old_name: &str, new_dir: u32, new_nam
     if fs_lookup(major, new_dir, new_name) >= 0 {
         return -1; // 目标已存在
     }
+    // 非 8.3 可表达的新名字拒绝（与 fs_create 同理）
+    if !fits_83(new_name) {
+        return -22; // -EINVAL
+    }
     let e = match entry_of(major, ino as u32) {
         Some(e) => *e,
         None => return -1,
     };
+    // ★ 目录重命名限制：FAT32 的 ".." 直接编码父目录簇号，跨目录移动目录
+    // 必须改写其 ".." 目录项（本实现不做），且移动子树还涉及祖先链一致性。
+    // 与 fs_simple 一致：目录只允许**同目录内**改名（父簇不变，".." 无需
+    // 改动），跨目录移动目录一律拒绝。
+    if e.attr & ATTR_DIRECTORY != 0 && od.cluster != nd.cluster {
+        return -1;
+    }
     // 读取旧目录项 → 改名 → 写入新目录空闲槽
     let mut ent = match dir_entry_at(&vol, od.cluster, e.slot) {
         Some(x) => x,
@@ -1169,6 +1449,13 @@ pub fn fs_rename(major: u32, old_dir: u32, old_name: &str, new_dir: u32, new_nam
 
 /// 读取目录第 `index` 个有效条目的名字，返回 ino；结束 -1。
 pub fn fs_readdir(major: u32, ino: u32, index: usize, name: &mut [u8]) -> i32 {
+    let _s = fat_lock();
+    let r = fs_readdir_unlocked(major, ino, index, name);
+    fat_unlock(_s);
+    r
+}
+
+fn fs_readdir_unlocked(major: u32, ino: u32, index: usize, name: &mut [u8]) -> i32 {
     let vol = match vol_of(major) {
         Some(v) => v,
         None => return -1,
@@ -1211,7 +1498,7 @@ pub fn fs_readdir(major: u32, ino: u32, index: usize, name: &mut [u8]) -> i32 {
             None => return -1,
         }
         slot += 1;
-        if slot > 0x10000 {
+        if slot > 0x1_000_000 {
             return -1;
         }
     }
@@ -1241,6 +1528,14 @@ pub fn fs_total_blocks(major: u32) -> u32 {
     match vol_of(major) {
         Some(v) => v.total_clusters,
         None => 0,
+    }
+}
+
+/// 块大小（字节）：FAT32 以「簇」为计数单位，簇 = 每簇扇区数 × 512。
+pub fn fs_block_size(major: u32) -> u32 {
+    match vol_of(major) {
+        Some(v) => v.sectors_per_cluster * SECTOR_SIZE as u32,
+        None => 512,
     }
 }
 

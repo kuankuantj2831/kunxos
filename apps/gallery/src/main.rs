@@ -24,12 +24,12 @@ use kit::*;
 
 // ==================== 布局与配色 ====================
 
-const C_BG: u32 = 0x00_10_18_28;
-const C_BORDER: u32 = 0x00_2A_3A_5A;
-const C_TEXT: u32 = 0x00_FF_FF_FF;
-const C_DIM: u32 = 0x00_9A_A7_B5;
-const C_BTN: u32 = 0x00_23_36_50;
-const C_BTN_BORDER: u32 = 0x00_4A_5A_7A;
+const C_BG: u32 = 0x00_F7_F8_FA;
+const C_BORDER: u32 = 0x00_D9_DE_E6;
+const C_TEXT: u32 = 0x00_1A_1C_22;
+const C_DIM: u32 = 0x00_6B_72_80;
+const C_BTN: u32 = 0x00_FF_FF_FF;
+const C_BTN_BORDER: u32 = 0x00_D9_DE_E6;
 
 const COLS: i32 = 3;
 const TILE_W: i32 = 164;
@@ -45,6 +45,10 @@ const PHOTO_COUNT: u32 = 18;
 
 /// u32::MAX = 网格；否则为查看的照片下标。
 static mut VIEWING: u32 = u32::MAX;
+
+/// 由文件管理器打开时传入的图片路径（argv[1] 的 basename）。
+static mut OPEN_NAME: [u8; 64] = [0; 64];
+static mut OPEN_NAME_LEN: usize = 0;
 
 // ==================== 渲染 ====================
 
@@ -64,7 +68,7 @@ fn draw_photo(x: i32, y: i32, w: i32, h: i32, seed: u32) {
 }
 
 fn render_grid() {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_BG);
+    draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("图库".as_bytes());
     for i in 0..PHOTO_COUNT {
         let r = (i as i32) / COLS;
@@ -74,55 +78,56 @@ fn render_grid() {
         if y + TILE_H > DISPLAY_H as i32 {
             break;
         }
+        // 照片网格单元容器 → 液态玻璃面板（照片内容原样画在其上）
+        draw_glass(x, y, TILE_W, TILE_H, (TILE_H * 25 / 100).min(24));
         draw_photo(x, y, TILE_W, TILE_H, i);
-        draw_rect(x, y, TILE_W, TILE_H, C_BORDER);
     }
-    draw_cursor();
+    draw_sys_nav();
 }
 
 fn render_view(idx: u32) {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_BG);
-    // 标题栏：返回 + 序号
-    fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_TITLE_BG);
-    fill_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN);
-    draw_rect(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, C_BTN_BORDER);
+    draw_gradient_bg(C_BG, glass_dark());
+    // 标题栏：返回 + 序号（液态玻璃）
+    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    let bs = BACK_SZ - 8;
+    draw_glass(BACK_X, BACK_Y, bs, bs, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
-    let mut t = [0u8; 16];
-    t[..7].copy_from_slice("照片 ".as_bytes());
-    let mut n = 7;
-    n = push_num(&mut t, n, idx + 1);
-    draw_text(48, (TITLE_H - 8) / 2, &t[..n], C_TEXT);
+    let open = unsafe { (OPEN_NAME_LEN, &OPEN_NAME[..OPEN_NAME_LEN]) };
+    if open.0 > 0 {
+        draw_text(48, (TITLE_H - 8) / 2, open.1, C_TEXT);
+    } else {
+        let mut t = [0u8; 16];
+        t[..7].copy_from_slice("照片 ".as_bytes());
+        let mut n = 7;
+        n = push_num(&mut t, n, idx + 1);
+        draw_text(48, (TITLE_H - 8) / 2, &t[..n], C_TEXT);
+    }
 
-    // 大图（上下留边）
+    // 大图（上下留边）：液态玻璃面板容器 + 照片内容原样
+    draw_glass(20, 90, DISPLAY_W as i32 - 40, 560, 24);
     draw_photo(20, 90, DISPLAY_W as i32 - 40, 560, idx);
-    draw_rect(20, 90, DISPLAY_W as i32 - 40, 560, C_BORDER);
 
-    // 上一张 / 下一张
-    draw_btn(30, 700, "上一张".as_bytes());
-    draw_btn(DISPLAY_W as i32 - 30 - 96, 700, "下一张".as_bytes());
+    // 上一张 / 下一张（液态玻璃按钮）
+    draw_glass_button(30, 700, 96, 44, "上一张".as_bytes(), false);
+    draw_glass_button(DISPLAY_W as i32 - 30 - 96, 700, 96, 44, "下一张".as_bytes(), false);
 
     // 底部提示
     let mut hint = [0u8; 32];
-    hint[..24].copy_from_slice("共 ".as_bytes());
-    let mut hn = 3;
+    hint[..4].copy_from_slice("共 ".as_bytes());
+    let mut hn = 4usize;
     hn = push_num(&mut hint, hn, PHOTO_COUNT);
-    hint[hn] = b' ';
-    hn += 1;
-    hint[hn..hn + 6].copy_from_slice("张照片".as_bytes());
-    hn += 6;
+    if hn < hint.len() {
+        hint[hn] = b' ';
+        hn += 1;
+    }
+    let tail = "张照片".as_bytes();
+    if hn + tail.len() <= hint.len() {
+        hint[hn..hn + tail.len()].copy_from_slice(tail);
+        hn += tail.len();
+    }
     draw_text(16, DISPLAY_H as i32 - 60, &hint[..hn], C_DIM);
 
-    draw_cursor();
-}
-
-fn draw_btn(x: i32, y: i32, label: &[u8]) {
-    let w = 96;
-    let h = 44;
-    fill_rect(x + 3, y, w - 6, h, C_BTN);
-    fill_rect(x, y + 3, w, h - 6, C_BTN);
-    draw_rect(x, y, w, h, C_BTN_BORDER);
-    let tx = x + (w - text_width(label)) / 2;
-    draw_text(tx, y + 18, label, C_TEXT);
+    draw_sys_nav();
 }
 
 fn push_num(buf: &mut [u8], mut n: usize, mut v: u32) -> usize {
@@ -149,25 +154,61 @@ fn push_num(buf: &mut [u8], mut n: usize, mut v: u32) -> usize {
 // ==================== 主循环 ====================
 
 #[no_mangle]
-pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[gallery] starting\n");
+pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
+    print("[gallery] 启动中\n");
     if !fb_init() {
-        print("[gallery] /dev/fb0 mmap failed, no framebuffer\n");
+        print("[gallery] /dev/fb0 mmap 失败，无帧缓冲\n");
         unsafe { exit(1); }
     }
-    print("[gallery] ready\n");
+    print("[gallery] 就绪\n");
+
+    // 文件管理器打开：argv[1] = 图片路径，取 basename 显示在查看页标题。
+    if argc > 1 && !argv.is_null() {
+        unsafe {
+            let p = *argv.add(1) as *const u8;
+            if !p.is_null() {
+                let mut buf = [0u8; 64];
+                let mut i = 0usize;
+                while i < buf.len() - 1 {
+                    let c = *p.add(i);
+                    if c == 0 {
+                        break;
+                    }
+                    buf[i] = c;
+                    i += 1;
+                }
+                let mut start = 0usize;
+                for j in 0..i {
+                    if buf[j] == b'/' {
+                        start = j + 1;
+                    }
+                }
+                let n = i - start;
+                if n > 0 {
+                    OPEN_NAME[..n].copy_from_slice(&buf[start..i]);
+                    OPEN_NAME[n] = 0;
+                    OPEN_NAME_LEN = n;
+                }
+            }
+        }
+    }
 
     let mut dirty = true;
     loop {
         let ev = poll_input();
         if ev.moved {
-            dirty = true;
+            cursor_overlay_move();
         }
+        if ev.nav != NavAction::None {
+            print("[nav] 系统导航 -> 退出\n");
+            unsafe { exit(nav_exit_code(ev.nav)); }
+        }
+
         if let Some((x, y)) = ev.tap {
             let viewing = unsafe { VIEWING };
             if viewing == u32::MAX {
                 if back_hit(x, y) {
-                    print("[gallery] back -> exit\n");
+                    print("[gallery] 返回 -> 退出\n");
                     break;
                 }
                 // 网格点击
@@ -178,7 +219,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     let ty = GRID_Y + r * (TILE_H + GAP);
                     if x >= tx && x < tx + TILE_W && y >= ty && y < ty + TILE_H {
                         unsafe { VIEWING = i; }
-                        print("[gallery] open photo ");
+                        print("[gallery] 打开照片 ");
                         print_dec(i as u64);
                         print("\n");
                         dirty = true;
@@ -193,24 +234,28 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     if viewing > 0 {
                         unsafe { VIEWING -= 1; }
                         dirty = true;
+                    } else {
+                        show_error("已是第一张".as_bytes());
                     }
                 } else if x >= DISPLAY_W as i32 - 126 && x < DISPLAY_W as i32 - 30 && y >= 700 && y < 744 {
                     if viewing + 1 < PHOTO_COUNT {
                         unsafe { VIEWING += 1; }
                         dirty = true;
+                    } else {
+                        show_error("已是最后一张".as_bytes());
                     }
                 }
             }
         }
         match ev.key {
             KeyAction::Esc => {
-                print("[gallery] ESC -> exit\n");
+                print("[gallery] ESC -> 退出\n");
                 break;
             }
             _ => {}
         }
         if poll_tty_esc() {
-            print("[gallery] ESC -> exit\n");
+            print("[gallery] ESC -> 退出\n");
             break;
         }
         if dirty {
@@ -221,12 +266,15 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 render_view(viewing);
             }
             flip();
+            cursor_overlay_redraw();
             dirty = false;
+            kit::font_init_checked();
+            if kit::font_just_refreshed() { dirty = true; }
         }
         sleep_ms(16);
     }
 
-    print("[gallery] exiting\n");
+    print("[gallery] 正在退出\n");
     unsafe { exit(0); }
 }
 
@@ -247,9 +295,26 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
+    struct BufWriter {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for BufWriter {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let k = b.len().min(self.buf.len() - self.len);
+            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
+            self.len += k;
+            Ok(())
+        }
+    }
+    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
     unsafe {
         write_fd(2, b"PANIC: gallery\n");
+        write_fd(2, &w.buf[..w.len]);
         syscall1(SYS_EXIT, 1);
     }
     loop {}

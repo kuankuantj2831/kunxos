@@ -43,7 +43,7 @@ pub fn yield_now() {
 
 /// 写入线程本地存储基址到 `TPIDR_EL0`。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限；调用者自行保证地址有效性。
 pub unsafe fn set_tp(value: u64) {
     asm!("msr tpidr_el0, {}", in(reg) value);
@@ -51,7 +51,7 @@ pub unsafe fn set_tp(value: u64) {
 
 /// 读取当前线程本地存储基址 `TPIDR_EL0`。
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 pub unsafe fn get_tp() -> u64 {
     let v: u64;

@@ -1,0 +1,16 @@
+[package]
+name = "kunxverify"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 主机侧 .kunx 验签/构建工具：复用设备端 (kunxpkg) 的 Ed25519/格式/证书代码（#[path] 单源）"
+
+[[bin]]
+name = "kunxverify"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

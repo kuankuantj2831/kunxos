@@ -5,10 +5,10 @@ import sys, os
 def load_ppm(path):
     with open(path, "rb") as f:
         data = f.read()
-    # P6 header
+    # P6 文件头
     assert data[:2] == b"P6", data[:2]
     parts = data[2:].split(b"\n", 4)
-    # tokens: width height maxval then raw
+    # 格式：width height maxval，随后为原始像素
     toks = []
     i = 2
     while len(toks) < 3:
@@ -24,7 +24,7 @@ def load_ppm(path):
 def ascii_art(path, cols=90):
     w, h, raw = load_ppm(path)
     rows = int(cols * h / w * 0.5)
-    # average blocks
+    # 对分块取平均
     out = []
     chars = " .:-=+*#%@"
     for by in range(rows):

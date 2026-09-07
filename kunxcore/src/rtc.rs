@@ -29,35 +29,37 @@ pub fn init(rtc_base: Option<usize>) {
         }
         if epoch != 0 {
             EPOCH_SECS.store(epoch, Ordering::Relaxed);
-            crate::uart_send_str("[rtc] PL031 epoch=");
-            crate::print_dec(epoch);
-            // 自检：打印当前墙钟日历时间（验证 civil_from_epoch）
-            let wall = wall_time_us() / 1_000_000;
-            let mut c = [0i32; 6];
-            civil_from_epoch(wall, &mut c);
-            crate::uart_send_str(" wall=");
-            crate::print_dec(c[0] as u64);
-            crate::uart_send_str("-");
-            if c[1] < 10 { crate::uart_send_str("0"); }
-            crate::print_dec(c[1] as u64);
-            crate::uart_send_str("-");
-            if c[2] < 10 { crate::uart_send_str("0"); }
-            crate::print_dec(c[2] as u64);
-            crate::uart_send_str(" ");
-            if c[3] < 10 { crate::uart_send_str("0"); }
-            crate::print_dec(c[3] as u64);
-            crate::uart_send_str(":");
-            if c[4] < 10 { crate::uart_send_str("0"); }
-            crate::print_dec(c[4] as u64);
-            crate::uart_send_str(":");
-            if c[5] < 10 { crate::uart_send_str("0"); }
-            crate::print_dec(c[5] as u64);
-            crate::uart_send_str("\n");
+            crate::kinfo! {
+                crate::uart_send_str("[rtc] PL031 epoch=");
+                crate::print_dec(epoch);
+                // 自检：打印当前墙钟日历时间（验证 civil_from_epoch）
+                let wall = wall_time_us() / 1_000_000;
+                let mut c = [0i32; 6];
+                civil_from_epoch(wall, &mut c);
+                crate::uart_send_str(" wall=");
+                crate::print_dec(c[0] as u64);
+                crate::uart_send_str("-");
+                if c[1] < 10 { crate::uart_send_str("0"); }
+                crate::print_dec(c[1] as u64);
+                crate::uart_send_str("-");
+                if c[2] < 10 { crate::uart_send_str("0"); }
+                crate::print_dec(c[2] as u64);
+                crate::uart_send_str(" ");
+                if c[3] < 10 { crate::uart_send_str("0"); }
+                crate::print_dec(c[3] as u64);
+                crate::uart_send_str(":");
+                if c[4] < 10 { crate::uart_send_str("0"); }
+                crate::print_dec(c[4] as u64);
+                crate::uart_send_str(":");
+                if c[5] < 10 { crate::uart_send_str("0"); }
+                crate::print_dec(c[5] as u64);
+                crate::uart_send_str("\n");
+            }
         } else {
-            crate::uart_send_str("[rtc] PL031 present but epoch=0, using monotonic clock\n");
+            crate::kinfo! { crate::uart_send_str("[rtc] 存在 PL031 但 epoch=0，改用单调时钟\n"); }
         }
     } else {
-        crate::uart_send_str("[rtc] no RTC device, using monotonic clock\n");
+        crate::kinfo! { crate::uart_send_str("[rtc] 无 RTC 设备，使用单调时钟\n"); }
     }
 }
 

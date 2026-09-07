@@ -1,0 +1,13 @@
+[package]
+name = "sfs_host_test"
+version = "0.1.0"
+edition = "2021"
+
+# 宿主测试：include 内核 fs_simple.rs 真实源码，用 RAM 磁盘桩验证
+# mkfs / 挂载 / 崩溃恢复 / 大文件 / 磨损分配，不依赖内核构建。
+
+[dependencies]
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

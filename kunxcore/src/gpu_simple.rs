@@ -66,7 +66,7 @@ static mut CFG: [u8; 28] = [0; 28];
 
 /// 选择 fw_cfg 条目。
 ///
-/// # Safety
+/// # 安全
 /// 需要有效映射的 `FWCFG_BASE`。
 unsafe fn fwcfg_select(key: u16) {
     // selector 寄存器为 DEVICE_BIG_ENDIAN：写大端 16 位（等价 Linux `writew_be`）
@@ -75,7 +75,7 @@ unsafe fn fwcfg_select(key: u16) {
 
 /// 从数据寄存器读取一个字节（流中的下一个字节）。
 ///
-/// # Safety
+/// # 安全
 /// 必须先选择条目。
 unsafe fn fwcfg_read_byte() -> u8 {
     read_volatile(FWCFG_BASE as *const u8)
@@ -83,7 +83,7 @@ unsafe fn fwcfg_read_byte() -> u8 {
 
 /// 读取当前选中条目的 `n` 个字节到 `out`。
 ///
-/// # Safety
+/// # 安全
 /// 调用前必须先 `fwcfg_select`。
 unsafe fn fwcfg_read(out: &mut [u8]) {
     for b in out.iter_mut() {
@@ -97,7 +97,7 @@ unsafe fn fwcfg_read(out: &mut [u8]) {
 /// `write` 为真时把缓冲区内容写入条目（触发写回调），否则从条目读入缓冲区。
 /// 返回是否成功（control 被回写为 0）。
 ///
-/// # Safety
+/// # 安全
 /// `buf_pa` 必须指向可被 QEMU DMA 访问的物理内存。
 unsafe fn fwcfg_dma(key: u16, buf_pa: usize, len: usize, write: bool) -> bool {
     let mut ctl = DMA_CTL_SELECT | ((key as u32) << 16);
@@ -169,10 +169,38 @@ unsafe fn write_ramfb_cfg(pa: usize, width: u32, height: u32, stride: u32) {
     fwcfg_dma(RAMFB_SEL | FW_CFG_WRITE_CHANNEL, addr_of!(CFG) as usize, 28, true);
 }
 
-/// 按虚拟地址清理数据缓存（写回内存，使 QEMU 扫描/ DMA 可见）。
+/// 帧缓冲是否需要显式 clean（dc cvac）后才能翻转。
 ///
-/// 在真实硬件（KVM）上帧缓冲写入会被缓存，翻转前必须 clean；TCG 下为无害操作。
+/// 只有真实硬件（Pi4：显示控制器从物理 RAM 扫描输出）才必须在翻转前把写入
+/// clean 回内存；QEMU 的 ramfb 是共享 RAM（TCG 无脏实现、KVM 也经宿主共享
+/// 内存），clean 纯属开销——整屏脏区时一次 `present` 要执行 ~3.2 万条 `dc cvac`
+/// + `dsb`，在慢宿主上每帧都是可见的固定成本。按平台名称跳过，不改变 540x960
+/// 双缓冲翻转的语义（QEMU 侧缓存一致性由宿主机保证）。
+/// 平台判定缓存：present_rects 每矩形各调一次，此前每次都做平台名
+/// 字符串 contains 扫描。
+fn clean_needed() -> bool {
+    // 0=未知 1=不需要 2=需要（avoid bool 静态初始化歧义）
+    static mut CLEAN_NEEDED: i8 = 0;
+    unsafe {
+        if CLEAN_NEEDED == 0 {
+            CLEAN_NEEDED = if kunxhal::current_platform().name().contains("QEMU") {
+                1
+            } else {
+                2
+            };
+        }
+        CLEAN_NEEDED == 2
+    }
+}
+
+/// 按虚拟地址清理数据缓存（写回内存，使扫描输出/DMA 可见）。
+///
+/// 真实硬件（KVM/Pi4）上帧缓冲写入会被缓存，翻转前必须 clean；QEMU 下跳过
+/// （见 [`clean_needed`]）。
 fn clean_dcache(va: usize, len: usize) {
+    if !clean_needed() {
+        return;
+    }
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
@@ -234,13 +262,45 @@ pub fn fb_pages() -> usize {
 /// 分配一整屏连续、页对齐的帧缓冲，返回其物理地址（恒等映射下即虚拟地址）。
 pub fn alloc_fb() -> usize {
     let pages = fb_pages();
-    allocator::alloc_pages_contig(pages).expect("gpu: out of memory for framebuffer")
+    allocator::alloc_pages_contig(pages).expect("gpu：帧缓冲内存不足")
 }
 
 /// 把扫描输出切换到 `pa` 处的帧缓冲（clean 缓存后写配置 → 页翻转）。
 pub fn present(pa: usize) {
     let bytes = unsafe { (WIDTH * HEIGHT * 4) as usize };
     clean_dcache(pa, bytes);
+    unsafe {
+        write_ramfb_cfg(pa, WIDTH, HEIGHT, STRIDE);
+    }
+}
+
+/// 按脏矩形集合 clean 帧缓冲的对应缓存行后做页翻转（`present` 的脏区变体）。
+///
+/// 整屏 `clean_dcache` 在翻转时把整块 2MB 缓冲写回内存（真实硬件上每帧
+/// 995MB/s 量级的带宽消耗）；脏区合成只改动少量矩形时，这里只 clean 这些
+/// 矩形覆盖的缓存行，把翻转开销从「整屏」降到「脏区」。`rects` 为空时回退
+/// 为整屏 clean（与 `present` 等价），保证语义完备。
+pub fn present_rects(pa: usize, rects: &[crate::compositor::Rect]) {
+    if rects.is_empty() {
+        present(pa);
+        return;
+    }
+    let sw = unsafe { WIDTH } as i32;
+    let sh = unsafe { HEIGHT } as i32;
+    let stride = unsafe { STRIDE } as usize;
+    for r in rects {
+        let x0 = r.x.max(0);
+        let y0 = r.y.max(0);
+        let x1 = r.right().min(sw);
+        let y1 = r.bottom().min(sh);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        // 该矩形覆盖的字节区间 [行首, 行尾)：clean 只触及这些缓存行
+        let start = y0 as usize * stride + x0 as usize * 4;
+        let end = (y1 - 1) as usize * stride + x1 as usize * 4;
+        clean_dcache(pa + start, end - start);
+    }
     unsafe {
         write_ramfb_cfg(pa, WIDTH, HEIGHT, STRIDE);
     }
@@ -258,6 +318,15 @@ static mut FB_BASE: usize = 0;
 pub fn fb_init() -> usize {
     let pa = alloc_fb();
     present(pa);
+    unsafe { FB_BASE = pa; }
+    pa
+}
+
+/// 接管既有的帧缓冲（如 bootloader 渲染的启动画面）作为 `/dev/fb0` 显存。
+///
+/// 只登记基址、不重新分配、不翻转扫描输出，保证 bootloader 阶段绘制的
+/// 画面在切换期间保持显示；像素几何由 `init` 确定的默认值提供。
+pub fn fb_adopt(pa: usize) -> usize {
     unsafe { FB_BASE = pa; }
     pa
 }

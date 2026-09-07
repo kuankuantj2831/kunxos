@@ -1,0 +1,17 @@
+[package]
+name = "kunxsec"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 安全启动链共享密码学与格式库（no_std）：SHA-256/512、Ed25519 验签、签名镜像头、A/B BCB、bsdiff 应用、OTA 更新包"
+
+# 纯 no_std 库：bootloader / 内核 / 用户态 OTA 客户端共用。
+# 不使用任何外部依赖，全部自研实现（RFC 8032 / FIPS 180-4 / BSDIFF40）。
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

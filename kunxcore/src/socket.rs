@@ -21,7 +21,7 @@ const MAX_SOCKETS: usize = 16;
 const MAX_UDP: usize = 8;
 const MAX_TCP: usize = 8;
 
-// TCP flags
+// TCP 标志
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
 #[allow(dead_code)]
@@ -29,7 +29,7 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
-// TCP states
+// TCP 状态
 const T_CLOSED: u8 = 0;
 const T_SYN_SENT: u8 = 1;
 const T_ESTABLISHED: u8 = 2;
@@ -54,6 +54,8 @@ const SEND_TIMEOUT_US: u64 = 30_000_000;
 const RECV_TIMEOUT_US: u64 = 60_000_000;
 const CLOSE_TIMEOUT_US: u64 = 10_000_000;
 const UDP_TIMEOUT_US: u64 = 30_000_000;
+/// 服务器侧 T_SYN_RCVD 子连接最长等待时间（客户端不回 ACK 则回收槽位）。
+const SYN_RCVD_TIMEOUT_US: u64 = 30_000_000;
 
 const UDP_QUEUE: usize = 8;
 const UDP_MSZ: usize = 1472;
@@ -131,6 +133,9 @@ struct TcpSock {
     rtx_seq: u32,
     rtx_active: bool,
     fin_sent: bool,
+    /// close 时数据段重传仍在登记（send 超时未获 ACK）：FIN 暂不能占用重传
+    /// 槽位，待数据被确认后补登（fin_rtx_pending → 重传槽位换 FIN）。
+    fin_rtx_pending: bool,
     peer_fin: bool,
     /// 监听套接字的待 accept 连接（子 TCP 槽位下标）。
     pending: [usize; MAX_TCP],
@@ -169,6 +174,7 @@ impl TcpSock {
             rtx_seq: 0,
             rtx_active: false,
             fin_sent: false,
+            fin_rtx_pending: false,
             peer_fin: false,
             pending: [usize::MAX; MAX_TCP],
             pending_count: 0,
@@ -183,17 +189,26 @@ impl TcpSock {
 
 static mut TCPS: [TcpSock; MAX_TCP] = [const { TcpSock::empty() }; MAX_TCP];
 
-/// 发送段组装缓冲（单线程进程上下文专用）。
+/// 发送段组装缓冲（经 net_stack::net_lock 与其他任务互斥）。
 static mut TCPBUF: [u8; 2048] = [0; 2048];
 
 /// 初始序号计数器。
 static mut ISS_COUNTER: u32 = 0x2000_0000;
 
+// 并发约定：syscall 上下文 IRQ 使能、可被 tick 抢占切任务，本文件全部静态
+// 状态（SOCKETS/UDPS/TCPS/TCPBUF/ISS_COUNTER）由 net_stack::net_lock 保护。
+// 短操作整体持锁；阻塞等待循环（accept/connect/send/recv/close）不得持锁
+// 跨过 poll/yield——只包住状态读写与重传段。tcp_input/udp_input 由
+// net_stack::poll（持锁）分发到达；tcp_xmit/tcp_retransmit/tcp_rx_push/
+// tcp_rx_drain/find_tcp/tcp_reap_syn_rcvd 的全部调用点均处于持锁上下文。
 fn next_iss() -> u32 {
-    unsafe {
+    net_stack::net_lock();
+    let r = unsafe {
         ISS_COUNTER = ISS_COUNTER.wrapping_add(0x1_0000);
         ISS_COUNTER
-    }
+    };
+    net_stack::net_unlock();
+    r
 }
 
 // ==================== 初始化 ====================
@@ -249,33 +264,68 @@ pub fn is_socket(h: i32) -> bool {
 
 // ==================== 公共接口 ====================
 
+/// 端口是否已被任一 UDP/TCP 套接字绑定（临时端口自动分配时跳过冲突）。
+pub fn port_in_use(port: u16) -> bool {
+    net_stack::net_lock();
+    let r = unsafe {
+        let mut used = false;
+        for u in UDPS.iter() {
+            if u.used && u.local_port == port {
+                used = true;
+                break;
+            }
+        }
+        if !used {
+            for t in TCPS.iter() {
+                if t.used && t.local_port == port {
+                    used = true;
+                    break;
+                }
+            }
+        }
+        used
+    };
+    net_stack::net_unlock();
+    r
+}
+
 /// 创建 UDP 套接字，返回句柄。
 #[allow(dead_code)]
 pub fn socket_udp() -> i32 {
-    unsafe {
+    net_stack::net_lock();
+    let r = unsafe {
+        let mut h = -1;
         for i in 0..MAX_UDP {
             if !UDPS[i].used {
                 UDPS[i].used = true;
-                return alloc_socket(SOCK_UDP, i);
+                h = alloc_socket(SOCK_UDP, i);
+                break;
             }
         }
-    }
-    -1
+        h
+    };
+    net_stack::net_unlock();
+    r
 }
 
 /// 创建 TCP 套接字，返回句柄。
 pub fn socket_tcp() -> i32 {
-    unsafe {
+    net_stack::net_lock();
+    let r = unsafe {
+        let mut h = -1;
         for i in 0..MAX_TCP {
             if !TCPS[i].used {
                 TCPS[i] = TcpSock::empty();
                 TCPS[i].used = true;
                 TCPS[i].local_ip = net_stack::local_ip();
-                return alloc_socket(SOCK_TCP, i);
+                h = alloc_socket(SOCK_TCP, i);
+                break;
             }
         }
-    }
-    -1
+        h
+    };
+    net_stack::net_unlock();
+    r
 }
 
 /// 绑定本地端口。
@@ -288,61 +338,87 @@ pub fn bind(h: i32, port: u16) -> i32 {
     if port == 0 {
         return 0; // 延迟到 connect/send 时自动分配
     }
-    unsafe {
+    net_stack::net_lock();
+    let r = unsafe {
         match s.ty {
             SOCK_UDP => {
+                let mut ok = true;
                 for i in 0..MAX_UDP {
                     if i != s.index && UDPS[i].used && UDPS[i].local_port == port {
-                        return -1; // 端口已被占用
+                        ok = false; // 端口已被占用
+                        break;
                     }
                 }
-                UDPS[s.index].local_port = port;
-                0
+                if ok {
+                    UDPS[s.index].local_port = port;
+                    0
+                } else {
+                    -1
+                }
             }
             SOCK_TCP => {
+                let mut ok = true;
                 for i in 0..MAX_TCP {
                     if i != s.index && TCPS[i].used && TCPS[i].local_port == port {
-                        return -1;
+                        ok = false;
+                        break;
                     }
                 }
-                TCPS[s.index].local_port = port;
-                0
+                if ok {
+                    TCPS[s.index].local_port = port;
+                    0
+                } else {
+                    -1
+                }
             }
             _ => -1,
         }
-    }
+    };
+    net_stack::net_unlock();
+    r
 }
 
 /// 监听：把已 bind 的 TCP 套接字置为监听状态，开始接受连接。
+/// 返回 0 或负 errno（此前一律 -1=EPERM，语义偏差）。
 pub fn listen(h: i32, backlog: usize) -> i32 {
-    let Some(s) = socket_index(h) else { return -1 };
+    let Some(s) = socket_index(h) else { return -9 }; // -EBADF
     if s.ty != SOCK_TCP {
-        return -1;
+        return -22; // -EINVAL
     }
     let _ = backlog; // 简化：待 accept 队列容量 = MAX_TCP
-    unsafe {
+    net_stack::net_lock();
+    let r = unsafe {
         let t = &mut TCPS[s.index];
         if t.local_port == 0 {
-            return -1; // 必须先 bind
+            net_stack::net_unlock();
+            return -22; // -EINVAL：必须先 bind
         }
         t.state = T_LISTEN;
-    }
-    0
+        0
+    };
+    net_stack::net_unlock();
+    r
 }
 
 /// 接受一个连接（阻塞直到有客户端接入），返回新的已连接套接字句柄。
+/// 失败返回负 errno（此前一律 -1=EPERM）。
 pub fn accept(h: i32) -> i32 {
-    let Some(s) = socket_index(h) else { return -1 };
+    let Some(s) = socket_index(h) else { return -9 }; // -EBADF
     if s.ty != SOCK_TCP {
-        return -1;
+        return -22; // -EINVAL
     }
     let lsn = s.index;
-    loop {
+    'outer: loop {
+        // 轮询驱动握手（poll 自身持锁），同时回收过期的 T_SYN_RCVD 子连接
+        net_stack::poll();
+        net_stack::net_lock();
+        unsafe { tcp_reap_syn_rcvd() };
         // 取最旧的待 accept 子连接
         let child = unsafe {
             let l = &mut TCPS[lsn];
             if l.state != T_LISTEN {
-                return -1;
+                net_stack::net_unlock();
+                return -22; // -EINVAL：未处于监听态
             }
             if l.pending_count > 0 {
                 let c = l.pending[0];
@@ -357,16 +433,45 @@ pub fn accept(h: i32) -> i32 {
                 None
             }
         };
+        net_stack::net_unlock();
         if let Some(c) = child {
-            // 为子连接分配句柄（等待其完成握手后返回）
+            // 子连接可能尚在 T_SYN_RCVD（SYN-ACK 刚发出、客户端 ACK 未到）：
+            // 此前直接返回 fd，调用方在握手完成前就收发会丢段。这里先轮询
+            // 等到 T_ESTABLISHED 再返回；失败（RST/超时）则回收子槽位继续等。
+            let start = crate::timer::now_us();
+            loop {
+                net_stack::net_lock();
+                let st = unsafe { TCPS[c].state };
+                if st == T_ESTABLISHED {
+                    net_stack::net_unlock();
+                    break;
+                }
+                if st == T_CLOSED || crate::timer::now_us() - start > CONNECT_TIMEOUT_US {
+                    unsafe { TCPS[c] = TcpSock::empty(); }
+                    net_stack::net_unlock();
+                    continue 'outer;
+                }
+                net_stack::net_unlock();
+                net_stack::poll();
+                sched_cfs::yield_now();
+            }
+            // 为子连接分配句柄
+            net_stack::net_lock();
             let fd = alloc_socket(SOCK_TCP, c);
+            net_stack::net_unlock();
             if fd >= 0 {
                 return fd;
             }
-            return -1;
+            // ★ 句柄耗尽：在锁内清子连接槽位（解锁后清会与其它任务的
+            // poll 投递竞态 —— 数据/ACK 写入后被整体清零，段丢失/状态撕裂），
+            // 否则 ESTABLISHED 子连接无句柄持有、reap（只回收 SYN_RCVD）
+            // 也不回收 → TCP 槽位永久泄漏，服务器拒绝服务。
+            net_stack::net_lock();
+            unsafe { TCPS[c] = TcpSock::empty(); }
+            net_stack::net_unlock();
+            return -12; // -ENOMEM：套接字句柄耗尽
         }
         // 无待 accept 连接：轮询等待
-        net_stack::poll();
         sched_cfs::yield_now();
     }
 }
@@ -376,14 +481,21 @@ pub fn connect(h: i32, ip: u32, port: u16) -> i32 {
     let Some(s) = socket_index(h) else { return -1 };
     match s.ty {
         SOCK_UDP => {
-            unsafe {
+            // 目标端口 0 非法：内核不向 dport 0 投递到未绑定套接字
+            if port == 0 {
+                return -22; // -EINVAL
+            }
+            net_stack::net_lock();
+            let r = unsafe {
                 UDPS[s.index].remote_ip = ip;
                 UDPS[s.index].remote_port = port;
                 if UDPS[s.index].local_port == 0 {
                     UDPS[s.index].local_port = net_stack::next_port();
                 }
-            }
-            0
+                0
+            };
+            net_stack::net_unlock();
+            r
         }
         SOCK_TCP => tcp_connect(s.index, ip, port),
         _ => -1,
@@ -406,6 +518,10 @@ pub fn send_to(h: i32, data: &[u8], ip: u32, port: u16) -> i32 {
     let Some(s) = socket_index(h) else { return -1 };
     if s.ty != SOCK_UDP {
         return -1;
+    }
+    // 目标端口 0 非法：内核不向 dport 0 投递到未绑定套接字
+    if port == 0 {
+        return -22; // -EINVAL
     }
     unsafe { udp_send_raw(s.index, ip, port, data) }
 }
@@ -434,6 +550,7 @@ pub fn recv_from(h: i32, buf: &mut [u8]) -> (i32, u32, u16) {
 ///
 /// 供 `netstat` 类工具显示连接状态。
 pub fn for_each_socket(f: &mut dyn FnMut(i32, &str, &str, u16, u32, u16)) {
+    net_stack::net_lock();
     unsafe {
         for h in 0..MAX_SOCKETS {
             let s = SOCKETS[h];
@@ -466,6 +583,7 @@ pub fn for_each_socket(f: &mut dyn FnMut(i32, &str, &str, u16, u32, u16)) {
             }
         }
     }
+    net_stack::net_unlock();
 }
 
 /// 关闭套接字。
@@ -473,6 +591,7 @@ pub fn close(h: i32) {
     let Some(s) = socket_index(h) else { return };
     match s.ty {
         SOCK_TCP => {
+            net_stack::net_lock();
             unsafe {
                 // 监听套接字：释放全部待 accept 子连接
                 let l = &TCPS[s.index];
@@ -484,24 +603,32 @@ pub fn close(h: i32) {
                     }
                 }
             }
+            net_stack::net_unlock();
             tcp_close(s.index);
         }
-        _ => unsafe {
-            UDPS[s.index] = UdpSock::empty();
-            SOCKETS[h as usize] = EMPTY_SOCKET;
-        },
+        _ => {
+            net_stack::net_lock();
+            unsafe {
+                UDPS[s.index] = UdpSock::empty();
+                SOCKETS[h as usize] = EMPTY_SOCKET;
+            }
+            net_stack::net_unlock();
+        }
     }
 }
 
 // ==================== UDP 实现 ====================
 
 unsafe fn udp_send_raw(idx: usize, ip: u32, port: u16, data: &[u8]) -> i32 {
+    net_stack::net_lock();
     // 未绑定/未 connect 过（本地端口为 0）：自动分配临时端口（Linux sendto 语义）
     if UDPS[idx].local_port == 0 {
         UDPS[idx].local_port = net_stack::next_port();
     }
     let sport = UDPS[idx].local_port;
-    net_stack::udp_send(ip, sport, port, data)
+    let r = net_stack::udp_send(ip, sport, port, data);
+    net_stack::net_unlock();
+    r
 }
 
 unsafe fn udp_send_connected(idx: usize, data: &[u8]) -> i32 {
@@ -518,7 +645,9 @@ pub fn udp_input(src_ip: u32, sport: u16, dport: u16, data: &[u8]) {
     unsafe {
         for i in 0..MAX_UDP {
             let u = &mut UDPS[i];
-            if !u.used || u.local_port != dport {
+            // 未绑定套接字（local_port == 0）不接收任何包，防止 dport==0
+            // 的伪造/损坏包被投递到未 bind 的套接字
+            if !u.used || u.local_port == 0 || u.local_port != dport {
                 continue;
             }
             // 已 connect 的套接字只接受对端数据
@@ -544,7 +673,10 @@ pub fn udp_input(src_ip: u32, sport: u16, dport: u16, data: &[u8]) {
 unsafe fn udp_recv_from(idx: usize, buf: &mut [u8]) -> (i32, u32, u16) {
     let start = crate::timer::now_us();
     loop {
-        {
+        // 出队段持锁；poll/yield 不持锁（否则阻塞中的读者会卡住其他任务
+        // 的全部联网操作直至超时）
+        net_stack::net_lock();
+        let out = {
             let u = &mut UDPS[idx];
             if u.rx_count > 0 {
                 let slot = u.rx_head;
@@ -554,8 +686,14 @@ unsafe fn udp_recv_from(idx: usize, buf: &mut [u8]) -> (i32, u32, u16) {
                 u.rx[slot].used = false;
                 u.rx_head = (u.rx_head + 1) % UDP_QUEUE;
                 u.rx_count -= 1;
-                return (n as i32, dg.ip, dg.port);
+                Some((n as i32, dg.ip, dg.port))
+            } else {
+                None
             }
+        };
+        net_stack::net_unlock();
+        if let Some(r) = out {
+            return r;
         }
         net_stack::poll();
         if crate::timer::now_us() - start > UDP_TIMEOUT_US {
@@ -573,14 +711,16 @@ unsafe fn udp_recv(idx: usize, buf: &mut [u8]) -> i32 {
 // ==================== TCP 实现 ====================
 
 /// 发送一个 TCP 段（seq 由参数指定，ack 取当前 rcv_nxt）。
-unsafe fn tcp_xmit(idx: usize, seq: u32, flags: u8, data: &[u8]) {
+/// 返回 `false` = 段未上线路（超长或 IP 层发送失败）——调用方**不得**
+/// 推进 snd_nxt（此前静默丢段但 snd_nxt 照常推进 → 连接永久失步）。
+unsafe fn tcp_xmit(idx: usize, seq: u32, flags: u8, data: &[u8]) -> bool {
     let (local_ip, remote_ip, local_port, remote_port, rcv_nxt) = {
         let s = &TCPS[idx];
         (s.local_ip, s.remote_ip, s.local_port, s.remote_port, s.rcv_nxt)
     };
     let total = 20 + data.len();
     if total > TCPBUF.len() {
-        return;
+        return false;
     }
     TCPBUF[0..2].copy_from_slice(&local_port.to_be_bytes());
     TCPBUF[2..4].copy_from_slice(&remote_port.to_be_bytes());
@@ -594,9 +734,10 @@ unsafe fn tcp_xmit(idx: usize, seq: u32, flags: u8, data: &[u8]) {
     TCPBUF[20..total].copy_from_slice(data);
     let ck = net_stack::tcp_checksum(local_ip, remote_ip, &TCPBUF[..total]);
     TCPBUF[16..18].copy_from_slice(&ck.to_be_bytes());
-    net_stack::ip_send(remote_ip, 6, &TCPBUF[..total]);
+    let sent = net_stack::ip_send(remote_ip, 6, &TCPBUF[..total]) >= 0;
     // 记录发送时间（RTT 采样起点；握手/挥手段也参与估计）
     TCPS[idx].last_send_us = crate::timer::now_us();
+    sent
 }
 
 unsafe fn send_ack(idx: usize) {
@@ -619,6 +760,11 @@ unsafe fn tcp_retransmit(idx: usize) {
     let (seq, len) = (s.rtx_seq, s.rtx_len);
     if s.state == T_SYN_SENT {
         tcp_xmit(idx, seq, TCP_SYN, &[]);
+        return;
+    }
+    // 服务器侧握手：重发 SYN|ACK（rtx_len == 0，由 T_SYN_RCVD 状态区分）
+    if s.state == T_SYN_RCVD {
+        tcp_xmit(idx, seq, TCP_SYN | TCP_ACK, &[]);
         return;
     }
     // 挥手阶段的重传：FIN 段（rtx_len == 0）必须重发 FIN|ACK 而非数据段，
@@ -683,9 +829,49 @@ fn seq_gt(a: u32, b: u32) -> bool {
 fn seq_ge(a: u32, b: u32) -> bool {
     a == b || seq_gt(a, b)
 }
+fn seq_le(a: u32, b: u32) -> bool {
+    a == b || seq_lt(a, b)
+}
+
+/// 回收长期停留在 T_SYN_RCVD 的子连接（客户端不回 ACK 或已离线），
+/// 避免子槽位永久泄漏；同时从监听者的待 accept 队列中移除。
+unsafe fn tcp_reap_syn_rcvd() {
+    let now = crate::timer::now_us();
+    for c in 0..MAX_TCP {
+        let s = &TCPS[c];
+        if !s.used || s.state != T_SYN_RCVD {
+            continue;
+        }
+        if now.saturating_sub(s.last_send_us) < SYN_RCVD_TIMEOUT_US {
+            continue;
+        }
+        // 从监听者的待 accept 队列移除
+        let lport = s.local_port;
+        for l in 0..MAX_TCP {
+            let lp = &mut TCPS[l];
+            if !lp.used || lp.state != T_LISTEN || lp.local_port != lport {
+                continue;
+            }
+            for i in 0..lp.pending_count {
+                if lp.pending[i] == c {
+                    for k in i + 1..lp.pending_count {
+                        lp.pending[k - 1] = lp.pending[k];
+                    }
+                    lp.pending_count -= 1;
+                    lp.pending[lp.pending_count] = usize::MAX;
+                    break;
+                }
+            }
+        }
+        // 回收子槽位（保持 MAX_TCP 计数一致：used=false）
+        TCPS[c] = TcpSock::empty();
+    }
+}
 
 /// 网卡收到的 TCP 段入口（由 net_stack 分发调用）。
 pub fn tcp_input(src_ip: u32, seg: &[u8]) {
+    // 每个 TCP 段到来时顺带回收过期的 T_SYN_RCVD 子连接
+    unsafe { tcp_reap_syn_rcvd() };
     if seg.len() < 20 {
         return;
     }
@@ -702,8 +888,7 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
 
     let Some(idx) = find_tcp(src_ip, sport, dport) else {
         // 未匹配到既有连接：若是 SYN 且目标端口在监听 → 建立服务器侧连接
-        if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-            unsafe {
+        if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {            unsafe {
                 for l in 0..MAX_TCP {
                     let lsn = &TCPS[l];
                     if lsn.used && lsn.state == T_LISTEN && lsn.local_port == dport {
@@ -738,6 +923,7 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                             rtx_seq: 0,
                             rtx_active: false,
                             fin_sent: false,
+                            fin_rtx_pending: false,
                             peer_fin: false,
                             pending: [usize::MAX; MAX_TCP],
                             pending_count: 0,
@@ -749,6 +935,11 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                         };
                         // 发送 SYN-ACK
                         tcp_xmit(child, iss, TCP_SYN | TCP_ACK, &[]);
+                        // 登记 SYN-ACK 重传：rtx_len == 0 表示握手段，
+                        // 供 tcp_retransmit 按 T_SYN_RCVD 状态重发 SYN|ACK
+                        TCPS[child].rtx_active = true;
+                        TCPS[child].rtx_seq = iss;
+                        TCPS[child].rtx_len = 0;
                         // 挂到监听者的待 accept 队列
                         let lp = &mut TCPS[l];
                         if lp.pending_count < MAX_TCP {
@@ -763,13 +954,34 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
         return;
     };
 
-    // RST：连接被对端重置（拒绝/崩溃），标记关闭并清除重传状态
+    // RST：连接被对端重置（拒绝/崩溃），标记关闭并清除重传状态。
+    // ★ 校验（RFC 793 思路）：seq == rcv_nxt 的裸 RST，或 ack == snd_nxt
+    // 的带 ACK RST 才接受 —— 此前无任何校验，off-path 伪造 RST（校验和
+    // 可按已知四元组重算）即可杀死任意连接。
     if flags & TCP_RST != 0 {
-        unsafe {
-            TCPS[idx].state = T_CLOSED;
-            TCPS[idx].rtx_active = false;
+        let ok = seq == unsafe { TCPS[idx].rcv_nxt }
+            || (flags & TCP_ACK != 0 && ack == unsafe { TCPS[idx].snd_nxt });
+        if ok {
+            unsafe {
+                TCPS[idx].state = T_CLOSED;
+                TCPS[idx].rtx_active = false;
+            }
         }
         return;
+    }
+
+    // 死亡套接字（CLOSED/TIME_WAIT）收到对端同四元组的裸 SYN：此前按
+    // 4 元组匹配静默吞掉（无 SYN-ACK 也无 RST），客户端重连只能空等到
+    // 自身超时。回 RST（ack=seq+1）让对端立即换端口重试。
+    if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+        let st = unsafe { TCPS[idx].state };
+        if st == T_CLOSED || st == T_TIME_WAIT {
+            unsafe {
+                TCPS[idx].rcv_nxt = seq.wrapping_add(1); // tcp_xmit 的 ack 字段取 rcv_nxt
+                tcp_xmit(idx, 0, TCP_RST | TCP_ACK, &[]);
+            }
+            return;
+        }
     }
 
     let state = unsafe { TCPS[idx].state };
@@ -791,11 +1003,26 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
             }
         }
         T_SYN_RCVD => {
+            // 客户端重传 SYN（丢失了 SYN-ACK）：用同一 iss 重发 SYN|ACK。
+            // 此前这种重 SYN 会被静默丢弃，客户端永远进不了 ESTAB。
+            if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+                unsafe {
+                    let iss = TCPS[idx].iss;
+                    TCPS[idx].rtx_active = true;
+                    TCPS[idx].rtx_seq = iss;
+                    TCPS[idx].rtx_len = 0;
+                    tcp_xmit(idx, iss, TCP_SYN | TCP_ACK, &[]);
+                }
+                return;
+            }
             // 客户端对 SYN-ACK 的 ACK：握手完成
-            if flags & TCP_ACK != 0 {
+            // ★ 校验 ack == iss+1（与客户端侧对称）：盲目接受任意 ACK 会让
+            // 伪造/迟到的旧 ACK 抢先完成握手并把 snd_una 回退，连接失步。
+            if flags & TCP_ACK != 0 && ack == unsafe { TCPS[idx].iss }.wrapping_add(1) {
                 unsafe {
                     TCPS[idx].snd_una = ack;
                     TCPS[idx].state = T_ESTABLISHED;
+                    TCPS[idx].rtx_active = false;
                 }
             }
         }
@@ -804,8 +1031,12 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
             if flags & TCP_ACK != 0 {
                 unsafe {
                     let new_ack = seq_gt(ack, TCPS[idx].snd_una);
-                    // 序号回绕安全比较：ack 比 snd_una 新才推进
-                    if new_ack {
+                    // 序号回绕安全比较：ack 比 snd_una 新才推进。
+                    // ★ 上界校验：ack 不得越过 snd_nxt —— 此前无上界，伪造/
+                    // 迟到的超大 ACK 会把 snd_una 推过 snd_nxt，未上线路的
+                    // 数据被误判"已确认"（rtx 误清除、连接失步）。越界 ACK
+                    // 只是不推进 snd_una，段内数据仍按下方流程处理。
+                    if new_ack && seq_le(ack, TCPS[idx].snd_nxt) {
                         TCPS[idx].snd_una = ack;
                     }
                     if TCPS[idx].rtx_active
@@ -815,6 +1046,16 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                         // 重传成功：退避复位，RTO 恢复基础值
                         TCPS[idx].retx_cnt = 0;
                         TCPS[idx].rto_us = RETX_US;
+                        // close 时数据段占用了重传槽位：数据确认后补登 FIN
+                        // 重传（FIN 序号 = snd_nxt-1，rtx_len=0 由挥手分支重发）
+                        if TCPS[idx].fin_rtx_pending
+                            && (TCPS[idx].state == T_FIN_WAIT1 || TCPS[idx].state == T_LAST_ACK)
+                        {
+                            TCPS[idx].fin_rtx_pending = false;
+                            TCPS[idx].rtx_active = true;
+                            TCPS[idx].rtx_seq = TCPS[idx].snd_nxt.wrapping_sub(1);
+                            TCPS[idx].rtx_len = 0;
+                        }
                     }
                     // 新 ACK：RTT 采样 + 拥塞窗口推进（慢启动 / 拥塞避免）
                     if new_ack {
@@ -902,16 +1143,30 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                 unsafe { send_ack(idx) };
             }
         }
+        T_TIME_WAIT => {
+            // 我方 ACK 丢失、对端 FIN 重传：重新 ACK（rcv_nxt 已越过 FIN），
+            // 让对端结束重传循环 —— 此前落在 `_ => {}`，对端只能 RTO 重传
+            // 到放弃，本端 TIME_WAIT 也只能靠用户 close 解除。
+            if flags & TCP_FIN != 0 {
+                unsafe { send_ack(idx) };
+            }
+        }
         _ => {}
     }
 }
 
 fn tcp_connect(idx: usize, ip: u32, port: u16) -> i32 {
-    // 先解析 ARP，避免握手途中阻塞
+    // 目标端口 0 非法（同 UDP connect）
+    if port == 0 {
+        return -22; // -EINVAL
+    }
+    // 先解析 ARP，避免握手途中阻塞（resolve 内部持锁）
     if !net_stack::resolve(ip) {
         return -1;
     }
     let iss = next_iss();
+    // 连接初始化 + 首个 SYN 段：原子完成（SYN 未发出前连接状态不可见）
+    net_stack::net_lock();
     unsafe {
         let s = &mut TCPS[idx];
         s.remote_ip = ip;
@@ -926,6 +1181,7 @@ fn tcp_connect(idx: usize, ip: u32, port: u16) -> i32 {
         s.rx_head = 0;
         s.rx_count = 0;
         s.fin_sent = false;
+        s.fin_rtx_pending = false;
         s.peer_fin = false;
         s.rtx_active = true;
         s.rtx_seq = iss;
@@ -936,21 +1192,34 @@ fn tcp_connect(idx: usize, ip: u32, port: u16) -> i32 {
     unsafe {
         TCPS[idx].snd_nxt = iss.wrapping_add(1);
     }
+    net_stack::net_unlock();
 
+    // 等待握手完成：状态检查与重传段持锁，poll/yield 不持锁
     let start = crate::timer::now_us();
     let mut next_retx = start + RETX_US;
     while crate::timer::now_us() - start < CONNECT_TIMEOUT_US {
-        net_stack::poll();
-        unsafe {
+        net_stack::net_lock();
+        let action = unsafe {
             if TCPS[idx].state == T_ESTABLISHED {
-                return 0;
+                Some(0)
+            } else if TCPS[idx].state == T_CLOSED {
+                // 连接被拒绝（对端 RST，如端口未监听）：立即失败，避免干等超时。
+                Some(-1)
+            } else {
+                None
             }
+        };
+        if let Some(rc) = action {
+            net_stack::net_unlock();
+            return rc;
         }
         let now = crate::timer::now_us();
         if now >= next_retx {
             unsafe { tcp_retransmit(idx) };
             next_retx = now + RETX_US;
         }
+        net_stack::net_unlock();
+        net_stack::poll();
         sched_cfs::yield_now();
     }
     -1
@@ -963,45 +1232,65 @@ fn tcp_send(idx: usize, data: &[u8]) -> i32 {
     if data.len() > TCP_RTXBUF {
         return -1;
     }
-    // 段必须能放进发送缓冲（20 字节 TCP 头），否则 tcp_xmit 会静默丢弃。
-    // 必须在这里拒绝，避免「段未上线路但 snd_nxt 已推进」导致连接永久失步。
-    if unsafe { 20 + data.len() > TCPBUF.len() } {
+    // 段必须能完整穿越下层缓冲，否则会被静默丢帧但 snd_nxt 照常推进 →
+    // 连接永久失步。链路极限 = FRAME(2048) − 14(以太网头) − 20(IP头)
+    // − 20(TCP头) = 1994 字节；必须在这里拒绝。
+    if unsafe { 54 + data.len() > TCPBUF.len() } {
         return -1;
     }
-    unsafe {
-        if TCPS[idx].state != T_ESTABLISHED {
-            return -1;
-        }
+    // 状态检查 + 重传登记 + 发段：原子完成（段未上线路前不得推进 snd_nxt）
+    net_stack::net_lock();
+    if unsafe { TCPS[idx].state != T_ESTABLISHED } {
+        net_stack::net_unlock();
+        return -1;
     }
     // 记录待重传段
     let seq = unsafe { TCPS[idx].snd_nxt };
-    unsafe {
+    let sent = unsafe {
         let s = &mut TCPS[idx];
         s.rtx[..data.len()].copy_from_slice(data);
         s.rtx_len = data.len();
         s.rtx_seq = seq;
         s.rtx_active = true;
+        tcp_xmit(idx, seq, TCP_PSH | TCP_ACK, data)
+    };
+    if !sent {
+        // 段未上线路：撤销重传登记、不推进 snd_nxt，报错给调用方
+        unsafe {
+            TCPS[idx].rtx_active = false;
+        }
+        net_stack::net_unlock();
+        return -1;
     }
-    unsafe { tcp_xmit(idx, seq, TCP_PSH | TCP_ACK, data) };
     unsafe {
         TCPS[idx].snd_nxt = seq.wrapping_add(data.len() as u32);
     }
+    net_stack::net_unlock();
 
-    // 等待 ACK
+    // 等待 ACK：检查与重传段持锁，poll/yield 不持锁
     let start = crate::timer::now_us();
     let mut next_retx = start + RETX_US;
     while crate::timer::now_us() - start < SEND_TIMEOUT_US {
-        net_stack::poll();
-        unsafe {
-            if TCPS[idx].snd_una >= seq.wrapping_add(data.len() as u32) {
-                return data.len() as i32;
-            }
+        net_stack::net_lock();
+        // 连接已被 RST：立即失败（此前只查 acked 与重传，RST 后空转满超时）
+        if unsafe { TCPS[idx].state == T_CLOSED } {
+            net_stack::net_unlock();
+            return -1;
+        }
+        // 序号回绕安全比较：snd_una 是否已越过段尾（原始 >= 在 32 位
+        // 回绕后可能误判，导致 send 提前返回 / 永远等不到）
+        let acked = unsafe { seq_ge(TCPS[idx].snd_una, seq.wrapping_add(data.len() as u32)) };
+        if acked {
+            net_stack::net_unlock();
+            return data.len() as i32;
         }
         let now = crate::timer::now_us();
         if now >= next_retx {
             unsafe { tcp_retransmit(idx) };
             next_retx = now + RETX_US;
         }
+        net_stack::net_unlock();
+        net_stack::poll();
         sched_cfs::yield_now();
     }
     -1
@@ -1009,34 +1298,37 @@ fn tcp_send(idx: usize, data: &[u8]) -> i32 {
 
 fn tcp_recv(idx: usize, buf: &mut [u8]) -> i32 {
     let start = crate::timer::now_us();
-    let mut next_retx = start + RETX_US;
     loop {
-        unsafe {
-            let n = tcp_rx_drain(idx, buf);
-            if n > 0 {
-                return n as i32;
-            }
-            // 对端已关闭（FIN）或连接被重置（RST → T_CLOSED）且无残留数据 → EOF。
-            // 此前 RST 只置 T_CLOSED 不置 peer_fin，recv 会干等 RECV_TIMEOUT_US（60s）。
-            if (TCPS[idx].peer_fin || TCPS[idx].state == T_CLOSED) && TCPS[idx].rx_count == 0 {
-                return 0;
-            }
+        // 出队/EOF 判定段持锁；poll/yield 不持锁
+        net_stack::net_lock();
+        let n = unsafe { tcp_rx_drain(idx, buf) };
+        if n > 0 {
+            net_stack::net_unlock();
+            return n as i32;
+        }
+        // 对端已关闭（FIN）或连接被重置（RST → T_CLOSED）且无残留数据 → EOF。
+        // 此前 RST 只置 T_CLOSED 不置 peer_fin，recv 会干等 RECV_TIMEOUT_US（60s）。
+        let eof = unsafe { (TCPS[idx].peer_fin || TCPS[idx].state == T_CLOSED) && TCPS[idx].rx_count == 0 };
+        net_stack::net_unlock();
+        if eof {
+            return 0;
         }
         net_stack::poll();
-        unsafe {
-            let n = tcp_rx_drain(idx, buf);
-            if n > 0 {
-                return n as i32;
-            }
-            if (TCPS[idx].peer_fin || TCPS[idx].state == T_CLOSED) && TCPS[idx].rx_count == 0 {
-                return 0;
-            }
+        net_stack::net_lock();
+        let n2 = unsafe { tcp_rx_drain(idx, buf) };
+        if n2 > 0 {
+            net_stack::net_unlock();
+            return n2 as i32;
+        }
+        let eof2 = unsafe { (TCPS[idx].peer_fin || TCPS[idx].state == T_CLOSED) && TCPS[idx].rx_count == 0 };
+        // 接收循环不做重传驱动：若同 socket 另一线程（fork 继承 fd）有在途
+        // send/FIN 重传，此处独立重发会制造重复段并把退避副作用（rto 翻倍、
+        // cwnd 压制）错误施加 —— 重传只由 send/close/超时路径负责。
+        net_stack::net_unlock();
+        if eof2 {
+            return 0;
         }
         let now = crate::timer::now_us();
-        if now >= next_retx {
-            unsafe { tcp_retransmit(idx) };
-            next_retx = now + RETX_US;
-        }
         if now - start > RECV_TIMEOUT_US {
             return -1;
         }
@@ -1045,6 +1337,8 @@ fn tcp_recv(idx: usize, buf: &mut [u8]) -> i32 {
 }
 
 fn tcp_close(idx: usize) {
+    // FIN 发送与重传登记：原子完成
+    net_stack::net_lock();
     unsafe {
         let s = &mut TCPS[idx];
         match s.state {
@@ -1054,10 +1348,18 @@ fn tcp_close(idx: usize) {
                 let seq = s.snd_nxt;
                 s.snd_nxt = s.snd_nxt.wrapping_add(1);
                 tcp_xmit(idx, seq, TCP_FIN | TCP_ACK, &[]);
-                // 登记 FIN 重传：FIN 丢失时由 tcp_retransmit 重发（而非旧数据段）
-                s.rtx_active = true;
-                s.rtx_seq = seq;
-                s.rtx_len = 0;
+                // ★ 数据段重传仍登记（send 超时未获 ACK）时不得覆盖重传槽位
+                // ——否则 tcp_send 已丢失/未确认的数据段永远不再上线，对端
+                // 停在等数据（对空洞回重复 ACK，不确认 FIN），双向死等超时
+                // 后连接静默拆除、数据丢失。数据确认后由 ACK 处理补登 FIN。
+                if s.rtx_active && s.rtx_len > 0 && !seq_ge(s.snd_una, s.rtx_seq.wrapping_add(s.rtx_len as u32)) {
+                    s.fin_rtx_pending = true;
+                } else {
+                    // 登记 FIN 重传：FIN 丢失时由 tcp_retransmit 重发（而非旧数据段）
+                    s.rtx_active = true;
+                    s.rtx_seq = seq;
+                    s.rtx_len = 0;
+                }
             }
             T_CLOSE_WAIT => {
                 s.fin_sent = true;
@@ -1065,34 +1367,45 @@ fn tcp_close(idx: usize) {
                 let seq = s.snd_nxt;
                 s.snd_nxt = s.snd_nxt.wrapping_add(1);
                 tcp_xmit(idx, seq, TCP_FIN | TCP_ACK, &[]);
-                s.rtx_active = true;
-                s.rtx_seq = seq;
-                s.rtx_len = 0;
+                if s.rtx_active && s.rtx_len > 0 && !seq_ge(s.snd_una, s.rtx_seq.wrapping_add(s.rtx_len as u32)) {
+                    s.fin_rtx_pending = true;
+                } else {
+                    s.rtx_active = true;
+                    s.rtx_seq = seq;
+                    s.rtx_len = 0;
+                }
             }
             _ => {}
         }
     }
+    net_stack::net_unlock();
 
-    // 等待对端 ACK + FIN（或超时）
+    // 等待对端 ACK + FIN（或超时）：检查与重传段持锁，poll/yield 不持锁
     let start = crate::timer::now_us();
     let mut next_retx = start + RETX_US;
     while crate::timer::now_us() - start < CLOSE_TIMEOUT_US {
-        net_stack::poll();
-        unsafe {
+        net_stack::net_lock();
+        let done = unsafe {
             let s = &TCPS[idx];
-            let done = s.fin_sent && s.snd_una >= s.snd_nxt && s.peer_fin;
-            if done || !s.fin_sent {
-                break;
-            }
+            // 序号回绕安全比较：累计传输 ≥4GB 后普通 >= 失效（全文件唯一
+            // 残留的普通比较），close 要么干等超时、要么误判 FIN 已确认。
+            (s.fin_sent && seq_ge(s.snd_una, s.snd_nxt) && s.peer_fin) || !s.fin_sent
+        };
+        if done {
+            net_stack::net_unlock();
+            break;
         }
         let now = crate::timer::now_us();
         if now >= next_retx {
             unsafe { tcp_retransmit(idx) };
             next_retx = now + RETX_US;
         }
+        net_stack::net_unlock();
+        net_stack::poll();
         sched_cfs::yield_now();
     }
     // 释放套接字
+    net_stack::net_lock();
     for h in 0..MAX_SOCKETS {
         unsafe {
             if SOCKETS[h].used && SOCKETS[h].ty == SOCK_TCP && SOCKETS[h].index == idx {
@@ -1103,4 +1416,5 @@ fn tcp_close(idx: usize) {
     unsafe {
         TCPS[idx] = TcpSock::empty();
     }
+    net_stack::net_unlock();
 }

@@ -3,8 +3,12 @@
 // 由内核 init_main 在 displayd 之后加载（/bin/oobe），仅在 /data/oobe/.done
 // 不存在时运行。职责：
 //   1. 打开 /dev/fb0（openat）并 mmap 到用户空间，在本地 back buffer 上绘制
-//      10 步向导（RGBA8888），`flip()` 一次性拷贝到显存：
-//      欢迎 -> 语言 -> 模块 -> 地区/时区 -> 网络 -> 协议 -> 账号 -> 安全 -> 主题 -> 完成
+//      13 步向导（RGBA8888），`flip()` 一次性拷贝到显存并经 FBIO_PRESENT 呈现：
+//      欢迎 -> 语言 -> 模块 -> 时区 -> 网络 -> 协议 -> 账号 -> 锁屏方式 -> 密码
+//      -> 胁迫密码 -> 胁迫动作 -> 外观 -> 完成
+//      版式对标 HyperOS 3 / ColorOS 15：页头为步骤图标（上方偏下）+ 居中标题，
+//      选项卡片/输入框 400px 栏宽居中，底部「上一步/下一步」，右上角「跳过」
+//      胶囊可放弃当前步直达完成页；所有卡片/输入框/按钮均为圆角。
 //   2. 每步点击「下一步」时把该步配置写入 /data/oobe/（openat/write/close，
 //      mkdir /data 与 /data/oobe）
 //   3. 完成页点击「进入系统」写 .done 后 exit(0)
@@ -20,10 +24,32 @@
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+#[path = "../../../shared/ttf_text.rs"]
+mod ttf_text;
+
+// 共享系统导航（用于主题步骤的导航方式预览）。
+#[path = "../../../shared/nav.rs"]
+mod sys_nav;
+
+// 共享错误提示状态（OOBE 无墙钟，用帧计数计时；横幅绘制见 draw_error_banner）。
+#[path = "../../../shared/error_ui.rs"]
+mod err_ui;
+
 
 // 共享 CJK 16x16 点阵字库（GB2312 一级，由 tools/gen_cjk_font.py 生成）。
 #[path = "../../../shared/cjk_font_oobe.rs"]
 mod cjk_font;
+
+// 系统鼠标指针贴图（tubiao/shubiao.png 生成，24x24 + 热点）。
+#[path = "../../../shared/cursor_sprite.rs"]
+mod cursor_sprite;
+
+// 统一圆角按钮组件（主/次/禁止三种状态 + 按压反馈），OOBE 所有按钮统一走此组件。
+#[path = "widgets/button.rs"]
+mod button;
+
+// OOBE -> 桌面过渡（预加载 + 进度条 + 资源释放），完成页点击「进入系统」时调用。
+mod finish;
 
 // ==================== 系统调用号 ====================
 
@@ -57,6 +83,15 @@ const MAP_SHARED: usize = 1;
 /// FBIOGET_VSCREENINFO 请求码（与内核 devfs 约定一致）。
 const FBIOGET_VSCREENINFO: usize = 0x4600;
 
+/// FBIO_FADE_SPLASH 请求码：触发内核侧启动画面线性淡出（首帧渲染完成后调用）。
+const FBIO_FADE_SPLASH: usize = 0x4601;
+
+/// FBIO_PUT_DAMAGE：应用直绘脏区域提交（[count:u32][rect×count]）。
+const FBIO_PUT_DAMAGE: usize = 0x4602;
+
+/// FBIO_PRESENT：应用帧呈现（合成器脏区拷贝 + 覆盖窗口合成 + 翻页）。
+const FBIO_PRESENT: usize = 0x4603;
+
 /// 帧缓冲设备路径。
 const FB_PATH: &str = "/dev/fb0";
 
@@ -67,41 +102,123 @@ const INPUT_PATH: &str = "/dev/input/event0";
 
 const DISPLAY_W: usize = 540;
 const DISPLAY_H: usize = 960;
-const TITLE_H: i32 = 44;
-const NAV_H: i32 = 76;
+const NAV_H: i32 = 84;
 const NAV_Y: i32 = DISPLAY_H as i32 - NAV_H;
-const CONTENT_Y: i32 = TITLE_H + 8;
 
-// 醒目的「下一步」按钮：底部大色块 + 高亮边框。
-const NEXT_BTN_X: i32 = 400;
-const NEXT_BTN_Y: i32 = 900;
-const NEXT_BTN_W: i32 = 130;
-const NEXT_BTN_H: i32 = 50;
+// ==================== 字体层级与行高 ====================
+//
+// 系统默认无衬线字体（cn.ttf 平滑渲染；缺失字形回退内置点阵字库，见
+// draw_bitmap_scaled_a）：页面标题 28px 加粗；副标题/说明 17px 常规；
+// 按钮文字 17px 半加粗；输入框提示 15px 常规 #8E8E93。
+// 行高 = 1.4 × 字号；相邻文本元素的 y 坐标差 ≥ 1.5 × 行高（见 GAP_*）。
 
-// ==================== 账号步骤输入框布局 ====================
+const FONT_TITLE_PX: f32 = 28.0;
+const FONT_BODY_PX: f32 = 17.0;
+const FONT_BTN_PX: f32 = 17.0;
+const FONT_HINT_PX: f32 = 15.0;
+/// 行高（1.4 × 字号，取整）。
+const LH_TITLE: i32 = 39; // 28 × 1.4 = 39.2
+const LH_BODY: i32 = 24;  // 17 × 1.4 = 23.8
+const LH_HINT: i32 = 21;  // 15 × 1.4 = 21.0
+/// 相邻文本元素的最小 y 间距（1.5 × 行高，取整）。
+const GAP_AFTER_TITLE: i32 = 59; // 1.5 × 39.2
+const GAP_AFTER_BODY: i32 = 36;  // 1.5 × 23.8
+const GAP_AFTER_HINT: i32 = 32;  // 1.5 × 21.0
 
-/// 三个输入框的 y 坐标（render_account / tap_account 共用，必须一致）。
-const FIELD_Y0: i32 = 118;
-const FIELD_Y1: i32 = 214;
-const FIELD_Y2: i32 = 310;
-const FIELD_X: i32 = 40;
-const FIELD_W: i32 = 460;
-const FIELD_H: i32 = 44;
-/// 云服务 / 家长控制复选框的 y 坐标。
-const CLOUD_Y: i32 = 384;
-const PARENTAL_Y: i32 = 434;
+// ==================== 页面版式 ====================
+//
+// HyperOS 3 / ColorOS 15 向导版式：页头 = 步骤图标（渐变绿圆角方块，上方
+// 偏下）+ 图标下方居中标题 + 副标题；选项卡片/输入框以 400px 栏宽水平居中；
+// 底部为「上一步 / 下一步」；右上角「跳过」胶囊直达完成页。
+
+/// 模块网格通栏区左缘（网格整体水平居中：24 + 240 + 12 + 240 = 516）。
+/// 步骤图标（72x72 圆角方块）顶部 y（上方偏下）。
+const ICON_Y: i32 = 84;
+const ICON_SIZE: i32 = 72;
+/// 页面标题（28px 加粗）顶部 y（图标正下方）。
+const PAGE_TITLE_Y: i32 = ICON_Y + ICON_SIZE + 24; // 180
+/// 副标题/说明（17px 常规）顶部 y。
+const PAGE_DESC_Y: i32 = PAGE_TITLE_Y + 42; // 222
+/// 输入/选择控件区顶部 y。
+const WIDGET_Y: i32 = PAGE_DESC_Y + 44;     // 266
+
+// ==================== 输入框布局 ====================
+
+/// 输入框（render_* 与 tap_* 共用，必须一致）。标签（15px 提示）位于
+/// 输入框上方 GAP_AFTER_HINT 处。400px 栏宽水平居中。
+const FIELD_X: i32 = 70;
+const FIELD_W: i32 = 400;
+const FIELD_H: i32 = 48;
+const FIELD_Y0: i32 = WIDGET_Y + GAP_AFTER_HINT;                 // 183
+const FIELD_Y1: i32 = FIELD_Y0 + FIELD_H + GAP_AFTER_HINT * 2;   // 295
+
+// 底部导航按钮统一由 button 组件绘制（高度固定 50px，宽度按内容自适应），
+// 布局见 draw_nav_buttons。
+const NAV_BTN_MARGIN: i32 = 12;
+
+// ==================== 模块网格版式 ====================
+
+/// 模块页（render_modules / module_pos / tap_modules 共用，必须一致）。
+/// 两列圆角芯片网格（列优先：左列 0..10、右列 11..20），整组水平居中。
+const GRID_X: i32 = 24;
+const GRID_COL_W: i32 = 240;
+const GRID_GAP: i32 = 12;
+const GRID_ROW_H: i32 = 44;
+const GRID_R: i32 = 12;
+const GRID_PITCH: i32 = 52;
+const GRID_ROWS_COL: usize = 11;
+
+// ==================== 选择卡片版式 ====================
+//
+// 语言/时区/锁屏/胁迫动作/外观 等步骤统一「白色圆角卡片 + 右侧单选」，对标
+// ColorOS 15 设置向导。选中态 = ColorOS 绿 描边 + 淡绿底 + 绿单选点。
+// 400px 栏宽水平居中（(540-400)/2 = 70）。
+
+const CARD_X: i32 = 70;
+const CARD_W: i32 = 400;
+const CARD_H: i32 = 54;
+const CARD_R: i32 = 16;
+const CARD_PITCH: i32 = 64;
+/// 卡片内右侧控件（单选圈/复选方框）24x24 命中区。
+const OPT_RX: i32 = CARD_X + CARD_W - 20 - 24; // 426
+const OPT_RY: i32 = 15; // 卡片内垂直居中偏移（(54-24)/2）
 
 // ==================== 颜色（0x00RRGGBB） ====================
 
-// 浅色向导：纯白背景 + 黑色字体（标题加粗，内容不加粗）。
-const C_TEXT: u32 = 0x00_00_00_00; // 黑色正文
-const C_DIM: u32 = 0x00_00_00_00; // 黑色次级文字
-const C_ACCENT: u32 = 0x00_35_B0_E6;
+// 浅色向导标准配色：白色基底 + 深灰正文 + 绿高亮（色板见 /tmp/light_theme_spec.md）。
+const C_TEXT: u32 = 0x00_1A_1C_22;      // 主文字（白底/浅玻璃上）
+const C_DIM: u32 = 0x00_6B_72_80;       // 次要/弱化文字
+const C_HINT: u32 = 0x00_95_9A_9F;      // 提示文字
+const C_ACCENT: u32 = 0x00_00_B9_6B;    // OPPO 绿（单选/描边/进度点）
+const C_ACCENT_STRONG: u32 = 0x00_00_8F_53; // 深绿（按压/描边加深）
+const C_ACCENT_TINT: u32 = 0x00_E6_F7_EE;   // 选中卡片淡绿底
+const C_ACCENT_SOFT: u32 = 0x00_B5_E4_C9;   // 已完成进度点淡绿
+const C_CARD_BORDER: u32 = 0x00_D9_DE_E6;   // 卡片描边
+const C_RADIO_BORDER: u32 = 0x00_C7_CC_D3;  // 未选中单选圈
+const C_BTN_PRIMARY: u32 = 0x00_1A_1C_22;   // 外观步骤「深色」选项预览圆（示例色，非页面主题色）
 const C_RED: u32 = 0x00_FF_5A_5A;
-const C_GREEN: u32 = 0x00_22_C5_5E;
-const C_BTN: u32 = 0x00_1B_2B_4A; // 返回箭头按钮底色
+const C_GREEN: u32 = 0x00_00_B9_6B;
 const C_BTN_BORDER: u32 = 0x00_FF_FF_FF;
 const C_WHITE: u32 = 0x00_FF_FF_FF;
+
+// 欢迎页 Hero 徽标（渐变绿圆盘 + K 字）。
+const HERO_CX: i32 = DISPLAY_W as i32 / 2; // 270
+const HERO_CY: i32 = 288;
+const HERO_R: i32 = 44;
+
+// ==================== 动画参数（对标 ColorOS 15，见 docs/animations.md） ====================
+
+/// 步骤间转场帧数（~50ms）。TCG 下每帧含 47 万像素合成 + 全屏呈现，
+/// 帧数越少越不卡；转场帧间短 sleep，保留「上滑回弹」的节奏感。
+const TRANS_FRAMES: i32 = 4;
+/// 转场上滑距离（px）。
+const TRANS_SLIDE: i32 = 26;
+/// 欢迎页 Hero 入场帧数（弹跳过冲）。
+const HERO_FRAMES: i32 = 5;
+/// 标题区淡入帧数（错峰叠加）。
+const TITLE_FRAMES: i32 = 6;
+/// 选中卡片脉冲帧数。
+const PULSE_FRAMES: i32 = 3;
 
 // ==================== 8x8 位图字体 ====================
 
@@ -223,6 +340,8 @@ static mut FB_PTR: *mut u32 = core::ptr::null_mut();
 static mut FB_W: usize = DISPLAY_W;
 static mut FB_H: usize = DISPLAY_H;
 static mut FB_STRIDE_PX: usize = DISPLAY_W;
+/// /dev/fb0 的描述符（呈现 ioctl 用；保持打开直至进程退出）。
+static mut FB_FD: i32 = -1;
 static mut BACK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
 static mut STEP: usize = 0;
 static mut LANG: usize = 0; // 0=zh_CN 1=en_US
@@ -239,21 +358,56 @@ static mut PARENTAL: bool = false;
 static mut PARENTAL_FILTER: bool = false;
 static mut PARENTAL_TIME: usize = 120;
 static mut SEC_TYPE: usize = 0; // 0=pin 1=pattern 2=password
+/// 是否启用了锁屏安全（用户主动选择才为 true；默认关闭 → 不写安全文件，
+/// launcher 启动不自动上锁，用户可直接进入系统）。
+static mut SEC_ENABLED: bool = false;
 static mut DURESS_ACTION: usize = 0; // 0=fake 1=wipe 2=alert
-static mut THEME_DARK: bool = true;
+/// 用户在「外观」步骤选择的主题（仅随用户选择写入 /data/oobe/theme 与
+/// desktop_meta；系统现已固定浅色，oobe 自身 UI 也恒以浅色渲染，不再据此切色）。
+static mut THEME_DARK: bool = false;
 static mut WALLPAPER: usize = 2;
+/// 导航方式：0=全面屏手势，1=三大虚拟按键（主题步骤选择，写入 /data/oobe/nav_mode）。
+static mut NAV_MODE: usize = 0;
 
-// ==================== 账号输入框状态 ====================
+// ==================== 统一圆角按钮（底部导航区） ====================
 
-/// 账号步骤的用户名 / 密码 / 确认密码缓冲（定长，<= 16 字符）。
+/// 底部导航区按钮：返回（次要）/ 下一步（主）/ 进入系统（主）。
+/// 标签与状态在 draw_nav_buttons 按步骤与语言设置；draw() 之后 x/y/w/h 即为命中区。
+static mut BTN_BACK: button::Button = button::Button::new(b"", button::ButtonState::Secondary);
+static mut BTN_NEXT: button::Button = button::Button::new(b"", button::ButtonState::Primary);
+static mut BTN_ENTER: button::Button = button::Button::new(b"", button::ButtonState::Primary);
+/// 右上角「跳过」胶囊（步骤 1..11 显示；点击放弃当前步直达完成页）。
+static mut BTN_SKIP: button::Button = button::Button::new(b"", button::ButtonState::Secondary);
+const SKIP_MARGIN: i32 = 16;
+const SKIP_Y: i32 = 14;
+
+// ==================== 账号 / 密码 / 胁迫密码输入框状态 ====================
+
+/// 账号步骤：用户名缓冲；密码步骤：密码与确认；胁迫步骤：胁迫密码与确认。
+/// 全部定长（<= 16 字符）。
 static mut USER_BUF: [u8; 16] = [0; 16];
 static mut USER_LEN: usize = 0;
 static mut PASS_BUF: [u8; 16] = [0; 16];
 static mut PASS_LEN: usize = 0;
 static mut CONFIRM_BUF: [u8; 16] = [0; 16];
 static mut CONFIRM_LEN: usize = 0;
-/// 当前焦点输入框：0=用户名 1=密码 2=确认密码 -1=无。
+static mut DURESS_BUF: [u8; 16] = [0; 16];
+static mut DURESS_LEN: usize = 0;
+static mut DURESS_CONFIRM_BUF: [u8; 16] = [0; 16];
+static mut DURESS_CONFIRM_LEN: usize = 0;
+/// 当前焦点输入框（按步骤解释：账号=0 用户名；密码=0 密码 / 1 确认；
+/// 胁迫=0 胁迫密码 / 1 确认）。-1=无。
 static mut FIELD_FOCUS: i32 = 0;
+
+/// 当前步骤的输入框数量（账号 1 个；密码 / 胁迫各 2 个）。
+fn step_field_count() -> usize {
+    unsafe {
+        match STEP {
+            8 | 9 => 2,
+            _ => 1,
+        }
+    }
+}
 
 /// 向焦点输入框追加一个字符（超长忽略）。
 fn append_field_char(f: usize, c: u8) {
@@ -268,20 +422,22 @@ fn append_field_char(f: usize, c: u8) {
 
 /// 从焦点输入框删除末尾一个字符。
 fn delete_field_char(f: usize) {
-    unsafe {
-        let (_, len) = field_buf(f);
-        if *len > 0 {
-            *len -= 1;
-        }
+    let (_, len) = field_buf(f);
+    if *len > 0 {
+        *len -= 1;
     }
 }
 
-/// 返回输入框的（缓冲指针，长度引用）。
+/// 返回输入框的（缓冲指针，长度引用）。字段按当前步骤解释。
 fn field_buf(f: usize) -> (*mut u8, &'static mut usize) {
     unsafe {
-        match f {
-            1 => (PASS_BUF.as_mut_ptr(), &mut PASS_LEN),
-            2 => (CONFIRM_BUF.as_mut_ptr(), &mut CONFIRM_LEN),
+        let step = STEP;
+        match (step, f) {
+            (8, 1) => (CONFIRM_BUF.as_mut_ptr(), &mut CONFIRM_LEN),
+            (8, _) => (PASS_BUF.as_mut_ptr(), &mut PASS_LEN),
+            (9, 1) => (DURESS_CONFIRM_BUF.as_mut_ptr(), &mut DURESS_CONFIRM_LEN),
+            (9, _) => (DURESS_BUF.as_mut_ptr(), &mut DURESS_LEN),
+            // 账号步骤：仅用户名
             _ => (USER_BUF.as_mut_ptr(), &mut USER_LEN),
         }
     }
@@ -290,8 +446,6 @@ fn field_buf(f: usize) -> (*mut u8, &'static mut usize) {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 const DEFAULT_USER: &[u8] = b"user";
-const DEFAULT_PASS: &[u8] = b"1234";
-const DURESS_PIN: &[u8] = b"9999";
 
 const TIMEZONES: [&str; 8] = [
     "Asia/Shanghai",
@@ -308,10 +462,10 @@ const REGIONS: [&str; 4] = ["Asia", "Europe", "America", "Other"];
 
 fn region_default_tz(region: usize) -> usize {
     match region {
-        1 => 3, // Europe -> London
-        2 => 5, // America -> New_York
-        3 => 7, // Other -> UTC
-        _ => 0, // Asia -> Shanghai
+        1 => 3, // 欧洲 -> 伦敦
+        2 => 5, // 美洲 -> 纽约
+        3 => 7, // 其他 -> UTC
+        _ => 0, // 亚洲 -> 上海
     }
 }
 
@@ -333,7 +487,7 @@ impl Module {
     }
 }
 
-static MODULES: [Module; 17] = [
+static MODULES: [Module; 21] = [
     Module { key: "phone",      name: "Phone",      name_zh: "电话",      core: true,  locked: true,  default_on: true },
     Module { key: "sms",        name: "SMS",        name_zh: "短信",      core: true,  locked: true,  default_on: true },
     Module { key: "contacts",   name: "Contacts",   name_zh: "通讯录",    core: true,  locked: true,  default_on: true },
@@ -351,9 +505,14 @@ static MODULES: [Module; 17] = [
     Module { key: "weather",    name: "Weather",    name_zh: "天气",      core: false, locked: false, default_on: true },
     Module { key: "store",      name: "Store",      name_zh: "应用商店",  core: false, locked: false, default_on: true },
     Module { key: "terminal",   name: "Terminal",   name_zh: "终端",      core: false, locked: false, default_on: true },
+    Module { key: "cloud",      name: "Cloud",      name_zh: "云服务",    core: false, locked: false, default_on: true },
+    Module { key: "video",      name: "Video",      name_zh: "视频",      core: false, locked: false, default_on: true },
+    Module { key: "notes",      name: "Notes",      name_zh: "备忘录",    core: false, locked: false, default_on: true },
+    // 生命周期演示/测试应用（docs/lifecycle-test.md 的 GUI 验证载体）。
+    Module { key: "lcapp",      name: "LCApp",      name_zh: "LCApp",     core: false, locked: false, default_on: true },
 ];
 
-static mut MODULE_ON: [bool; 17] = [false; 17];
+static mut MODULE_ON: [bool; 21] = [false; 21];
 
 fn module_on(i: usize) -> bool {
     unsafe { MODULE_ON[i] }
@@ -460,26 +619,49 @@ unsafe fn open(path: &str, flags: usize) -> isize {
     syscall3(SYS_OPENAT, AT_FDCWD, path_ptr(path), flags) as isize
 }
 
-unsafe fn mkdir(path: &str) {
-    syscall3(SYS_MKDIRAT, AT_FDCWD, path_ptr(path), 0o755);
+unsafe fn mkdir(path: &str) -> isize {
+    syscall3(SYS_MKDIRAT, AT_FDCWD, path_ptr(path), 0o755) as isize
 }
 
 /// 创建 /data 与 /data/oobe（幂等，忽略已存在的错误）。
 fn mkdir_all() {
     unsafe {
-        mkdir("/data");
-        mkdir("/data/oobe");
+        let r1 = mkdir("/data");
+        let r2 = mkdir("/data/oobe");
+        // -17 = EEXIST（目录已存在，正常）；其它负值才是真实失败。
+        if (r1 != 0 && r1 != -17) || (r2 != 0 && r2 != -17) {
+            print("[oobe] 致命错误：无法创建 /data 或 /data/oobe（r1=");
+            print_dec((-r1) as usize);
+            print(" r2=");
+            print_dec((-r2) as usize);
+            print("）\n");
+            show_error("无法创建数据目录".as_bytes());
+        }
     }
-    print("[oobe] /data/oobe ready\n");
+    print("[oobe] /data/oobe 就绪\n");
 }
 
 /// 写文件（open O_CREAT|O_TRUNC + write + close）。
-fn write_file(path: &str, data: &[u8]) {
+fn write_file(path: &str, data: &[u8]) -> bool {
     unsafe {
         let fd = open(path, O_CREAT | O_TRUNC | O_WRONLY);
         if fd >= 0 {
-            write_fd(fd as usize, data);
+            let n = write_fd(fd as usize, data);
             syscall1(SYS_CLOSE, fd as usize);
+            if n != data.len() {
+                print("[oobe] 写入过短：");
+                print(path);
+                print("\n");
+                show_error("配置保存失败".as_bytes());
+                return false;
+            }
+            true
+        } else {
+            print("[oobe] 打开失败：");
+            print(path);
+            print("\n");
+            show_error("配置保存失败".as_bytes());
+            false
         }
     }
 }
@@ -521,13 +703,88 @@ fn fb_init() -> bool {
             return false;
         }
         FB_PTR = base as *mut u32;
-        // 映射建立后即可关闭 fd（页表已指向显存物理页）。
-        syscall1(SYS_CLOSE, fd as usize);
+        // 保留 fd：呈现（FBIO_PUT_DAMAGE / FBIO_PRESENT）需要它；进程退出时回收。
+        FB_FD = fd as i32;
         true
     }
 }
 
-/// 把 back buffer 一次性拷贝到显存。
+/// 触发内核侧启动画面淡出：首帧渲染完成后调用一次；无启动画面时内核直接
+/// 返回（open/ioctl 失败也静默跳过，不阻塞启动流程）。
+fn splash_fade() {
+    unsafe {
+        let fd = open(FB_PATH, O_RDWR);
+        if fd < 0 {
+            return;
+        }
+        syscall3(SYS_IOCTL, fd as usize, FBIO_FADE_SPLASH, 0);
+        syscall1(SYS_CLOSE, fd as usize);
+    }
+}
+
+/// 首帧之前的同步字体加载：先加载 OOBE 超小子集（oobe-cn/oobe-bold）再渲染
+/// 首帧，向导自始至终显示平滑 TTF 汉字（无点阵闪现）。加载失败时回退内置
+/// 点阵继续，不阻塞向导。
+fn load_fonts_sync() {
+    let ok = ttf_text::font_init_oobe();
+    print("[oobe] font_init ");
+    if ok {
+        print("done (oobe uiputong + oobe bold)\n");
+    } else {
+        print("failed，回退点阵兜底\n");
+    }
+}
+
+/// 呈现当前 canvas 帧：提交整屏脏区并请求合成器翻页（`flip`/转场/脉冲逐帧调用）。
+fn present_fb() {
+    unsafe {
+        if FB_FD < 0 || FB_PTR.is_null() {
+            return;
+        }
+        // 脏区头：[count:u32][rect{x:i32,y:i32,w:u32,h:u32}]，count=1 整屏。
+        let mut hdr = [0u8; 20];
+        hdr[0] = 1;
+        hdr[4..8].copy_from_slice(&0i32.to_le_bytes());
+        hdr[8..12].copy_from_slice(&0i32.to_le_bytes());
+        hdr[12..16].copy_from_slice(&(FB_W as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&(FB_H as u32).to_le_bytes());
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PUT_DAMAGE, hdr.as_ptr() as usize);
+        // count=0 → 仅呈现（合成器把 canvas 合成到 back 并翻页）。
+        let empty = [0u8; 4];
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, empty.as_ptr() as usize);
+    }
+}
+
+/// 只呈现 [x,y,w,h] 小矩形（光标/呼吸/选中脉冲用）：脏矩形内 canvas→back
+/// 增量拷贝 + 覆盖窗口合成 + 翻页，避免每帧整屏 2MB 拷贝（QEMU 下卡顿主因）。
+fn present_rect(x: i32, y: i32, w: i32, h: i32) {
+    unsafe {
+        if FB_FD < 0 || FB_PTR.is_null() {
+            return;
+        }
+        // 裁剪到屏幕：调用方（如光标 overlay 的旧+新位置并集）可能给出
+        // 超出屏幕的矩形 —— 此前直接丢弃导致该帧更新整个丢失（光标瞬移
+        // 停滞一帧），裁剪后仍呈现可见部分。
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w).min(DISPLAY_W as i32);
+        let y1 = (y + h).min(DISPLAY_H as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let mut hdr = [0u8; 20];
+        hdr[0] = 1;
+        hdr[4..8].copy_from_slice(&x0.to_le_bytes());
+        hdr[8..12].copy_from_slice(&y0.to_le_bytes());
+        hdr[12..16].copy_from_slice(&((x1 - x0) as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&((y1 - y0) as u32).to_le_bytes());
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PUT_DAMAGE, hdr.as_ptr() as usize);
+        let empty = [0u8; 4];
+        syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, empty.as_ptr() as usize);
+    }
+}
+
+/// 把 back buffer 一次性拷贝到显存并呈现。
 ///
 /// 当显存 stride 与逻辑宽度一致时执行单次 `copy_nonoverlapping`（最快路径）；
 /// 否则退化为逐行拷贝，兼容带 padding 的 stride。
@@ -554,6 +811,7 @@ fn flip() {
             }
         }
     }
+    present_fb();
 }
 
 // ==================== 绘制原语 ====================
@@ -564,6 +822,65 @@ fn put_pixel(x: i32, y: i32, color: u32) {
     }
     unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] = color; }
 }
+
+// ==================== 毛玻璃 / 液态玻璃（OOBE 浅色主题） ====================
+
+use sys_nav::glass::{GlassStyle, GlassTarget, STYLE_DANGER, glass_rect, glass_rect_style};
+
+/// OOBE 毛玻璃目标：背景取自 BACK_BUF，像素经 put_pixel 写入。
+struct OobeGlass;
+impl GlassTarget for OobeGlass {
+    fn backdrop(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+}
+
+/// 毛玻璃面板（OOBE 为浅色主题，默认浅色玻璃）。
+fn draw_glass(x: i32, y: i32, w: i32, h: i32, r: i32) {
+    glass_rect(&mut OobeGlass, x, y, w, h, r, false, true);
+}
+
+/// 自定义样式液态玻璃面板。
+fn draw_glass_style(x: i32, y: i32, w: i32, h: i32, r: i32, st: &GlassStyle) {
+    glass_rect_style(&mut OobeGlass, x, y, w, h, r, st, true);
+}
+
+/// 主按钮玻璃样式：浅色磨砂（白色着色 + 浅灰描边，液态玻璃质感）。
+static STYLE_PRIMARY: GlassStyle = GlassStyle {
+    tint: 0x00_FF_FF_FF,
+    alpha: 225,
+    spec: 60,
+    sheen: 18,
+    border: 0x00_D9_DE_E6,
+    border_a: 220,
+};
+
+/// 次要芯片按钮玻璃样式：白色着色 + 浅灰描边。
+static STYLE_SECONDARY: GlassStyle = GlassStyle {
+    tint: 0x00_FF_FF_FF,
+    alpha: 232,
+    spec: 66,
+    sheen: 26,
+    border: 0x00_D9_DE_E6,
+    border_a: 200,
+};
+
+/// 底部导航面板：白色半透玻璃 + 浅灰顶描边（浅色「底sheet」）。
+static STYLE_SHEET: GlassStyle = GlassStyle {
+    tint: 0x00_FF_FF_FF,
+    alpha: 222,
+    spec: 34,
+    sheen: 12,
+    border: 0x00_D9_DE_E6,
+    border_a: 170,
+};
 
 fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     for dy in 0..h {
@@ -597,410 +914,1142 @@ fn isqrt(n: i32) -> i32 {
     x
 }
 
+/// 实心圆（抗锯齿）。
 fn fill_circle(cx: i32, cy: i32, r: i32, color: u32) {
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r * r {
-                put_pixel(cx + dx, cy + dy, color);
-            }
+    sys_nav::glass::smooth_fill_circle(&mut OobeSmooth, cx, cy, r, color);
+}
+
+/// BACK_BUF 抗锯齿绘制目标（oobe 自有帧缓冲）。
+struct OobeSmooth;
+
+impl sys_nav::glass::SmoothTarget for OobeSmooth {
+    fn put_aa(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
+        if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+            return;
+        }
+        unsafe {
+            let idx = y as usize * DISPLAY_W + x as usize;
+            BACK_BUF[idx] = blend_px(BACK_BUF[idx], color, alpha);
         }
     }
 }
 
+/// 填充圆角矩形（抗锯齿超椭圆连续曲率，ColorOS 15 观感）。
 fn fill_rounded(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
-    fill_rect(x + r, y, w - 2 * r, h, color);
-    fill_rect(x, y + r, w, h - 2 * r, color);
-    for dy in 0..r {
-        for dx in 0..r {
-            if dx * dx + dy * dy <= r * r {
-                put_pixel(x + r - 1 - dx, y + r - 1 - dy, color);
-                put_pixel(x + w - r + dx, y + r - 1 - dy, color);
-                put_pixel(x + r - 1 - dx, y + h - r + dy, color);
-                put_pixel(x + w - r + dx, y + h - r + dy, color);
-            }
-        }
+    sys_nav::glass::smooth_fill_rr(&mut OobeSmooth, x, y, w, h, r, color);
+}
+
+// ==================== TTF 平滑字体（cn.ttf，可回退内置点阵字库） ====================
+
+/// 码点是否可用已加载字体渲染（字体就绪且包含该字形）。
+fn ttf_has(cp: u32) -> bool {
+    ttf_text::font_render::font_ready() && ttf_text::font_render::has_glyph(cp)
+}
+
+/// 点阵回退的缩放系数：把 8x8 ASCII / 16x16 CJK 位图放大到贴近目标字号。
+fn bitmap_scale(px: i32, native: i32) -> i32 {
+    let s = (px + native - 1) / native;
+    if s < 1 { 1 } else { s }
+}
+
+/// 位图回退的字形推进宽度（与绘制一致）。
+fn bitmap_advance(cp: u32, px: i32) -> i32 {
+    if cp < 0x80 {
+        8 * bitmap_scale(px, 8)
+    } else if cp <= 0xFFFF && cjk_font::cjk_index(cp as u16).is_some() {
+        16 * bitmap_scale(px, 16)
+    } else {
+        16
     }
 }
 
-fn draw_char(x: i32, y: i32, c: u8, color: u32) {
-    let g = glyph(c);
-    for (row, bits) in g.iter().enumerate() {
-        for col in 0..8 {
-            if bits & (0x80 >> col) != 0 {
-                put_pixel(x + col as i32, y + row as i32, color);
-            }
-        }
-    }
+/// 把前景色按 alpha 淡出到白色背景（浅色主题背景恒为白色）。
+fn fade_to_white(color: u32, alpha: u32) -> u32 {
+    ttf_text::font_render::blend(C_WHITE, color, alpha as u8)
 }
 
-/// 绘制单个 16x16 中文字形。
-fn draw_cjk(x: i32, y: i32, idx: usize, color: u32) {
-    let base = idx * 32;
-    for row in 0..16i32 {
-        let b0 = cjk_font::CJK_BITMAPS[base + row as usize * 2];
-        let b1 = cjk_font::CJK_BITMAPS[base + row as usize * 2 + 1];
-        let bits = ((b0 as u16) << 8) | b1 as u16;
-        for col in 0..16i32 {
-            if bits & (0x8000u16 >> col) != 0 {
-                put_pixel(x + col, y + row, color);
+/// 绘制内置点阵字形（8x8 ASCII / 16x16 CJK，按字号缩放）；点阵中也没有的
+/// 码点只推进宽度、不绘制任何方块。返回推进宽度。
+fn draw_bitmap_scaled_a(x: i32, y: i32, cp: u32, px: i32, color: u32, alpha: u32) -> i32 {
+    if alpha == 0 {
+        return bitmap_advance(cp, px);
+    }
+    let fill = fade_to_white(color, alpha);
+    if cp < 0x80 {
+        let g = glyph(cp as u8);
+        let s = bitmap_scale(px, 8);
+        for row in 0..8 {
+            for col in 0..8 {
+                if g[row] & (0x80u8 >> col) != 0 {
+                    fill_rect(x + col as i32 * s, y + row as i32 * s, s, s, fill);
+                }
             }
         }
+        return 8 * s;
     }
+    let idx = if cp <= 0xFFFF { cjk_font::cjk_index(cp as u16) } else { None };
+    if let Some(idx) = idx {
+        let base = idx * 32;
+        let s = bitmap_scale(px, 16);
+        for row in 0..16 {
+            let b0 = cjk_font::CJK_BITMAPS[base + row * 2];
+            let b1 = cjk_font::CJK_BITMAPS[base + row * 2 + 1];
+            for col in 0..16 {
+                let bit = if col < 8 {
+                    b0 & (0x80u8 >> col)
+                } else {
+                    b1 & (0x80u8 >> (col - 8))
+                };
+                if bit != 0 {
+                    fill_rect(x + col as i32 * s, y + row as i32 * s, s, s, fill);
+                }
+            }
+        }
+        return 16 * s;
+    }
+    if cp >= 0x80 { 16 } else { 8 }
 }
 
-fn draw_text(x: i32, y: i32, s: &[u8], color: u32) {
+/// 把单个码点绘制到 (x, y)（y 为字形顶部）。TTF 平滑字形优先；字体未加载
+/// 或缺少该字形时回退内置点阵字库；两者都不可用时只推进宽度（不画乱码方块）。
+/// `alpha`（0..255）用于半加粗的第二遍叠加。返回推进宽度。
+fn ttf_glyph_a(x: i32, y: i32, cp: u32, color: u32, px: f32, alpha: u32) -> i32 {
+    if ttf_has(cp) {
+        let ch = core::char::from_u32(cp).unwrap_or(' ');
+        if let Some(g) = ttf_text::font_render::rasterize_char(ch, px) {
+            let gx = x + g.xmin;
+            let gy = ttf_text::font_render::glyph_draw_top(y, g.ymin, g.height, px);
+            for row in 0..g.height {
+                for col in 0..g.width {
+                    let v = g.data[row * g.width + col];
+                    if v != 0 {
+                        let px_ = gx + col as i32;
+                        let py_ = gy + row as i32;
+                        let in_b = px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32;
+                        if in_b {
+                            let a = ((v as u32) * alpha) / 255;
+                            let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                            put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a as u8));
+                        }
+                    }
+                }
+            }
+            return g.advance;
+        }
+    }
+    draw_bitmap_scaled_a(x, y, cp, px as i32, color, alpha)
+}
+
+fn ttf_glyph(x: i32, y: i32, cp: u32, color: u32, px: f32) -> i32 {
+    ttf_glyph_a(x, y, cp, color, px, 255)
+}
+
+/// 单个码点的推进宽度（与 ttf_glyph_a 的绘制宽度一致）。
+fn glyph_advance(cp: u32, px: f32) -> i32 {
+    if ttf_has(cp) {
+        return ttf_text::font_render::advance(cp, px);
+    }
+    bitmap_advance(cp, px as i32)
+}
+
+/// 以标题字体（bold.ttf）绘制单个码点（带 alpha）。标题字体就绪时用真实
+/// 粗体字形；否则退回常规字体 + 模拟加粗（两遍叠加）。
+fn ttf_glyph_bold_a(x: i32, y: i32, cp: u32, color: u32, px: f32, alpha: u32) -> i32 {
+    if ttf_text::font_render::has_glyph_bold(cp) {
+        let ch = core::char::from_u32(cp).unwrap_or(' ');
+        if let Some(g) = ttf_text::font_render::rasterize_char_bold(ch, px) {
+            let gx = x + g.xmin;
+            let gy = ttf_text::font_render::glyph_draw_top_bold(y, g.ymin, g.height, px);
+            for row in 0..g.height {
+                for col in 0..g.width {
+                    let v = g.data[row * g.width + col];
+                    if v != 0 {
+                        let px_ = gx + col as i32;
+                        let py_ = gy + row as i32;
+                        let in_b =
+                            px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32;
+                        if in_b {
+                            let a = ((v as u32) * (alpha % 256)) / 255;
+                            let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                            put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a as u8));
+                        }
+                    }
+                }
+            }
+            return g.advance;
+        }
+    }
+    ttf_glyph_a(x, y, cp, color, px, alpha)
+}
+
+/// 标题字体的字形推进宽度（不可用时退回常规宽度，保证与绘制一致）。
+fn glyph_advance_bold(cp: u32, px: f32) -> i32 {
+    if ttf_text::font_render::has_glyph_bold(cp) {
+        return ttf_text::font_render::advance_bold(cp, px);
+    }
+    glyph_advance(cp, px)
+}
+
+/// 按 UTF-8 渲染文本（px 字号）。
+fn draw_text_px(x: i32, y: i32, s: &[u8], px: f32, color: u32) {
     let mut cx = x;
     let mut i = 0;
     while i < s.len() {
-        let (cp, n) = cjk_font::utf8_next(s, i);
-        if cp >= 0x80 {
-            if let Some(idx) = cjk_font::cjk_index(cp as u16) {
-                draw_cjk(cx, y, idx, color);
-            }
-            cx += cjk_font::CJK_W;
-            i += n;
-        } else {
-            draw_char(cx, y, cp as u8, color);
-            cx += 8;
-            i += n;
-        }
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        cx += ttf_glyph_a(cx, y, cp, color, px, 255);
+        i += n;
     }
 }
 
-fn text_width(s: &[u8]) -> i32 {
-    cjk_font::text_width(s)
-}
-
-fn draw_center(y: i32, s: &[u8], color: u32) {
-    let tx = (DISPLAY_W as i32 - text_width(s)) / 2;
-    draw_text(tx, y, s, color);
-}
-
-/// 粗体文本：每个字形横向重复绘制一次（右移 1 像素）模拟加粗（标题用）。
-fn draw_text_bold(x: i32, y: i32, s: &[u8], color: u32) {
+/// 标题文本（真粗体，bold.ttf）：标题字体就绪时用其实字体渲染，否则退回
+/// 常规字体两遍叠加模拟加粗。
+fn draw_text_bold_px(x: i32, y: i32, s: &[u8], px: f32, color: u32) {
     let mut cx = x;
     let mut i = 0;
     while i < s.len() {
-        let (cp, n) = cjk_font::utf8_next(s, i);
-        if cp >= 0x80 {
-            if let Some(idx) = cjk_font::cjk_index(cp as u16) {
-                draw_cjk(cx, y, idx, color);
-                draw_cjk(cx + 1, y, idx, color);
-            }
-            cx += cjk_font::CJK_W;
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        if ttf_text::font_render::font_bold_ready() && ttf_text::font_render::has_glyph_bold(cp) {
+            cx += ttf_glyph_bold_a(cx, y, cp, color, px, 255);
         } else {
-            draw_char(cx, y, cp as u8, color);
-            draw_char(cx + 1, y, cp as u8, color);
-            cx += 8;
+            ttf_glyph_a(cx, y, cp, color, px, 255);
+            ttf_glyph_a(cx + 1, y, cp, color, px, 255);
+            cx += glyph_advance(cp, px);
         }
         i += n;
     }
 }
 
-/// 水平居中粗体文本（标题用）。
-fn draw_center_bold(y: i32, s: &[u8], color: u32) {
-    let tx = (DISPLAY_W as i32 - text_width(s)) / 2;
-    draw_text_bold(tx, y, s, color);
-}
-
-/// 纯白背景。
-fn draw_background() {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, C_WHITE);
-}
-
-fn draw_checkbox(x: i32, y: i32, checked: bool, color: u32) {
-    draw_rect(x, y, 12, 12, color);
-    if checked {
-        fill_rect(x + 3, y + 3, 6, 6, color);
+/// 半加粗（17px 按钮等）：标题字体就绪时直接使用粗体字形，否则第二遍以
+/// 128 alpha 叠加模拟。
+fn draw_text_semibold_px(x: i32, y: i32, s: &[u8], px: f32, color: u32) {
+    let mut cx = x;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        if ttf_text::font_render::font_bold_ready() && ttf_text::font_render::has_glyph_bold(cp) {
+            cx += ttf_glyph_bold_a(cx, y, cp, color, px, 255);
+        } else {
+            ttf_glyph_a(cx, y, cp, color, px, 255);
+            ttf_glyph_a(cx + 1, y, cp, color, px, 128);
+            cx += glyph_advance(cp, px);
+        }
+        i += n;
     }
 }
 
-fn draw_radio(x: i32, y: i32, selected: bool, color: u32) {
-    let cx = x + 6;
-    let cy = y + 6;
-    for dy in -6..=6 {
-        for dx in -6..=6 {
+fn text_width_px(s: &[u8], px: f32) -> i32 {
+    let mut w = 0i32;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        w += glyph_advance(cp, px);
+        i += n;
+    }
+    w
+}
+
+/// 标题字体下的文本宽度（对齐 draw_text_bold_px 的真实推进）。
+fn text_width_px_bold(s: &[u8], px: f32) -> i32 {
+    let mut w = 0i32;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        w += glyph_advance_bold(cp, px);
+        i += n;
+    }
+    w
+}
+
+/// 水平居中文本（px 字号）。
+fn draw_center_px(y: i32, s: &[u8], px: f32, color: u32) {
+    let tx = (DISPLAY_W as i32 - text_width_px(s, px)) / 2;
+    draw_text_px(tx, y, s, px, color);
+}
+
+/// 水平居中加粗文本。
+fn draw_center_bold_px(y: i32, s: &[u8], px: f32, color: u32) {
+    let tx = (DISPLAY_W as i32 - text_width_px_bold(s, px)) / 2;
+    draw_text_bold_px(tx, y, s, px, color);
+}
+
+/// 带 alpha（淡入动画）的文本绘制：每个字形按 alpha 透明度混合到背景。
+fn draw_text_px_a(x: i32, y: i32, s: &[u8], px: f32, color: u32, alpha: u32) {
+    let mut cx = x;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        cx += ttf_glyph_a(cx, y, cp, color, px, (alpha % 256) as u32);
+        i += n;
+    }
+}
+
+/// 带 alpha 的标题绘制（标题字体就绪时用真实粗体，否则两遍叠加模拟）。
+fn draw_text_bold_px_a(x: i32, y: i32, s: &[u8], px: f32, color: u32, alpha: u32) {
+    let mut cx = x;
+    let mut i = 0;
+    while i < s.len() {
+        let (cp, n) = ttf_text::font_render::utf8_next(s, i);
+        if ttf_text::font_render::font_bold_ready() && ttf_text::font_render::has_glyph_bold(cp) {
+            cx += ttf_glyph_bold_a(cx, y, cp, color, px, alpha);
+        } else {
+            ttf_glyph_a(cx, y, cp, color, px, (alpha % 256) as u32);
+            ttf_glyph_a(cx + 1, y, cp, color, px, ((alpha.min(128) * 2 + alpha) / 3).min(255));
+            cx += glyph_advance(cp, px);
+        }
+        i += n;
+    }
+}
+
+/// 带 alpha 的水平居中文本。
+fn draw_center_px_a(y: i32, s: &[u8], px: f32, color: u32, alpha: u32) {
+    let tx = (DISPLAY_W as i32 - text_width_px(s, px)) / 2;
+    draw_text_px_a(tx, y, s, px, color, alpha);
+}
+
+/// 带 alpha 的水平居中加粗文本。
+fn draw_center_bold_px_a(y: i32, s: &[u8], px: f32, color: u32, alpha: u32) {
+    let tx = (DISPLAY_W as i32 - text_width_px_bold(s, px)) / 2;
+    draw_text_bold_px_a(tx, y, s, px, color, alpha);
+}
+
+/// 兼容入口：16px 常规文本（finish 过渡 UI 使用）。
+fn draw_text(x: i32, y: i32, s: &[u8], color: u32) {
+    draw_text_px(x, y, s, ttf_text::font_render::FONT_PX, color);
+}
+
+/// 兼容入口：16px 宽度。
+fn text_width(s: &[u8]) -> i32 {
+    text_width_px(s, ttf_text::font_render::FONT_PX)
+}
+
+fn draw_center(y: i32, s: &[u8], color: u32) {
+    draw_center_px(y, s, ttf_text::font_render::FONT_PX, color);
+}
+
+fn draw_char(x: i32, y: i32, c: u8, color: u32) {
+    ttf_glyph(x, y, c as u32, color, ttf_text::font_render::FONT_PX);
+}
+
+fn draw_cjk(x: i32, y: i32, cp: u16, color: u32) {
+    ttf_glyph(x, y, cp as u32, color, ttf_text::font_render::FONT_PX);
+}
+
+/// ColorOS 15 浅色向导背景：近白底 + 极淡绿冷色垂直渐变。
+fn draw_background() {
+    let (tr, tg, tb) = (0xF9u32, 0xFBu32, 0xFD);
+    let (br, bg, bb) = (0xE9u32, 0xF1u32, 0xF4);
+    for y in 0..DISPLAY_H as i32 {
+        let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
+        let inv = 255 - t;
+        let r = (tr * inv + br * t) / 255;
+        let g = (tg * inv + bg * t) / 255;
+        let b = (tb * inv + bb * t) / 255;
+        let row = (r << 16) | (g << 8) | b;
+        let iy = y as usize * DISPLAY_W;
+        unsafe {
+            for x in 0..DISPLAY_W {
+                BACK_BUF[iy + x] = row;
+            }
+        }
+    }
+}
+
+/// 标准 alpha 混合（本地实现，供动画逐帧合成）。
+fn blend_px(a: u32, b: u32, t: u32) -> u32 {
+    let t = t.min(255);
+    let inv = 255 - t;
+    let r = (((a >> 16) & 0xFF) * inv + ((b >> 16) & 0xFF) * t) / 255;
+    let g = (((a >> 8) & 0xFF) * inv + ((b >> 8) & 0xFF) * t) / 255;
+    let bl = ((a & 0xFF) * inv + (b & 0xFF) * t) / 255;
+    (r << 16) | (g << 8) | bl
+}
+
+/// 二次平滑插值（对标 EaseInEaseOut 的近似曲线，动画进度 x ∈ [0,1]）。
+fn ease_step(t: f32) -> f32 {
+    if t <= 0.0 {
+        0.0
+    } else if t >= 1.0 {
+        1.0
+    } else {
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
+/// 快速出场（元素入场用）：1 - (1-t)^2。
+fn ease_out(t: f32) -> f32 {
+    if t <= 0.0 {
+        0.0
+    } else if t >= 1.0 {
+        1.0
+    } else {
+        1.0 - (1.0 - t) * (1.0 - t)
+    }
+}
+
+/// ColorOS 弹跳过冲（back ease，对标 ColorOS 15 徽标/页面入场）：
+/// 1.0 + c3·(t-1)³ + c1·(t-1)²，进度末端轻微过冲后回落到 1.0。
+fn ease_out_back(t: f32) -> f32 {
+    if t <= 0.0 {
+        0.0
+    } else if t >= 1.0 {
+        1.0
+    } else {
+        let c1 = 1.70158;
+        let c3 = c1 + 1.0;
+        1.0 + c3 * (t - 1.0) * (t - 1.0) * (t - 1.0) + c1 * (t - 1.0) * (t - 1.0)
+    }
+}
+
+/// Bresenham 直线（像素级，供复选勾/返回箭头等几何绘制）。
+fn draw_line(x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    let mut x = x0;
+    let mut y = y0;
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        put_pixel(x, y, color);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// 2px 加粗直线（复选勾等）。
+fn draw_line_thick(x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    draw_line(x0, y0, x1, y1, color);
+    draw_line(x0, y0 + 1, x1, y1 + 1, color);
+}
+
+/// 圆角矩形 1px 描边（抗锯齿：直边锐利、圆角段随曲线淡出）。
+fn card_border(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+    sys_nav::glass::smooth_stroke_rr(&mut OobeSmooth, x, y, w, h, r, color, 255);
+}
+
+/// ColorOS 15 白色选择卡片：未选中 = 白底 + 中性灰描边；选中 = 淡绿底 + 绿描边。
+fn draw_option_card(x: i32, y: i32, w: i32, h: i32, selected: bool) {
+    if selected {
+        fill_rounded(x, y, w, h, CARD_R, C_ACCENT_TINT);
+        card_border(x, y, w, h, CARD_R, C_ACCENT_STRONG);
+    } else {
+        fill_rounded(x, y, w, h, CARD_R, C_WHITE);
+        card_border(x, y, w, h, CARD_R, C_CARD_BORDER);
+    }
+}
+
+/// ColorOS 15 单选圈（24x24）：未选中灰圈，选中 绿圈 + 白芯。
+/// `color` 参数保留兼容旧调用方（选中色恒为ColorOS 绿）。
+fn draw_radio(x: i32, y: i32, selected: bool, _color: u32) {
+    let cx = x + 12;
+    let cy = y + 12;
+    for dy in -12..=12 {
+        for dx in -12..=12 {
             let d = dx * dx + dy * dy;
-            if d <= 36 && d >= 25 {
-                put_pixel(cx + dx, cy + dy, color);
+            if d <= 121 && d >= 64 {
+                put_pixel(cx + dx, cy + dy, if selected { C_ACCENT_STRONG } else { C_RADIO_BORDER });
             }
         }
     }
     if selected {
-        fill_circle(cx, cy, 3, color);
+        fill_circle(cx, cy, 6, C_ACCENT);
+        put_pixel(cx, cy, C_WHITE);
     }
 }
 
-/// 选项胶囊：选中 = 强调色底；未选中 = 白底 + 黑色边框（浅色主题）。
+/// ColorOS 15 复选方框（24x24 圆角）：未选中灰边，选中 绿填充 + 白色对勾。
+/// `color` 参数保留兼容旧调用方。
+fn draw_checkbox(x: i32, y: i32, checked: bool, _color: u32) {
+    let r = 6;
+    if checked {
+        fill_rounded(x, y, 24, 24, r, C_ACCENT);
+        draw_line_thick(x + 6, y + 13, x + 10, y + 17, C_WHITE);
+        draw_line_thick(x + 10, y + 17, x + 18, y + 7, C_WHITE);
+    } else {
+        card_border(x, y, 24, 24, r, C_RADIO_BORDER);
+    }
+}
+
+/// 欢迎页 Hero：渐变绿圆盘 + 白色 K 字（`e` ∈ [0,1] 为入场进度，
+/// 叠加透明淡入与缩放；ColorOS 15 风格徽标）。
+fn draw_brand(e: f32) {
+    draw_brand_ex(e, 0.72 + 0.28 * e);
+}
+
+/// 闲置呼吸：Hero 持续微缩放（0.975..1.025 正弦三角振荡），ColorOS 常驻动效。
+fn draw_brand_idle(sc: f32) {
+    draw_brand_ex(1.0, sc);
+}
+
+fn draw_brand_ex(e: f32, scale: f32) {
+    let r = (HERO_R as f32 * scale) as i32;
+    let a = (255.0 * e) as u32;
+    let cy = HERO_CY + ((1.0 - e) * 10.0) as i32;
+    let glow_r = r + 10;
+    // ColorOS 入场光晕：徽标背后先扩散一圈淡绿柔光（淡入淡出）。
+    if (a as f32) > 0.0 {
+        for dy in -glow_r..=glow_r {
+            for dx in -glow_r..=glow_r {
+                let d = dx * dx + dy * dy;
+                if d > glow_r * glow_r {
+                    continue;
+                }
+                let fall = (glow_r * glow_r - d) * (a as i32) / (glow_r * glow_r);
+                let ga = (fall / 8).min(120) as u32;
+                if ga > 0 {
+                    let g = blend_px(
+                        put_pixel_get(HERO_CX + dx, cy + dy),
+                        0x00_5A_D2_8A,
+                        ga,
+                    );
+                    put_pixel(HERO_CX + dx, cy + dy, g);
+                }
+            }
+        }
+    }
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d = dx * dx + dy * dy;
+            if d > r * r {
+                continue;
+            }
+            // ColorOS 绿垂直渐变（顶部亮绿 → 底部深绿）。
+            let t = ((dy + r) * 255 / (2 * r)).min(255) as u32;
+            let c = blend_px(
+                0x00_45_E0_8B,
+                0x00_09_9E_58,
+                t,
+            );
+            let disc = blend_px(0x00_F0_FA_F6, c, a);
+            put_pixel(HERO_CX + dx, cy + dy, disc);
+        }
+    }
+    // 内圈高光（ColorOS 徽标镜面感）。
+    for dy in -12..=12 {
+        for dx in -12..=12 {
+            if dx * dx + dy * dy <= 144 {
+                put_pixel(HERO_CX + dx, cy - 8 + dy, blend_px(
+                    put_pixel_get(HERO_CX + dx, cy - 8 + dy),
+                    0x00_FF_FF_FF,
+                    ((10 - dy.max(1)) * 14).clamp(0, 60) as u32,
+                ));
+            }
+        }
+    }
+    // K 字（白色，scaled 由调用方用大字号文本叠加）。
+    draw_center_bold_px(cy - 16, "K".as_bytes(), 40.0, 0x00_FF_FF_FF);
+}
+
+/// 读取背景像素（供 Hero 高光混合）。
+fn put_pixel_get(x: i32, y: i32) -> u32 {
+    if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+        0
+    } else {
+        unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+    }
+}
+
+/// 选项胶囊：选中 = 浅色磨砂主玻璃；未选中 = 白色玻璃 + 浅灰描边（液态玻璃）。
 fn draw_option_pill(x: i32, y: i32, w: i32, h: i32, r: i32, selected: bool) {
     if selected {
-        fill_rounded(x, y, w, h, r, C_ACCENT);
+        draw_glass_style(x, y, w, h, r, &STYLE_PRIMARY);
     } else {
-        fill_rounded(x, y, w, h, r, C_WHITE);
-        draw_rect(x, y, w, h, C_TEXT);
+        draw_glass_style(x, y, w, h, r, &STYLE_SECONDARY);
     }
 }
 
-/// 右箭头按钮（色块拼成的圆角矩形 + 三角）。
-fn draw_arrow_right(x: i32, y: i32, color: u32) {
-    fill_rounded(x, y, 44, 44, 6, color);
-    let c = C_WHITE;
-    let cx = x + 14;
-    let cy = y + 22;
-    for i in 0..14 {
-        fill_rect(cx + i, cy - 8 + i, 2, 16 - 2 * i, c);
+/// 底部导航区按钮统一绘制（ColorOS 15 风格）：
+///   - 欢迎页（STEP=0）：通栏「开始使用」主按钮（浅色磨砂玻璃 + 近黑文字）；
+///   - 其余步骤：左下次要「返回」芯片 + 右下「下一步/进入系统」主按钮。
+/// 全部通过 button 组件（圆角、固定高度、按压缩放反馈）。
+fn draw_nav_buttons() {
+    let mut cv = OobeCanvas;
+    let by = NAV_Y + (NAV_H - button::BTN_H) / 2;
+    let sw = DISPLAY_W as i32;
+    unsafe {
+        if STEP == 0 {
+            BTN_NEXT.label = if LANG == 0 { "开始使用".as_bytes() } else { "Start".as_bytes() };
+            BTN_NEXT.state = button::ButtonState::Primary;
+            BTN_NEXT.draw_full(&mut cv, NAV_BTN_MARGIN, by, sw);
+        } else {
+            BTN_BACK.label = if LANG == 0 { "上一步".as_bytes() } else { "Back".as_bytes() };
+            BTN_BACK.state = button::ButtonState::Secondary;
+            BTN_BACK.draw(&mut cv, NAV_BTN_MARGIN, by, sw);
+            if STEP < 12 {
+                BTN_NEXT.label = if LANG == 0 { "下一步 >".as_bytes() } else { "Next >".as_bytes() };
+                BTN_NEXT.state = button::ButtonState::Primary;
+                let w = BTN_NEXT.width(&cv, sw);
+                BTN_NEXT.draw(&mut cv, sw - NAV_BTN_MARGIN - w, by, sw);
+            } else {
+                BTN_ENTER.label = if LANG == 0 { "进入系统".as_bytes() } else { "Enter".as_bytes() };
+                BTN_ENTER.state = button::ButtonState::Primary;
+                let w = BTN_ENTER.width(&cv, sw);
+                BTN_ENTER.draw(&mut cv, sw - NAV_BTN_MARGIN - w, by, sw);
+            }
+        }
     }
 }
 
-/// 左箭头按钮。
-fn draw_arrow_left(x: i32, y: i32, color: u32) {
-    fill_rounded(x, y, 44, 44, 6, color);
-    let c = C_WHITE;
-    let cx = x + 14;
-    let cy = y + 22;
-    for i in 0..14 {
-        fill_rect(cx + i, cy - i, 2, 2 * i + 2, c);
+/// 按下反馈：光标落在可点击按钮上时置为按下态并整屏重绘。
+fn btn_on_press(x: i32, y: i32) {
+    let mut any = false;
+    unsafe {
+        for b in [&mut BTN_BACK, &mut BTN_NEXT, &mut BTN_ENTER, &mut BTN_SKIP] {
+            if b.enabled() && b.hit(x, y) {
+                b.press();
+                any = true;
+            }
+        }
+    }
+    if any {
+        render_and_flip();
     }
 }
 
-/// 醒目的「下一步」按钮：白色大色块 + 当前步骤高亮边框 + 居中黑色文字。
-fn draw_next_button() {
-    fill_rounded(NEXT_BTN_X, NEXT_BTN_Y, NEXT_BTN_W, NEXT_BTN_H, 10, C_WHITE);
-    draw_rect(NEXT_BTN_X, NEXT_BTN_Y, NEXT_BTN_W, NEXT_BTN_H, C_ACCENT);
-    draw_rect(NEXT_BTN_X + 1, NEXT_BTN_Y + 1, NEXT_BTN_W - 2, NEXT_BTN_H - 2, C_ACCENT);
-    let s = "下一步 >".as_bytes();
-    let tw = text_width(s);
-    let tx = NEXT_BTN_X + (NEXT_BTN_W - tw) / 2;
-    let ty = NEXT_BTN_Y + (NEXT_BTN_H - 8) / 2;
-    draw_text(tx, ty, s, C_TEXT);
-}
-
-fn draw_title() {
-    // 白色标题栏 + 黑色加粗标题、黑色步骤序号。
-    fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_WHITE);
-    let (name, num) = unsafe {
-        match STEP {
-            0 => (if LANG == 0 { "Welcome" } else { "Welcome" }, 0usize),
-            1 => (if LANG == 0 { "语言" } else { "Language" }, 2),
-            2 => (if LANG == 0 { "模块" } else { "Modules" }, 3),
-            3 => (if LANG == 0 { "时区" } else { "Timezone" }, 4),
-            4 => (if LANG == 0 { "网络" } else { "Network" }, 5),
-            5 => (if LANG == 0 { "协议" } else { "Agreement" }, 6),
-            6 => (if LANG == 0 { "账户" } else { "Account" }, 7),
-            7 => (if LANG == 0 { "安全" } else { "Security" }, 8),
-            8 => (if LANG == 0 { "主题" } else { "Theme" }, 9),
-            _ => (if LANG == 0 { "完成" } else { "Complete" }, 10),
+/// 松开反馈：被按下的按钮进入 150ms 回弹过渡并整屏重绘。
+fn btn_on_release() {
+    let mut any = false;
+    unsafe {
+        for b in [&mut BTN_BACK, &mut BTN_NEXT, &mut BTN_ENTER, &mut BTN_SKIP] {
+            if b.pressed() {
+                b.release();
+                any = true;
+            }
         }
-    };
-    draw_text_bold(16, (TITLE_H - 8) / 2, name.as_bytes(), C_TEXT);
-    if num > 0 {
-        let mut buf = [0u8; 12];
-        let mut n = 0usize;
-        for &c in (if unsafe { LANG == 0 } { "步骤 " } else { "Step " }).as_bytes() {
-            buf[n] = c;
-            n += 1;
-        }
-        let v = num;
-        if v >= 10 {
-            buf[n] = b'0' + (v / 10) as u8;
-            n += 1;
-        }
-        buf[n] = b'0' + (v % 10) as u8;
-        n += 1;
-        for &c in b"/10" {
-            buf[n] = c;
-            n += 1;
-        }
-        let tx = DISPLAY_W as i32 - 16 - text_width(&buf[..n]);
-        draw_text(tx, (TITLE_H - 8) / 2, &buf[..n], C_DIM);
+    }
+    if any {
+        render_and_flip();
     }
 }
 
-fn draw_dots() {
-    let total = 10;
-    let gap = 16;
+/// 是否有按钮正处于松开回弹过渡中（主循环据此逐帧推进动画）。
+fn btn_animating() -> bool {
+    unsafe { BTN_BACK.animating() || BTN_NEXT.animating() || BTN_ENTER.animating() || BTN_SKIP.animating() }
+}
+
+/// 逐帧推进所有按钮的回弹过渡。
+fn btn_tick_all() {
+    unsafe {
+        BTN_BACK.tick();
+        BTN_NEXT.tick();
+        BTN_ENTER.tick();
+        BTN_SKIP.tick();
+    }
+}
+
+/// 复位所有按钮（切步骤时调用，避免上一屏的按压/回弹状态残留）。
+fn btn_reset_all() {
+    unsafe {
+        BTN_BACK.reset();
+        BTN_NEXT.reset();
+        BTN_ENTER.reset();
+        BTN_SKIP.reset();
+    }
+}
+
+/// 右上角「跳过」胶囊（步骤 1..11 显示；点击放弃当前步直达完成页）。
+fn draw_skip_button() {
+    let mut cv = OobeCanvas;
+    let sw = DISPLAY_W as i32;
+    unsafe {
+        if (1..=11).contains(&STEP) {
+            BTN_SKIP.label = if LANG == 0 { "跳过".as_bytes() } else { "Skip".as_bytes() };
+            BTN_SKIP.state = button::ButtonState::Secondary;
+            let w = BTN_SKIP.width(&cv, sw);
+            BTN_SKIP.draw(&mut cv, sw - SKIP_MARGIN - w, SKIP_Y, sw);
+        }
+    }
+}
+
+/// 跳过按钮是否命中（组件命中区；未显示的步骤 rect 为空、必然不命中）。
+fn btn_skip_hit(x: i32, y: i32) -> bool {
+    unsafe { (1..=11).contains(&STEP) && BTN_SKIP.enabled() && BTN_SKIP.hit(x, y) }
+}
+
+/// 返回按钮是否命中（组件命中区，未绘制过则 rect 为空、必然不命中）。
+fn btn_back_hit(x: i32, y: i32) -> bool {
+    unsafe { STEP > 0 && BTN_BACK.enabled() && BTN_BACK.hit(x, y) }
+}
+
+/// 底部进度指示器：13 个圆点（ColorOS 15 风格：当前步骤绿，已完成淡绿，
+/// 未到灰色），位于导航面板顶部一行，避开底部按钮。
+fn draw_progress() {
+    let total = 13;
+    let gap = 18;
     let total_w = (total - 1) * gap;
     let start = (DISPLAY_W as i32 - total_w) / 2;
-    let cy = NAV_Y + NAV_H / 2;
+    let cy = NAV_Y + 10;
     for i in 0..total {
         let cx = start + i * gap;
-        if unsafe { i as usize == STEP } {
+        let step = unsafe { i as usize == STEP };
+        if step {
             fill_circle(cx, cy, 5, C_ACCENT);
+        } else if unsafe { (i as usize) < STEP } {
+            fill_circle(cx, cy, 3, C_ACCENT_SOFT);
         } else {
-            fill_circle(cx, cy, 3, C_DIM);
+            fill_circle(cx, cy, 3, C_RADIO_BORDER);
+        }
+    }
+}
+
+/// 转场期间的进度点动画：当前点由小放大、已推进点亮。（`e` ∈ [0,1]）
+fn draw_progress_anim(to: usize, e: f32) {
+    let total = 13;
+    let gap = 18;
+    let total_w = (total - 1) * gap;
+    let start = (DISPLAY_W as i32 - total_w) / 2;
+    let cy = NAV_Y + 10;
+    let grow = (3.0 * e) as i32;
+    for i in 0..total {
+        let cx = start + i * gap;
+        if i as usize == to {
+            fill_circle(cx, cy, 3 + grow, C_ACCENT);
+        } else if (i as usize) < to {
+            fill_circle(cx, cy, 3, C_ACCENT_SOFT);
+        } else {
+            fill_circle(cx, cy, 3, C_RADIO_BORDER);
         }
     }
 }
 
 fn draw_nav() {
-    // 白色导航栏。
-    fill_rect(0, NAV_Y, DISPLAY_W as i32, NAV_H, C_WHITE);
-    fill_rect(0, NAV_Y, DISPLAY_W as i32, 1, C_TEXT);
-    if unsafe { STEP > 0 } {
-        draw_arrow_left(32, NAV_Y + (NAV_H - 44) / 2, C_BTN);
+    // ColorOS 15 底部轻玻璃面板（白色半透 + 中性灰描边）。
+    draw_glass_style(0, NAV_Y, DISPLAY_W as i32, NAV_H, 0, &STYLE_SHEET);
+    // 返回 / 下一步 / 进入系统：统一圆角按钮组件。
+    draw_nav_buttons();
+    draw_progress();
+    // 错误提示横幅画在最上层（无墙钟，按帧计数自动消失）。
+    draw_error_banner();
+}
+
+/// 设置一条用户可见的错误提示（OOBE 无墙钟：按帧计数，约 250 帧 ≈ 4 秒后消失）。
+fn show_error(msg: &[u8]) {
+    err_ui::err_set_ticks(msg, 250);
+}
+
+/// 若存在未过期的错误提示，在屏幕顶部绘制横幅（不遮挡页面标题）。
+/// 红色液态玻璃材质。
+fn draw_error_banner() {
+    if !err_ui::err_active(0) {
+        return;
     }
-    if unsafe { STEP < 9 } {
-        draw_next_button();
-    } else {
-        // 完成页：进入系统按钮
-        let bw = 180;
-        let bx = DISPLAY_W as i32 - 32 - bw;
-        fill_rounded(bx, NAV_Y + (NAV_H - 44) / 2, bw, 44, 6, C_GREEN);
-        draw_rect(bx, NAV_Y + (NAV_H - 44) / 2, bw, 44, C_WHITE);
-        draw_center(NAV_Y + (NAV_H - 8) / 2, (if unsafe { LANG == 0 } { "进入系统" } else { "Enter" }).as_bytes(), C_TEXT);
+    let msg = err_ui::err_msg();
+    if msg.is_empty() {
+        return;
     }
-    draw_dots();
+    draw_glass_style(0, 0, DISPLAY_W as i32, 44, 0, &STYLE_DANGER);
+    let tx = (DISPLAY_W as i32 - text_width_px(msg, FONT_BODY_PX)) / 2;
+    draw_text_px(tx, 10, msg, FONT_BODY_PX, 0x00_FF_FF_FF);
+}
+
+// ==================== 步骤图标与页头（HyperOS 3 / ColorOS 15 风格） ====================
+
+/// 图标渐变（顶部亮绿 → 底部深绿，`dy` 为相对图标顶部的偏移；与 Hero 同色系）。
+fn icon_grad(dy: i32) -> u32 {
+    let k = (dy.clamp(0, ICON_SIZE) * 255 / ICON_SIZE) as u32;
+    blend_px(0x00_45_E0_8B, 0x00_09_9E_58, k)
+}
+
+/// 白色 2px 圆环（图标字形用）。
+fn icon_ring(cx: i32, cy: i32, r: i32) {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d = dx * dx + dy * dy;
+            if d <= r * r && d >= (r - 2) * (r - 2) {
+                put_pixel(cx + dx, cy + dy, C_WHITE);
+            }
+        }
+    }
+}
+
+/// 当前步骤图标：72x72 渐变绿圆角方块 + 白色几何字形（纯原语绘制，无字库依赖）。
+fn draw_step_icon(step: usize) {
+    let x = (DISPLAY_W as i32 - ICON_SIZE) / 2;
+    let y = ICON_Y;
+    for dy in 0..ICON_SIZE {
+        for dx in 0..ICON_SIZE {
+            if sys_nav::glass::in_round_rect(dx, dy, ICON_SIZE, ICON_SIZE, 22) {
+                put_pixel(x + dx, y + dy, icon_grad(dy));
+            }
+        }
+    }
+    let cx = x + ICON_SIZE / 2;
+    let cy = y + ICON_SIZE / 2;
+    match step {
+        // 1 语言：地球（圆环 + 赤道 + 经线椭圆）。
+        1 => {
+            icon_ring(cx, cy, 19);
+            draw_line_thick(cx - 19, cy, cx + 19, cy, C_WHITE);
+            for dy in -19..=19 {
+                for dx in -9..=9 {
+                    let v = dx * dx * 361 + dy * dy * 81;
+                    if v <= 81 * 361 && v >= 81 * 361 - 7300 {
+                        put_pixel(cx + dx, cy + dy, C_WHITE);
+                    }
+                }
+            }
+        }
+        // 2 应用：2x2 圆角方格。
+        2 => {
+            for (ox, oy) in [(-21, -21), (3, -21), (-21, 3), (3, 3)] {
+                fill_rounded(cx + ox, cy + oy, 18, 18, 5, C_WHITE);
+            }
+        }
+        // 3 时区：时钟（圆环 + 时针分针）。
+        3 => {
+            icon_ring(cx, cy, 19);
+            draw_line_thick(cx, cy, cx, cy - 11, C_WHITE);
+            draw_line_thick(cx, cy, cx + 8, cy + 5, C_WHITE);
+        }
+        // 4 网络：Wi-Fi（三段上弧 + 圆点）。
+        4 => {
+            for r in [19i32, 13, 7] {
+                for dy in -r..=0 {
+                    for dx in -r..=r {
+                        let d = dx * dx + dy * dy;
+                        if d <= r * r && d >= (r - 2) * (r - 2) {
+                            put_pixel(cx + dx, cy + 8 + dy, C_WHITE);
+                        }
+                    }
+                }
+            }
+            fill_circle(cx, cy + 8, 3, C_WHITE);
+        }
+        // 5 协议：文档（白色圆角纸 + 绿色行）。
+        5 => {
+            fill_rounded(cx - 14, cy - 19, 28, 38, 6, C_WHITE);
+            for i in 0..3 {
+                let ly = cy - 9 + i * 9;
+                draw_line_thick(cx - 8, ly, cx + 8, ly, C_ACCENT_STRONG);
+            }
+        }
+        // 6 账号：人像（头 + 肩）。
+        6 => {
+            fill_circle(cx, cy - 9, 8, C_WHITE);
+            for dy in -12..=4 {
+                for dx in -12..=12 {
+                    if dx * dx + dy * dy <= 144 {
+                        put_pixel(cx + dx, cy + 14 + dy, C_WHITE);
+                    }
+                }
+            }
+        }
+        // 7 锁屏方式：挂锁（锁环 + 锁体 + 绿锁孔）。
+        7 => {
+            for dy in -10..=0 {
+                for dx in -10..=10 {
+                    let d = dx * dx + dy * dy;
+                    if d <= 100 && d >= 36 {
+                        put_pixel(cx + dx, cy - 8 + dy, C_WHITE);
+                    }
+                }
+            }
+            fill_rounded(cx - 13, cy - 6, 26, 22, 7, C_WHITE);
+            fill_circle(cx, cy + 3, 3, C_ACCENT_STRONG);
+            draw_line_thick(cx, cy + 3, cx, cy + 8, C_ACCENT_STRONG);
+        }
+        // 8 密码：钥匙（环 + 柄 + 齿）。
+        8 => {
+            icon_ring(cx - 10, cy - 2, 7);
+            draw_line_thick(cx - 4, cy - 2, cx + 18, cy - 2, C_WHITE);
+            draw_line_thick(cx - 4, cy - 1, cx + 18, cy - 1, C_WHITE);
+            draw_line_thick(cx + 12, cy - 1, cx + 12, cy + 6, C_WHITE);
+            draw_line_thick(cx + 17, cy - 1, cx + 17, cy + 4, C_WHITE);
+        }
+        // 9 胁迫密码：盾牌 + 绿色感叹号。
+        9 => {
+            for dy in -19..=19 {
+                let hw = if dy < 0 { 18 } else { isqrt(361 - dy * dy) };
+                fill_rect(cx - hw, cy + dy, hw * 2, 1, C_WHITE);
+            }
+            fill_rect(cx - 1, cy - 10, 3, 13, C_ACCENT_STRONG);
+            fill_rect(cx - 1, cy + 7, 3, 3, C_ACCENT_STRONG);
+        }
+        // 10 胁迫动作：闪电。
+        10 => {
+            draw_line_thick(cx + 4, cy - 18, cx - 7, cy + 2, C_WHITE);
+            draw_line_thick(cx + 5, cy - 18, cx - 6, cy + 2, C_WHITE);
+            draw_line_thick(cx - 7, cy + 2, cx + 5, cy + 2, C_WHITE);
+            draw_line_thick(cx - 7, cy + 3, cx + 5, cy + 3, C_WHITE);
+            draw_line_thick(cx + 5, cy + 2, cx - 5, cy + 18, C_WHITE);
+            draw_line_thick(cx + 4, cy + 3, cx - 4, cy + 18, C_WHITE);
+        }
+        // 11 外观：月牙（白圆被背景色圆咬去一角）。
+        11 => {
+            for dy in -15..=15 {
+                for dx in -15..=15 {
+                    if dx * dx + dy * dy <= 225 {
+                        put_pixel(cx - 3 + dx, cy + dy, C_WHITE);
+                    }
+                }
+            }
+            let (bx, by) = (cx + 7, cy - 6);
+            for dy in -15..=15 {
+                for dx in -15..=15 {
+                    if dx * dx + dy * dy <= 225 {
+                        put_pixel(bx + dx, by + dy, icon_grad(by + dy - y));
+                    }
+                }
+            }
+        }
+        // 兜底：对勾。
+        _ => {
+            draw_line_thick(cx - 9, cy + 1, cx - 2, cy + 8, C_WHITE);
+            draw_line_thick(cx - 2, cy + 8, cx + 10, cy - 6, C_WHITE);
+        }
+    }
+}
+
+/// 页头：步骤图标（上方偏下）+ 图标下方居中标题 + 副标题。
+fn draw_page_header(step: usize, title: &[u8], desc: &[u8]) {
+    draw_step_icon(step);
+    draw_center_bold_px(PAGE_TITLE_Y, title, FONT_TITLE_PX, C_TEXT);
+    draw_center_px(PAGE_DESC_Y, desc, FONT_BODY_PX, C_DIM);
 }
 
 // ==================== 各步骤渲染 ====================
 
+// 欢迎页版式（ColorOS 15 风格：Hero 徽标居中，标题/副标题在其下方）。
+const WEL_TITLE_Y: i32 = HERO_CY + HERO_R + 26; // 358
+const WEL_DESC_Y: i32 = WEL_TITLE_Y + GAP_AFTER_TITLE; // 417
+
 fn render_welcome() {
-    draw_center_bold(280, (if unsafe { LANG == 0 } { "Welcome to" } else { "Welcome to" }).as_bytes(), C_TEXT);
-    draw_center_bold(300, b"KunxOS", C_TEXT);
-    draw_center(340, (if unsafe { LANG == 0 } { "你的安全移动操作系统" } else { "Your secure mobile OS" }).as_bytes(), C_DIM);
+    draw_brand(1.0);
+    draw_center_bold_px(
+        WEL_TITLE_Y,
+        (if unsafe { LANG == 0 } { "欢迎使用 KunxOS" } else { "Welcome to KunxOS" }).as_bytes(),
+        FONT_TITLE_PX,
+        C_TEXT,
+    );
+    let desc: &[u8] = (if unsafe { LANG == 0 } { "你的安全移动操作系统" } else { "Your secure mobile OS" }).as_bytes();
+    draw_center_px(WEL_DESC_Y, desc, FONT_BODY_PX, C_DIM);
+    // 副标题下方小字（ColorOS 15 欢迎语）。
+    draw_center_px(
+        WEL_DESC_Y + GAP_AFTER_BODY,
+        (if unsafe { LANG == 0 } { "安全护航，简单开始" } else { "Secure by design, simple to start" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
 }
 
 fn render_language() {
-    let x = 60;
-    let mut y = CONTENT_Y + 24;
-    draw_text(x, y, (if unsafe { LANG == 0 } { "选择语言" } else { "Select language" }).as_bytes(), C_TEXT);
-    y += 32;
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("选择语言".as_bytes(), "设置系统界面语言".as_bytes())
+    } else {
+        ("Select Language".as_bytes(), "Set the system language".as_bytes())
+    };
+    draw_page_header(1, title, desc);
     for i in 0..2 {
+        let y = WIDGET_Y + i as i32 * CARD_PITCH;
         let label: &[u8] = (if i == 0 { "简体中文" } else { "English" }).as_bytes();
         let selected = unsafe { LANG == i };
-        draw_option_pill(x, y, 420, 48, 6, selected);
-        draw_radio(x + 16, y + 18, selected, C_TEXT);
-        draw_text(x + 44, y + 20, label, C_TEXT);
-        y += 60;
+        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
+        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
+        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, label, FONT_BODY_PX, C_TEXT);
     }
+}
+
+/// 模块 i 的芯片左上角（列优先：左列 0..10、右列 11..20）。
+fn module_pos(i: usize) -> (i32, i32) {
+    let col = (i / GRID_ROWS_COL) as i32;
+    let row = (i % GRID_ROWS_COL) as i32;
+    (
+        GRID_X + col * (GRID_COL_W + GRID_GAP),
+        WIDGET_Y + row * GRID_PITCH,
+    )
+}
+
+/// 单个模块芯片：圆角卡 + 右侧复选方框（选中=淡绿底绿描边；锁定=灰字）。
+fn draw_module_chip(i: usize) {
+    let (gx, gy) = module_pos(i);
+    let on = module_on(i);
+    let locked = MODULES[i].locked;
+    if on && !locked {
+        fill_rounded(gx, gy, GRID_COL_W, GRID_ROW_H, GRID_R, C_ACCENT_TINT);
+        card_border(gx, gy, GRID_COL_W, GRID_ROW_H, GRID_R, C_ACCENT_STRONG);
+    } else {
+        fill_rounded(gx, gy, GRID_COL_W, GRID_ROW_H, GRID_R, C_WHITE);
+        card_border(gx, gy, GRID_COL_W, GRID_ROW_H, GRID_R, C_CARD_BORDER);
+    }
+    let c = if locked { C_HINT } else { C_TEXT };
+    draw_checkbox(gx + GRID_COL_W - 34, gy + 10, on, c);
+    draw_text_px(
+        gx + 14,
+        gy + (GRID_ROW_H - 17) / 2,
+        MODULES[i].display_name().as_bytes(),
+        FONT_BODY_PX,
+        c,
+    );
 }
 
 fn render_modules() {
-    let x = 40;
-    let mut y = CONTENT_Y;
-    draw_text(x, y, "选择你的应用".as_bytes(), C_TEXT);
-    y += 28;
-    draw_text(x, y, "系统核心".as_bytes(), C_DIM);
-    y += 24;
-    for i in 0..17 {
-        if i == 5 {
-            y += 8;
-            draw_text(x, y, "预装应用".as_bytes(), C_DIM);
-            y += 24;
-        }
-        let on = module_on(i);
-        let c = if MODULES[i].locked { C_DIM } else { C_TEXT };
-        draw_checkbox(x, y, on, c);
-        draw_text(x + 20, y + 2, MODULES[i].display_name().as_bytes(), c);
-        y += 22;
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        (
+            "选择应用".as_bytes(),
+            "选择需要预装的应用，可在设置中随时更改".as_bytes(),
+        )
+    } else {
+        (
+            "Select Apps".as_bytes(),
+            "Choose apps to install; change anytime in Settings".as_bytes(),
+        )
+    };
+    draw_page_header(2, title, desc);
+    for i in 0..MODULES.len() {
+        draw_module_chip(i);
     }
-    draw_text(x, y + 4, "可在设置中恢复已移除的应用".as_bytes(), C_DIM);
 }
 
 fn render_timezone() {
-    let x = 60;
-    let mut y = CONTENT_Y + 16;
-    draw_text(x, y, "地区".as_bytes(), C_TEXT);
-    y += 26;
-    for i in 0..4 {
-        let selected = unsafe { REGION == i };
-        draw_option_pill(x, y, 200, 40, 6, selected);
-        draw_radio(x + 12, y + 14, selected, C_TEXT);
-        draw_text(x + 36, y + 16, REGIONS[i].as_bytes(), C_TEXT);
-        y += 48;
-    }
-    let tx = 280;
-    y = CONTENT_Y + 16;
-    draw_text(tx, y, "时区".as_bytes(), C_TEXT);
-    y += 26;
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("选择时区".as_bytes(), "时区影响日期与时间显示".as_bytes())
+    } else {
+        ("Select Timezone".as_bytes(), "Affects date and time display".as_bytes())
+    };
+    draw_page_header(3, title, desc);
     let tz = unsafe { TIMEZONE };
     for i in 0..8 {
+        let y = WIDGET_Y + i as i32 * CARD_PITCH;
         let selected = tz == i;
-        draw_option_pill(tx, y, 220, 32, 5, selected);
-        draw_radio(tx + 10, y + 10, selected, C_TEXT);
-        draw_text(tx + 30, y + 12, TIMEZONES[i].as_bytes(), C_TEXT);
-        y += 36;
+        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
+        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
+        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, TIMEZONES[i].as_bytes(), FONT_BODY_PX, C_TEXT);
     }
 }
 
 fn render_network() {
-    let x = 60;
-    let mut y = CONTENT_Y + 24;
-    draw_text(x, y, "网络状态".as_bytes(), C_TEXT);
-    y += 32;
-    draw_text(x, y, "已连接".as_bytes(), C_GREEN);
-    y += 28;
-    draw_text(x, y, b"IP: 10.0.2.15", C_TEXT);
-    y += 24;
-    draw_text(x, y, b"Gateway: 10.0.2.2", C_TEXT);
-    y += 40;
-    let skip = unsafe { NET_SKIP };
-    draw_checkbox(x, y, skip, C_TEXT);
-    draw_text(x + 20, y + 2, "跳过网络设置".as_bytes(), C_TEXT);
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        (
+            "网络设置".as_bytes(),
+            "建议连接网络，可稍后在设置中更改".as_bytes(),
+        )
+    } else {
+        (
+            "Network".as_bytes(),
+            "A network is recommended; change anytime in Settings".as_bytes(),
+        )
+    };
+    draw_page_header(4, title, desc);
+    // 已连接状态行（绿色圆点 + 居中文本）。
+    let s: &[u8] = (if unsafe { LANG == 0 } { "已连接 10.0.2.15" } else { "Connected 10.0.2.15" }).as_bytes();
+    let tx = (DISPLAY_W as i32 - text_width_px(s, FONT_BODY_PX)) / 2;
+    fill_circle(tx - 16, WIDGET_Y + 8 + 8, 4, C_GREEN);
+    draw_text_px(tx, WIDGET_Y + 8, s, FONT_BODY_PX, C_DIM);
+    draw_network_skip_row();
+}
+
+/// 「跳过网络设置」圆角卡片行（render 与局部重绘共用，必须一致）。
+fn draw_network_skip_row() {
+    let ry = WIDGET_Y + GAP_AFTER_BODY;
+    fill_rounded(CARD_X, ry, CARD_W, CARD_H, CARD_R, C_WHITE);
+    card_border(CARD_X, ry, CARD_W, CARD_H, CARD_R, C_CARD_BORDER);
+    draw_text_px(
+        CARD_X + 20,
+        ry + (CARD_H - 17) / 2,
+        (if unsafe { LANG == 0 } { "跳过网络设置" } else { "Skip network setup" }).as_bytes(),
+        FONT_BODY_PX,
+        C_TEXT,
+    );
+    draw_checkbox(OPT_RX, ry + OPT_RY, unsafe { NET_SKIP }, C_TEXT);
 }
 
 fn render_agreement() {
-    let x = 40;
-    let mut y = CONTENT_Y + 8;
-    draw_text(x, y, "KunxOS 用户协议".as_bytes(), C_TEXT);
-    y += 26;
-    // 简化显示前 3 条 + 同意条款
-    let lines: [&[u8]; 7] = [
-        "1. 我们尽量少收集数据，本地数据".as_bytes(),
-        "   保留在你的设备上。".as_bytes(),
-        "2. 云控制（查找/锁定/擦除）需要".as_bytes(),
-        "   KunxOS 服务器，服务器不稳定。".as_bytes(),
-        "3. KunxOS 部分组件开源，遵循".as_bytes(),
-        "   MIT 许可证。".as_bytes(),
-        "4. 更多条款请参阅项目文档。".as_bytes(),
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("用户协议".as_bytes(), "".as_bytes())
+    } else {
+        ("Agreement".as_bytes(), "".as_bytes())
+    };
+    draw_page_header(5, title, desc);
+    let lines: [&[u8]; 3] = [
+        (if unsafe { LANG == 0 } { "1. 我们尽量少收集数据，数据保留在本机。" } else { "1. We collect minimal data; stored locally." }).as_bytes(),
+        (if unsafe { LANG == 0 } { "2. 云服务依赖 KunxOS 服务器，可能不稳定。" } else { "2. Cloud features rely on KunxOS servers." }).as_bytes(),
+        (if unsafe { LANG == 0 } { "3. 部分组件开源，遵循 MIT 许可证。" } else { "3. Some components are open source (MIT)." }).as_bytes(),
     ];
-    for l in lines.iter() {
-        draw_text(x, y, l, C_DIM);
-        y += 18;
+    for (i, l) in lines.iter().enumerate() {
+        draw_center_px(WIDGET_Y + i as i32 * GAP_AFTER_BODY, l, FONT_BODY_PX, C_DIM);
     }
-    y += 16;
-    let ok = unsafe { AGREEMENT };
-    draw_checkbox(x, y, ok, C_TEXT);
-    draw_text(x + 20, y + 2, "我已阅读并同意".as_bytes(), C_TEXT);
-    y += 24;
-    draw_text(x, y, "（可选，不勾选也可使用）".as_bytes(), C_DIM);
+    draw_agreement_row();
+    draw_center_px(
+        WIDGET_Y + 3 * GAP_AFTER_BODY + CARD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "（可选，不勾选也可使用）" } else { "(Optional)" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+}
+
+/// 「我已阅读并同意」圆角卡片行（render 与局部重绘共用，必须一致）。
+fn draw_agreement_row() {
+    let cy = WIDGET_Y + 3 * GAP_AFTER_BODY;
+    fill_rounded(CARD_X, cy, CARD_W, CARD_H, CARD_R, C_WHITE);
+    card_border(CARD_X, cy, CARD_W, CARD_H, CARD_R, C_CARD_BORDER);
+    draw_text_px(
+        CARD_X + 20,
+        cy + (CARD_H - 17) / 2,
+        (if unsafe { LANG == 0 } { "我已阅读并同意" } else { "I have read and agree" }).as_bytes(),
+        FONT_BODY_PX,
+        C_TEXT,
+    );
+    draw_checkbox(OPT_RX, cy + OPT_RY, unsafe { AGREEMENT }, C_TEXT);
 }
 
 fn render_account() {
-    let x = FIELD_X;
-    // 标题
-    draw_text(x, CONTENT_Y + 4, "本地账户".as_bytes(), C_TEXT);
-    draw_text(x + 130, CONTENT_Y + 4, b"*", C_RED);
-    // 用户名输入框
-    draw_text(x, FIELD_Y0 - 30, "用户名".as_bytes(), C_DIM);
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("创建账户".as_bytes(), "设置本地用户名".as_bytes())
+    } else {
+        ("Create Account".as_bytes(), "Set a local username".as_bytes())
+    };
+    draw_page_header(6, title, desc);
+    draw_text_px(
+        FIELD_X,
+        WIDGET_Y,
+        (if unsafe { LANG == 0 } { "用户名" } else { "Username" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
     let ub = unsafe { &USER_BUF[..USER_LEN] };
     let f0 = unsafe { FIELD_FOCUS == 0 };
-    draw_field(x, FIELD_Y0, ub, f0, false);
-    // 密码输入框（掩码显示）
-    draw_text(x, FIELD_Y1 - 30, "密码（6-16 位）".as_bytes(), C_DIM);
-    let pb = unsafe { &PASS_BUF[..PASS_LEN] };
-    let f1 = unsafe { FIELD_FOCUS == 1 };
-    draw_field(x, FIELD_Y1, pb, f1, true);
-    // 确认密码输入框
-    draw_text(x, FIELD_Y2 - 30, "确认密码".as_bytes(), C_DIM);
-    let cb = unsafe { &CONFIRM_BUF[..CONFIRM_LEN] };
-    let f2 = unsafe { FIELD_FOCUS == 2 };
-    draw_field(x, FIELD_Y2, cb, f2, true);
-    // 云服务复选框
-    let cloud = unsafe { CLOUD_ENABLED };
-    draw_checkbox(x, CLOUD_Y, cloud, C_TEXT);
-    draw_text(x + 20, CLOUD_Y + 2, "启用云服务".as_bytes(), C_TEXT);
-    // 家长控制复选框
-    let pc = unsafe { PARENTAL };
-    draw_checkbox(x, PARENTAL_Y, pc, C_TEXT);
-    draw_text(x + 20, PARENTAL_Y + 2, "家长控制（本地）".as_bytes(), C_TEXT);
+    draw_field(
+        FIELD_X,
+        FIELD_Y0,
+        ub,
+        f0,
+        false,
+        (if unsafe { LANG == 0 } { "输入用户名" } else { "Enter username" }).as_bytes(),
+    );
+    draw_text_px(
+        FIELD_X,
+        FIELD_Y0 + FIELD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "密码与锁屏将在后续步骤设置" } else { "Passcode and lock screen come next" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
 }
 
-/// 绘制一个输入框：白色底 + 边框（聚焦为强调色），文本靠左；密码掩码为 `*`，
-/// 聚焦时在末尾显示 `_` 光标。
-fn draw_field(x: i32, y: i32, s: &[u8], focused: bool, masked: bool) {
-    fill_rect(x, y, FIELD_W, FIELD_H, C_WHITE);
-    draw_rect(x, y, FIELD_W, FIELD_H, if focused { C_ACCENT } else { C_TEXT });
+/// 绘制一个输入框：白色底 + 边框（聚焦为强调色）；空内容显示 15px 占位提示
+/// （#8E8E93），有内容以 17px 正文显示（密码掩码为 `*`，聚焦时末尾加 `_` 光标）。
+fn draw_field(x: i32, y: i32, s: &[u8], focused: bool, masked: bool, ph: &[u8]) {
+    // ColorOS 15 输入框：白色圆角底 + 中性灰描边；聚焦 = 淡绿底 + 绿描边。
+    if focused {
+        fill_rounded(x, y, FIELD_W, FIELD_H, 16, C_ACCENT_TINT);
+        card_border(x, y, FIELD_W, FIELD_H, 16, C_ACCENT_STRONG);
+    } else {
+        fill_rounded(x, y, FIELD_W, FIELD_H, 16, C_WHITE);
+        card_border(x, y, FIELD_W, FIELD_H, 16, C_CARD_BORDER);
+    }
+    if s.is_empty() {
+        draw_text_px(x + 12, y + (FIELD_H - 17) / 2, ph, FONT_HINT_PX, C_HINT);
+        return;
+    }
     let mut buf = [0u8; 20];
     let mut n = 0usize;
     for &c in s {
@@ -1014,94 +2063,265 @@ fn draw_field(x: i32, y: i32, s: &[u8], focused: bool, masked: bool) {
         buf[n] = b'_';
         n += 1;
     }
-    draw_text(x + 8, y + (FIELD_H - 16) / 2, &buf[..n], C_TEXT);
+    draw_text_px(x + 12, y + (FIELD_H - 17) / 2, &buf[..n], FONT_BODY_PX, C_TEXT);
 }
 
+/// 锁屏方式选择（PIN / 图案 / 密码）。
 fn render_security() {
-    let x = 40;
-    let mut y = CONTENT_Y + 4;
-    draw_text(x, y, "锁屏方式".as_bytes(), C_TEXT);
-    y += 26;
-    let names: [&[u8]; 3] = ["PIN（4 位数字）".as_bytes(), "图案（3x3）".as_bytes(), "密码（6-16 位）".as_bytes()];
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("选择锁屏方式".as_bytes(), "选择解锁时的验证方式".as_bytes())
+    } else {
+        ("Lock Screen".as_bytes(), "Choose how to unlock".as_bytes())
+    };
+    draw_page_header(7, title, desc);
+    let names: [&[u8]; 3] = ["PIN（数字密码）".as_bytes(), "图案（3x3）".as_bytes(), "密码（4-16 位）".as_bytes()];
     for i in 0..3 {
-        let selected = unsafe { SEC_TYPE == i };
-        draw_option_pill(x, y, 320, 40, 6, selected);
-        draw_radio(x + 14, y + 14, selected, C_TEXT);
-        draw_text(x + 40, y + 16, names[i], C_TEXT);
-        y += 48;
+        let y = WIDGET_Y + i as i32 * CARD_PITCH;
+        let selected = unsafe { SEC_ENABLED && SEC_TYPE == i };
+        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
+        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
+        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, names[i], FONT_BODY_PX, C_TEXT);
     }
-    y += 8;
-    draw_text(x, y, "胁迫设置".as_bytes(), C_TEXT);
-    y += 18;
-    draw_text(x, y, "胁迫 PIN：9999".as_bytes(), C_DIM);
-    y += 26;
-    draw_text(x, y, "触发动作".as_bytes(), C_TEXT);
-    y += 24;
-    let acts: [&[u8]; 3] = ["伪装系统".as_bytes(), "静默擦除".as_bytes(), "发送警报".as_bytes()];
+}
+
+/// 锁屏密码设置（密码 + 二次确认，掩码显示）。
+fn render_password() {
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("设置锁屏密码".as_bytes(), "输入 4-16 位密码并再次确认".as_bytes())
+    } else {
+        ("Set Passcode".as_bytes(), "Enter a 4-16 digit passcode twice".as_bytes())
+    };
+    draw_page_header(8, title, desc);
+    draw_text_px(
+        FIELD_X,
+        WIDGET_Y,
+        (if unsafe { LANG == 0 } { "密码（4-16 位）" } else { "Passcode (4-16 digits)" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+    let pb = unsafe { &PASS_BUF[..PASS_LEN] };
+    let f0 = unsafe { FIELD_FOCUS == 0 };
+    draw_field(
+        FIELD_X,
+        FIELD_Y0,
+        pb,
+        f0,
+        true,
+        (if unsafe { LANG == 0 } { "输入密码" } else { "Enter passcode" }).as_bytes(),
+    );
+    draw_text_px(
+        FIELD_X,
+        FIELD_Y0 + FIELD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "确认密码" } else { "Confirm passcode" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+    let cb = unsafe { &CONFIRM_BUF[..CONFIRM_LEN] };
+    let f1 = unsafe { FIELD_FOCUS == 1 };
+    draw_field(
+        FIELD_X,
+        FIELD_Y1,
+        cb,
+        f1,
+        true,
+        (if unsafe { LANG == 0 } { "再次输入密码" } else { "Re-enter passcode" }).as_bytes(),
+    );
+    draw_text_px(
+        FIELD_X,
+        FIELD_Y1 + FIELD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "解锁时输入同一密码，请牢记" } else { "Use this passcode to unlock; remember it" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+}
+
+/// 胁迫密码设置（胁迫密码 + 二次确认，掩码显示）。
+fn render_duress() {
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("设置胁迫密码".as_bytes(), "被胁迫时输入的隐蔽密码".as_bytes())
+    } else {
+        ("Set Duress PIN".as_bytes(), "A hidden passcode for duress".as_bytes())
+    };
+    draw_page_header(9, title, desc);
+    draw_text_px(
+        FIELD_X,
+        WIDGET_Y,
+        (if unsafe { LANG == 0 } { "胁迫密码（4-16 位）" } else { "Duress PIN (4-16 digits)" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+    let db = unsafe { &DURESS_BUF[..DURESS_LEN] };
+    let f0 = unsafe { FIELD_FOCUS == 0 };
+    draw_field(
+        FIELD_X,
+        FIELD_Y0,
+        db,
+        f0,
+        true,
+        (if unsafe { LANG == 0 } { "输入胁迫密码" } else { "Enter duress PIN" }).as_bytes(),
+    );
+    draw_text_px(
+        FIELD_X,
+        FIELD_Y0 + FIELD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "确认胁迫密码" } else { "Confirm duress PIN" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+    let dc = unsafe { &DURESS_CONFIRM_BUF[..DURESS_CONFIRM_LEN] };
+    let f1 = unsafe { FIELD_FOCUS == 1 };
+    draw_field(
+        FIELD_X,
+        FIELD_Y1,
+        dc,
+        f1,
+        true,
+        (if unsafe { LANG == 0 } { "再次输入胁迫密码" } else { "Re-enter duress PIN" }).as_bytes(),
+    );
+    draw_text_px(
+        FIELD_X,
+        FIELD_Y1 + FIELD_H + GAP_AFTER_HINT,
+        (if unsafe { LANG == 0 } { "将触发你选择的隐蔽动作" } else { "Triggers your chosen hidden action" }).as_bytes(),
+        FONT_HINT_PX,
+        C_HINT,
+    );
+}
+
+/// 胁迫密码触发动作（伪装系统 / 静默擦除 / 发送警报）。
+fn render_duress_action() {
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        (
+            "胁迫密码触发动作".as_bytes(),
+            "选择输入胁迫密码后的行为".as_bytes(),
+        )
+    } else {
+        (
+            "Duress Action".as_bytes(),
+            "Choose what happens when the duress PIN is used".as_bytes(),
+        )
+    };
+    draw_page_header(10, title, desc);
+    let acts: [&[u8]; 3] = [
+        (if unsafe { LANG == 0 } { "伪装系统（保持锁定）" } else { "Fake system (stay locked)" }).as_bytes(),
+        (if unsafe { LANG == 0 } { "静默擦除（恢复出厂）" } else { "Wipe data (factory reset)" }).as_bytes(),
+        (if unsafe { LANG == 0 } { "发送警报（上报安全中心）" } else { "Send alert" }).as_bytes(),
+    ];
     for i in 0..3 {
+        let y = WIDGET_Y + i as i32 * CARD_PITCH;
         let selected = unsafe { DURESS_ACTION == i };
-        draw_radio(x, y, selected, C_TEXT);
-        draw_text(x + 24, y + 2, acts[i], C_TEXT);
-        y += 24;
+        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
+        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
+        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, acts[i], FONT_BODY_PX, C_TEXT);
     }
 }
 
 fn render_theme() {
-    let mut x = 60;
-    let mut y = CONTENT_Y + 16;
-    draw_text(x, y, "外观".as_bytes(), C_TEXT);
-    y += 26;
+    let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
+        ("选择外观".as_bytes(), "浅色或深色主题".as_bytes())
+    } else {
+        ("Appearance".as_bytes(), "Light or dark theme".as_bytes())
+    };
+    draw_page_header(11, title, desc);
     for i in 0..2 {
+        let y = WIDGET_Y + i as i32 * CARD_PITCH;
         let selected = unsafe { (i == 1) == THEME_DARK };
         let label: &[u8] = if i == 0 { "浅色".as_bytes() } else { "深色".as_bytes() };
-        draw_option_pill(x, y, 200, 40, 6, selected);
-        draw_radio(x + 14, y + 14, selected, C_TEXT);
-        draw_text(x + 40, y + 16, label, C_TEXT);
-        y += 48;
-    }
-    y += 8;
-    draw_text(x, y, "壁纸".as_bytes(), C_TEXT);
-    y += 26;
-    let wp: [u32; 3] = [0x00_1E_3A_8A, 0x00_8A_2E_1E, 0x00_1E_5A_3C];
-    let wnames: [&[u8]; 3] = ["星空".as_bytes(), "熔岩".as_bytes(), "森林".as_bytes()];
-    for i in 0..3 {
-        let selected = unsafe { WALLPAPER == i };
-        fill_rect(x, y, 48, 48, wp[i]);
-        if selected {
-            draw_rect(x, y, 48, 48, C_BTN_BORDER);
+        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
+        // 颜色预览圆（浅色=白圈灰边；深色=近黑圈）。
+        let sx = OPT_RX - 20 - 26;
+        let sy = y + OPT_RY;
+        if i == 0 {
+            fill_circle(sx + 13, sy + 12, 12, C_WHITE);
+            let r = 12;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let d = dx * dx + dy * dy;
+                    if d <= r * r && d >= (r - 2) * (r - 2) {
+                        put_pixel(sx + 13 + dx, sy + 12 + dy, C_CARD_BORDER);
+                    }
+                }
+            }
+        } else {
+            fill_circle(sx + 13, sy + 12, 12, C_BTN_PRIMARY);
         }
-        draw_text(x + 60, y + 20, wnames[i], C_TEXT);
-        x += 160;
+        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
+        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, label, FONT_BODY_PX, C_TEXT);
     }
-    // 预览区域
-    let pv = unsafe { WALLPAPER };
-    fill_rect(60, 400, 420, 200, wp[pv]);
-    draw_rect(60, 400, 420, 200, C_BTN_BORDER);
-    draw_center(490, "预览".as_bytes(), C_TEXT);
+}
+
+struct OobeCanvas;
+impl sys_nav::NavCanvas for OobeCanvas {
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+    fn backdrop(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+}
+impl button::ButtonCanvas for OobeCanvas {
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+    fn fill_rounded(&mut self, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+        fill_rounded(x, y, w, h, r, color);
+    }
+    fn text_width(&self, s: &[u8]) -> i32 {
+        text_width_px(s, FONT_BTN_PX)
+    }
+    fn draw_text(&mut self, x: i32, y: i32, s: &[u8], color: u32) {
+        draw_text_semibold_px(x, y, s, FONT_BTN_PX, color);
+    }
+    fn backdrop(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
 }
 
 fn render_complete() {
-    draw_center_bold(260, (if unsafe { LANG == 0 } { "KunxOS 已就绪" } else { "KunxOS is ready" }).as_bytes(), C_TEXT);
-    let mut y = 320;
-    // 摘要：用户名、已选模块数、锁屏方式
-    draw_text(120, y, (if unsafe { LANG == 0 } { "用户：user" } else { "User: user" }).as_bytes(), C_TEXT);
-    y += 28;
+    // ColorOS 15 完成页：绿对勾圆盘 + 标题 + 白卡摘要。
+    fill_circle(270, 212, 34, C_ACCENT);
+    draw_line_thick(258, 212, 264, 218, C_WHITE);
+    draw_line_thick(264, 218, 282, 200, C_WHITE);
+    draw_center_bold_px(278, (if unsafe { LANG == 0 } { "KunxOS 已就绪" } else { "KunxOS is ready" }).as_bytes(), FONT_TITLE_PX, C_TEXT);
+    // 摘要卡片
+    let ch = 172;
+    let cy = 278 + GAP_AFTER_TITLE - 10;
+    fill_rounded(CARD_X, cy, CARD_W, ch, CARD_R, C_WHITE);
+    card_border(CARD_X, cy, CARD_W, ch, CARD_R, C_CARD_BORDER);
+    let ty = cy + 16;
+    // 用户名
+    let un = unsafe { USER_LEN.min(USER_BUF.len()) };
+    let mut buf = [0u8; 40];
+    let mut n = 0usize;
+    for &c in (if unsafe { LANG == 0 } { "用户：" } else { "User: " }).as_bytes() {
+        buf[n] = c;
+        n += 1;
+    }
+    unsafe { buf[n..n + un].copy_from_slice(&USER_BUF[..un]); }
+    n += un;
+    draw_text_px(CARD_X + 20, ty, &buf[..n], FONT_BODY_PX, C_TEXT);
+    // 已选模块数
     let mut cnt = 0usize;
-    for i in 0..17 {
+    for i in 0..MODULES.len() {
         if module_on(i) {
             cnt += 1;
         }
     }
-    let mut buf = [0u8; 40];
-    let mut n = 0usize;
+    let mut m = 0usize;
     for &c in (if unsafe { LANG == 0 } { "应用模块：" } else { "Modules: " }).as_bytes() {
-        buf[n] = c;
-        n += 1;
+        buf[m] = c;
+        m += 1;
     }
     let mut v = cnt;
     if v == 0 {
-        buf[n] = b'0';
-        n += 1;
+        buf[m] = b'0';
+        m += 1;
     } else {
         let mut tmp = [0u8; 8];
         let mut ti = tmp.len();
@@ -1111,19 +2331,32 @@ fn render_complete() {
             v /= 10;
         }
         let c = tmp.len() - ti;
-        buf[n..n + c].copy_from_slice(&tmp[ti..]);
-        n += c;
+        buf[m..m + c].copy_from_slice(&tmp[ti..]);
+        m += c;
     }
-    draw_text(120, y, &buf[..n], C_TEXT);
-    y += 28;
-    draw_text(120, y, (if unsafe { LANG == 0 } { "锁屏：PIN" } else { "Lock: PIN" }).as_bytes(), C_TEXT);
-    y += 40;
-    draw_center(y, (if unsafe { LANG == 0 } { "所有配置将被保存。" } else { "All config will be saved." }).as_bytes(), C_DIM);
+    draw_text_px(CARD_X + 20, ty + GAP_AFTER_BODY, &buf[..m], FONT_BODY_PX, C_TEXT);
+    // 锁屏方式 + 胁迫动作摘要
+    let lock_name: &[u8] = unsafe {
+        match SEC_TYPE {
+            1 => if LANG == 0 { "锁屏：图案".as_bytes() } else { "Lock: Pattern".as_bytes() },
+            2 => if LANG == 0 { "锁屏：密码".as_bytes() } else { "Lock: Password".as_bytes() },
+            _ => if LANG == 0 { "锁屏：PIN".as_bytes() } else { "Lock: PIN".as_bytes() },
+        }
+    };
+    let duress_name: &[u8] = unsafe {
+        match DURESS_ACTION {
+            1 => if LANG == 0 { "胁迫：静默擦除".as_bytes() } else { "Duress: Wipe".as_bytes() },
+            2 => if LANG == 0 { "胁迫：发送警报".as_bytes() } else { "Duress: Alert".as_bytes() },
+            _ => if LANG == 0 { "胁迫：伪装系统".as_bytes() } else { "Duress: Fake".as_bytes() },
+        }
+    };
+    draw_text_px(CARD_X + 20, ty + 2 * GAP_AFTER_BODY, lock_name, FONT_BODY_PX, C_TEXT);
+    draw_text_px(CARD_X + 20, ty + 3 * GAP_AFTER_BODY, duress_name, FONT_BODY_PX, C_TEXT);
+    draw_center_px(cy + ch + GAP_AFTER_BODY, (if unsafe { LANG == 0 } { "所有配置将被保存" } else { "All config will be saved" }).as_bytes(), FONT_BODY_PX, C_DIM);
 }
 
 fn render() {
         draw_background();
-        draw_title();
         unsafe {
         match STEP {
             0 => render_welcome(),
@@ -1134,37 +2367,731 @@ fn render() {
             5 => render_agreement(),
             6 => render_account(),
             7 => render_security(),
-            8 => render_theme(),
+            8 => render_password(),
+            9 => render_duress(),
+            10 => render_duress_action(),
+            11 => render_theme(),
             _ => render_complete(),
         }
     }
+        // 右上角「跳过」胶囊（欢迎页与完成页不显示）。
+        draw_skip_button();
         draw_nav();
-        // 鼠标指针：鼠标移入系统后显示，始终绘制在最上层
-    if unsafe { MOUSE_SEEN } {
-        draw_cursor();
+    // 光标由 render_and_flip 的 cursor_overlay_init 负责（FB 直绘 overlay），
+    // 此处不再整屏绘制光标。
+}
+
+// ==================== 光标 overlay 快速路径 ====================
+//
+// 鼠标移动只更新显存 FB 上光标所在的 26x26 小区域（恢复旧位置像素 → 备份
+// 新位置像素 → 画光标），不再整屏重绘。此前每次移动都 render()+flip() 整屏
+// （含 TTF 文字栅格化）并在串口打印移动日志，QEMU 软件渲染下光标严重不跟手。
+// 光标不再画进 BACK_BUF，而是作为 overlay 直接写 FB（与 launcher 同方案）。
+
+const CUR_UW: usize = cursor_sprite::CUR_UW as usize;
+const CUR_UH: usize = cursor_sprite::CUR_UH as usize;
+
+/// 光标下 26x26 区域的备份（贴图 24x24 + 1px 边距），用于 overlay 移动时擦除旧光标。
+static mut CUR_UNDER: [u32; CUR_UW * CUR_UH] = [0u32; CUR_UW * CUR_UH];
+static mut CUR_UNDER_X: i32 = -1;
+static mut CUR_UNDER_Y: i32 = -1;
+
+fn fb_px(x: i32, y: i32) -> u32 {
+    unsafe {
+        if x < 0 || y < 0 || x >= FB_W as i32 || y >= FB_H as i32 {
+            0
+        } else {
+            *FB_PTR.add(y as usize * FB_STRIDE_PX + x as usize)
+        }
     }
 }
 
-/// 鼠标指针：先画黑色描边（8 邻域），再画白色实心，保证深浅背景下都可见。
-fn draw_cursor() {
-    let (x, y) = unsafe { (CUR_X, CUR_Y) };
-    const OUTLINE: [(i32, i32); 8] =
-        [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)];
-    for (ox, oy) in OUTLINE {
-        draw_cursor_bits(x + ox, y + oy, 0x00_00_00_00);
+fn fb_set_px(x: i32, y: i32, color: u32) {
+    unsafe {
+        if x >= 0 && y >= 0 && x < FB_W as i32 && y < FB_H as i32 {
+            *FB_PTR.add(y as usize * FB_STRIDE_PX + x as usize) = color;
+        }
     }
-    draw_cursor_bits(x, y, 0x00_FF_FF_FF);
 }
 
-/// 把 9x9 指针位图画到 (x, y)。
-fn draw_cursor_bits(x: i32, y: i32, color: u32) {
-    for (row, bits) in CURSOR_BITS.iter().enumerate() {
-        for col in 0..9 {
-            if bits & (0x100 >> col) != 0 {
-                put_pixel(x + col as i32, y + row as i32, color);
+/// 把 FB 上贴图外扩 1px 的区域保存到 CUR_UNDER。
+fn save_cursor_under(x: i32, y: i32) {
+    unsafe {
+        let sx = cursor_sprite::under_x(x);
+        let sy = cursor_sprite::under_y(y);
+        CUR_UNDER_X = sx;
+        CUR_UNDER_Y = sy;
+        for dy in 0..CUR_UH as i32 {
+            for dx in 0..CUR_UW as i32 {
+                CUR_UNDER[(dy * CUR_UW as i32 + dx) as usize] = fb_px(sx + dx, sy + dy);
             }
         }
     }
+}
+
+/// 把 CUR_UNDER 写回 FB（擦除旧光标，恢复被覆盖的界面像素）。
+fn restore_cursor_under() {
+    unsafe {
+        let x = CUR_UNDER_X;
+        let y = CUR_UNDER_Y;
+        for dy in 0..CUR_UH as i32 {
+            for dx in 0..CUR_UW as i32 {
+                fb_set_px(
+                    x + dx,
+                    y + dy,
+                    CUR_UNDER[(dy * CUR_UW as i32 + dx) as usize],
+                );
+            }
+        }
+    }
+}
+
+/// 把指针贴图直接写入显存 FB（tubiao/shubiao.png，热点对齐指针位置）。
+fn draw_cursor_fb() {
+    unsafe {
+        cursor_sprite::draw_at(
+            FB_PTR,
+            FB_STRIDE_PX,
+            FB_W as i32,
+            FB_H as i32,
+            CUR_X,
+            CUR_Y,
+            None,
+        );
+    }
+}
+
+/// 整屏重绘（render + flip）后调用：备份光标下像素并以 overlay 画回显存，
+/// 用脏矩形呈现（光标画在 canvas 上，不呈现则屏幕看不到指针更新）。
+fn cursor_overlay_init() {
+    if unsafe { MOUSE_SEEN && !FB_PTR.is_null() } {
+        unsafe {
+            save_cursor_under(CUR_X, CUR_Y);
+            draw_cursor_fb();
+            let (cx, cy) = (CUR_X, CUR_Y);
+            present_rect(
+                cursor_sprite::under_x(cx),
+                cursor_sprite::under_y(cy),
+                cursor_sprite::CUR_UW,
+                cursor_sprite::CUR_UH,
+            );
+        }
+    }
+}
+
+/// 光标移动快速路径：只更新 FB 上光标所在小区域，不重绘整屏，随后
+/// 用旧+新位置的并集小矩形呈现（避免整屏拖动卡顿）。
+fn move_cursor_fb() {
+    unsafe {
+        if !MOUSE_SEEN || FB_PTR.is_null() {
+            CURSOR_DIRTY = false;
+            return;
+        }
+        restore_cursor_under();
+        let u = (CUR_UNDER_X, CUR_UNDER_Y);
+        save_cursor_under(CUR_X, CUR_Y);
+        draw_cursor_fb();
+        CURSOR_DIRTY = false;
+        // 并集矩形：覆盖旧（u）与新（CUR）两个 26x26 光标区域。
+        let nx = cursor_sprite::under_x(CUR_X);
+        let ny = cursor_sprite::under_y(CUR_Y);
+        let x0 = u.0.min(nx);
+        let y0 = u.1.min(ny);
+        let x1 = u.0.max(nx) + cursor_sprite::CUR_UW;
+        let y1 = u.1.max(ny) + cursor_sprite::CUR_UH;
+        present_rect(x0, y0, x1 - x0, y1 - y0);
+    }
+}
+
+/// render + flip + 光标 overlay 重绘（所有整屏更新统一走此入口）。
+fn render_and_flip() {
+    render();
+    flip();
+    cursor_overlay_init();
+}
+
+// ==================== 动画引擎（对标ColorOS 15，见 docs/animations.md） ====================
+//
+// 步间转场：旧页交叉淡化 + 新页上滑 16px（EaseInEaseOut 260ms），底部导航面板
+// 每帧重绘（动画进度点）；内容区直接合成写入显存 FB，避免整屏二次拷贝。
+// 欢迎页：Hero 徽标呼吸入场 + 标题上滑淡入。选项卡片：选中 绿脉冲。
+
+/// 转场用的旧页快照（仅内容区 0..NAV_Y，不含底部导航面板）。
+static mut PREV_BUF: [u32; DISPLAY_W * NAV_Y as usize] = [0u32; DISPLAY_W * NAV_Y as usize];
+
+/// 选中脉冲目标矩形（-1 表示无）。
+static mut SEL_X: i32 = -1;
+static mut SEL_Y: i32 = -1;
+static mut SEL_W: i32 = -1;
+static mut SEL_H: i32 = -1;
+
+/// 记录下一次选中脉冲的卡片矩形。
+fn pulse_target(x: i32, y: i32, w: i32, h: i32) {
+    unsafe {
+        SEL_X = x;
+        SEL_Y = y;
+        SEL_W = w;
+        SEL_H = h;
+    }
+}
+
+/// 选中脉冲：卡片矩形内 绿高亮淡出（≈110ms）。写显存 FB，结束后恢复光标。
+fn pulse_selection() {
+    unsafe {
+        if SEL_W <= 0 {
+            return;
+        }
+        // 钳制到屏幕（present_rect 对超界矩形此前会整体丢弃，光标横跨时漏帧）。
+        let x0 = SEL_X.max(0);
+        let y0 = SEL_Y.max(0);
+        let x1 = (SEL_X + SEL_W).min(DISPLAY_W as i32);
+        let y1 = (SEL_Y + SEL_H).min(DISPLAY_H as i32);
+        if x0 >= x1 || y0 >= y1 {
+            SEL_W = -1;
+            return;
+        }
+        let (sx, sy) = (x0, y0);
+        let (sw, sh) = (x1 - x0, y1 - y0);
+        for f in 0..PULSE_FRAMES {
+            let t = f as f32 / (PULSE_FRAMES - 1) as f32;
+            let a = ((1.0 - t) * 96.0) as u32;
+            // 每帧先从 BACK_BUF 恢复卡片底图再叠加本帧 tint：此前直接在
+            // canvas 上逐帧叠加，帧间 tint 累积（96+48+0），脉冲结束后卡片
+            // 永久残留约 50% 绿色。
+            for dy in 0..sh {
+                for dx in 0..sw {
+                    fb_set_px(
+                        sx + dx,
+                        sy + dy,
+                        BACK_BUF[(sy + dy) as usize * DISPLAY_W + (sx + dx) as usize],
+                    );
+                }
+            }
+            if a > 0 {
+                for dy in 0..sh {
+                    for dx in 0..sw {
+                        if sys_nav::glass::in_round_rect(dx, dy, sw, sh, CARD_R) {
+                            let (px, py) = (sx + dx, sy + dy);
+                            fb_set_px(px, py, blend_px(fb_px(px, py), C_ACCENT, a));
+                        }
+                    }
+                }
+            }
+            present_rect(sx, sy, sw, sh);
+            sleep_ms(3);
+        }
+        SEL_W = -1;
+        cursor_overlay_init();
+    }
+}
+
+/// 转场期间的底部导航面板（玻璃 + 复位态按钮 + 动画进度点 + 错误横幅）。
+fn draw_nav_anim(to: usize, e: f32) {
+    draw_glass_style(0, NAV_Y, DISPLAY_W as i32, NAV_H, 0, &STYLE_SHEET);
+    btn_reset_all();
+    draw_nav_buttons();
+    draw_progress_anim(to, e);
+    draw_error_banner();
+}
+
+/// 步间转场：`from` -> `to`（`reverse` = 返回导航，新页由上滑入）。
+fn transition_pages(_from: usize, to: usize, reverse: bool) {
+    unsafe {
+        // 1. 快照当前内容区（旧页）。
+        core::ptr::copy_nonoverlapping(
+            BACK_BUF.as_ptr(),
+            PREV_BUF.as_mut_ptr(),
+            DISPLAY_W * NAV_Y as usize,
+        );
+        // 2. 渲染新页到 BACK_BUF（内容 + 导航，导航玻璃取景新内容）。
+        render();
+        btn_reset_all();
+    }
+    let ny = NAV_Y;
+    for f in 0..=TRANS_FRAMES {
+        let t = f as f32 / TRANS_FRAMES as f32;
+        // ColorOS 步进转场：交叉淡化走平滑阶跃，位移走「上滑回弹」
+        // （ease_out_back 末端轻微过冲后回落，页面有呼吸感）。
+        let e = ease_step(t);
+        let eb = ease_out_back(t);
+        let ea = (255.0 * e) as u32;
+        let off = if reverse {
+            -(TRANS_SLIDE as f32 * (1.0 - eb)) as i32
+        } else {
+            (TRANS_SLIDE as f32 * (1.0 - eb)) as i32
+        };
+        // 内容区：旧页淡出、新页淡入并滑入就位。
+        for y in 0..ny {
+            let sy = y + off;
+            for x in 0..DISPLAY_W as i32 {
+                let i = y as usize * DISPLAY_W + x as usize;
+                let oldc = unsafe { PREV_BUF[i] };
+                let newc = if sy >= 0 && sy < ny {
+                    unsafe { BACK_BUF[sy as usize * DISPLAY_W + x as usize] }
+                } else {
+                    oldc
+                };
+                fb_set_px(x, y, blend_px(oldc, newc, ea));
+            }
+        }
+        // 导航区整行重绘后刷到显存，并呈现本帧（合成器提交 + 翻页）。
+        draw_nav_anim(to, e);
+        for y in ny..DISPLAY_H as i32 {
+            for x in 0..DISPLAY_W as i32 {
+                fb_set_px(x, y, unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] });
+            }
+        }
+        present_fb();
+    }
+    render_and_flip();
+}
+
+/// 欢迎页入场动画：Hero 徽标呼吸缩放淡入 + 标题/副标题上滑淡入。
+fn animate_welcome() {
+    let title: &[u8] = if unsafe { LANG == 0 } {
+        "欢迎使用 KunxOS".as_bytes()
+    } else {
+        "Welcome to KunxOS".as_bytes()
+    };
+    let desc: &[u8] = if unsafe { LANG == 0 } {
+        "你的安全移动操作系统".as_bytes()
+    } else {
+        "Your secure mobile OS".as_bytes()
+    };
+    let sub: &[u8] = if unsafe { LANG == 0 } {
+        "安全护航，简单开始".as_bytes()
+    } else {
+        "Secure by design, simple to start".as_bytes()
+    };
+    // 阶段 A：徽标弹跳入场（ColorOS spring-pop：缩放 0.5 → 1.0，
+    // ease_out_back 中段轻微过冲后回落，伴随淡入与柔光晕开）。
+    for f in 0..HERO_FRAMES {
+        let t = f as f32 / (HERO_FRAMES - 1) as f32;
+        let e = ease_out(t);
+        let eb = ease_out_back(t);
+        draw_background();
+        draw_brand_ex(e, 0.5 + 0.5 * eb);
+        draw_nav();
+        flip();
+        sleep_ms(5);
+    }
+    // 阶段 B：标题/副标题/标语 错峰上滑淡入（ColorOS 文字逐级浮现：
+    // 标题先行，副标题滞后一档，标语最后，位移各自略小营造视差）。
+    for f in 0..TITLE_FRAMES {
+        let p = f as f32 / TITLE_FRAMES as f32;
+        let e0 = ease_out((p / 0.86).min(1.0));
+        let e1 = ease_out(((p - 0.14) / 0.86).clamp(0.0, 1.0));
+        let e2 = ease_out(((p - 0.28) / 0.86).clamp(0.0, 1.0));
+        let dy0 = ((1.0 - e0) * 16.0) as i32;
+        let dy1 = ((1.0 - e1) * 12.0) as i32;
+        let dy2 = ((1.0 - e2) * 10.0) as i32;
+        draw_background();
+        draw_brand(1.0);
+        draw_center_bold_px_a(WEL_TITLE_Y + dy0, title, FONT_TITLE_PX, C_TEXT, (255.0 * e0) as u32);
+        draw_center_px_a(WEL_DESC_Y + dy1, desc, FONT_BODY_PX, C_DIM, (255.0 * e1) as u32);
+        draw_center_px_a(WEL_DESC_Y + GAP_AFTER_BODY + dy2, sub, FONT_HINT_PX, C_HINT, (255.0 * e2) as u32);
+        draw_nav();
+        flip();
+        sleep_ms(8);
+    }
+    render_and_flip();
+}
+
+// ==================== 闲置持续动画（ColorOS 15 常驻动效，脏矩形呈现） ====================
+//
+// 等待输入期间屏幕不再静止：欢迎页 Hero 徽标呼吸缩放；其余页当前进度点
+// 呼吸脉动；卡片上带「进入悬浮态」高亮。全部只重绘小区域并 `present_rect`，
+// 避免整屏 canvas→back 拷贝（这是 QEMU 下鼠标拖动卡顿的主因）。
+
+/// 动画帧计数（16ms/帧，三角形振荡做呼吸）。
+static mut ANIM_T: u32 = 0;
+
+/// 卡片悬停状态（上次所在步骤/索引，-1 = 无）。
+static mut HOVER_STEP: i32 = -1;
+static mut HOVER_IDX: i32 = -1;
+
+/// 把 BACK_BUF 的 [x,y,w,h] 区域刷入 canvas 并呈现（所有闲置动画统一走此
+/// 入口：绘制原语写 BACK_BUF，此处才触碰 canvas —— 避免 canvas 与 BACK_BUF
+/// 长期不一致）。
+fn present_back_rect(x: i32, y: i32, w: i32, h: i32) {
+    // 钳制到 BACK_BUF（DISPLAY_W×DISPLAY_H）与屏幕范围内：调用方传入的区域
+    // （如模块页最后一行的 bottom = last+26）可能超出 960 行，直接循环会
+    // BACK_BUF 越界 panic（实测：选择应用页点任意一行必崩）。
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(DISPLAY_W as i32);
+    let y1 = (y + h).min(DISPLAY_H as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for dy in y0..y1 {
+        for dx in x0..x1 {
+            fb_set_px(
+                dx,
+                dy,
+                unsafe { BACK_BUF[dy as usize * DISPLAY_W + dx as usize] },
+            );
+        }
+    }
+    present_rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+/// 当前进度圆点中心（与 draw_progress 布局一致）。
+fn dot_center(step: usize) -> (i32, i32) {
+    let total = 13;
+    let gap = 18;
+    let start = (DISPLAY_W as i32 - (total - 1) * gap) / 2;
+    (start + step as i32 * gap, NAV_Y + 10)
+}
+
+/// 闲置呼吸基线快照：呼吸原语写 BACK_BUF 且逐帧在上一帧结果上混合，
+/// 不恢复基线会把光晕/呼吸外圈永久烧进底图（光晕逐帧加深成实心绿圈、
+/// r=6 外圈残留）。每帧先恢复快照再绘制 —— 绘制结果与首帧完全一致。
+const HERO_SNAP_HALF: i32 = 57; // 覆盖 glow_r+1 = HERO_R*1.025+11
+static mut HERO_SNAP: [u32; ((HERO_SNAP_HALF * 2 + 1) * (HERO_SNAP_HALF * 2 + 1)) as usize] =
+    [0; ((HERO_SNAP_HALF * 2 + 1) * (HERO_SNAP_HALF * 2 + 1)) as usize];
+static mut DOT_SNAP: [u32; 15 * 15] = [0; 15 * 15];
+static mut HERO_SNAP_OK: bool = false;
+static mut DOT_SNAP_OK: bool = false;
+
+/// 页面重渲染后失效闲置快照（主循环每步进入时调用）。
+fn idle_snap_invalidate() {
+    unsafe {
+        HERO_SNAP_OK = false;
+        DOT_SNAP_OK = false;
+    }
+}
+
+/// 进度点呼吸：半径 5..6 脉动（周期 24 帧 ≈ 380ms）。每帧先恢复基线快照
+/// 再绘制 —— 此前 r=6 的外圈会永久残留（「基圆始终被覆盖」的假设在
+/// r>5 的帧不成立）。
+fn dot_breathe(step: usize) {
+    let ph = (unsafe { ANIM_T } % 24) as f32 / 24.0;
+    let up = if unsafe { ANIM_T % 24 } < 12 {
+        ph * 2.0
+    } else {
+        2.0 - ph * 2.0
+    };
+    let r = 5 + (up * 1.0) as i32;
+    let (cx, cy) = dot_center(step);
+    unsafe {
+        let mut i = 0usize;
+        if !DOT_SNAP_OK {
+            for dy in -7i32..=7 {
+                for dx in -7i32..=7 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    DOT_SNAP[i] = if x < 0
+                        || y < 0
+                        || x >= DISPLAY_W as i32
+                        || y >= DISPLAY_H as i32
+                    {
+                        0
+                    } else {
+                        BACK_BUF[y as usize * DISPLAY_W + x as usize]
+                    };
+                    i += 1;
+                }
+            }
+            DOT_SNAP_OK = true;
+            i = 0;
+        }
+        for dy in -7i32..=7 {
+            for dx in -7i32..=7 {
+                let (x, y) = (cx + dx, cy + dy);
+                if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+                    BACK_BUF[y as usize * DISPLAY_W + x as usize] = DOT_SNAP[i];
+                }
+                i += 1;
+            }
+        }
+    }
+    fill_circle(cx, cy, r, C_ACCENT);
+    present_back_rect(cx - 7, cy - 7, 15, 15);
+}
+
+/// 欢迎页 Hero 呼吸：徽标整体 0.975..1.025 缩放（周期 40 帧 ≈ 640ms）。
+/// 每帧先恢复基线快照再绘制 —— 此前光晕在 BACK_BUF 上逐帧叠加，
+/// 1-3 秒内饱和成实心绿圈，且 1.025 缩放的外圈残永久留。
+fn hero_breathe() {
+    let ph = (unsafe { ANIM_T } % 40) as f32 / 40.0;
+    let up = if unsafe { ANIM_T % 40 } < 20 {
+        ph * 2.0
+    } else {
+        2.0 - ph * 2.0
+    };
+    unsafe {
+        let half = HERO_SNAP_HALF;
+        let mut i = 0usize;
+        if !HERO_SNAP_OK {
+            for dy in -half..=half {
+                for dx in -half..=half {
+                    let (x, y) = (HERO_CX + dx, HERO_CY + dy);
+                    HERO_SNAP[i] = if x < 0
+                        || y < 0
+                        || x >= DISPLAY_W as i32
+                        || y >= DISPLAY_H as i32
+                    {
+                        0
+                    } else {
+                        BACK_BUF[y as usize * DISPLAY_W + x as usize]
+                    };
+                    i += 1;
+                }
+            }
+            HERO_SNAP_OK = true;
+            i = 0;
+        }
+        for dy in -half..=half {
+            for dx in -half..=half {
+                let (x, y) = (HERO_CX + dx, HERO_CY + dy);
+                if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+                    BACK_BUF[y as usize * DISPLAY_W + x as usize] = HERO_SNAP[i];
+                }
+                i += 1;
+            }
+        }
+    }
+    draw_brand_idle(1.0 + 0.025 * up);
+    let size = HERO_SNAP_HALF * 2 + 1;
+    present_back_rect(
+        HERO_CX - HERO_SNAP_HALF,
+        HERO_CY - HERO_SNAP_HALF,
+        size,
+        size,
+    );
+}
+
+/// 每帧闲置推进：Hero（第 0 步）/ 进度点（其余步）呼吸。
+fn animate_idle(step: usize) {
+    unsafe { ANIM_T = ANIM_T.wrapping_add(1); }
+    if step == 0 {
+        hero_breathe();
+    } else {
+        dot_breathe(step);
+    }
+}
+
+/// 卡片页命中检测（语言/时区/锁屏/胁迫动作）。
+fn hover_card_at(step: usize, x: i32, y: i32) -> Option<usize> {
+    let count = match step {
+        1 => 2,
+        3 => 8,
+        7 => 3,
+        10 => 3,
+        _ => return None,
+    };
+    for i in 0..count {
+        let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+        if x >= CARD_X && x < CARD_X + CARD_W && y >= ry && y < ry + CARD_H {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn card_selected(step: usize, i: usize) -> bool {
+    unsafe {
+        match step {
+            1 => LANG == i,
+            3 => TIMEZONE == i,
+            7 => SEC_ENABLED && SEC_TYPE == i,
+            10 => DURESS_ACTION == i,
+            // 外观页：i=0 浅色 / i=1 深色（与 render_theme 一致）。缺失分支
+            // 会让 partial_redraw 把新旧卡都画成未选中态（点击无反馈）。
+            11 => (i == 1) == THEME_DARK,
+            _ => false,
+        }
+    }
+}
+
+fn card_label(step: usize, i: usize) -> &'static [u8] {
+    match step {
+        1 => {
+            if i == 0 {
+                "简体中文".as_bytes()
+            } else {
+                "English".as_bytes()
+            }
+        }
+        3 => TIMEZONES[i].as_bytes(),
+        7 => {
+            let names: [&[u8]; 3] = [
+                "PIN（数字密码）".as_bytes(),
+                "图案（3x3）".as_bytes(),
+                "密码（4-16 位）".as_bytes(),
+            ];
+            names[i]
+        }
+        10 => {
+            let acts: [&[u8]; 3] = [
+                (if unsafe { LANG == 0 } {
+                    "伪装系统（保持锁定）"
+                } else {
+                    "Fake system (stay locked)"
+                })
+                .as_bytes(),
+                (if unsafe { LANG == 0 } {
+                    "静默擦除（恢复出厂）"
+                } else {
+                    "Wipe data (factory reset)"
+                })
+                .as_bytes(),
+                (if unsafe { LANG == 0 } {
+                    "发送警报（上报安全中心）"
+                } else {
+                    "Send alert"
+                })
+                .as_bytes(),
+            ];
+            acts[i]
+        }
+        11 => {
+            if i == 0 {
+                "浅色".as_bytes()
+            } else {
+                "深色".as_bytes()
+            }
+        }
+        _ => &[],
+    }
+}
+
+/// 外观步骤卡片内的颜色预览圆（浅=白圈灰边；深=近黑），与 render_theme 一致。
+fn draw_theme_swatch(sx: i32, sy: i32, dark: bool) {
+    if dark {
+        fill_circle(sx + 13, sy + 12, 12, C_BTN_PRIMARY);
+    } else {
+        fill_circle(sx + 13, sy + 12, 12, C_WHITE);
+        let r = 12;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let d = dx * dx + dy * dy;
+                if d <= r * r && d >= (r - 2) * (r - 2) {
+                    put_pixel(sx + 13 + dx, sy + 12 + dy, C_CARD_BORDER);
+                }
+            }
+        }
+    }
+}
+
+/// 按卡片页当前选中态整卡重绘（卡片底色/描边 + 单选 + 文本）。
+fn redraw_card(step: usize, i: usize) {
+    let y = WIDGET_Y + i as i32 * CARD_PITCH;
+    let sel = card_selected(step, i);
+    draw_option_card(CARD_X, y, CARD_W, CARD_H, sel);
+    if step == 11 {
+        // 外观卡片：颜色预览圆（浅=白圈灰边；深=近黑）。
+        let sx = OPT_RX - 20 - 26;
+        draw_theme_swatch(sx, y + OPT_RY, i == 1);
+    }
+    draw_radio(OPT_RX, y + OPT_RY, sel, C_TEXT);
+    draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, card_label(step, i), FONT_BODY_PX, C_TEXT);
+}
+
+/// 卡片悬停：进入卡片 → 绿描边高亮；离开 → 恢复常态。仅同页生效。
+fn hover_tick() {
+    unsafe {
+        let step = STEP;
+        let idx = match hover_card_at(step, CUR_X, CUR_Y) {
+            Some(i) => i as i32,
+            None => -1,
+        };
+        // 离开旧卡片（同页才恢复，避免跨页写坏新页）。
+        if HOVER_STEP == step as i32 && HOVER_IDX >= 0 && HOVER_IDX != idx {
+            redraw_card(step, HOVER_IDX as usize);
+            let y = WIDGET_Y + HOVER_IDX * CARD_PITCH;
+            present_back_rect(CARD_X, y, CARD_W, CARD_H);
+        }
+        // 进入新卡片：重绘后在描边上叠加绿高亮。
+        if HOVER_STEP == step as i32 && idx >= 0 && idx != HOVER_IDX {
+            redraw_card(step, idx as usize);
+            let y = WIDGET_Y + idx * CARD_PITCH;
+            card_border(CARD_X, y, CARD_W, CARD_H, CARD_R, C_ACCENT);
+            present_back_rect(CARD_X, y, CARD_W, CARD_H);
+        }
+        HOVER_STEP = step as i32;
+        HOVER_IDX = idx;
+    }
+}
+
+/// 当前卡片页选中索引（供选中变化的局部重绘/回退用）。
+fn current_selection(step: usize) -> Option<usize> {
+    unsafe {
+        match step {
+            1 => Some(LANG),
+            3 => Some(TIMEZONE),
+            7 => Some(SEC_TYPE),
+            10 => Some(DURESS_ACTION),
+            11 => Some(if THEME_DARK { 1 } else { 0 }),
+            _ => None,
+        }
+    }
+}
+
+/// 点击消费后的局部重绘：卡片页只重绘选中变化的卡片（旧/新两张）；
+/// 复选页只重绘复选框；输入类步骤仍整屏渲染（含字段/提示联动）。
+fn partial_redraw(step: usize, sel_before: Option<usize>) {
+    match step {
+        1 | 3 | 7 | 10 | 11 => {
+            let new = current_selection(step);
+            let old = sel_before;
+            if old != new {
+                if let Some(oi) = old {
+                    redraw_card(step, oi);
+                    let y = WIDGET_Y + oi as i32 * CARD_PITCH;
+                    present_back_rect(CARD_X, y, CARD_W, CARD_H);
+                }
+                if let Some(ni) = new {
+                    redraw_card(step, ni);
+                    let y = WIDGET_Y + ni as i32 * CARD_PITCH;
+                    present_back_rect(CARD_X, y, CARD_W, CARD_H);
+                }
+            }
+        }
+        2 => {
+            // 模块网格：整组芯片重绘（选中态底色/描边 + 复选框联动）。
+            for i in 0..MODULES.len() {
+                draw_module_chip(i);
+            }
+            let (_, ly) = module_pos(MODULES.len() - 1);
+            present_back_rect(
+                GRID_X,
+                WIDGET_Y,
+                GRID_COL_W * 2 + GRID_GAP,
+                ly + GRID_ROW_H - WIDGET_Y,
+            );
+        }
+        4 => {
+            draw_network_skip_row();
+            let ry = WIDGET_Y + GAP_AFTER_BODY;
+            present_back_rect(CARD_X, ry, CARD_W, CARD_H);
+        }
+        5 => {
+            draw_agreement_row();
+            let cy = WIDGET_Y + 3 * GAP_AFTER_BODY;
+            present_back_rect(CARD_X, cy, CARD_W, CARD_H);
+        }
+        _ => {
+            render_and_flip();
+        }
+    }
+}
+
+/// 按钮松开回弹：只重绘底部导航区（玻璃 + 按钮 + 进度点），不整屏渲染。
+/// 每帧成本从「整屏 render + 2MB 呈现」降到「540×84 导航条 + 脏矩形」。
+fn btn_tick_nav_only() {
+    btn_tick_all();
+    draw_glass_style(0, NAV_Y, DISPLAY_W as i32, NAV_H, 0, &STYLE_SHEET);
+    draw_nav_buttons();
+    draw_progress();
+    draw_error_banner();
+    // 导航条从 BACK_BUF 刷入 canvas，再呈现导航条矩形。
+    for y in NAV_Y..DISPLAY_H as i32 {
+        for x in 0..DISPLAY_W as i32 {
+            fb_set_px(x, y, unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] });
+        }
+    }
+    present_rect(0, NAV_Y, DISPLAY_W as i32, NAV_H);
 }
 
 // ==================== 字符串构建与保存 ====================
@@ -1181,10 +3108,23 @@ fn fnv1a_hex(data: &[u8], out: &mut [u8; 8]) {
     }
 }
 
+/// FNV-1a 64 位哈希（16 位 hex），与云服务应用/网关/Worker 的令牌哈希一致。
+fn fnv1a64_hex(data: &[u8], out: &mut [u8; 16]) {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1_0000_0001_B3);
+    }
+    for i in 0..16 {
+        let nib = (h >> ((15 - i) * 4)) & 0xF;
+        out[i] = HEX[nib as usize];
+    }
+}
+
 /// 构建 modules 或 modules_removed 的逗号分隔串，返回长度。
 fn build_modules_str(out: &mut [u8], removed: bool) -> usize {
     let mut n = 0usize;
-    for i in 0..17 {
+    for i in 0..MODULES.len() {
         let on = module_on(i);
         if (removed && !on) || (!removed && on) {
             let key = MODULES[i].key.as_bytes();
@@ -1222,8 +3162,82 @@ fn save_agreement() {
     write_file("/data/oobe/agreement", v);
 }
 
+/// 账户表单校验：用户名非空。不满足时给出横幅提示并返回 false。
+fn validate_account() -> bool {
+    unsafe {
+        if USER_LEN == 0 {
+            print("[oobe] 账号：用户名不能为空
+");
+            show_error("用户名不能为空".as_bytes());
+            return false;
+        }
+    }
+    true
+}
+
+/// 锁屏密码校验：4-16 位、两次一致。
+fn validate_password() -> bool {
+    unsafe {
+        if PASS_LEN < 4 {
+            print("[oobe] 密码太短
+");
+            show_error("密码至少 4 位".as_bytes());
+            return false;
+        }
+        if PASS_LEN > 16 {
+            print("[oobe] 密码过长
+");
+            show_error("密码最多 16 位".as_bytes());
+            return false;
+        }
+        if CONFIRM_LEN != PASS_LEN
+            || &CONFIRM_BUF[..CONFIRM_LEN] != &PASS_BUF[..PASS_LEN]
+        {
+            print("[oobe] 密码不一致
+");
+            show_error("两次密码不一致".as_bytes());
+            return false;
+        }
+    }
+    true
+}
+
+/// 胁迫密码校验：4-16 位、两次一致、且不能与锁屏密码相同。
+fn validate_duress() -> bool {
+    unsafe {
+        if DURESS_LEN < 4 {
+            print("[oobe] 胁迫密码太短
+");
+            show_error("胁迫密码至少 4 位".as_bytes());
+            return false;
+        }
+        if DURESS_LEN > 16 {
+            print("[oobe] 胁迫密码过长
+");
+            show_error("胁迫密码最多 16 位".as_bytes());
+            return false;
+        }
+        if DURESS_CONFIRM_LEN != DURESS_LEN
+            || &DURESS_CONFIRM_BUF[..DURESS_CONFIRM_LEN] != &DURESS_BUF[..DURESS_LEN]
+        {
+            print("[oobe] 胁迫密码不一致
+");
+            show_error("两次胁迫密码不一致".as_bytes());
+            return false;
+        }
+        if DURESS_LEN == PASS_LEN && &DURESS_BUF[..DURESS_LEN] == &PASS_BUF[..PASS_LEN] {
+            print("[oobe] 胁迫密码 == 密码
+");
+            show_error("胁迫密码不能与锁屏密码相同".as_bytes());
+            return false;
+        }
+    }
+    true
+}
+
 fn save_account() {
-    // local_account = "<用户名>:<fnv1a hex>"
+    // local_account = "<用户名>:<fnv1a hex>"（密码哈希在密码步骤补齐，
+    // 见 save_password；此处先写用户名部分，保持与云服务约定的文件存在）。
     let mut buf = [0u8; 64];
     let un = unsafe { USER_LEN.min(USER_BUF.len()) };
     let mut n = un;
@@ -1240,21 +3254,13 @@ fn save_account() {
     let ce: &[u8] = if unsafe { CLOUD_ENABLED } { b"1" } else { b"0" };
     write_file("/data/oobe/cloud_enabled", ce);
 
-    // cloud_account = "" 或 "username:token"
-    if unsafe { CLOUD_ENABLED } {
-        write_file("/data/oobe/cloud_account", b"user:token");
-    } else {
-        write_file("/data/oobe/cloud_account", b"");
-    }
-
     // cloud_control = "enabled:0" 或 "enabled:1,find:1,lock:0,wipe:0"
     let mut cc = [0u8; 40];
     let mut m = 0usize;
     if unsafe { CLOUD_CONTROL } {
         for &c in b"enabled:1,find:" {
             cc[m] = c;
-            m += 1;
-        }
+            m += 1;        }
         cc[m] = if unsafe { CLOUD_FIND } { b'1' } else { b'0' };
         m += 1;
         for &c in b",lock:" {
@@ -1317,7 +3323,13 @@ fn save_account() {
     write_file("/data/oobe/parental_control", &pc[..k]);
 }
 
-fn save_security() {
+/// 锁屏方式步骤：写入 security_type。用户未主动选择安全（SEC_ENABLED=false，
+/// 默认/无交互推进）时不写文件 —— launcher 读不到安全配置就不自动上锁，
+/// 用户可直接进入系统（安全功能仅在用户主动选择后生效）。
+fn save_security_type() {
+    if !unsafe { SEC_ENABLED } {
+        return;
+    }
     let ty: &[u8] = unsafe {
         match SEC_TYPE {
             1 => b"pattern",
@@ -1326,16 +3338,89 @@ fn save_security() {
         }
     };
     write_file("/data/oobe/security_type", ty);
+}
 
+/// 锁屏密码步骤：写入 security_hash + local_account 哈希部分 + 云令牌。
+fn save_password() {
+    // security_hash = fnv1a(锁屏密码)，launcher 锁屏校验用。未启用安全时跳过，
+    // 避免默认密码把用户挡在锁屏外（local_account 仍照常写入）。
     let mut h = [0u8; 8];
     let pl = unsafe { PASS_LEN };
     fnv1a_hex(unsafe { &PASS_BUF[..pl] }, &mut h);
-    write_file("/data/oobe/security_hash", &h);
+    if unsafe { SEC_ENABLED } {
+        write_file("/data/oobe/security_hash", &h);
+    } else {
+        // 未启用安全（或空闲自动推进留空）：清空 security_type。此前的
+        // save_security_type（步骤 7）可能已写入 pin/pattern/password，
+        // 留着会造成「有 security_type 无 security_hash」→ launcher 开机
+        // 即锁死且无法解锁。
+        write_file("/data/oobe/security_type", b"");
+    }
 
+    // local_account = "<用户名>:<fnv1a hex>"（哈希用最终密码补齐，
+    // 与云服务应用 /data/oobe/local_account 约定一致）。
+    let mut buf = [0u8; 64];
+    let un = unsafe { USER_LEN.min(USER_BUF.len()) };
+    let mut n = un;
+    unsafe { buf[..n].copy_from_slice(&USER_BUF[..n]); }
+    buf[n] = b':';
+    n += 1;
+    buf[n..n + 8].copy_from_slice(&h);
+    n += 8;
+    write_file("/data/oobe/local_account", &buf[..n]);
+
+    // cloud_account = "" 或 "username:<token>"（token = fnv1a64(用户名:密码:盐)，
+    // 与云服务应用约定一致；见 cloud/PROTOCOL.md）。密码此时才最终确定，
+    // 故在此步骤生成。
+    if unsafe { CLOUD_ENABLED } {
+        let mut seed = [0u8; 96];
+        unsafe {
+            seed[..un].copy_from_slice(&USER_BUF[..un]);
+        }
+        let mut si = un;
+        seed[si] = b':';
+        si += 1;
+        seed[si..si + pl].copy_from_slice(unsafe { &PASS_BUF[..pl] });
+        si += pl;
+        for &c in b":kunxos-cloud" {
+            seed[si] = c;
+            si += 1;
+        }
+        let mut tok = [0u8; 16];
+        fnv1a64_hex(&seed[..si], &mut tok);
+        let mut acct = [0u8; 96];
+        unsafe {
+            acct[..un].copy_from_slice(&USER_BUF[..un]);
+        }
+        let mut ai = un;
+        acct[ai] = b':';
+        ai += 1;
+        acct[ai..ai + 16].copy_from_slice(&tok);
+        ai += 16;
+        write_file("/data/oobe/cloud_account", &acct[..ai]);
+        // 默认服务器（QEMU slirp 宿主机；真机部署可改 /data/oobe/cloud_server）
+        write_file("/data/oobe/cloud_server", b"10.0.2.2:8080");
+    } else {
+        write_file("/data/oobe/cloud_account", b"");
+    }
+}
+
+/// 胁迫密码步骤：写入 duress_hash（用户设置的胁迫密码哈希）。未启用安全时跳过。
+fn save_duress() {
+    if !unsafe { SEC_ENABLED } {
+        return;
+    }
     let mut d = [0u8; 8];
-    fnv1a_hex(DURESS_PIN, &mut d);
+    let dl = unsafe { DURESS_LEN };
+    fnv1a_hex(unsafe { &DURESS_BUF[..dl] }, &mut d);
     write_file("/data/oobe/duress_hash", &d);
+}
 
+/// 胁迫动作步骤：写入 duress_action。未启用安全时跳过。
+fn save_duress_action() {
+    if !unsafe { SEC_ENABLED } {
+        return;
+    }
     let act: &[u8] = unsafe {
         match DURESS_ACTION {
             1 => b"wipe",
@@ -1360,6 +3445,9 @@ fn save_theme() {
     buf[n] = b'0' + unsafe { WALLPAPER } as u8;
     n += 1;
     write_file("/data/oobe/theme", &buf[..n]);
+    // 导航方式："gesture" / "buttons"
+    let nav: &[u8] = if unsafe { NAV_MODE == 1 } { b"buttons" } else { b"gesture" };
+    write_file("/data/oobe/nav_mode", nav);
 }
 
 fn save_step(step: usize) {
@@ -1369,8 +3457,11 @@ fn save_step(step: usize) {
         3 => save_timezone(),
         5 => save_agreement(),
         6 => save_account(),
-        7 => save_security(),
-        8 => save_theme(),
+        7 => save_security_type(),
+        8 => save_password(),
+        9 => save_duress(),
+        10 => save_duress_action(),
+        11 => save_theme(),
         _ => {}
     }
 }
@@ -1379,16 +3470,32 @@ fn save_step(step: usize) {
 
 fn log_step(step: usize) {
     match step {
-        0 => print("[oobe] welcome to KunxOS\n"),
-        1 => print("[oobe] step 2/10: language\n"),
-        2 => print("[oobe] step 3/10: modules\n"),
-        3 => print("[oobe] step 4/10: timezone\n"),
-        4 => print("[oobe] step 5/10: network\n"),
-        5 => print("[oobe] step 6/10: agreement\n"),
-        6 => print("[oobe] step 7/10: account\n"),
-        7 => print("[oobe] step 8/10: security\n"),
-        8 => print("[oobe] step 9/10: theme\n"),
-        _ => print("[oobe] step 10/10: complete\n"),
+        0 => print("[oobe] 欢迎使用 KunxOS
+"),
+        1 => print("[oobe] 第 2/13 步：语言
+"),
+        2 => print("[oobe] 第 3/13 步：模块
+"),
+        3 => print("[oobe] 第 4/13 步：时区
+"),
+        4 => print("[oobe] 第 5/13 步：网络
+"),
+        5 => print("[oobe] 第 6/13 步：协议
+"),
+        6 => print("[oobe] 第 7/13 步：账号
+"),
+        7 => print("[oobe] 第 8/13 步：锁屏方式
+"),
+        8 => print("[oobe] 第 9/13 步：密码
+"),
+        9 => print("[oobe] 第 10/13 步：胁迫 PIN
+"),
+        10 => print("[oobe] 第 11/13 步：胁迫动作
+"),
+        11 => print("[oobe] 第 12/13 步：外观
+"),
+        _ => print("[oobe] 第 13/13 步：完成
+"),
     }
 }
 
@@ -1398,11 +3505,13 @@ fn query_network() {
         let fd = open(NET_PIPE_PATH, O_RDWR);
         if fd >= 0 {
             syscall3(SYS_LSEEK, fd as usize, 0, SEEK_END);
-            write_fd(fd as usize, b"STATUS\n");
+            write_fd(fd as usize, b"STATUS
+");
             syscall1(SYS_CLOSE, fd as usize);
         }
     }
-    print("[oobe] network STATUS: IP=10.0.2.15 GW=10.0.2.2\n");
+    print("[oobe] network STATUS: IP=10.0.2.15 GW=10.0.2.2
+");
 }
 
 // ==================== 输入事件 ====================
@@ -1477,19 +3586,6 @@ static mut MOUSE_SEEN: bool = true; // 默认显示指针，鼠标移动后跟�
 /// 指针移动标记：等待循环据此重绘（OOBE 每步只渲染一次，需主动刷新光标）。
 static mut CURSOR_DIRTY: bool = false;
 
-/// 鼠标指针位图（9x9，'1' 为实心像素）：经典箭头，黑描边 + 白填充。
-static CURSOR_BITS: [u16; 9] = [
-    0b100000000,
-    0b110000000,
-    0b101000000,
-    0b100100000,
-    0b100010000,
-    0b100001000,
-    0b111111100,
-    0b100010100,
-    0b100010010,
-];
-
 static mut INPUT_FD: isize = -1;
 static mut CUR_X: i32 = DISPLAY_W as i32 / 2; // 屏幕中心
 static mut CUR_Y: i32 = DISPLAY_H as i32 / 2;
@@ -1503,13 +3599,18 @@ fn log_input(kind: &str, x: i32, y: i32) {
     print_dec(y as usize);
     print(", type=");
     print(kind);
-    print("\n");
+    print("
+");
 }
 
 /// 输入累积缓冲：事件可能跨 read 分割（单次 read 未必返回完整 24 字节），
 /// 先把零散字节累积进缓冲，凑满一个 `input_event` 后再解析，避免事件被丢弃。
 static mut EV_BUF: [u8; 64] = [0u8; 64];
 static mut EV_LEN: usize = 0;
+/// 「最近有原始输入数据」标记：read 返回 >0 字节即置位（含纯指针移动）。
+/// 空闲自动推进计时器消费此标记——用户持续移动鼠标（不点击）也应视为
+/// 在场，不应被 30 秒无输入判定强推到下一步。
+static mut ANY_INPUT_RECENT: bool = false;
 
 /// 解析并消费缓冲头部的单个 input_event（24B）；是完整点击（按下+抬起）或
 /// 回车键或返回按钮按下时返回 true，并把动作写入 ev。无论结果如何都消费该事件
@@ -1538,48 +3639,55 @@ unsafe fn consume_input_event(ev: &mut InputEvent) -> bool {
     } else if etype == EV_ABS {
         match code {
             ABS_X => {
-                CUR_X = value;
+                CUR_X = value.clamp(0, DISPLAY_W as i32 - 1);
                 CURSOR_DIRTY = true;
             }
             ABS_Y => {
-                CUR_Y = value;
-                log_input("move", CUR_X, CUR_Y);
+                CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
+                // 注意：移动不打印日志 —— 每帧阻塞串口输出是鼠标卡顿的主因
                 CURSOR_DIRTY = true;
             }
-            ABS_MT_POSITION_X => CUR_X = value,
+            ABS_MT_POSITION_X => {
+                CUR_X = value.clamp(0, DISPLAY_W as i32 - 1);
+                CURSOR_DIRTY = true;
+            }
             ABS_MT_POSITION_Y => {
-                CUR_Y = value;
-                log_input("move", CUR_X, CUR_Y);
+                CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
+                CURSOR_DIRTY = true;
             }
             _ => {}
         }
     } else if etype == EV_KEY {
         if code == BTN_LEFT {
-            // 鼠标左键：按下记录，抬起在指针处产生一次点击。
+            // 鼠标左键：按下记录并触发按钮按压反馈，抬起在指针处产生一次点击。
             if value == 1 {
                 MOUSE_DOWN = true;
                 log_input("down", CUR_X, CUR_Y);
+                btn_on_press(CUR_X, CUR_Y);
             } else if value == 0 && MOUSE_DOWN {
                 log_input("up", CUR_X, CUR_Y);
                 MOUSE_DOWN = false;
+                btn_on_release();
                 ev.x = CUR_X;
                 ev.y = CUR_Y;
                 ev.enter = false;
-                ev.back = CUR_Y > 880 && CUR_X < 120;
+                ev.back = btn_back_hit(CUR_X, CUR_Y);
                 click = true;
             }
         } else if code == BTN_TOUCH {
             if value == 1 {
                 TOUCH_DOWN = true;
                 log_input("down", CUR_X, CUR_Y);
+                btn_on_press(CUR_X, CUR_Y);
             } else if value == 0 {
                 log_input("up", CUR_X, CUR_Y);
                 if TOUCH_DOWN {
                     TOUCH_DOWN = false;
+                    btn_on_release();
                     ev.x = CUR_X;
                     ev.y = CUR_Y;
                     ev.enter = false;
-                    ev.back = CUR_Y > 880 && CUR_X < 120;
+                    ev.back = btn_back_hit(CUR_X, CUR_Y);
                     click = true;
                 }
             }
@@ -1608,7 +3716,8 @@ unsafe fn consume_input_event(ev: &mut InputEvent) -> bool {
                 print_dec(code);
                 print(" ch='");
                 write_fd(1, &[c]);
-                print("'\n");
+                print("'
+");
             }
         }
     }
@@ -1629,7 +3738,8 @@ fn read_input_event(ev: &mut InputEvent) -> bool {
         if INPUT_FD < 0 {
             INPUT_FD = open(INPUT_PATH, O_RDONLY | O_NONBLOCK);
             if INPUT_FD >= 0 {
-                print("[input] /dev/input/event0 ready\n");
+                print("[input] /dev/input/event0 就绪
+");
             }
         }
         if INPUT_FD < 0 {
@@ -1659,40 +3769,40 @@ fn read_input_event(ev: &mut InputEvent) -> bool {
                 return false; // 无数据（非阻塞 EAGAIN）或读失败
             }
             EV_LEN += n;
+            unsafe { ANY_INPUT_RECENT = true; }
         }
     }
 }
 
-/// 模块步骤第 `i` 行复选框的 y 坐标（与 render_modules 的绘制位置一致）。
-fn module_row_y(i: usize) -> i32 {
-    let mut y = CONTENT_Y + 28 + 24; // 104
-    for j in 0..=i {
-        if j == 5 {
-            y += 8 + 24; // 「预装应用」分组标题
-        }
-        if j < i {
-            y += 22;
-        }
-    }
-    y
-}
-
-/// 处理点击：返回 1=下一步、-1=返回、2=本步选项被消费（已重绘状态）、0=未命中。
+/// 处理点击：返回 1=下一步、-1=上一步、2=本步选项被消费（已重绘状态）、
+/// 3=跳过（右上角）、0=未命中。
 fn handle_tap(x: i32, y: i32) -> i32 {
-    print("[oobe] tap at (");
+    print("[oobe] 点击 (");
     print_dec(x as usize);
     print(",");
     print_dec(y as usize);
-    print("), checking buttons...\n");
-    // 返回箭头区域（底部左侧）
-    if y > 880 && x < 120 {
-        print("[oobe] back button hit\n");
-        return -1;
-    }
-    // 「下一步」按钮区域（底部右侧，400..530 x 900..950，含扩大命中区）
-    if y > 880 && x > 380 {
-        print("[oobe] next button hit -> next\n");
-        return 1;
+    print("），检查按钮...
+");
+    unsafe {
+        // 跳过按钮（右上角胶囊）：放弃当前步，直接进入完成页。
+        if btn_skip_hit(x, y) {
+            print("[oobe] 已点击跳过按钮 -> 完成页
+");
+            return 3;
+        }
+        // 上一步按钮（次要，底部左侧）：组件命中区。
+        if btn_back_hit(x, y) {
+            print("[oobe] 已点击返回按钮
+");
+            return -1;
+        }
+        // 下一步 / 进入系统（主，底部右侧）：组件命中区。
+        let nav_btn: &button::Button = if STEP < 12 { &BTN_NEXT } else { &BTN_ENTER };
+        if nav_btn.enabled() && nav_btn.hit(x, y) {
+            print("[oobe] 已点击下一步按钮 -> 下一步
+");
+            return 1;
+        }
     }
     let step = unsafe { STEP };
     let r = match step {
@@ -1703,41 +3813,39 @@ fn handle_tap(x: i32, y: i32) -> i32 {
         5 => tap_agreement(x, y),
         6 => tap_account(x, y),
         7 => tap_security(x, y),
-        8 => tap_theme(x, y),
+        8 => tap_password(x, y),
+        9 => tap_duress(x, y),
+        10 => tap_duress_action(x, y),
+        11 => tap_theme(x, y),
         _ => 0,
     };
     if r == 2 {
-        print("[oobe] option consumed\n");
+        print("[oobe] 选项已消费
+");
     }
     r
 }
 
-/// 语言步骤：两个选项胶囊（简体中文 / English）。
+/// 语言步骤：两个白色卡片单选（右侧 绿圆点）。
 fn tap_language(x: i32, y: i32) -> i32 {
-    if x >= 60 && x < 480 {
-        if y >= 108 && y < 156 {
-            unsafe { LANG = 0; }
-            return 2;
-        }
-        if y >= 168 && y < 216 {
-            unsafe { LANG = 1; }
+    for i in 0..2 {
+        let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+        if x >= CARD_X && x < CARD_X + CARD_W && y >= ry && y < ry + CARD_H {
+            unsafe { LANG = i; }
+            pulse_target(CARD_X, ry, CARD_W, CARD_H);
             return 2;
         }
     }
     0
 }
 
-/// 模块步骤：勾选/取消勾选应用（锁定项忽略）。
+/// 模块步骤：勾选/取消勾选应用（两列圆角芯片网格，锁定项忽略）。
 fn tap_modules(x: i32, y: i32) -> i32 {
-    if x < 40 || x >= 520 {
-        return 0;
-    }
-    for i in 0..17 {
-        let ry = module_row_y(i);
-        if y >= ry && y < ry + 22 {
-            if !unsafe { MODULES[i].locked } {
+    for i in 0..MODULES.len() {
+        let (gx, gy) = module_pos(i);
+        if x >= gx && x < gx + GRID_COL_W && y >= gy && y < gy + GRID_ROW_H {
+            if !MODULES[i].locked {
                 unsafe { MODULE_ON[i] = !MODULE_ON[i]; }
-                return 2;
             }
             return 2; // 锁定项也消费点击（不改变状态）
         }
@@ -1745,25 +3853,14 @@ fn tap_modules(x: i32, y: i32) -> i32 {
     0
 }
 
-/// 地区/时区步骤：左列地区胶囊，右列时区胶囊。
+/// 时区步骤：8 个白色卡片单选（右侧 绿圆点）。
 fn tap_timezone(x: i32, y: i32) -> i32 {
-    if x >= 60 && x < 260 {
-        for i in 0..4 {
-            let ry = CONTENT_Y + 16 + 26 + i as i32 * 48;
-            if y >= ry && y < ry + 40 {
-                unsafe {
-                    REGION = i;
-                    TIMEZONE = region_default_tz(i);
-                }
-                return 2;
-            }
-        }
-    }
-    if x >= 280 && x < 500 {
+    if x >= CARD_X && x < CARD_X + CARD_W {
         for i in 0..8 {
-            let ry = CONTENT_Y + 16 + 26 + i as i32 * 36;
-            if y >= ry && y < ry + 32 {
+            let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+            if y >= ry && y < ry + CARD_H {
                 unsafe { TIMEZONE = i; }
+                pulse_target(CARD_X, ry, CARD_W, CARD_H);
                 return 2;
             }
         }
@@ -1771,61 +3868,82 @@ fn tap_timezone(x: i32, y: i32) -> i32 {
     0
 }
 
-/// 网络步骤：「跳过网络设置」复选框。
+/// 网络步骤：「跳过网络设置」圆角卡片行（右侧复选方框）。
 fn tap_network(x: i32, y: i32) -> i32 {
-    if x >= 60 && y >= 200 && y < 222 {
+    let ry = WIDGET_Y + GAP_AFTER_BODY;
+    if x >= CARD_X && x < CARD_X + CARD_W && y >= ry && y < ry + CARD_H {
         unsafe { NET_SKIP = !NET_SKIP; }
         return 2;
     }
     0
 }
 
-/// 协议步骤：「我已阅读并同意」复选框。
+/// 协议步骤：「我已阅读并同意」圆角卡片行（右侧复选方框）。
 fn tap_agreement(x: i32, y: i32) -> i32 {
-    if x >= 40 && y >= 210 && y < 222 {
+    let cy = WIDGET_Y + 3 * GAP_AFTER_BODY; // 与 render_agreement 一致
+    if x >= CARD_X && x < CARD_X + CARD_W && y >= cy && y < cy + CARD_H {
         unsafe { AGREEMENT = !AGREEMENT; }
         return 2;
     }
     0
 }
 
-/// 账号步骤：输入框焦点切换 + 云服务/家长控制复选框。
+/// 账号步骤：用户名输入框焦点。
 fn tap_account(x: i32, y: i32) -> i32 {
-    // 三个输入框（与 render_account 布局一致）
-    let field_y = [FIELD_Y0, FIELD_Y1, FIELD_Y2];
+    if x >= FIELD_X && x < FIELD_X + FIELD_W && y >= FIELD_Y0 && y < FIELD_Y0 + FIELD_H {
+        unsafe { FIELD_FOCUS = 0; }
+        return 2;
+    }
+    0
+}
+
+/// 锁屏方式步骤：三种方式卡片单选（右侧 绿圆点）。
+fn tap_security(x: i32, y: i32) -> i32 {
+    if x >= CARD_X && x < CARD_X + CARD_W {
+        for i in 0..3 {
+            let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+            if y >= ry && y < ry + CARD_H {
+                unsafe { SEC_TYPE = i; SEC_ENABLED = true; }
+                pulse_target(CARD_X, ry, CARD_W, CARD_H);
+                return 2;
+            }
+        }
+    }
+    0
+}
+
+/// 锁屏密码步骤：两个输入框焦点切换。
+fn tap_password(x: i32, y: i32) -> i32 {
+    let field_y = [FIELD_Y0, FIELD_Y1];
     for (i, fy) in field_y.iter().enumerate() {
-        if x >= 40 && x < 500 && y >= *fy && y < *fy + 44 {
+        if x >= FIELD_X && x < FIELD_X + FIELD_W && y >= *fy && y < *fy + FIELD_H {
             unsafe { FIELD_FOCUS = i as i32; }
             return 2;
         }
     }
-    if x >= 40 && y >= CLOUD_Y && y < CLOUD_Y + 16 {
-        unsafe { CLOUD_ENABLED = !CLOUD_ENABLED; }
-        return 2;
-    }
-    if x >= 40 && y >= PARENTAL_Y && y < PARENTAL_Y + 16 {
-        unsafe { PARENTAL = !PARENTAL; }
-        return 2;
+    0
+}
+
+/// 胁迫密码步骤：两个输入框焦点切换。
+fn tap_duress(x: i32, y: i32) -> i32 {
+    let field_y = [FIELD_Y0, FIELD_Y1];
+    for (i, fy) in field_y.iter().enumerate() {
+        if x >= FIELD_X && x < FIELD_X + FIELD_W && y >= *fy && y < *fy + FIELD_H {
+            unsafe { FIELD_FOCUS = i as i32; }
+            return 2;
+        }
     }
     0
 }
 
-/// 安全步骤：锁屏方式胶囊 + 胁迫动作单选。
-fn tap_security(x: i32, y: i32) -> i32 {
-    if x >= 40 && x < 360 {
+/// 胁迫动作步骤：三个动作卡片单选（右侧 绿圆点）。
+fn tap_duress_action(x: i32, y: i32) -> i32 {
+    if x >= CARD_X && x < CARD_X + CARD_W {
         for i in 0..3 {
-            let ry = CONTENT_Y + 4 + 26 + i as i32 * 48;
-            if y >= ry && y < ry + 40 {
-                unsafe { SEC_TYPE = i; }
-                return 2;
-            }
-        }
-    }
-    if x >= 40 {
-        for i in 0..3 {
-            let ry = CONTENT_Y + 4 + 26 + 3 * 48 + 8 + 18 + 26 + 24 + i as i32 * 24;
-            if y >= ry && y < ry + 20 {
+            let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+            if y >= ry && y < ry + CARD_H {
                 unsafe { DURESS_ACTION = i; }
+                pulse_target(CARD_X, ry, CARD_W, CARD_H);
                 return 2;
             }
         }
@@ -1833,31 +3951,41 @@ fn tap_security(x: i32, y: i32) -> i32 {
     0
 }
 
-/// 主题步骤：外观胶囊 + 壁纸方块。
+/// 主题步骤：浅色 / 深色外观卡片单选（含颜色预览圆）。
 fn tap_theme(x: i32, y: i32) -> i32 {
-    if x >= 60 && x < 260 {
+    if x >= CARD_X && x < CARD_X + CARD_W {
         for i in 0..2 {
-            let ry = CONTENT_Y + 16 + 26 + i as i32 * 48;
-            if y >= ry && y < ry + 40 {
+            let ry = WIDGET_Y + i as i32 * CARD_PITCH;
+            if y >= ry && y < ry + CARD_H {
                 unsafe { THEME_DARK = i == 1; }
-                return 2;
-            }
-        }
-    }
-    if y >= 224 && y < 272 {
-        for i in 0..3 {
-            if x >= 60 + i as i32 * 160 && x < 60 + i as i32 * 160 + 48 {
-                unsafe { WALLPAPER = i; }
+                pulse_target(CARD_X, ry, CARD_W, CARD_H);
                 return 2;
             }
         }
     }
     0
+}
+
+/// 当前步骤是否需要输入框编辑（账号=用户名；密码/胁迫=双字段）。
+fn step_has_fields(step: usize) -> bool {
+    matches!(step, 6 | 8 | 9)
+}
+
+/// 按步骤校验输入：账号=用户名非空；密码=4-16 位且两次一致；
+/// 胁迫=4-16 位、两次一致且不同于锁屏密码。
+fn validate_step(step: usize) -> bool {
+    match step {
+        6 => validate_account(),
+        8 => validate_password(),
+        9 => validate_duress(),
+        _ => true,
+    }
 }
 
 /// 阻塞等待用户点击「下一步」或按下回车。
 ///
-/// 30 秒无任何输入时回退为模拟点击自动推进（应用该步默认选择后进入下一步），
+/// 返回：1 = 用户点击「下一步」/回车；-1 = 返回；3 = 跳过；
+/// 4 = 30 秒无输入自动推进（主循环据此应用该步默认选择），
 /// 保证 run-gui（/dev/input/event0 可打开但无串口触摸事件）下 OOBE 不会永久挂起。
 fn wait_for_tap_next_button() -> i32 {
     let mut event = InputEvent {
@@ -1870,75 +3998,108 @@ fn wait_for_tap_next_button() -> i32 {
     };
     let mut idle = 0usize;
     loop {
+        err_ui::err_tick();
         if read_input_event(&mut event) {
             idle = 0;
             if event.enter {
-                // 账号步骤：回车推进输入框焦点；最后一个输入框回车 = 下一步。
-                if unsafe { STEP == 6 } {
+                // 输入框步骤：回车推进焦点；最后一个输入框回车 = 下一步。
+                if step_has_fields(unsafe { STEP }) {
                     let f = unsafe { FIELD_FOCUS };
-                    if f >= 0 && f < 2 {
+                    let cnt = step_field_count();
+                    if f >= 0 && (f as usize) < cnt - 1 {
                         unsafe { FIELD_FOCUS = f + 1; }
-                        print("[oobe] focus -> next field\n");
-                        render();
-                        flip();
+                        print("[oobe] 焦点 -> 下一输入框
+");
+                        render_and_flip();
+                        continue;
+                    }
+                    // 已在最后一个输入框回车：先校验再放行。
+                    if !validate_step(unsafe { STEP }) {
                         continue;
                     }
                 }
-                print("[oobe] enter key -> next\n");
+                print("[oobe] 回车键 -> 下一步
+");
                 return 1;
             }
             if event.backspace {
-                if unsafe { STEP == 6 } {
+                if step_has_fields(unsafe { STEP }) {
                     let f = unsafe { FIELD_FOCUS };
                     if f >= 0 {
                         delete_field_char(f as usize);
-                        print("[oobe] backspace\n");
-                        render();
-                        flip();
+                        print("[oobe] 退格
+");
+                        render_and_flip();
                     }
                 }
                 continue;
             }
             if let Some(c) = event.ch {
-                if unsafe { STEP == 6 } {
+                if step_has_fields(unsafe { STEP }) {
                     let f = unsafe { FIELD_FOCUS };
                     if f >= 0 {
                         append_field_char(f as usize, c);
-                        print("[oobe] typed char\n");
-                        render();
-                        flip();
+                        print("[oobe] 已输入字符
+");
+                        render_and_flip();
                     }
                 }
                 continue;
             }
             if event.back {
-                print("[oobe] back button hit\n");
+                print("[oobe] 已点击返回按钮
+");
                 return -1;
             }
+            let sel_before = current_selection(unsafe { STEP });
             let r = handle_tap(event.x, event.y);
             if r == 1 {
+                // 输入框步骤点击「下一步」：先校验再放行。
+                if step_has_fields(unsafe { STEP }) && !validate_step(unsafe { STEP }) {
+                    continue;
+                }
                 return 1;
             }
             if r == -1 {
                 return -1;
             }
+            if r == 3 {
+                // 右上角「跳过」：交给主流程处理（放弃当前步直达完成页）。
+                return 3;
+            }
             if r == 2 {
-                // 本步选项被消费：立即重绘反映状态变化。
-                render();
-                flip();
+                // 本步选项被消费：只局部重绘变化区域（卡片/复选），不再整屏
+                // render + 2MB 呈现（否则每点一下都卡）；随后播放选中脉冲。
+                partial_redraw(unsafe { STEP }, sel_before);
+                pulse_selection();
             }
         } else {
-            // 指针移动：重绘以更新光标位置（OOBE 每步只渲染一次）
+            // 指针移动：overlay 快速路径只更新光标所在小区域，
+            // 不再整屏 render()+flip()（TTF 重栅格化是鼠标卡顿的主因）。
             if unsafe { CURSOR_DIRTY } {
-                unsafe { CURSOR_DIRTY = false; }
-                render();
-                flip();
+                move_cursor_fb();
+            }
+            // 卡片悬停高亮（同页生效，脏矩形呈现）。
+            hover_tick();
+            // 闲置持续动画：欢迎页 Hero 呼吸 / 其余页进度点呼吸。
+            animate_idle(unsafe { STEP });
+            // 按钮松开回弹过渡（≈150ms）：无输入时逐帧推进，
+            // 只重绘导航条（不整屏 render + 2MB 呈现，避免卡顿）。
+            if btn_animating() {
+                btn_tick_nav_only();
             }
             sleep_ms(16);
+            // 纯指针移动（不构成点击）也算用户在场：消费「最近有输入」标记，
+            // 重置空闲计时，避免用户浏览页面时被 30 秒判定强推下一步。
+            if unsafe { ANY_INPUT_RECENT } {
+                unsafe { ANY_INPUT_RECENT = false };
+                idle = 0;
+            }
             idle += 16;
             if idle >= 30000 {
-                print("[oobe] no input for 30s, simulated tap -> next\n");
-                return 1;
+                print("[oobe] 30 秒无输入，应用默认选择 -> 下一步
+");
+                return 4;
             }
         }
     }
@@ -1951,7 +4112,7 @@ fn apply_step_defaults(step: usize) {
             0 => {}
             1 => { LANG = 0; }
             2 => {
-                for i in 0..17 {
+                for i in 0..MODULES.len() {
                     MODULE_ON[i] = MODULES[i].default_on;
                 }
             }
@@ -1959,8 +4120,16 @@ fn apply_step_defaults(step: usize) {
             4 => { NET_SKIP = false; }
             5 => { AGREEMENT = false; }
             6 => { CLOUD_ENABLED = false; CLOUD_CONTROL = false; PARENTAL = false; }
-            7 => { SEC_TYPE = 0; DURESS_ACTION = 0; }
-            8 => { THEME_DARK = true; WALLPAPER = 2; }
+            7 => { SEC_TYPE = 0; SEC_ENABLED = false; }
+            // 注意：密码/胁迫密码不预填（用户输入），
+            // 这里不能重置 —— apply_step_defaults 在 save_step 之前执行，
+            // 重置会覆盖用户刚输入的内容导致保存错误的哈希。
+            // 空闲自动推进到达 8/9 时输入必为空：关闭 SEC_ENABLED，
+            // 让 save_password 走「未启用安全」路径（清空 security_type），
+            // 不留下「有 security_type 而无 security_hash」的锁死配置。
+            8 | 9 => { SEC_ENABLED = false; }
+            10 => { DURESS_ACTION = 0; }
+            11 => { THEME_DARK = false; WALLPAPER = 1; NAV_MODE = 0; }
             _ => {}
         }
     }
@@ -1968,20 +4137,25 @@ fn apply_step_defaults(step: usize) {
 
 /// 模拟点击（固定坐标）：无输入设备时（如 run-gui）主流程回退调用本函数
 /// 应用该步默认选择并自动推进，与 launcher 的模拟点击 fallback 一致。
+/// 坐标取底部「下一步 / 进入系统」按钮组件命中区的中心（render 后 rect 有效）。
 fn simulate_click(step: usize) {
-    let (x, y) = (DISPLAY_W as i32 - 32 - 22, NAV_Y + NAV_H / 2);
-    print("[oobe] simulated tap next (");
+    let (x, y) = unsafe {
+        let b: &button::Button = if STEP < 12 { &BTN_NEXT } else { &BTN_ENTER };
+        (b.x + b.w / 2, b.y + b.h / 2)
+    };
+    print("[oobe] 模拟点击下一步 (");
     print_dec(x as usize);
     print(",");
     print_dec(y as usize);
-    print(")\n");
+    print(")
+");
     // 各步在点击「下一步」前的默认选择处理
     unsafe {
         match step {
             0 => {}
             1 => { LANG = 0; } // 默认简体中文
             2 => {
-                for i in 0..17 {
+                for i in 0..MODULES.len() {
                     MODULE_ON[i] = MODULES[i].default_on;
                 }
             }
@@ -1989,8 +4163,10 @@ fn simulate_click(step: usize) {
             4 => { NET_SKIP = false; }
             5 => { AGREEMENT = false; }
             6 => { CLOUD_ENABLED = false; CLOUD_CONTROL = false; PARENTAL = false; }
-            7 => { SEC_TYPE = 0; DURESS_ACTION = 0; }
-            8 => { THEME_DARK = true; WALLPAPER = 2; }
+            7 => { SEC_TYPE = 0; SEC_ENABLED = false; }
+            8 | 9 => {} // 密码/胁迫密码不预填（仅模拟模式下留空推进）
+            10 => { DURESS_ACTION = 0; }
+            11 => { THEME_DARK = false; WALLPAPER = 1; NAV_MODE = 0; }
             _ => {}
         }
     }
@@ -2000,33 +4176,40 @@ fn simulate_click(step: usize) {
 
 #[no_mangle]
 pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
-    print("[oobe] starting\n");
+    // 启动顺序调整：首帧渲染前**同步加载**向导超小子集（/fonts/oobe-cn.ttf
+    // 正文 + oobe-bold.ttf 标题，~380KB/867 字形，配合大块缓冲 brk 分配器
+    // TCG 慢宿主也秒级）——首帧即平滑 TTF，向导全程无点阵兜底闪现。
+    print("[oobe] 正在启动\n");
     mkdir_all();
 
     // 打开 /dev/fb0 并 mmap 到用户空间，直接绘制像素。
     if !fb_init() {
-        print("[oobe] /dev/fb0 mmap failed, no framebuffer\n");
+        print("[oobe] /dev/fb0 mmap 失败，无帧缓冲
+");
         unsafe { exit(1); }
     }
-    print("[oobe] framebuffer ");
+    print("[oobe] 帧缓冲 ");
     print_dec(unsafe { FB_W });
     print("x");
     print_dec(unsafe { FB_H });
-    print(" mapped\n");
+    print(" 已映射
+");
 
     // 初始化默认模块勾选
     unsafe {
-        for i in 0..17 {
+        for i in 0..MODULES.len() {
             MODULE_ON[i] = MODULES[i].default_on;
         }
         STEP = 0;
-        // 账号步骤默认值（可在输入框中修改）
+        // 各输入框默认值（可在输入框中修改）。
+        // 密码/胁迫密码不预填：留空由用户输入，避免默认“1234/9999”被直接
+        // 当作真实密码保存（校验要求 4-16 位且两次一致，未输入则无法通过）。
         USER_BUF[..4].copy_from_slice(b"user");
         USER_LEN = 4;
-        PASS_BUF[..4].copy_from_slice(b"1234");
-        PASS_LEN = 4;
-        CONFIRM_BUF[..4].copy_from_slice(b"1234");
-        CONFIRM_LEN = 4;
+        PASS_LEN = 0;
+        CONFIRM_LEN = 0;
+        DURESS_LEN = 0;
+        DURESS_CONFIRM_LEN = 0;
         FIELD_FOCUS = 0;
     }
 
@@ -2035,57 +4218,113 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     if input_fd < 0 {
         // 无输入设备（如 run-gui 无串口触摸）：回退为固定坐标模拟点击自动推进，
         // 与 launcher 的模拟点击 fallback 一致，避免 OOBE 永久挂起。
-        print("[input] /dev/input/event0 not ready, fallback to simulated taps\n");
+        print("[input] /dev/input/event0 未就绪，回退为模拟点击
+");
     } else {
-        print("[input] /dev/input/event0 ready\n");
+        print("[input] /dev/input/event0 就绪
+");
     }
 
     let mut step = 0usize;
     // 无输入设备时用固定坐标模拟点击自动推进（与 launcher 回退一致）。
     let simulated = input_fd < 0;
-    while step < 10 {
+    // 转场跟踪：from = 上一屏步骤；reverse = 返回导航（新页由上滑入）。
+    let mut from = 0usize;
+    let mut reverse = false;
+    let mut first_show = true;
+    while step < 13 {
         unsafe { STEP = step; }
-        // 进入账号步骤时默认聚焦用户名输入框。
-        if step == 6 {
+        // 新页面重渲染后，闲置呼吸基线快照需重新抓取。
+        idle_snap_invalidate();
+        // 切步骤：复位按钮按压/回弹状态，避免上一屏状态残留到新步骤。
+        btn_reset_all();
+        // 进入输入框步骤时默认聚焦第一个输入框。
+        if step == 6 || step == 8 || step == 9 {
             unsafe { FIELD_FOCUS = 0; }
         }
         log_step(step);
         if step == 4 {
             query_network();
         }
-                render();
-                flip();
-        
-        if step == 9 {
-            // 完成页：进入系统
-            print("[oobe] saving config...\n");
-            write_file("/data/oobe/.done", b"1");
-            print("[oobe] /data/oobe/.done created\n");
+        if first_show {
+            // 首次进入欢迎页：先同步加载 OOBE 超小子集（首帧即平滑 TTF，
+            // 全程无点阵闪现），再渲染首帧并触发启动画面淡出、播放入场动画。
+            load_fonts_sync();
+            render_and_flip();
+            splash_fade();
+            animate_welcome();
+            first_show = false;
+        } else {
+            // 其余步骤：ColorOS 15 交叉淡化 + 上滑转场。
+            transition_pages(from, step, reverse);
+        }
+        if step == 12 {
+            // 完成页：真实输入时等待用户点击「进入系统」（BTN_ENTER，
+            // handle_tap 已接线）；30 秒无输入自动进入，保证无人值守可推进。
+            if !simulated {
+                let _ = wait_for_tap_next_button();
+            }
+            // 进入系统（预加载桌面资源 -> 写 .done -> 退出）。
+            print("[oobe] 正在保存配置
+");
+            finish::enter_desktop();
+            print("[oobe] 正在进入桌面
+");
             break;
         }
 
+        // 仅「30 秒空闲自动推进」应用该步默认选择；用户点击推进时保留其选择
+        // （此前无条件 apply_step_defaults 会把用户刚选的语言/模块/主题/锁屏
+        // 方式等全部重置为默认值再保存，用户选择静默丢失）。
+        let mut use_defaults = false;
         if simulated {
             // 无输入设备：模拟点击「下一步」（应用该步默认选择），短暂停留后推进。
-                        simulate_click(step);
-                        sleep_ms(1500);
-                    } else {
+            simulate_click(step);
+            sleep_ms(300);
+        } else {
             // 等待用户点击「下一步」（真实输入，不自动跳过）
-                        let action = wait_for_tap_next_button();
-                        if action < 0 {
+            let action = wait_for_tap_next_button();
+            if action == 3 {
+                // 跳过：放弃当前步（不保存），直接进入完成页。
+                print("[oobe] 跳过当前步骤，直达完成页
+");
+                unsafe {
+                    // 锁屏密码步骤被跳过时不得留下「有 security_type 但无
+                    // security_hash」的配置 —— launcher 会开机即锁死且无法
+                    // 解锁。清空安全配置回到默认滑动解锁。
+                    if step == 8 {
+                        SEC_ENABLED = false;
+                        write_file("/data/oobe/security_type", b"");
+                    }
+                }
+                from = step;
+                reverse = false;
+                step = 12;
+                continue;
+            }
+            if action < 0 {
+                reverse = true;
+                from = step;
                 if step > 0 {
                     step -= 1;
                 }
                 continue;
             }
+            use_defaults = action == 4;
         }
 
+        if use_defaults {
             apply_step_defaults(step);
-            save_step(step);
+        }
+        save_step(step);
 
-            step += 1;
+        from = step;
+        reverse = false;
+        step += 1;
     }
 
-    print("[oobe] exiting\n");
+    print("[oobe] 正在退出
+");
     unsafe { exit(0); }
 }
 
@@ -2106,9 +4345,23 @@ global_asm!(
 );
 
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
     unsafe {
-        write_fd(2, b"PANIC: oobe\n");
+        write_fd(2, b"PANIC: oobe ");
+        if let Some(loc) = info.location() {
+            write_fd(2, loc.file().as_bytes());
+            write_fd(2, b":");
+            let mut buf = [0u8; 12];
+            let mut i = buf.len();
+            let mut n = loc.line() as u64;
+            while n > 0 {
+                i -= 1;
+                buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            write_fd(2, &buf[i..]);
+        }
+        write_fd(2, b"\n");
         syscall1(SYS_EXIT, 1);
     }
     loop {}

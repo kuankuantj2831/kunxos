@@ -48,7 +48,7 @@ pub fn init() {
     }
 }
 
-/// 阻塞发送单个字符（把 `\n` 转换为 `\r\n`）。
+/// 发送单个字符（把 `\n` 转换为 `\r\n`）；超时失败时静默丢弃该字符。
 pub fn send_byte(c: u8) {
     if c == b'\n' {
         send_byte_raw(b'\r');
@@ -56,15 +56,22 @@ pub fn send_byte(c: u8) {
     send_byte_raw(c);
 }
 
-/// 阻塞发送单个字符（不处理换行转换）。
-fn send_byte_raw(c: u8) {
-    // 等待发送 FIFO 非满（TXFF 位清零）
+/// 发送单个字符（不处理换行转换）；发送 FIFO 长时间不空（UART 挂起/不存在）
+/// 时超时返回 false，调用方容忍失败（丢弃该字符，避免 bootloader 死循环）。
+fn send_byte_raw(c: u8) -> bool {
+    let mut spins = 0usize;
+    // 等待发送 FIFO 非满（TXFF 位清零），带超时
     while unsafe { read_volatile((UART_BASE + UART_FR) as *const u32) } & FR_TXFF != 0 {
         core::hint::spin_loop();
+        spins += 1;
+        if spins > 100_000 {
+            return false;
+        }
     }
     unsafe {
         write_volatile((UART_BASE + UART_DR) as *mut u32, c as u32);
     }
+    true
 }
 
 /// 发送字符串。

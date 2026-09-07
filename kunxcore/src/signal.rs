@@ -86,8 +86,11 @@ pub fn set_action(pid: u32, sig: usize, act: Option<*const u8>) -> i32 {
     }
     if let Some(a) = act {
         unsafe {
+            // PAN 下 EL1 读用户 sigaction 需临时放行（无 PAN 时为空操作）
+            crate::mmu::uaccess_begin();
             let handler = *(a as *const u64);
             let mask = *((a as *const u8).add(24) as *const u64);
+            crate::mmu::uaccess_end();
             process::set_sig_handler(pid, sig, handler, mask);
         }
     }
@@ -104,12 +107,36 @@ pub fn handler_of(pid: u32, sig: usize) -> u64 {
 fn deliver(f: &mut TrapFrame, sig: usize, handler: u64) -> Option<u64> {
     let sp = f.sp_el0;
     let frame = sp.checked_sub(SIG_FRAME_SIZE as u64)?;
-    // 帧必须落在用户栈内（[USER_STACK_BASE, USER_STACK_TOP)）
-    if frame < vm::USER_STACK_BASE as u64 {
+    // 帧落在主线程用户栈内（[ASLR 随机化栈底, 栈顶)）时按栈边界快速通过。
+    // CLONE_THREAD 工作线程的用户栈由用户态 mmap/堆分配，不在主栈 ASLR 区间
+    // 内 —— 此前仅按主栈边界校验，工作线程收信号一律判「栈越界」→ 按默认
+    // 动作误杀。放宽为：或全帧落在用户空间 [PAGE_SIZE, USER_TOP) 内（逐页
+    // 已映射可写由下方 ensure_user_range_writable 强制，LAZY 落地/COW break
+    // 亦由其完成）。内核完整性不受影响：帧只写用户页，USER_TOP 之上的内核
+    // 恒等映射区仍然被拒。
+    let stack_base = crate::elf::current_stack_base() as u64;
+    let stack_top = crate::elf::current_stack_top() as u64;
+    let in_main_stack = frame >= stack_base
+        && frame.checked_add(SIG_FRAME_SIZE as u64).map_or(false, |e| e <= stack_top);
+    let in_user_space = frame >= vm::PAGE_SIZE as u64
+        && frame
+            .checked_add(SIG_FRAME_SIZE as u64)
+            .map_or(false, |e| e <= crate::linux_compat::USER_TOP as u64);
+    if !in_main_stack && !in_user_space {
         return None;
     }
-    // 写入信号帧（逐字段拷贝，等效 copy_to_user）
+    // ★ 内核写用户帧前必须**逐页**校验「已映射且可写」（此前只检查帧落在栈区间内）：
+    // 帧所在页若是 COW 共享页（fork 后页表映射只读）或 LAZY 未落地预留页，EL1 直接
+    // 写会触发 permission/translation fault → 同步异常处理器死循环 → 整机挂死
+    // （任意用户进程可经「注册 handler + 触发信号」路径单方面挂死内核）。
+    // ensure_user_range_writable 会先落地 LAZY 页、break COW 页为私有可写、把共享
+    // 只读页复制为私有副本；任一页失败则本次信号不投递（按默认动作处理）。
+    if !crate::process::ensure_user_range_writable(frame as usize, SIG_FRAME_SIZE) {
+        return None;
+    }
+    // 写入信号帧（逐字段拷贝，等效 copy_to_user；PAN 下需 uaccess 放行）
     let bytes = frame as usize;
+    unsafe { crate::mmu::uaccess_begin() };
     for (i, v) in f.x.iter().enumerate() {
         unsafe { *((bytes + i * 8) as *mut u64) = *v };
     }
@@ -119,6 +146,7 @@ fn deliver(f: &mut TrapFrame, sig: usize, handler: u64) -> Option<u64> {
         *((bytes + OFF_SPSR) as *mut u64) = f.spsr;
         *((bytes + OFF_SIG) as *mut u64) = sig as u64;
     }
+    unsafe { crate::mmu::uaccess_end() };
     // 改写陷阱帧：进入 handler
     f.sp_el0 = frame;
     f.elr = handler;
@@ -141,10 +169,25 @@ pub fn handle_pending(f: &mut TrapFrame) -> bool {
             continue;
         }
         process::signal_clear(pid, sig as u32);
-        // 不可捕获/忽略：SIGKILL(9) 与 SIGSTOP(19) 直接终止
-        if sig == 9 || sig == 19 {
+        // 不可捕获/忽略的信号：
+        // - SIGKILL(9)：直接终止
+        // - SIGSTOP(19)：停止进程（应用后台/挂起语义），直到 SIGCONT。
+        //   停止发生在信号投递点（syscall 入口）：当前任务置为 Stopped
+        //   并切走，进程不再被调度；SIGCONT 由 sys_kill 调用
+        //   sched_cfs::cont_pid 唤醒（Stopped → Ready），随后从 stop_current
+        //   返回，本 syscall 继续执行。
+        if sig == 9 {
             process::exit(-1);
         }
+        if sig == 19 {
+            crate::sched_cfs::stop_current();
+            // SIGCONT 后从 stop_current 返回：清除 SIGSTOP 位（已在上方
+            // signal_clear），继续处理其余待处理信号（若 SIGCONT 也待处理，
+            // 其默认动作为继续，无需额外动作）。
+            continue;
+        }
+        // SIGCONT(18) 的恢复动作在发送方（sys_kill → cont_pid）完成；
+        // 若进程持有 SIGCONT 的 handler，此处按普通信号投递。
         let handler = process::sig_handler(pid, sig);
         if handler != 0 {
             if deliver(f, sig, handler).is_some() {
@@ -165,14 +208,27 @@ pub fn handle_pending(f: &mut TrapFrame) -> bool {
 /// 恢复后由 syscall 返回路径按 `f.elr` 返回到信号打断点。
 pub fn sigreturn(f: &mut TrapFrame) -> i64 {
     let frame = f.sp_el0 as usize;
-    // 帧应指向用户栈内的信号帧
-    if frame < vm::USER_STACK_BASE
-        || frame + 272 > vm::USER_STACK_TOP
+    // 帧应指向信号帧所在处：主线程用户栈区间，或工作线程栈（用户态 mmap，
+    // 不在主栈 ASLR 区间）—— 全帧须在用户空间 [0, USER_TOP) 内且已映射
+    // （deliver 侧同理放宽，否则工作线程 handler 返回永远恢复失败）。
+    let stack_base = crate::elf::current_stack_base();
+    let stack_top = crate::elf::current_stack_top();
+    let in_main_stack = frame >= stack_base && frame + 272 <= stack_top;
+    let in_user_space = frame >= vm::PAGE_SIZE
+        && frame.checked_add(272).map_or(false, |e| e <= crate::linux_compat::USER_TOP as usize);
+    if (!in_main_stack && !in_user_space)
         || !vm::user_range_mapped(process::current_root(), frame, 272)
     {
         return -1;
     }
+    // LAZY 页兜底：帧范围若仍含预留未落地页，先落地（记录级校验已通过但页表
+    // 尚未映射时 EL1 读会触发 translation fault 挂死内核）。
+    if !crate::process::ensure_user_range_mapped(frame, 272) {
+        return -1;
+    }
     unsafe {
+        // PAN 下 EL1 读用户信号帧需 uaccess 放行
+        crate::mmu::uaccess_begin();
         // 恢复 x0..x30
         for (i, slot) in f.x.iter_mut().enumerate() {
             *slot = *((frame + i * 8) as *const u64);
@@ -180,9 +236,21 @@ pub fn sigreturn(f: &mut TrapFrame) -> i64 {
         f.sp_el0 = *((frame + OFF_SP) as *const u64);
         f.elr = *((frame + OFF_ELR) as *const u64);
         f.spsr = *((frame + OFF_SPSR) as *const u64);
+        crate::mmu::uaccess_end();
     }
-    // 弹出信号帧：新栈顶 = 帧 + 288
-    f.sp_el0 += SIG_FRAME_SIZE as u64;
+    // ★ SPSR 清洗：帧内容完全由用户控制，若原样恢复 M[3:0]（如伪造 EL1h），
+    // eret 会以 EL1 特权返回用户地址 —— 指令中止直接挂死内核（无条件
+    // DoS）。信号帧只在 EL0 间跳转，强制 EL0t（M[3:0]=0），保留 NZCV 标志。
+    // 同时清 DAIF（bit 9:6）：AArch64 的 EL0 可直接 `msr daifset` 屏蔽中断，
+    // 伪造帧携带 DAIF=0xF 会让 eret 后的 EL0 吞掉全部定时器 tick（单核整机
+    // 冻结）；SS/IL（bit 21/20）为单步/非法异常状态位，同样不得从用户帧恢复。
+    // syscall_return_restore 的 eret 路径另有同款硬件掩码兜底。
+    f.spsr &= !(0xF | (0xF << 6) | (1 << 20) | (1 << 21));
+    // 注意：上面 `f.sp_el0 = *(frame + OFF_SP)` 恢复的就是被打断时的原始
+    // 栈指针（deliver 把 sp 而非帧地址存进 OFF_SP），信号帧本身位于原始 sp
+    // 下方、随 sp 恢复已被隐式"弹出"。此处绝不能再 `+= SIG_FRAME_SIZE`，
+    // 否则每次信号处理返回用户栈就永久上漂 288 字节，叠加数次后
+    // 被打断函数的尾声从错误槽位恢复 x29/x30 → ret 到垃圾地址。
     0
 }
 
@@ -196,16 +264,26 @@ pub fn rt_sigaction_syscall(f: &mut TrapFrame) -> i64 {
     }
     let pid = process::current_pid();
     if old != 0 {
-        if !vm::user_range_mapped(process::current_root(), old as usize, 32) {
+        // old 是内核写入目标：只查"已映射"不够 —— RO 页/COW 未断页在 EL1
+        // 裸写会权限故障 panic（或污染共享 COW 页）。必须走可写校验
+        // （含 COW break）。
+        if old >= crate::linux_compat::USER_TOP
+            || old.checked_add(32).map_or(true, |e| e > crate::linux_compat::USER_TOP)
+            || !process::ensure_user_range_writable(old as usize, 32)
+            || !vm::user_range_mapped(process::current_root(), old as usize, 32)
+        {
             return -14; // EFAULT
         }
         let h = process::sig_handler(pid, sig);
         let m = process::sig_mask(pid, sig);
         unsafe {
+            // PAN 下写用户 old sigaction 槽位需 uaccess 放行
+            crate::mmu::uaccess_begin();
             *((old as usize) as *mut u64) = h;
             *(((old as usize) + 8) as *mut u64) = 0; // flags
             *(((old as usize) + 16) as *mut u64) = 0; // restorer
             *(((old as usize) + 24) as *mut u64) = m;
+            crate::mmu::uaccess_end();
         }
     }
     if act != 0 {

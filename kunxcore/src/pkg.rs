@@ -31,6 +31,11 @@ const NAME_MAX: usize = 28;
 const MAX_RES: usize = 8;
 /// 资源名单串长度上限。
 const RES_NAME_MAX: usize = 64;
+/// 文件系统单条目录名上限（对应 `fs_simple::MAX_NAME = 27`）。
+///
+/// 包内可以携带更长名字，但写盘时 `fs_create` 会拒绝超长名字，
+/// 若等到写资源阶段才发现，会让 /bin、/pkg 文件半安装残留，这里保持一致。
+const FS_NAME_MAX: usize = 27;
 
 /// 校验包名/资源名：仅允许 `[A-Za-z0-9_-]`，拒绝路径分隔符、`.`、`..` 与 NUL，
 /// 防止 `/bin/../evil` 之类的路径穿越与任意文件写。
@@ -283,6 +288,31 @@ pub fn install(pkg: &Pkg, data: &[u8]) -> i32 {
         return -1;
     }
 
+    // 先整体校验资源区：名字超文件系统上限（MAX_NAME=27）或非法时直接拒绝，
+    // 避免「先写 /bin、/pkg 再到写资源阶段才失败」造成半安装包残留。
+    let mut off = pkg.res_off;
+    for _ in 0..pkg.res_count {
+        if off + 8 > data.len() {
+            return -1;
+        }
+        let rnl = get_u32(data, off) as usize;
+        off += 4;
+        let rdl = get_u32(data, off) as usize;
+        off += 4;
+        if off + rnl + rdl > data.len() || rnl == 0 {
+            return -1;
+        }
+        let rname = &data[off..off + rnl];
+        if rnl > FS_NAME_MAX {
+            return -1; // 资源名超 FS 上限：文件系统会拒绝创建目录项
+        }
+        let rname_str = core::str::from_utf8(rname).unwrap_or("");
+        if !valid_res_name(rname_str) {
+            return -1;
+        }
+        off += rnl + rdl;
+    }
+
     vfs::mkdir("/bin");
     vfs::mkdir("/pkg");
     vfs::mkdir("/res");
@@ -298,22 +328,25 @@ pub fn install(pkg: &Pkg, data: &[u8]) -> i32 {
     // manifest → /pkg/<name>.mf
     join(&mut path, "/pkg/", name, ".mf");
     if write_file(path_str(&path), &data[pkg.man_off..pkg.man_off + pkg.man_len]) != 0 {
+        // 回滚已写的 /bin/<name>
+        join(&mut path, "/bin/", name, "");
+        vfs::unlink(path_str(&path));
         return -1;
     }
 
     // 资源 → /res/<name>/<resname>
-    // 路径最长："/res/" + 28（包名）+ "/" + 64（资源名）= 99 字节（含 NUL）
+    // 路径最长："/res/" + 28（包名）+ "/" + 27（资源名）= 62 字节（含 NUL）
     let mut off = pkg.res_off;
     for _ in 0..pkg.res_count {
         if off + 8 > data.len() {
-            return -1;
+            break;
         }
         let rnl = get_u32(data, off) as usize;
         off += 4;
         let rdl = get_u32(data, off) as usize;
         off += 4;
         if off + rnl + rdl > data.len() {
-            return -1;
+            break;
         }
         let rname = &data[off..off + rnl];
         off += rnl;
@@ -321,18 +354,57 @@ pub fn install(pkg: &Pkg, data: &[u8]) -> i32 {
         off += rdl;
 
         let rname_str = core::str::from_utf8(rname).unwrap_or("");
-        if !valid_res_name(rname_str) {
-            return -1;
+        if rnl == 0 || rnl > FS_NAME_MAX || !valid_res_name(rname_str) {
+            break; // 防御：预检已保证合法，此处不写
         }
         // /res/<name>
         join(&mut path, "/res/", name, "");
         vfs::mkdir(path_str(&path));
-        // /res/<name>/<resname>（full 容量 ≥ 99，容纳最长路径）
+        // /res/<name>/<resname>
         join(&mut path, "/res/", name, "/");
         let base = path_str(&path);
         let mut full = [0u8; 128];
         join(&mut full, base, rname_str, "");
         if write_file(path_str(&full), rdata) != 0 {
+            // 回滚：删除已写的 /bin、/pkg 文件与本包已写入的 /res/<name>/
+            // 资源（复用 uninstall 的枚举删除；此前残留的半包资源会在
+            // 重装同名包时与新文件混装）
+            join(&mut path, "/bin/", name, "");
+            vfs::unlink(path_str(&path));
+            join(&mut path, "/pkg/", name, ".mf");
+            vfs::unlink(path_str(&path));
+            let mut resdir = [0u8; 96];
+            join(&mut resdir, "/res/", name, "");
+            let dir = path_str(&resdir);
+            let mut entry = [0u8; 32];
+            let mut idx = 0usize;
+            let mut fails = 0usize;
+            loop {
+                let ino = vfs::readdir(dir, idx, &mut entry);
+                if ino < 0 {
+                    break;
+                }
+                let elen = entry.iter().position(|&c| c == 0).unwrap_or(entry.len());
+                let ename = core::str::from_utf8(&entry[..elen]).unwrap_or("");
+                if ename == "." || ename == ".." {
+                    idx += 1;
+                    continue;
+                }
+                let mut full2 = [0u8; 128];
+                join(&mut full2, dir, "/", "");
+                let base2 = path_str(&full2);
+                let mut full3 = [0u8; 128];
+                join(&mut full3, base2, ename, "");
+                let del = vfs::unlink(path_str(&full3));
+                // 删除成功不递增 idx（条目前移）；失败递增跳过，防死循环
+                if del != 0 {
+                    idx += 1;
+                    fails += 1;
+                    if fails > 64 {
+                        break;
+                    }
+                }
+            }
             return -1;
         }
     }
@@ -342,7 +414,9 @@ pub fn install(pkg: &Pkg, data: &[u8]) -> i32 {
 
 /// 卸载包：删除 `/bin/<name>`、`/pkg/<name>.mf` 及 `/res/<name>/` 下内容。
 pub fn uninstall(name: &str) -> i32 {
-    if name.is_empty() {
+    // 包名直接拼进绝对路径，不做白名单校验时 `pkg uninstall ../../etc/hosts`
+    // 会经真实的 `..` 目录项解析删除任意文件 —— 与 install 同等对待。
+    if !valid_name(name) {
         return -1;
     }
     let mut path = [0u8; 96];
@@ -358,6 +432,7 @@ pub fn uninstall(name: &str) -> i32 {
     let dir = path_str(&path);
     let mut entry = [0u8; 32];
     let mut idx = 0usize;
+    let mut fails = 0usize;
     loop {
         let ino = vfs::readdir(dir, idx, &mut entry);
         if ino < 0 {
@@ -374,8 +449,17 @@ pub fn uninstall(name: &str) -> i32 {
         let base = path_str(&full);
         let mut full2 = [0u8; 96];
         join(&mut full2, base, ename, "");
-        vfs::unlink(path_str(&full2));
-        // 删除后条目序号整体前移：不递增 idx，同一位置重读，避免跳过一半条目
+        let del = vfs::unlink(path_str(&full2));
+        // 删除成功后条目序号整体前移：不递增 idx，同一位置重读，避免跳过一半
+        // 条目。★ 删除失败（文件仍打开/子目录/介质错误）必须递增 idx 跳过并
+        // 计数，否则同一失败条目无限重读 → 内核任务死循环挂起。
+        if del != 0 {
+            idx += 1;
+            fails += 1;
+            if fails > 64 {
+                break;
+            }
+        }
     }
 
     0

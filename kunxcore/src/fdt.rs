@@ -100,7 +100,10 @@ impl Fdt {
                 len += 1;
             }
             if p + len >= self.struct_end {
-                return ("", p); // 无终止符：损坏
+                // 无终止符：损坏。必须至少前进 4 字节，否则 `skip_subtree`/`search`
+                // 对同一地址反复解析同一 token → 深度只增不减的死循环（启动挂死）。
+                let adv = 4usize.min(self.struct_end.saturating_sub(p).max(1));
+                return ("", p + adv);
             }
             // 安全 UTF-8 校验（DTB 属性名可能含任意字节；from_utf8_unchecked 为 UB）
             let raw = slice::from_raw_parts(p as *const u8, len);

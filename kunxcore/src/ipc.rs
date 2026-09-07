@@ -69,6 +69,11 @@ struct Pipe {
     /// close/exit -1，归零才释放槽位 —— 防止 fork 子进程退出时把父进程仍在
     /// 使用的管道整槽清空，也防止 close 泄漏槽位）。
     refs: u32,
+    /// 存活的**读端 fd** 数（EOF 判定）：写端全部关闭后读者醒来发现
+    /// `readers == 0 && writers`（见下）……实际含义见注释：`readers`
+    /// 统计仍打开的读端 fd，`writers` 统计仍打开的写端 fd。
+    readers: u32,
+    writers: u32,
     reader_wait: [Option<u32>; WAITERS], // 阻塞中的读线程（多等待者）
     writer_wait: [Option<u32>; WAITERS], // 阻塞中的写线程（多等待者）
 }
@@ -82,6 +87,8 @@ impl Pipe {
             tail: 0,
             count: 0,
             refs: 0,
+            readers: 0,
+            writers: 0,
             reader_wait: [None; WAITERS],
             writer_wait: [None; WAITERS],
         }
@@ -99,9 +106,15 @@ struct Msg {
     data: [u8; MSG_SIZE],
     len: usize,
     prio: i32,
+    /// 全局入队序号：同优先级按 FIFO 选择（槽位复用会打乱下标序，
+    /// 必须按序号判定先后）。
+    seq: u64,
 }
 
-const EMPTY_MSG: Msg = Msg { used: false, data: [0; MSG_SIZE], len: 0, prio: 0 };
+/// 全局消息序号计数器（msgq_send 内屏蔽 IRQ 下递增）。
+static mut MSG_SEQ: u64 = 0;
+
+const EMPTY_MSG: Msg = Msg { used: false, data: [0; MSG_SIZE], len: 0, prio: 0, seq: 0 };
 
 /// 消息队列：固定槽位 + 优先级。
 struct MsgQueue {
@@ -221,6 +234,8 @@ pub fn pipe_create() -> (i32, i32) {
     };
     unsafe {
         PIPES[idx].refs = 2; // 读端 + 写端两个 fd
+        PIPES[idx].readers = 1;
+        PIPES[idx].writers = 1;
     }
     let rfd = process::alloc_fd(FdKind::Pipe, idx, FD_READ);
     let wfd = process::alloc_fd(FdKind::Pipe, idx, FD_WRITE);
@@ -252,9 +267,21 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
         // 缓冲满：登记并阻塞（block_current 内部管理 DAIF，返回时恢复 IRQ）
         while unsafe { PIPES[idx].count == PIPE_BUF } {
             unsafe {
-                if !wait_reg(&mut PIPES[idx].writer_wait, sched_cfs::current_tid()) {
+                // ★ EPIPE 语义：所有读端 fd 已关闭（readers == 0）或槽位已清空
+                // （used == false，refs 归零）时，写者不应再等待——此前只检查
+                // 缓冲满、读者全部关闭后写者永久挂起。
+                if !PIPES[idx].used || PIPES[idx].readers == 0 {
                     asm!("msr daifclr, #2");
                     return written;
+                }
+                if !wait_reg(&mut PIPES[idx].writer_wait, sched_cfs::current_tid()) {
+                    // 等待者表满（≥5 并发等待者）：让出 CPU 后重试登记。
+                    // 此前直接 return written —— written==0 时被调用方误判
+                    // 为"写入 0 字节成功"，实际数据未写。
+                    asm!("msr daifclr, #2");
+                    sched_cfs::yield_now();
+                    asm!("msr daifset, #2");
+                    continue;
                 }
             }
             sched_cfs::block_current();
@@ -262,6 +289,11 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
         }
         unsafe {
             let pipe = &mut PIPES[idx];
+            if !pipe.used || pipe.readers == 0 {
+                // 等待期间对端全部关闭：不再写入
+                asm!("msr daifclr, #2");
+                return written;
+            }
             pipe.buf[pipe.tail] = data[written];
             pipe.tail = (pipe.tail + 1) % PIPE_BUF;
             pipe.count += 1;
@@ -288,16 +320,25 @@ pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
     }
     let idx = entry.index;
     unsafe { asm!("msr daifset, #2") };
-    // 阻塞直到至少 1 字节
-    while unsafe { PIPES[idx].count == 0 } {
+    // 阻塞直到至少 1 字节；所有写端关闭（writers == 0）或槽位清空 = EOF。
+    while unsafe { PIPES[idx].count == 0 && PIPES[idx].used && PIPES[idx].writers > 0 } {
         unsafe {
             if !wait_reg(&mut PIPES[idx].reader_wait, sched_cfs::current_tid()) {
+                // 等待者表满：让出 CPU 后重试登记。此前 return 0 会被应用
+                // 当作 EOF（管道关闭），实际只是并发读者过多。
                 asm!("msr daifclr, #2");
-                return 0;
+                sched_cfs::yield_now();
+                asm!("msr daifset, #2");
+                continue;
             }
         }
         sched_cfs::block_current();
         unsafe { asm!("msr daifset, #2") };
+    }
+    // EOF：槽位已清空或写端全部关闭且无数据 → 返回 0（read 的 EOF 语义）
+    if unsafe { !PIPES[idx].used || (PIPES[idx].count == 0 && PIPES[idx].writers == 0) } {
+        unsafe { asm!("msr daifclr, #2") };
+        return 0;
     }
     // 读取当前全部可读字节（不超过 out.len()），原子完成
     let n = out.len().min(unsafe { PIPES[idx].count });
@@ -336,7 +377,9 @@ pub fn msgq_create() -> i32 {
 
 /// 发送一条消息（`data` 长度不超过 `MSG_SIZE`），返回发送字节数；队满时阻塞。
 ///
-/// 临界区屏蔽 IRQ（同 [`pipe_write`]）。
+/// 临界区屏蔽 IRQ（同 [`pipe_write`]）。每轮阻塞唤醒后重查槽位 `used`：
+/// 队列在等待期间可能被最后一方 close 清空复用（此前把消息写进已关闭/
+/// 复用的队列并报成功——假成功）。
 pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::MsgQueue => e,
@@ -345,6 +388,11 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
     let len = data.len().min(MSG_SIZE);
     unsafe { asm!("msr daifset, #2") };
     loop {
+        // 阻塞唤醒后槽位可能已被清空：按发送失败处理（0 字节）
+        if !unsafe { QUEUES[entry.index].used } {
+            unsafe { asm!("msr daifclr, #2") };
+            return 0;
+        }
         let slot = unsafe {
             let q = &mut QUEUES[entry.index];
             q.msgs.iter().position(|m| !m.used)
@@ -352,9 +400,11 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
         match slot {
             Some(s) => unsafe {
                 let q = &mut QUEUES[entry.index];
+                MSG_SEQ = MSG_SEQ.wrapping_add(1);
                 q.msgs[s].used = true;
                 q.msgs[s].len = len;
                 q.msgs[s].prio = prio;
+                q.msgs[s].seq = MSG_SEQ;
                 q.msgs[s].data[..len].copy_from_slice(&data[..len]);
                 // 唤醒全部等待中的接收者（多接收者场景不丢唤醒）
                 wait_wake(&mut q.recv_wait);
@@ -365,8 +415,12 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
                 // 队满：登记并阻塞
                 unsafe {
                     if !wait_reg(&mut QUEUES[entry.index].send_wait, sched_cfs::current_tid()) {
+                        // 等待者表满：让出重试。此前 return 0 被调用方当作
+                        // "发送成功 0 字节"，实际消息未入队。
                         asm!("msr daifclr, #2");
-                        return 0;
+                        sched_cfs::yield_now();
+                        asm!("msr daifset, #2");
+                        continue;
                     }
                 }
                 sched_cfs::block_current();
@@ -378,7 +432,8 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
 
 /// 接收一条消息（取当前最高优先级，同优先级 FIFO），返回消息长度；队空时阻塞。
 ///
-/// 临界区屏蔽 IRQ（同 [`pipe_write`]）。
+/// 临界区屏蔽 IRQ（同 [`pipe_write`]）。每轮阻塞唤醒后重查槽位 `used`：
+/// 队列被最后一方 close 清空时返回 EOF（(0, 0)），不再重新登记永久阻塞。
 pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::MsgQueue => e,
@@ -386,7 +441,12 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
     };
     unsafe { asm!("msr daifset, #2") };
     loop {
-        // 找出最高优先级、且最早入队的消息
+        if !unsafe { QUEUES[entry.index].used } {
+            // 队列已关闭：EOF 语义
+            unsafe { asm!("msr daifclr, #2") };
+            return (0, 0);
+        }
+        // 找出最高优先级、同优先级最早入队（按 seq）的消息
         let slot = unsafe {
             let q = &QUEUES[entry.index];
             let mut best: Option<usize> = None;
@@ -397,7 +457,9 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
                 match best {
                     None => best = Some(i),
                     Some(b) => {
-                        if q.msgs[i].prio > q.msgs[b].prio {
+                        if q.msgs[i].prio > q.msgs[b].prio
+                            || (q.msgs[i].prio == q.msgs[b].prio && q.msgs[i].seq < q.msgs[b].seq)
+                        {
                             best = Some(i);
                         }
                     }
@@ -420,8 +482,12 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
             None => {
                 unsafe {
                     if !wait_reg(&mut QUEUES[entry.index].recv_wait, sched_cfs::current_tid()) {
+                        // 等待者表满：让出重试。此前 return (0,0) 被调用方
+                        // 当作"空消息成功"，实际队非空只是并发读者过多。
                         asm!("msr daifclr, #2");
-                        return (0, 0);
+                        sched_cfs::yield_now();
+                        asm!("msr daifset, #2");
+                        continue;
                     }
                 }
                 sched_cfs::block_current();
@@ -479,18 +545,27 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
     }
     unsafe {
         let mut recorded = false;
+        let mut free_slot = false;
         for m in SHMS[entry.index].maps.iter_mut() {
             if m.0 == pid && m.1 == vaddr {
-                recorded = true; // 本进程已映射同一地址：不重复计数
+                recorded = true; // 同一进程同一地址重复映射：保持幂等，不重复计数
                 break;
             }
             if m.0 == 0 {
                 *m = (pid, vaddr);
-                recorded = true;
+                free_slot = true;
                 break;
             }
         }
-        if recorded {
+        // ★ 映射记录表已满（MAX_SHM_MAPS）且本 (pid,vaddr) 未登记：此前仍继续
+        // 建立页表映射但不加入记录——刷新引用归零后该进程页表仍引用已释放的
+        // 物理页（use-after-free）。记录表满时**拒绝本次映射**，不留无记录映射。
+        if !recorded && !free_slot {
+            return 0;
+        }
+        // 只对「新登记」+1：已登记（幂等重复映射）不重复计数——此前重复映射会
+        // 虚增 refs，最终 shm 槽与物理页永不被释放（泄漏）。
+        if free_slot {
             SHMS[entry.index].refs = SHMS[entry.index].refs.saturating_add(1);
         }
     }
@@ -506,79 +581,135 @@ pub fn shm_attach(fd: i32, vaddr: usize) -> usize {
 
 /// 增加共享内存引用计数（供 fork 复制 fd 表时调用，防止子进程 close 导致提前释放）。
 pub fn shm_add_ref(index: usize) {
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         if index < MAX_SHMS && SHMS[index].used {
             SHMS[index].refs = SHMS[index].refs.saturating_add(1);
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
-/// 按下标释放一个共享内存引用（进程退出清理 fd 时调用）。
+/// 按下标释放共享内存引用（进程退出/回收清理 fd 时调用）。
 ///
-/// `pid` 为退出进程：其页表已随 `reap` 销毁，映射自动解除，此处只清
-/// 映射记录（防 pid 复用后误 unmap）并减 fd 引用。
+/// `pid` 为退出进程：其页表已随 `reap` 销毁，映射自动解除，此处清
+/// 映射记录并归还引用。★ 引用必须**逐映射记录**归还（`shm_map` 对每个
+/// 新登记映射 +1）：此前只减 1 次 fd 引用，"create → map → exit" 一次
+/// 即永久泄漏 1 个引用，MAX_SHMS 槽位耗尽后 shm_create 永久失败。
 pub fn shm_close_index(pid: u32, index: usize) {
     if index >= MAX_SHMS {
         return;
     }
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         let s = &mut SHMS[index];
         if !s.used || s.refs == 0 {
+            asm!("msr daifclr, #2");
             return;
         }
-        // 清掉该进程的映射记录（页表已销毁，无需 unmap）
+        // 清掉该进程的映射记录（页表已销毁，无需 unmap），并按清除的
+        // 映射数归还引用（与 shm_map 的逐映射 +1 对账）。
+        let mut maps_released = 0usize;
         for m in s.maps.iter_mut() {
             if m.0 == pid {
                 m.0 = 0;
                 m.1 = 0;
+                maps_released += 1;
             }
         }
-        s.refs -= 1;
+        // fd 引用 -1（本 fd 本身），再按映射数归还
+        let total = 1usize.saturating_add(maps_released);
+        s.refs = s.refs.saturating_sub(total as u32);
         if s.refs == 0 {
             crate::allocator::free_page(s.page);
             *s = Shm::empty();
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 /// 增加管道引用计数（fork/dup 复制 fd 时调用，防止子进程退出清空父进程管道）。
-pub fn pipe_add_ref(index: usize) {
+/// `is_write` 区分该 fd 是写端还是读端：EOF/EPIPE 判定按「对端 fd 是否全部
+/// 关闭」进行，而不只是总引用归零——只关写端也必须唤醒等 EOF 的读者。
+pub fn pipe_add_ref(index: usize, is_write: bool) {
     if index < MAX_PIPES {
+        // 引用计数为普通读-改-写：调用点（fork/dup）处于 IRQ 使能的任务
+        // 上下文，被 tick 抢占后另一任务对同一管道并发 add/drop 会丢更新
+        // → 槽位泄漏或提前清空。与 pipe_write 同款屏蔽。
+        unsafe { asm!("msr daifset, #2") };
         unsafe {
             if PIPES[index].used {
                 PIPES[index].refs = PIPES[index].refs.saturating_add(1);
+                if is_write {
+                    PIPES[index].writers = PIPES[index].writers.saturating_add(1);
+                } else {
+                    PIPES[index].readers = PIPES[index].readers.saturating_add(1);
+                }
             }
         }
+        unsafe { asm!("msr daifclr, #2") };
     }
 }
 
-/// 释放一个管道引用（close/exit 时调用），引用归零才清空槽位。
-pub fn pipe_drop_ref(index: usize) {
+/// 释放一个管道引用（close/exit 时调用）。`is_write` 标记该 fd 端。
+///
+/// 三方语义：
+/// - 最后一个**写端**关闭（`writers` 归零而读者仍在）→ 唤醒全部读者，
+///   读者醒来发现 `writers == 0` 按 EOF（0 字节）返回（此前只关写端不
+///   唤醒，读空的读者永久挂起）；槽位在 `refs` 归零后仍会清空。
+/// - 最后一个**读端**关闭 → 唤醒全部写者，写者返回 EPIPE（写计数停止）。
+/// - `refs` 归零（所有 fd 均已关闭）→ 清空槽位（两侧等候者同时唤醒）。
+pub fn pipe_drop_ref(index: usize, is_write: bool) {
     if index >= MAX_PIPES {
         return;
     }
+    // 引用计数/端计数为普通读-改-写，且尾部要唤醒等待者：全程屏蔽 IRQ
+    // （fork 回滚、reap、close 收尾都在 IRQ 使能上下文，并发 drop 丢一次
+    // 递减 → 槽位与其中的等待者永久泄漏）。
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         let p = &mut PIPES[index];
         if !p.used {
+            asm!("msr daifclr, #2");
             return;
         }
         if p.refs > 0 {
             p.refs -= 1;
         }
+        if is_write {
+            if p.writers > 0 {
+                p.writers -= 1;
+            }
+        } else {
+            if p.readers > 0 {
+                p.readers -= 1;
+            }
+        }
+        if p.writers == 0 {
+            wait_wake(&mut p.reader_wait);
+        }
+        if p.readers == 0 {
+            wait_wake(&mut p.writer_wait);
+        }
         if p.refs == 0 {
+            wait_wake(&mut p.reader_wait);
+            wait_wake(&mut p.writer_wait);
             *p = Pipe::empty();
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 /// 增加消息队列引用计数（fork/dup 复制 fd 时调用）。
 pub fn msgq_add_ref(index: usize) {
     if index < MAX_QUEUES {
+        unsafe { asm!("msr daifset, #2") };
         unsafe {
             if QUEUES[index].used {
                 QUEUES[index].refs = QUEUES[index].refs.saturating_add(1);
             }
         }
+        unsafe { asm!("msr daifclr, #2") };
     }
 }
 
@@ -587,18 +718,26 @@ pub fn msgq_drop_ref(index: usize) {
     if index >= MAX_QUEUES {
         return;
     }
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         let q = &mut QUEUES[index];
         if !q.used {
+            asm!("msr daifclr, #2");
             return;
         }
         if q.refs > 0 {
             q.refs -= 1;
         }
         if q.refs == 0 {
+            // ★ 最后一方 close：唤醒阻塞中的收发线程（此前只清槽位不唤醒——
+            // 读空等消息的接收者 / 写满等槽位的发送者会永久挂起）。清空前
+            // 唤醒：接收者醒来见 used==false 返回 EOF，发送者返回错误。
+            wait_wake(&mut q.recv_wait);
+            wait_wake(&mut q.send_wait);
             *q = MsgQueue::empty();
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 /// 获取共享内存物理页地址（供内核态直接读写演示）。
@@ -691,6 +830,10 @@ struct PairSock {
     ring_b: PairRing,
     /// 指向本对象的 fd 数（两个用户 fd）。
     refs: u32,
+    /// 引用 side0 的 fd 数（写 ring_a / 读 ring_b）。
+    side0: u32,
+    /// 引用 side1 的 fd 数（写 ring_b / 读 ring_a）。
+    side1: u32,
 }
 
 impl PairSock {
@@ -700,6 +843,8 @@ impl PairSock {
             ring_a: PairRing::empty(),
             ring_b: PairRing::empty(),
             refs: 0,
+            side0: 0,
+            side1: 0,
         }
     }
 }
@@ -726,6 +871,8 @@ pub fn socketpair_create() -> (i32, i32) {
     };
     unsafe {
         PAIRS[idx].refs = 2;
+        PAIRS[idx].side0 = 1;
+        PAIRS[idx].side1 = 1;
     }
     let f0 = process::alloc_fd(FdKind::Pair, idx, 0);
     let f1 = process::alloc_fd(FdKind::Pair, idx, 1);
@@ -739,99 +886,48 @@ pub fn socketpair_create() -> (i32, i32) {
     (f0, f1)
 }
 
-/// 取 side 的写环（对方读）与读环（对方写）。
-fn pair_rings(idx: usize, side: u32) -> (*mut PairRing, *mut PairRing) {
+/// 取 side 的写环（对方读）：side0 写 ring_a，side1 写 ring_b。
+///
+/// 每次访问都从 `PAIRS[idx]` 重新取引用——阻塞唤醒后槽位可能已被
+/// `pair_drop_ref` 清空并被新 `socketpair_create` 复用，跨阻塞持有裸指针
+/// 会把数据写进新连接的环（跨连接串扰）。
+fn pair_write_ring(idx: usize, side: usize) -> &'static mut PairRing {
     unsafe {
         if side == 0 {
-            (&mut PAIRS[idx].ring_a as *mut PairRing, &mut PAIRS[idx].ring_b as *mut PairRing)
+            &mut PAIRS[idx].ring_a
         } else {
-            (&mut PAIRS[idx].ring_b as *mut PairRing, &mut PAIRS[idx].ring_a as *mut PairRing)
+            &mut PAIRS[idx].ring_b
         }
     }
 }
 
-fn ring_write(ring: &mut PairRing, data: &[u8], saved: u64) -> usize {
-    // 调用方已屏蔽 IRQ；循环写入直至全部写入（写满时登记等待并阻塞）
-    let mut written = 0usize;
-    while written < data.len() {
-        let n = (data.len() - written).min(PAIR_BUF - ring.count);
-        if n == 0 {
-            // 缓冲满：登记写等待并阻塞
-            let cur = sched_cfs::current_tid();
-            let mut reg = false;
-            for w in ring.write_wait.iter_mut() {
-                if w.is_none() {
-                    *w = Some(cur);
-                    reg = true;
-                    break;
-                }
-            }
-            if !reg {
-                unsafe {
-                    crate::sched_cfs::write_daif(saved);
-                    crate::sched_cfs::yield_now();
-                    crate::sched_cfs::write_daif(saved);
-                }
-                continue;
-            }
-            unsafe {
-                crate::sched_cfs::write_daif(saved);
-                sched_cfs::block_current();
-                crate::sched_cfs::write_daif(saved);
-            }
-            continue;
-        }
-        for i in 0..n {
-            ring.buf[(ring.tail + i) % PAIR_BUF] = data[written + i];
-        }
-        ring.tail = (ring.tail + n) % PAIR_BUF;
-        ring.count += n;
-        written += n;
-        wait_wake(&mut ring.read_wait);
-    }
-    written
-}
-
-fn ring_read(ring: &mut PairRing, out: &mut [u8], saved: u64) -> usize {
-    // 调用方已屏蔽 IRQ
-    loop {
-        if ring.count > 0 {
-            let n = out.len().min(ring.count);
-            for i in 0..n {
-                out[i] = ring.buf[(ring.head + i) % PAIR_BUF];
-            }
-            ring.head = (ring.head + n) % PAIR_BUF;
-            ring.count -= n;
-            wait_wake(&mut ring.write_wait);
-            return n;
-        }
-        // 空缓冲：登记读等待并阻塞
-        let cur = sched_cfs::current_tid();
-        let mut reg = false;
-        for w in ring.read_wait.iter_mut() {
-            if w.is_none() {
-                *w = Some(cur);
-                reg = true;
-                break;
-            }
-        }
-        if !reg {
-            unsafe {
-                crate::sched_cfs::write_daif(saved);
-                crate::sched_cfs::yield_now();
-                crate::sched_cfs::write_daif(saved);
-            }
-            continue;
-        }
-        unsafe {
-            crate::sched_cfs::write_daif(saved);
-            sched_cfs::block_current();
-            crate::sched_cfs::write_daif(saved);
+/// 取 side 的读环（对方写）：side0 读 ring_b，side1 读 ring_a。
+fn pair_read_ring(idx: usize, side: usize) -> &'static mut PairRing {
+    unsafe {
+        if side == 0 {
+            &mut PAIRS[idx].ring_b
+        } else {
+            &mut PAIRS[idx].ring_a
         }
     }
 }
 
-/// `socketpair` fd 写入：写入本方写环（对方读）。
+/// 对端 side 的 fd 计数：side0 的对端是 side1，反之亦然。
+fn pair_peer_count(idx: usize, side: usize) -> u32 {
+    unsafe {
+        if side == 0 {
+            PAIRS[idx].side1
+        } else {
+            PAIRS[idx].side0
+        }
+    }
+}
+
+/// `socketpair` fd 写入：写入本方写环（对方读）；写满时阻塞直至写完。
+///
+/// 与 [`pipe_write`] 同款临界区纪律：全程屏蔽 IRQ；每轮循环重查槽位
+/// `used` 与对端 fd 计数——对端全部关闭（EPIPE 语义）或槽位被清空复用
+/// 时立即返回已写字节数，不再等待（此前永久挂起或写进复用后的新连接）。
 pub fn pair_write(fd: i32, data: &[u8]) -> usize {
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::Pair => e,
@@ -840,48 +936,164 @@ pub fn pair_write(fd: i32, data: &[u8]) -> usize {
     if entry.index >= MAX_PAIRS {
         return 0;
     }
-    let (wring, _rring) = pair_rings(entry.index, entry.flags);
-    let saved = unsafe { crate::sched_cfs::read_daif() };
-    unsafe {
-        core::arch::asm!("msr daifset, #2");
-        let n = ring_write(&mut *wring, data, saved);
-        crate::sched_cfs::write_daif(saved);
-        n
+    let idx = entry.index;
+    let side = entry.flags as usize;
+    let mut written = 0usize;
+    unsafe { asm!("msr daifset, #2") };
+    while written < data.len() {
+        // 槽位已清空或对端 fd 全部关闭：停止写入（短写 = EPIPE 语义）
+        if !unsafe { PAIRS[idx].used } || pair_peer_count(idx, side) == 0 {
+            break;
+        }
+        let count = pair_write_ring(idx, side).count;
+        let n = (data.len() - written).min(PAIR_BUF - count);
+        if n == 0 {
+            // 缓冲满：登记写等待并阻塞（屏蔽窗口贯穿登记→阻塞，不丢唤醒）
+            if !wait_reg(&mut pair_write_ring(idx, side).write_wait, sched_cfs::current_tid()) {
+                // 等待者表满：让出 CPU 后重试登记
+                unsafe { asm!("msr daifclr, #2") };
+                sched_cfs::yield_now();
+                unsafe { asm!("msr daifset, #2") };
+                continue;
+            }
+            sched_cfs::block_current();
+            unsafe { asm!("msr daifset, #2") };
+            continue;
+        }
+        {
+            let ring = pair_write_ring(idx, side);
+            for i in 0..n {
+                ring.buf[(ring.tail + i) % PAIR_BUF] = data[written + i];
+            }
+            ring.tail = (ring.tail + n) % PAIR_BUF;
+            ring.count += n;
+        }
+        written += n;
+        wait_wake(&mut pair_read_ring(idx, side).read_wait);
     }
+    unsafe { asm!("msr daifclr, #2") };
+    written
 }
 
 /// `socketpair` fd 读取：从本方读环（对方写）取数据；空时阻塞。
+///
+/// 对端 fd 全部关闭或槽位清空且无数据 → 返回 0（EOF 语义，此前对端
+/// 关闭只减引用不唤醒，阻塞读者永久挂起）。
 pub fn pair_read(fd: i32, out: &mut [u8]) -> usize {
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::Pair => e,
         _ => return 0,
     };
-    if entry.index >= MAX_PAIRS {
+    if entry.index >= MAX_PAIRS || out.is_empty() {
         return 0;
     }
-    let (_wring, rring) = pair_rings(entry.index, entry.flags);
-    let saved = unsafe { crate::sched_cfs::read_daif() };
-    unsafe {
-        core::arch::asm!("msr daifset, #2");
-        let n = ring_read(&mut *rring, out, saved);
-        crate::sched_cfs::write_daif(saved);
-        n
+    let idx = entry.index;
+    let side = entry.flags as usize;
+    unsafe { asm!("msr daifset, #2") };
+    // 空缓冲且对端仍在：登记读等待并阻塞
+    while unsafe { PAIRS[idx].used && pair_peer_count(idx, side) > 0 && pair_read_ring(idx, side).count == 0 } {
+        if !wait_reg(&mut pair_read_ring(idx, side).read_wait, sched_cfs::current_tid()) {
+            // 等待者表满：让出 CPU 后重试登记
+            unsafe { asm!("msr daifclr, #2") };
+            sched_cfs::yield_now();
+            unsafe { asm!("msr daifset, #2") };
+            continue;
+        }
+        sched_cfs::block_current();
+        unsafe { asm!("msr daifset, #2") };
     }
+    // EOF：槽位已清空或对端 fd 全部关闭且无数据
+    if !unsafe { PAIRS[idx].used } {
+        unsafe { asm!("msr daifclr, #2") };
+        return 0;
+    }
+    let n = {
+        let ring = pair_read_ring(idx, side);
+        let n = out.len().min(ring.count);
+        for i in 0..n {
+            out[i] = ring.buf[(ring.head + i) % PAIR_BUF];
+        }
+        ring.head = (ring.head + n) % PAIR_BUF;
+        ring.count -= n;
+        n
+    };
+    wait_wake(&mut pair_write_ring(idx, side).write_wait);
+    unsafe { asm!("msr daifclr, #2") };
+    n
+}
+
+/// 增加套接字对引用计数（fork/dup 复制 fd 时调用，防子进程 close/exit
+/// 提前清空对端槽位 —— 与管道/消息队列同源的多进程生命周期问题）。
+/// `side` 为该 fd 的端（0/1），EOF/EPIPE 判定按「对端 fd 是否全部关闭」。
+pub fn pair_add_ref(index: usize, side: u32) {
+    if index >= MAX_PAIRS {
+        return;
+    }
+    unsafe { asm!("msr daifset, #2") };
+    unsafe {
+        if PAIRS[index].used {
+            PAIRS[index].refs = PAIRS[index].refs.saturating_add(1);
+            if side == 0 {
+                PAIRS[index].side0 = PAIRS[index].side0.saturating_add(1);
+            } else {
+                PAIRS[index].side1 = PAIRS[index].side1.saturating_add(1);
+            }
+        }
+    }
+    unsafe { asm!("msr daifclr, #2") };
+}
+
+/// 按下标释放一个套接字对引用（close/exit 时调用），引用归零才清空槽位。
+///
+/// 与 [`pipe_drop_ref`] 一致：一侧 fd 全部关闭时唤醒对端阻塞的读写线程
+/// （读者见 EOF、写者短写退出，此前只在 refs 归零时唤醒——对端关闭后
+/// 阻塞在空环/满环上的读写线程会永久挂起）。
+pub fn pair_drop_ref(index: usize, side: u32) {
+    if index >= MAX_PAIRS {
+        return;
+    }
+    unsafe { asm!("msr daifset, #2") };
+    unsafe {
+        let p = &mut PAIRS[index];
+        if !p.used {
+            asm!("msr daifclr, #2");
+            return;
+        }
+        if p.refs > 0 {
+            p.refs -= 1;
+        }
+        if side == 0 {
+            if p.side0 > 0 {
+                p.side0 -= 1;
+            }
+        } else {
+            if p.side1 > 0 {
+                p.side1 -= 1;
+            }
+        }
+        if p.refs == 0 {
+            wait_wake(&mut p.ring_a.read_wait);
+            wait_wake(&mut p.ring_a.write_wait);
+            wait_wake(&mut p.ring_b.read_wait);
+            wait_wake(&mut p.ring_b.write_wait);
+            *p = PairSock::empty();
+        } else if p.side0 == 0 || p.side1 == 0 {
+            // 某一侧 fd 全关：唤醒两侧等待者（对端读者醒来见 EOF/槽位判定，
+            // 对端写者醒来见 peer count == 0 短写退出）
+            wait_wake(&mut p.ring_a.read_wait);
+            wait_wake(&mut p.ring_a.write_wait);
+            wait_wake(&mut p.ring_b.read_wait);
+            wait_wake(&mut p.ring_b.write_wait);
+        }
+    }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 /// `socketpair` fd 关闭：引用计数 -1，归零释放槽位。
 pub fn pair_close(fd: i32) {
     if let Some(entry) = process::get_fd(fd) {
-        if entry.kind == FdKind::Pair && entry.index < MAX_PAIRS {
-            unsafe {
-                let p = &mut PAIRS[entry.index];
-                if p.refs > 0 {
-                    p.refs -= 1;
-                }
-                if p.refs == 0 {
-                    *p = PairSock::empty();
-                }
-            }
+        if entry.kind == FdKind::Pair {
+            pair_drop_ref(entry.index, entry.flags as u32);
         }
     }
 }

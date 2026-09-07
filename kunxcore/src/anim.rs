@@ -18,6 +18,23 @@ use core::arch::asm;
 
 use crate::compositor;
 use crate::timer;
+
+/// 屏蔽 IRQ 进入动画管理器临界区（ANIMS 槽位表）。
+///
+/// 槽位操作来自进程上下文（gesture / 窗口管理），而 `frame_tick` 由 CNTP
+/// IRQ 驱动并发遍历同一数组：槽位写入非原子，IRQ 打在写入中间会读到
+/// 半初始化的 `Anim`。保存 DAIF 后屏蔽（与 `compositor::irq_save` 同款），
+/// 调用方可能本身就在 IRQ 上下文，恢复式写回避免嵌套中断。
+unsafe fn irq_save() -> u64 {
+    let d: u64;
+    asm!("mrs {}, daif", out(reg) d);
+    asm!("msr daifset, #2");
+    d
+}
+
+unsafe fn irq_restore(saved: u64) {
+    asm!("msr daif, {}", in(reg) saved);
+}
 // ==================== 缓动曲线 ====================
 
 /// 缓动曲线（三次贝塞尔时序函数）。
@@ -61,8 +78,10 @@ impl Easing {
 
     /// 在进度 `t`（0..=1）处的曲线值（0..=1）。
     pub fn sample(self, t: f32) -> f32 {
+        // 钳位输入：越界的 x 会让 solve_x 的牛顿/二分外推（与
+        // shared/motion.rs 的 eval 行为保持一致）。
         let (x1, y1, x2, y2) = self.control_points();
-        solve_bezier(x1, y1, x2, y2, t)
+        solve_bezier(x1, y1, x2, y2, t.clamp(0.0, 1.0))
     }
 }
 
@@ -89,9 +108,11 @@ fn bezier_deriv(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
 fn solve_x(x1: f32, x2: f32, x: f32) -> f32 {
     const EPS: f32 = 1e-4;
     let mut t = x;
+    let mut converged = false;
     for _ in 0..8 {
         let err = bezier_sample(0.0, x1, x2, 1.0, t) - x;
         if err.abs() < EPS {
+            converged = true;
             break;
         }
         let d = bezier_deriv(0.0, x1, x2, 1.0, t);
@@ -100,9 +121,11 @@ fn solve_x(x1: f32, x2: f32, x: f32) -> f32 {
         }
         t -= err / d;
     }
-    // 二分细化，消除牛顿迭代的残余误差
-    let mut lo = 0.0f32;
-    let mut hi = 1.0f32;
+    if converged {
+        return t.clamp(0.0, 1.0);
+    }
+    // 二分细化，消除牛顿迭代的残余误差；用牛顿结果收窄区间。
+    let (mut lo, mut hi) = if t > x { (0.0f32, t.clamp(0.0, 1.0)) } else { (t.clamp(0.0, 1.0), 1.0f32) };
     for _ in 0..12 {
         let m = (lo + hi) * 0.5;
         if bezier_sample(0.0, x1, x2, 1.0, m) < x {
@@ -247,8 +270,8 @@ struct Anim {
     easing: Option<Easing>,
     // 物理型弹簧
     spring: Option<Spring>,
-    /// 完成回调（如链式动画 / 销毁窗口）。
-    on_finish: Option<fn()>,
+    /// 完成回调（参数为动画所属窗口 id，如链式动画 / 销毁窗口 / 重置 transform）。
+    on_finish: Option<fn(usize)>,
 }
 
 const EMPTY_ANIM: Anim = Anim {
@@ -281,11 +304,17 @@ pub fn tween(
     to: f32,
     dur_us: u64,
     easing: Easing,
-    on_finish: Option<fn()>,
+    on_finish: Option<fn(usize)>,
 ) -> bool {
     unsafe {
+        let saved = irq_save();
         for a in ANIMS.iter_mut() {
             if !a.active {
+                // 从空闲重启帧时钟时清零上次 tick 时刻：否则首帧 dt 为
+                // 空闲时长（被钳到 0.1s），弹簧动画第一步就跳 100ms。
+                if !ANY_ACTIVE {
+                    LAST_TICK_US = 0;
+                }
                 *a = Anim {
                     active: true,
                     window,
@@ -301,9 +330,14 @@ pub fn tween(
                 // 立即应用起始值（避免首帧跳变）
                 apply(window, prop, from);
                 ANY_ACTIVE = true;
+                // 按需点亮 CNTP：空闲时动画定时器已停（frame_tick 无活动时停），
+                // 有新动画立即重新启动 120Hz 帧节拍。
+                crate::timer::timer2_start();
+                irq_restore(saved);
                 return true;
             }
         }
+        irq_restore(saved);
     }
     false
 }
@@ -315,13 +349,17 @@ pub fn spring(
     from: f32,
     to: f32,
     mut sp: Spring,
-    on_finish: Option<fn()>,
+    on_finish: Option<fn(usize)>,
 ) -> bool {
     sp.pos = from;
     sp.target = to;
     unsafe {
+        let saved = irq_save();
         for a in ANIMS.iter_mut() {
             if !a.active {
+                if !ANY_ACTIVE {
+                    LAST_TICK_US = 0;
+                }
                 *a = Anim {
                     active: true,
                     window,
@@ -336,9 +374,12 @@ pub fn spring(
                 };
                 apply(window, prop, from);
                 ANY_ACTIVE = true;
+                crate::timer::timer2_start();
+                irq_restore(saved);
                 return true;
             }
         }
+        irq_restore(saved);
     }
     false
 }
@@ -368,10 +409,38 @@ fn apply(window: usize, prop: AnimProp, value: f32) {
     }
 }
 
+/// 本 tick 到期的 on_finish 回调暂存：回调（链式动画/销毁窗口）可能调用
+/// tween/cancel_window 改写 ANIMS 槽位表，必须等 frame_tick 的迭代循环
+/// 结束后统一执行 —— 迭代中重入会让回调选中的槽位与外层迭代元素交叠。
+static mut FINISH_Q: [Option<(usize, fn(usize))>; 8] = [None; 8];
+static mut FINISH_Q_COUNT: usize = 0;
+
 fn finish(a: &mut Anim) {
     a.active = false;
     if let Some(cb) = a.on_finish {
-        cb();
+        unsafe {
+            if FINISH_Q_COUNT < FINISH_Q.len() {
+                FINISH_Q[FINISH_Q_COUNT] = Some((a.window, cb));
+                FINISH_Q_COUNT += 1;
+            } else {
+                // 队列满（单 tick 8 个完成即溢出）：保持原语义就地执行。
+                cb(a.window);
+            }
+        }
+    }
+}
+
+/// 循环外执行本 tick 到期的完成回调。
+fn run_finish_queue() {
+    unsafe {
+        let n = FINISH_Q_COUNT;
+        FINISH_Q_COUNT = 0;
+        for i in 0..n {
+            if let Some((w, cb)) = FINISH_Q[i] {
+                FINISH_Q[i] = None;
+                cb(w);
+            }
+        }
     }
 }
 
@@ -381,6 +450,7 @@ fn finish(a: &mut Anim) {
 /// （位置/透明度/缩放被旧目标覆盖）。销毁前必须取消。
 pub fn cancel_window(window: usize) {
     unsafe {
+        let saved = irq_save();
         let mut any = false;
         for a in ANIMS.iter_mut() {
             if a.active && a.window == window {
@@ -390,6 +460,59 @@ pub fn cancel_window(window: usize) {
             }
         }
         ANY_ACTIVE = any;
+        if !any {
+            // 帧时钟只由本模块启停：取消后无剩余动画时立即停掉 CNTP，
+            // 否则 frame_tick 的 `!ANY_ACTIVE` 早退路径永远不会走到停表，
+            // 定时器以 120Hz 空转唤醒。清零 LAST_TICK_US 保证下次动画
+            // 首帧 dt 从 0 开始。
+            LAST_TICK_US = 0;
+            crate::timer::timer2_stop();
+        }
+        irq_restore(saved);
+    }
+}
+
+// ==================== 页面切换动画（OOBE 等向导型 UI） ====================
+
+/// 页面切换动画时长：淡出 / 淡入各 200ms。
+pub const PAGE_FADE_US: u64 = 200_000;
+
+/// 淡入结束后强制重置窗口 transform 为 identity。
+fn reset_page_transform(window: usize) {
+    compositor::reset_window_transform(window);
+}
+
+/// 页面切换：旧窗口 200ms 淡出（alpha 255->0）、新窗口 200ms 淡入
+/// （alpha 0->255），曲线 cubic-bezier(0.4, 0, 0.2, 1)，无位移、无缩放。
+///
+/// 新窗口位置在切换前强制重置为默认居中（含边界检查），transform 为 identity；
+/// 淡入结束后再次强制重置 transform 为 identity。旧窗口淡出至 alpha 0 后由
+/// 调用方负责销毁。
+pub fn page_transition(old_win: Option<usize>, new_win: Option<usize>) {
+    if let Some(o) = old_win {
+        cancel_window(o);
+        tween(
+            o,
+            AnimProp::Alpha,
+            255.0,
+            0.0,
+            PAGE_FADE_US,
+            Easing::FastOutSlowIn,
+            None,
+        );
+    }
+    if let Some(n) = new_win {
+        cancel_window(n);
+        compositor::reset_window_transform(n);
+        tween(
+            n,
+            AnimProp::Alpha,
+            0.0,
+            255.0,
+            PAGE_FADE_US,
+            Easing::FastOutSlowIn,
+            Some(reset_page_transform),
+        );
     }
 }
 
@@ -473,7 +596,23 @@ fn record_frame(now: u64, render_us: u64) {
         if render_us > s.render_max {
             s.render_max = render_us;
         }
+        // ★ 统计打印延迟到线程上下文：报告窗口约 110 字符的串口输出在
+        // 115200 波特下逐字节忙等 ≈9.5ms 且全程 IRQ 关闭（CNTP 中断上下文），
+        // 超过 8.33ms 帧预算本身，期间调度 tick 与 UART RX 全部顺延。
         if s.count >= STAT_REPORT_EVERY {
+            STATS_PENDING = true;
+        }
+    }
+}
+
+/// 统计报告待打印标记（IRQ 侧置位，线程上下文消费）。
+static mut STATS_PENDING: bool = false;
+
+/// 线程上下文冲刷待打印的帧统计（内核主循环每轮调用）。
+pub fn poll_deferred_stats() {
+    unsafe {
+        if STATS_PENDING {
+            STATS_PENDING = false;
             report_frame_stats();
         }
     }
@@ -499,9 +638,9 @@ fn report_frame_stats() {
         let p95 = buf[(n * 95 / 100).min(n - 1)];
         let avg = if s.count > 0 { s.sum / s.count as u64 } else { 0 };
         let ravg = if s.count > 0 { s.render_sum / s.count as u64 } else { 0 };
-        uart(" [anim] frame stats n=");
+        uart(" [anim] 帧统计 n=");
         crate::print_dec(s.count as u64);
-        uart(" ival(min=");
+uart(" 间隔(min=");
         crate::print_dec(s.min);
         uart(",avg=");
         crate::print_dec(avg);
@@ -509,9 +648,9 @@ fn report_frame_stats() {
         crate::print_dec(p95);
         uart(",max=");
         crate::print_dec(s.max);
-        uart(")us spikes(>20ms)=");
+        uart(")us 尖峰(>20ms)=");
         crate::print_dec(s.spike_count);
-        uart(" render(avg=");
+        uart(" 渲染(avg=");
         crate::print_dec(ravg);
         uart(",max=");
         crate::print_dec(s.render_max);
@@ -534,6 +673,9 @@ fn report_frame_stats() {
 pub fn frame_tick() {
     unsafe {
         if !ANY_ACTIVE {
+            // 动画可能被 cancel_window（而非自然完成）清空：停掉 CNTP，
+            // 避免帧时钟在无动画时空转唤醒。
+            crate::timer::timer2_stop();
             return;
         }
         let now = timer::now_us();
@@ -570,83 +712,356 @@ pub fn frame_tick() {
             }
         }
         ANY_ACTIVE = any;
+        // 统一执行完成回调（迭代外，见 FINISH_Q 注释）。
+        run_finish_queue();
 
-        if ANY_ACTIVE && compositor::ready() {
-            let t0 = timer::now_us();
+        // 应用直绘接管后（compositor::fb_active），显示节奏由应用的
+        // `fb_present` 决定（应用在帧边界提交脏区并请求翻转），本 tick 只
+        // 推进动画并标记脏区域，**不再自行翻转**——否则会在应用绘制中途
+        // 翻转，把半帧内容送上扫描输出（撕裂）。内核覆盖窗口（Home
+        // Indicator / 变暗层）的动画脏区会在应用下一次 present 时一并合成。
+        if ANY_ACTIVE && compositor::ready() && !compositor::fb_active() {
+            // 复用本 tick 的 `now` 作为起点（now_us 每次重读 CNTFRQ + u64 除法）。
+            let t0 = now;
             if compositor::composite() {
                 compositor::present();
-                let render_us = timer::now_us() - t0;
+                let render_us = timer::now_us().saturating_sub(t0);
                 record_frame(now, render_us);
             }
+        }
+        // 无活动动画：停掉 120Hz CNTP —— 空转时不再被每秒 120 次中断唤醒
+        // （内核覆盖窗口动画结束后系统只保留调度 tick，空闲 CPU 可真正 wfi）。
+        if !ANY_ACTIVE {
+            crate::timer::timer2_stop();
         }
     }
 }
 
 // ==================== 启动期动画管线性能自检 ====================
 
-/// 启动阶段跑一段补间动画，驱动 `frame_tick → composite + present` 全管线，
-/// 收集第 0 步的帧间隔统计后恢复 `/dev/fb0` 扫描输出。
+/// 帧率基线测试：验证 CNTP 120Hz 帧时钟驱动 `frame_tick` 全管线，并建立
+/// 应用直绘路径（`fb_damage` → 脏区拷贝 → `composite` → `present`）的帧率
+/// 基线。
 ///
-/// 仅在启动期调用（定时器与 GIC 已就绪、调度器尚未启动）：IRQ 在此期间默认
-/// 屏蔽，本函数自行开/关；动画结束后把扫描输出切回 `/dev/fb0` 的缓冲，
-/// 保证 launcher/OOBE 的直接绘制继续可见。
+/// 场景（直接驱动，模拟应用在帧边界的 present）：
+///   0. 定时器看门狗：补间动画 + 开 IRQ，验证 frame_tick 在推进帧（120Hz）；
+///   A. 局部脏区（320×200 移动矩形）：时钟/通知/拖动等局部更新的典型开销；
+///   B. 整屏脏区（最坏情况：页面切换/整帧重绘）；540×960 实测后按像素比
+///      （×4）外推 1080p 全屏预算（纯 CPU 行拷贝/混合为线性带宽瓶颈）；
+///   C. 内核覆盖窗口 alpha 混合（Home Indicator 式 overlay）的合成成本。
+/// 每个场景报告帧间隔 min/avg/p95/max、掉帧数（>12ms）与合成+呈现耗时。
+///
+/// 仅在启动期调用（定时器与 GIC 已就绪、调度器尚未启动）：IRQ 默认屏蔽，
+/// 本函数自行开/关；应用直绘（launcher）尚未接管显示，不与用户 UI 冲突。
+
+/// 掉帧判定阈值（µs）：120Hz 帧预算 8.33ms 的宽松上界（任务验收阈值）。
+const DROP_US: u64 = 12_000;
+
+/// 单场景统计窗口（样本数）。
+const PERF_WINDOW: usize = 128;
+
+struct PerfStats {
+    count: usize,
+    last_us: u64,
+    min_iv: u64,
+    max_iv: u64,
+    sum_iv: u64,
+    render_sum: u64,
+    render_max: u64,
+    drops: u64,
+    iv: [u64; PERF_WINDOW],
+    render: [u64; PERF_WINDOW],
+}
+
+impl PerfStats {
+    const fn new() -> PerfStats {
+        PerfStats {
+            count: 0,
+            last_us: 0,
+            min_iv: u64::MAX,
+            max_iv: 0,
+            sum_iv: 0,
+            render_sum: 0,
+            render_max: 0,
+            drops: 0,
+            iv: [0; PERF_WINDOW],
+            render: [0; PERF_WINDOW],
+        }
+    }
+
+    fn record(&mut self, now: u64, render_us: u64) {
+        if self.last_us != 0 {
+            let iv = now.saturating_sub(self.last_us);
+            if self.count < PERF_WINDOW {
+                self.iv[self.count] = iv;
+            }
+            if iv < self.min_iv {
+                self.min_iv = iv;
+            }
+            if iv > self.max_iv {
+                self.max_iv = iv;
+            }
+            self.sum_iv += iv;
+            if iv > DROP_US {
+                self.drops += 1;
+            }
+        }
+        if self.count < PERF_WINDOW {
+            self.render[self.count] = render_us;
+        }
+        self.render_sum += render_us;
+        if render_us > self.render_max {
+            self.render_max = render_us;
+        }
+        self.last_us = now;
+        self.count += 1;
+    }
+}
+
+/// 取前 `n` 个样本的 p95（插入排序，n ≤ 128 开销可忽略）。
+fn p95_of(arr: &[u64; PERF_WINDOW], n: usize) -> u64 {
+    let mut buf = [0u64; PERF_WINDOW];
+    buf[..n].copy_from_slice(&arr[..n]);
+    for i in 1..n {
+        let key = buf[i];
+        let mut j = i;
+        while j > 0 && buf[j - 1] > key {
+            buf[j] = buf[j - 1];
+            j -= 1;
+        }
+        buf[j] = key;
+    }
+    buf[(n * 95 / 100).min(n - 1)]
+}
+
+fn perf_report(label: &str, s: &PerfStats) {
+    let n = s.count;
+    if n == 0 {
+        uart(" [anim-perf] ");
+        uart(label);
+        uart(" 无样本\n");
+        return;
+    }
+    let p95_iv = p95_of(&s.iv, n);
+    let p95_r = p95_of(&s.render, n);
+    let avg_iv = s.sum_iv / n as u64;
+    let avg_r = s.render_sum / n as u64;
+    let fps = if avg_iv > 0 { 1_000_000 / avg_iv } else { 0 };
+    uart(" [anim-perf] ");
+    uart(label);
+    uart(" n=");
+    crate::print_dec(n as u64);
+    uart(" fps=");
+    crate::print_dec(fps);
+    uart(" ival(min=");
+    crate::print_dec(s.min_iv);
+    uart(",avg=");
+    crate::print_dec(avg_iv);
+    uart(",p95=");
+    crate::print_dec(p95_iv);
+    uart(",max=");
+    crate::print_dec(s.max_iv);
+    uart(")us render(avg=");
+    crate::print_dec(avg_r);
+    uart(",p95=");
+    crate::print_dec(p95_r);
+    uart(",max=");
+    crate::print_dec(s.render_max);
+    uart(")us drops(>12ms)=");
+    crate::print_dec(s.drops);
+    uart("\n");
+}
+
+/// 输出「p95 合成+呈现耗时」相对 120Hz 预算与任务阈值（12ms）的判定。
+fn perf_verdict(label: &str, p95_render: u64) {
+    uart(" [anim-perf] ");
+    uart(label);
+    uart(" p95-render=");
+    crate::print_dec(p95_render);
+    uart("us → ");
+    if p95_render < 8_333 {
+        uart("120Hz 通过（符合 8.33ms 预算）\n");
+    } else if p95_render < 12_000 {
+        uart("p95<12ms 通过（超出 120Hz 预算）\n");
+    } else {
+        uart("失败（超过 12ms — 见 docs/perf-baseline.md 降级计划）\n");
+    }
+}
+
+/// 画布基底色（模拟应用壁纸）。
+const CANVAS_BASE: u32 = 0x00_1C_22_2E;
+/// 移动矩形色（模拟应用强调色控件）。
+const CANVAS_MOVE: u32 = 0x00_42_85_F4;
+
+/// 在持久画布（fb0 映射目标）铺一层渐变「壁纸」。
+fn fill_canvas_base() {
+    let dst = compositor::fb_target() as *mut u32;
+    let w = compositor::width() as usize;
+    let h = compositor::height() as usize;
+    for y in 0..h {
+        for x in 0..w {
+            unsafe {
+                *dst.add(y * w + x) =
+                    CANVAS_BASE + (((x / 64) + (y / 64)) % 3) as u32 * 0x00_00_12_08;
+            }
+        }
+    }
+}
+
+/// 在画布上填 `r` 矩形（越界裁剪）。
+fn fill_canvas_rect(r: compositor::Rect, color: u32) {
+    let dst = compositor::fb_target() as *mut u32;
+    let w = compositor::width() as usize;
+    for y in r.y.max(0)..r.bottom() {
+        for x in r.x.max(0)..r.right() {
+            unsafe {
+                *dst.add(y as usize * w + x as usize) = color;
+            }
+        }
+    }
+}
+
+/// 整帧换色（模拟整帧重绘的不同内容）。
+fn fill_canvas_frame(f: usize) {
+    let dst = compositor::fb_target() as *mut u32;
+    let w = compositor::width() as usize;
+    let h = compositor::height() as usize;
+    let c = CANVAS_BASE + ((f % 4) as u32) * 0x00_01_02_03;
+    for y in 0..h {
+        for x in 0..w {
+            unsafe {
+                *dst.add(y * w + x) = c;
+            }
+        }
+    }
+}
+
 pub fn perf_test() {
-    uart(" [anim-perf] pipeline perf test begin\n");
+    uart(" [anim-perf] 渲染管线性能测试开始\n");
     if !compositor::ready() {
-        uart(" [anim-perf] compositor not ready, skip\n");
+        uart(" [anim-perf] 合成器未就绪，跳过测试\n");
         return;
     }
+    let sw = compositor::width();
+    let sh = compositor::height();
+    uart(" [anim-perf] 原生分辨率 ");
+    crate::print_dec(sw as u64);
+    uart("x");
+    crate::print_dec(sh as u64);
+    uart("\n");
+
+    // ---- 0. 定时器看门狗：CNTP 120Hz → frame_tick → composite → present ----
     let w = compositor::create_window(30, 200, 320, 400, 10, 255);
-    if w == usize::MAX {
-        uart(" [anim-perf] create_window failed\n");
-        return;
+    if w != usize::MAX {
+        if let Some(s) = compositor::window_surface(w) {
+            s.fill(compositor::Color::ACCENT);
+        }
+        tween(w, AnimProp::X, 30.0, 300.0, 300_000, Easing::EaseInEaseOut, None);
+        let start = timer::now_us();
+        let deadline = start + 1_000_000;
+        unsafe {
+            asm!("msr daifclr, #2");
+        }
+        while active() && timer::now_us() < deadline {
+            core::hint::spin_loop();
+        }
+        unsafe {
+            asm!("msr daifset, #2");
+        }
+        let frames = frames_presented();
+        uart(" [anim-perf] 300ms 动画内定时器驱动帧数：");
+        crate::print_dec(frames);
+        uart(if frames >= 20 {
+            "（120Hz 帧时钟正常）\n"
+        } else {
+            "（WARN：定时器未驱动帧节拍！）\n"
+        });
+        compositor::destroy_window(w);
+    } else {
+        uart(" [anim-perf] 创建窗口失败，跳过定时器看门狗\n");
     }
-    // 窗口表面画一点内容，让合成有真实工作量（非纯色填充）
-    if let Some(s) = compositor::window_surface(w) {
-        s.fill(compositor::Color::ACCENT);
-        let mut y = 0i32;
-        while y < s.h as i32 {
-            let mut x = 0i32;
-            while x < s.w as i32 {
-                s.set(x, y, compositor::Color::WHITE.pixel());
-                x += 32;
-            }
-            y += 32;
+
+    // 基准：持久画布铺壁纸并整屏上屏
+    fill_canvas_base();
+    compositor::fb_present(&[compositor::fb_full_rect()]);
+
+    // ---- A. 局部脏区（320×200 移动矩形，模拟时钟/通知/拖动） ----
+    let mut stats_a = PerfStats::new();
+    let mut x = 30i32;
+    for _ in 0..120 {
+        let old = compositor::Rect::new(x - 3, 220, 320, 200);
+        let new = compositor::Rect::new(x, 220, 320, 200);
+        // 模拟应用直绘：擦旧画新（写入持久画布，时间不计入合成）
+        fill_canvas_rect(old, CANVAS_BASE);
+        fill_canvas_rect(new, CANVAS_MOVE);
+        let t0 = timer::now_us();
+        compositor::fb_present(&[old, new]);
+        let t1 = timer::now_us();
+        stats_a.record(t1, t1 - t0);
+        x += 3;
+        if x as u32 + 320 >= sw {
+            x = 30;
         }
     }
+    perf_report("A/local-dirty-320x200", &stats_a);
 
-    // 1.5s 水平补间：100Hz 定时器下约 150 帧，触发 2 次统计报告
-    tween(w, AnimProp::X, 30.0, 500.0, 1_500_000, Easing::EaseInEaseOut, None);
-
-    // 开 IRQ，让定时器驱动 frame_tick；自旋等待动画结束（硬截止 3s）。
-    // 看门狗：50ms 内无任何帧呈现 → 定时器未驱动，提前退出避免拖慢启动。
-    let start = timer::now_us();
-    let deadline = start + 3_000_000;
-    unsafe {
-        asm!("msr daifclr, #2");
+    // ---- B. 整屏脏区（最坏情况：整帧重绘） ----
+    let mut stats_b = PerfStats::new();
+    for f in 0..60 {
+        fill_canvas_frame(f);
+        let t0 = timer::now_us();
+        compositor::fb_present(&[compositor::fb_full_rect()]);
+        let t1 = timer::now_us();
+        stats_b.record(t1, t1 - t0);
     }
-    let mut watchdog_checked = false;
-    while active() && timer::now_us() < deadline {
-        if !watchdog_checked && timer::now_us().saturating_sub(start) > 50_000 {
-            watchdog_checked = true;
-            if frames_presented() == 0 {
-                uart(" [anim-perf] no frames advanced (timer not driving), abort\n");
-                break;
+    perf_report("B/full-screen", &stats_b);
+
+    // ---- C. 内核覆盖窗口 alpha 混合（Home Indicator 式 overlay） ----
+    let ov = compositor::create_window(30, 30, 200, 200, i32::MAX, 128);
+    let mut stats_c = PerfStats::new();
+    if ov != usize::MAX {
+        if let Some(s) = compositor::window_surface(ov) {
+            s.fill(compositor::Color::WHITE);
+        }
+        let mut ox = 30i32;
+        for _ in 0..120 {
+            let old = compositor::Rect::new(ox, 30, 200, 200);
+            compositor::move_window(ov, ox + 3, 30);
+            let new = compositor::Rect::new(ox + 3, 30, 200, 200);
+            let t0 = timer::now_us();
+            compositor::fb_present(&[old, new]);
+            let t1 = timer::now_us();
+            stats_c.record(t1, t1 - t0);
+            ox += 3;
+            if ox + 200 >= sw as i32 {
+                ox = 30;
             }
         }
-        core::hint::spin_loop();
-    }
-    unsafe {
-        asm!("msr daifset, #2");
+        perf_report("C/overlay-alpha-200x200", &stats_c);
+        compositor::destroy_window(ov);
+    } else {
+        uart(" [anim-perf] 叠加窗口创建失败，跳过叠加测试\n");
     }
 
-    compositor::destroy_window(w);
-    // 恢复扫描输出到 /dev/fb0 的缓冲，保证后续 GUI 进程直接绘制可见
-    let fb = crate::gpu_simple::fb_base();
-    if fb != 0 {
-        crate::gpu_simple::present(fb);
+    // ---- 汇总：1080p 外推 + 判定 ----
+    let n_b = stats_b.count.max(1);
+    let full_avg = stats_b.render_sum / n_b as u64;
+    let full_p95 = p95_of(&stats_b.render, stats_b.count);
+    // 1080p = 4 × 540×960 像素；纯 CPU 行拷贝/混合为线性带宽瓶颈 → 按像素比外推
+    let est_avg = full_avg.saturating_mul(4);
+    let est_p95 = full_p95.saturating_mul(4);
+    uart(" [anim-perf] 1080p 估算（4 倍像素，线性缩放）：整屏渲染平均=");
+    crate::print_dec(est_avg);
+    uart("us p95=");
+    crate::print_dec(est_p95);
+    uart("us\n");
+    if sw == 540 && sh == 960 {
+        perf_verdict("540x960 full-screen", full_p95);
+        perf_verdict("1080p full-screen (estimate)", est_p95);
+    } else {
+        perf_verdict("native full-screen", full_p95);
     }
-    uart(" [anim-perf] pipeline perf test end\n");
+    uart(" [anim-perf] 渲染管线性能测试结束\n");
 }
 
 // ==================== 自检 ====================

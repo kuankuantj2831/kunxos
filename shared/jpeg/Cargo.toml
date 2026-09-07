@@ -1,0 +1,19 @@
+[package]
+name = "kunxjpeg"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 纯 Rust baseline JPEG 编码器（no_std，无堆分配，RGB888 → JFIF/4:2:0）"
+
+[lib]
+name = "kunxjpeg"
+
+[features]
+default = []
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

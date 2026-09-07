@@ -1,0 +1,18 @@
+[package]
+name = "lcapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fontdue = "0.9.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

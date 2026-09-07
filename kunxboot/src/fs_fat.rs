@@ -75,17 +75,15 @@ fn short_name(name: &str) -> [u8; 11] {
 }
 
 impl FatVolume {
-    /// 读取 MBR 并挂载第一个 FAT32 分区。
+    /// 读取 MBR 并挂载第一个 FAT32 分区（兼容旧镜像）。
     pub fn mount() -> Option<FatVolume> {
         let mut mbr = [0u8; SECTOR_SIZE];
         if !mmc::read_block(0, mbr.as_mut_ptr()) {
             return None;
         }
-        // 校验 MBR 签名
         if mbr[510] != 0x55 || mbr[511] != 0xAA {
             return None;
         }
-
         // 查找 FAT32 分区
         let mut part_lba = 0u64;
         for i in 0..4 {
@@ -100,11 +98,43 @@ impl FatVolume {
                 part_lba = lba;
                 break;
             }
-            // 兜底：第一个非空分区
             if part_lba == 0 {
                 part_lba = lba;
             }
         }
+        if part_lba == 0 {
+            return None;
+        }
+        Self::mount_at(part_lba)
+    }
+
+    /// 按分区索引读取 MBR 并挂载第 `slot` 个分区（0..=3，A/B 槽位选择用）。
+    pub fn mount_index(slot: usize) -> Option<FatVolume> {
+        let mut mbr = [0u8; SECTOR_SIZE];
+        if !mmc::read_block(0, mbr.as_mut_ptr()) {
+            return None;
+        }
+        if mbr[510] != 0x55 || mbr[511] != 0xAA {
+            return None;
+        }
+        if slot >= 4 {
+            return None;
+        }
+        let e = &mbr[446 + slot * 16..446 + slot * 16 + 16];
+        let ptype = e[4];
+        let lba = le32(&e[8..12]) as u64;
+        let nsectors = le32(&e[12..16]) as u64;
+        if nsectors == 0 || ptype == 0 {
+            return None;
+        }
+        if ptype != PART_TYPE_FAT32_LBA && ptype != PART_TYPE_FAT32_CHS {
+            return None;
+        }
+        Self::mount_at(lba)
+    }
+
+    /// 在指定起始 LBA 挂载 FAT32 卷（boot_a / boot_b 共用）。
+    fn mount_at(part_lba: u64) -> Option<FatVolume> {
         if part_lba == 0 {
             return None;
         }
@@ -202,6 +232,9 @@ impl FatVolume {
                     }
                     if e[11] & 0x0F == 0x0F {
                         continue; // 长文件名项
+                    }
+                    if e[11] & 0x18 != 0 {
+                        continue; // 目录(0x10) / 卷标(0x08)：不是文件，跳过
                     }
                     if e[0..11] == short[..] {
                         let cluster_high = le16(&e[26..28]) as u32;

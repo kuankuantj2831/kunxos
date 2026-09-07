@@ -9,6 +9,9 @@ qemu = []
 pi4 = []
 
 [dependencies]
+# 无线协议栈共享库：QEMU 模拟后端用它做「真 4-way handshake」的 AP 侧；
+# Pi4 后端经它编解码 EAPOL/WPA 常量。
+kunxwireless = { path = "../wireless" }
 
 # 裸机环境：panic 直接中止，不展开栈（无 unwinding 支持）。
 [profile.dev]
@@ -17,3 +20,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 opt-level = 2
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

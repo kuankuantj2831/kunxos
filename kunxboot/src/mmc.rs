@@ -41,6 +41,7 @@ mod virtio {
 
     // virtio-blk 请求类型：读
     const VIRTIO_BLK_T_IN: u32 = 0;
+    const VIRTIO_BLK_T_OUT: u32 = 1;
 
     // 描述符标志
     const DESC_F_NEXT: u16 = 1;
@@ -51,6 +52,8 @@ mod virtio {
 
     /// 找到的 virtio-blk 设备 MMIO 基地址。
     static mut VIRTIO_BASE: usize = 0;
+    /// 协商后的队列深度（init_device 写入；avail/used 环索引取模用它）。
+    static mut VQ_NUM: usize = QUEUE_SIZE;
 
     /// virtqueue 缓冲（4096 对齐）：描述符表 + available ring + used ring。
     #[repr(C, align(4096))]
@@ -133,6 +136,12 @@ mod virtio {
             if num == 0 {
                 return false;
             }
+            // 队列深度小于静态缓冲布局容量（16 描述符 + 16 项 avail/used 环）：
+            // 拒绝，避免 avail 环索引数学按错误深度取模。
+            if num < QUEUE_SIZE as u32 {
+                crate::uart::send_str("[mmc] virtio 队列深度过小\n");
+                return false;
+            }
             reg_write(MMIO_QUEUE_NUM, num);
             reg_write(MMIO_QUEUE_ALIGN, GUEST_PAGE_SIZE);
             // 队列物理页帧号
@@ -148,6 +157,7 @@ mod virtio {
                 MMIO_STATUS,
                 STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
             );
+            VQ_NUM = num as usize;
         }
         true
     }
@@ -205,10 +215,10 @@ mod virtio {
             write_le16(desc.add(44), DESC_F_WRITE);
             write_le16(desc.add(46), 0);
 
-            // available ring：追加描述符 0
+            // available ring：追加描述符 0（索引取模协商后的队列深度 VQ_NUM）
             let idx = read_le16(avail.add(2)) as usize;
             let old_used = read_le16(used.add(2)) as usize;
-            write_le16(avail.add(4 + (idx % QUEUE_SIZE) * 2), 0);
+            write_le16(avail.add(4 + (idx % VQ_NUM) * 2), 0);
             write_le16(avail.add(2), (idx as u16).wrapping_add(1));
 
             // 内存屏障 + 通知设备
@@ -216,6 +226,61 @@ mod virtio {
             reg_write(MMIO_QUEUE_NOTIFY, 0);
 
             // 轮询 used ring 直到设备完成（带超时，防止损坏设备/总线挂起导致 bootloader 死循环）
+            let mut tries = 0usize;
+            while read_le16(used.add(2)) as usize == old_used {
+                tries += 1;
+                if tries > 100_000_000 {
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+            mb();
+
+            STATUS_BYTE == 0
+        }
+    }
+
+    /// 写入单个 512 字节块（设备写出：BCB / OTP 持久化用）。
+    pub fn write_block(lba: u64, src: *const u8) -> bool {
+        unsafe {
+            if VIRTIO_BASE == 0 {
+                return false;
+            }
+            let desc = VQ.0.as_mut_ptr();
+            let avail = desc.add(256);
+            let used = desc.add(4096);
+
+            // 输出头：VIRTIO_BLK_T_OUT
+            write_le32(OUT_HDR.as_mut_ptr(), VIRTIO_BLK_T_OUT);
+            write_le32(OUT_HDR.as_mut_ptr().add(4), 0); // ioprio
+            write_le64(OUT_HDR.as_mut_ptr().add(8), lba);
+
+            // 描述符 0：输出头（设备读取，只读）
+            write_le64(desc, OUT_HDR.as_ptr() as u64);
+            write_le32(desc.add(8), 16);
+            write_le16(desc.add(12), DESC_F_NEXT);
+            write_le16(desc.add(14), 1);
+
+            // 描述符 1：数据缓冲（设备读取 = 写出源；无 F_WRITE）
+            write_le64(desc.add(16), src as u64);
+            write_le32(desc.add(24), BLOCK_SIZE as u32);
+            write_le16(desc.add(28), DESC_F_NEXT);
+            write_le16(desc.add(30), 2);
+
+            // 描述符 2：状态字节（设备写入）
+            write_le64(desc.add(32), (&mut STATUS_BYTE as *mut u8) as u64);
+            write_le32(desc.add(40), 1);
+            write_le16(desc.add(44), DESC_F_WRITE);
+            write_le16(desc.add(46), 0);
+
+            let idx = read_le16(avail.add(2)) as usize;
+            let old_used = read_le16(used.add(2)) as usize;
+            write_le16(avail.add(4 + (idx % VQ_NUM) * 2), 0);
+            write_le16(avail.add(2), (idx as u16).wrapping_add(1));
+
+            mb();
+            reg_write(MMIO_QUEUE_NOTIFY, 0);
+
             let mut tries = 0usize;
             while read_le16(used.add(2)) as usize == old_used {
                 tries += 1;
@@ -241,6 +306,10 @@ mod virtio {
     pub fn read_block(_lba: u64, _dst: *mut u8) -> bool {
         false
     }
+
+    pub fn write_block(_lba: u64, _src: *const u8) -> bool {
+        false
+    }
 }
 
 /// 初始化块存储设备。
@@ -251,6 +320,11 @@ pub fn init() -> bool {
 /// 读取单个块（512 字节）。
 pub fn read_block(lba: u64, dst: *mut u8) -> bool {
     virtio::read_block(lba, dst)
+}
+
+/// 写入单个块（512 字节）。
+pub fn write_block(lba: u64, src: *const u8) -> bool {
+    virtio::write_block(lba, src)
 }
 
 /// 从字节偏移 `offset` 开始读取 `len` 字节到 `dst`（自动处理非对齐边界）。

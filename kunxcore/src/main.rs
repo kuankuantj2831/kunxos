@@ -7,6 +7,120 @@
 // 被引用，这里统一放行 dead_code，避免构建日志被大量提示淹没。
 #![allow(dead_code)]
 
+extern crate alloc;
+
+// ==================== 内存原语（编译器内建 memcpy/memset 实现） ====================
+// no_std 内核必须提供这些符号：编译器对 96KB+ 大对象（Process/ProcPageTable）
+// 的 move/清零会生成 memcpy/memset 调用，缺失或不可靠时静默损坏内存。
+
+/// 字节拷贝（src/dst 不重叠）。
+///
+/// 性能：帧缓冲脏区行拷贝 / ELF 段加载等大块拷贝经此符号，纯字节循环在
+/// QEMU 软件渲染与慢速核心上不足以喂满 120Hz 帧预算（540×960 整屏 = 2MB
+/// 拷贝）。这里在两端 16 字节对齐时用 AArch64 `ldp/stp` 16 字节宽通道，
+/// 仅 8 字节对齐时用 `ldr/str x`，尾部与未对齐场景回退字节循环 ——
+/// 任意对齐都正确，同时把大块拷贝降到接近 NEON 前的理论上限。
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut d = dest as usize;
+    let mut s = src as usize;
+    let end = d.saturating_add(n);
+    // 两端 16 字节对齐：ldp/stp 对（每迭代 16B）
+    if (d & 15) == 0 && (s & 15) == 0 {
+        while end.saturating_sub(d) >= 16 {
+            asm!(
+                "ldp {v0}, {v1}, [{s}]",
+                "add {s}, {s}, #16",
+                "stp {v0}, {v1}, [{d}]",
+                "add {d}, {d}, #16",
+                v0 = out(reg) _,
+                v1 = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
+    }
+    // 仅 8 字节对齐：ldr/str x（每迭代 8B）
+    if (d & 7) == 0 && (s & 7) == 0 {
+        while end.saturating_sub(d) >= 8 {
+            asm!(
+                "ldr {v}, [{s}]",
+                "add {s}, {s}, #8",
+                "str {v}, [{d}]",
+                "add {d}, {d}, #8",
+                v = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
+    }
+    // 尾部 / 未对齐：字节循环（保持任意对齐语义正确）
+    while d < end {
+        *((d) as *mut u8) = *((s) as *const u8);
+        d += 1;
+        s += 1;
+    }
+    dest
+}
+
+/// 字节拷贝（允许重叠）。无重叠/dst 更低走 memcpy 的宽通道，重叠时反向。
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dest as usize) < (src as usize)
+        || (dest as usize) >= (src as usize).saturating_add(n)
+    {
+        memcpy(dest, src, n);
+    } else {
+        // dst > src 且重叠：反向逐字节保序（volatile 免疫循环惯用语变换）。
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            (dest.add(i)).write_volatile(src.add(i).read_volatile());
+        }
+    }
+    dest
+}
+
+/// 字节填充：8B `str` 宽通道（页清零 / 画布填充走此路径）。
+#[no_mangle]
+pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut p = s as usize;
+    let end = p.saturating_add(n);
+    let v = (c as u8) as u64;
+    let word = u64::from_ne_bytes([v as u8; 8]);
+    while p < end && (p & 7) != 0 {
+        (p as *mut u8).write_volatile(v as u8);
+        p += 1;
+    }
+    if p & 15 == 0 {
+        while end.saturating_sub(p) >= 16 {
+            asm!(
+                "stp {w}, {w}, [{p}]",
+                "add {p}, {p}, #16",
+                w = in(reg) word,
+                p = inout(reg) p,
+                options(nostack),
+            );
+        }
+    }
+    while end.saturating_sub(p) >= 8 {
+        asm!(
+            "str {w}, [{p}]",
+            "add {p}, {p}, #8",
+            w = in(reg) word,
+            p = inout(reg) p,
+            options(nostack),
+        );
+    }
+    while p < end {
+        (p as *mut u8).write_volatile(v as u8);
+        p += 1;
+    }
+    s
+}
+
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -14,10 +128,12 @@ use core::ptr::{addr_of, read_volatile, write_volatile};
 
 mod allocator;
 mod anim;
+mod audio;
 mod bionic_shim;
 mod blkdev;
 mod compositor;
 mod devfs;
+mod modem;
 mod elf;
 mod fdt;
 mod fat32;
@@ -25,18 +141,22 @@ mod fs_simple;
 mod fsops;
 mod gic;
 mod gpu_simple;
+mod gesture;
 mod heap;
 mod input;
 mod input_stack;
 mod interrupt;
 mod ipc;
 mod linux_compat;
+mod mem_pressure;
 mod mmu;
 mod net_stack;
 mod net_virtio;
+mod ota;
 mod pci;
 mod ac97;
 mod pkg;
+mod power;
 mod gdbstub;
 mod process;
 mod procfs;
@@ -44,18 +164,26 @@ mod tmpfs;
 mod signal;
 mod rtc;
 mod sched_cfs;
+mod sensor_dev;
 mod smp;
 mod shell;
 mod socket;
 mod syscall_table;
 mod thread;
 mod timer;
+mod tty;
 mod ui_framework;
 mod vfs;
 mod virtio_blk;
 mod virtio_input;
 mod virtio_rng;
+mod virtio_snd;
 mod vm;
+mod wifi;
+// ===== 开发者工具链模块（日志 / 崩溃报告 / 性能统计） =====
+mod crash;
+mod log;
+mod perf;
 
 // ==================== 启动信息 ====================
 
@@ -107,7 +235,7 @@ static mut UART_BASE: usize = 0x0900_0000;
 
 /// 获取 UART 设备引用
 ///
-/// # Safety
+/// # 安全
 /// `UART_BASE` 指向的 MMIO 地址处始终存在一个 PL011 设备。
 fn uart() -> &'static mut Pl011 {
     unsafe { &mut *(UART_BASE as *mut Pl011) }
@@ -132,6 +260,94 @@ static mut UART_RX_TAIL: usize = 0;
 static mut UART_RX_COUNT: usize = 0;
 /// 缓冲满时被丢弃的字节数（溢出计数，供消费方提示用户）。
 static mut UART_RX_DROPPED: usize = 0;
+
+/// bootargs 是否含 "shell"（QEMU `-append "shell"` → /chosen/bootargs）。
+/// 置位时 GUI 启动同时拉起内置 shell，供 UART 驱动测试。
+static mut BOOT_SHELL: bool = false;
+
+/// bootargs 是否含 "recovery"（bootloader 注入）：恢复模式启动。
+static mut BOOT_RECOVERY: bool = false;
+
+/// 安全启动链属性（bootloader 经 /chosen 注入）：
+/// kunx,build-version / kunx,ramdisk-sha256 / kunx,recovery-ramdisk。
+static mut SEC_BUILD_VERSION: u32 = 0;
+static mut SEC_RAMDISK_SHA: [u8; 32] = [0xEE; 32]; // 0xEE.. = 属性缺失
+static mut SEC_RECOVERY_RAMDISK: (usize, usize) = (0, 0);
+
+/// 读取 bootargs shell 标志（供 init_main 决定是否并起 shell）。
+pub(crate) fn bootargs_shell() -> bool {
+    unsafe { BOOT_SHELL }
+}
+
+/// 读取 bootargs recovery 标志。
+pub(crate) fn bootargs_recovery() -> bool {
+    unsafe { BOOT_RECOVERY }
+}
+
+/// 读取安全启动链属性（内核 ota 模块 / 恢复挂载用）。
+pub(crate) fn sec_build_version() -> u32 {
+    unsafe { SEC_BUILD_VERSION }
+}
+pub(crate) fn sec_ramdisk_sha() -> &'static [u8; 32] {
+    unsafe { &SEC_RAMDISK_SHA }
+}
+pub(crate) fn sec_recovery_ramdisk() -> (usize, usize) {
+    unsafe { SEC_RECOVERY_RAMDISK }
+}
+
+/// bootargs 是否含 "wifitest"（无头 Wi-Fi 自检：扫描 → WPA2-PSK 4-way → 已连接）。
+static mut BOOT_WIFITEST: bool = false;
+pub(crate) fn bootargs_wifitest() -> bool {
+    unsafe { BOOT_WIFITEST }
+}
+
+/// bootargs 是否含 "perftest"：启动期动画管线性能基线（anim::perf_test）。
+/// 默认不执行——该测试每次启动固定消耗约 1.5s 来宾时间（1s 120Hz 看门狗 + A/B/C
+/// 约 300 帧 composite/present 基准），属于开发期测量工具。需要时经
+/// QEMU `-append "perftest"` 触发，运行时仍可用 shell `perf on|stats` 观察。
+static mut BOOT_PERFTEST: bool = false;
+pub(crate) fn bootargs_perftest() -> bool {
+    unsafe { BOOT_PERFTEST }
+}
+
+/// bootargs 是否含 "selftest"：启动期内核自检（堆分配器 + 动画曲线 + 符号链接 +
+/// 电源状态机）。默认不执行——这些是开发/CI 诊断，每次开机固定跑会拖慢启动并
+/// 刷屏大量 [test]/[symlink]/[power-selftest] 日志。需要时经
+/// QEMU `-append "selftest"` 触发；运行时仍可用 shell `power selftest` 单独执行。
+static mut BOOT_SELFTEST: bool = false;
+pub(crate) fn bootargs_selftest() -> bool {
+    unsafe { BOOT_SELFTEST }
+}
+
+// ==================== 控制台安静模式（简洁 CLI） ====================
+
+/// 控制台安静模式（默认开启）：内核启动期与运行期的信息性日志（[hal]/[FDT]/
+/// [fs]/[gpu]/[net]/[diag]/[perf]/[pinit] 等）不再输出到串口，命令行界面只保留
+/// 错误、崩溃报告与交互输出。恢复完整日志的途径：
+/// - 启动参数 `-append "verbose"`；
+/// - 运行时 shell `verbose on|off`。
+/// 结构化日志（printk!）不受影响：始终写入环形缓冲，shell `log` 可查看。
+pub(crate) static CONSOLE_QUIET: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// 当前是否处于安静模式（信息日志不上串口）。
+pub(crate) fn console_quiet() -> bool {
+    CONSOLE_QUIET.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// 切换安静模式（bootargs "verbose" / shell `verbose` 命令）。
+pub(crate) fn console_set_quiet(quiet: bool) {
+    CONSOLE_QUIET.store(quiet, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 启动期信息打印（整段输出共用一次开关判断）：安静模式下不上串口。
+/// 仅用于信息性日志；错误 / 崩溃 / 自检 PASS-FAIL 等必须可见的输出不要包进来。
+#[macro_export]
+macro_rules! kinfo {
+    ($($arg:tt)*) => {
+        if !crate::console_quiet() { $($arg)* }
+    };
+}
 
 // ==================== 内核消息环形缓冲（dmesg） ====================
 
@@ -218,6 +434,10 @@ pub(crate) fn uart_send_char(c: u8) {
     unsafe {
         write_volatile(&mut uart.dr, c as u32);
     }
+    // TTY/PTY 屏幕镜像：把串口输出同步到活动会话的 out_q（图形终端主侧读取）。
+    // 未附接时是零开销布尔判断；附接后 GUI 终端因此能看到 Shell 提示符、回显
+    // 与所有命令输出（包含 ANSI 光标/颜色序列）。
+    crate::tty::echo_mirror(c);
 }
 
 /// 诊断打印（冷路径）：输出标记 + 两个十六进制值。
@@ -362,7 +582,7 @@ pub(crate) fn print_dec(mut v: u64) {
 
 /// 清除 PSTATE 的 I 位，开启 IRQ
 ///
-/// # Safety
+/// # 安全
 /// 调用者必须已正确初始化异常向量表与 GIC，否则开启 IRQ 会导致未定义行为。
 pub(crate) unsafe fn enable_irq() {
     asm!("msr daifclr, #2");
@@ -370,7 +590,7 @@ pub(crate) unsafe fn enable_irq() {
 
 /// 等待中断
 ///
-/// # Safety
+/// # 安全
 /// wfi 是架构指令，任意时刻可执行。
 pub(crate) unsafe fn wfi() {
     asm!("wfi");
@@ -378,7 +598,7 @@ pub(crate) unsafe fn wfi() {
 
 /// 读取 ESR_EL1（异常综合寄存器）
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn read_esr_el1() -> u64 {
     let v: u64;
@@ -388,7 +608,7 @@ unsafe fn read_esr_el1() -> u64 {
 
 /// 读取 ELR_EL1（异常链接寄存器，保存故障指令地址）
 ///
-/// # Safety
+/// # 安全
 /// 需要 EL1 权限。
 unsafe fn read_elr_el1() -> u64 {
     let v: u64;
@@ -448,6 +668,11 @@ pub extern "C" fn rust_main() -> ! {
     // fw_cfg 为 QEMU 特有设备（Pi 4 无此设备），保留默认值，由设备树覆盖
     let mut fwcfg_base: usize = 0x0902_0000;
     let mut stdout_path: Option<&str> = None;
+    let mut boot_shell = false; // bootargs 含 "shell"：GUI 启动同时拉起内置 shell（QEMU 测试用）
+    let mut boot_wifitest = false; // bootargs 含 "wifitest"：无头 Wi-Fi 自检
+    let mut boot_perftest = false; // bootargs 含 "perftest"：启动期动画性能基线（默认跳过）
+    let mut boot_selftest = false; // bootargs 含 "selftest"：启动期内核自检（默认跳过）
+    let mut boot_verbose = false; // bootargs 含 "verbose"：完整启动日志（默认安静控制台）
     let mut virtio_devs: [net_virtio::MmioDev; 32] = [net_virtio::MmioDev::empty(); 32];
     let mut virtio_count = 0usize;
 
@@ -455,6 +680,46 @@ pub extern "C" fn rust_main() -> ! {
         // /chosen
         if let Some(chosen) = fdt.node("/chosen") {
             stdout_path = chosen.prop_str(&fdt, "stdout-path");
+            // QEMU `-append "shell"` 会写入 /chosen/bootargs；含 "shell" 时
+            // 在 /init 之外再拉起内置交互 shell（供 UART 驱动测试）。
+            if let Some(args) = chosen.prop_str(&fdt, "bootargs") {
+                boot_shell = args.split_whitespace().any(|w| w == "shell");
+                boot_wifitest = args.split_whitespace().any(|w| w == "wifitest");
+                boot_perftest = args.split_whitespace().any(|w| w == "perftest");
+                boot_selftest = args.split_whitespace().any(|w| w == "selftest");
+                boot_verbose = args.split_whitespace().any(|w| w == "verbose");
+                // 恢复模式（bootloader 注入 "recovery"）
+                if ota::has_recovery_arg(args) {
+                    unsafe { BOOT_RECOVERY = true; }
+                }
+            }
+            // 安全启动链属性
+            if let Some(bv) = chosen.prop_u32(&fdt, "kunx,build-version", 0) {
+                unsafe { SEC_BUILD_VERSION = bv; }
+            }
+            if let Some(raw) = chosen.prop(&fdt, "kunx,ramdisk-sha256") {
+                if raw.value.len() == 32 {
+                    unsafe {
+                        SEC_RAMDISK_SHA.copy_from_slice(&raw.value);
+                    }
+                }
+            }
+            if let Some(addr) = chosen.prop_u32(&fdt, "kunx,recovery-ramdisk", 0) {
+                if let Some(size) = chosen.prop_u32(&fdt, "kunx,recovery-ramdisk", 1) {
+                    unsafe { SEC_RECOVERY_RAMDISK = (addr as usize, size as usize); }
+                }
+            }
+        }
+        // 记录 bootargs 标志供 init_main 使用（静态，跨线程）。
+        unsafe {
+            BOOT_SHELL = boot_shell;
+            BOOT_WIFITEST = boot_wifitest;
+            BOOT_PERFTEST = boot_perftest;
+            BOOT_SELFTEST = boot_selftest;
+        }
+        // verbose bootargs：关闭控制台安静模式（此时尚未开始打印，完整日志可见）。
+        if boot_verbose {
+            console_set_quiet(false);
         }
         // /memory（QEMU 用 device_type = "memory" 标识）
         if let Some(mem) = fdt.node("/memory").or_else(|| fdt.find_property("device_type", "memory"))
@@ -527,82 +792,89 @@ pub extern "C" fn rust_main() -> ! {
     smp::smp_init();
 
     // ===== 2.1 打印平台信息（HAL） =====
-    uart_send_str("[hal] platform=");
-    uart_send_str(platform.name());
-    uart_send_str("\n");
-    uart_send_str("[hal] uart=");
-    print_hex(platform.uart_base() as u64);
-    uart_send_str(" irq=");
-    print_dec(platform.uart_irq() as u64);
-    uart_send_str("\n");
-    uart_send_str("[hal] ram=");
-    print_hex(platform.ram_base() as u64);
-    uart_send_str(" size=");
-    print_dec((platform.ram_size() / (1024 * 1024)) as u64);
-    uart_send_str("MB\n");
-    uart_send_str("[hal] gic gicd=");
-    print_hex(platform.gicd_base() as u64);
-    uart_send_str(" gicc=");
-    print_hex(platform.gicc_base() as u64);
-    uart_send_str("\n");
-    uart_send_str("[hal] timer=");
-    print_dec(platform.timer_freq());
-    uart_send_str("Hz\n");
-    uart_send_str("[hal] display=");
-    match platform.display_init() {
-        Some(d) => {
-            uart_send_str("display ");
-            print_dec(d.width as u64);
-            uart_send_str("x");
-            print_dec(d.height as u64);
-        }
-        None => uart_send_str("none"),
-    }
-    uart_send_str("\n");
-    uart_send_str("[hal] net=");
-    match platform.net_init() {
-        Some(n) => {
-            uart_send_str("virtio-net ");
-            for i in 0..6 {
-                if i > 0 {
-                    uart_send_char(b':');
-                }
-                print_hex_byte(n.mac[i]);
+    // 注意：display_init/net_init 有初始化副作用，必须在门控外调用。
+    let hal_display = platform.display_init();
+    let hal_net = platform.net_init();
+    kinfo! {
+        uart_send_str("[hal] platform=");
+        uart_send_str(platform.name());
+        uart_send_str("\n");
+        uart_send_str("[hal] uart=");
+        print_hex(platform.uart_base() as u64);
+        uart_send_str(" irq=");
+        print_dec(platform.uart_irq() as u64);
+        uart_send_str("\n");
+        uart_send_str("[hal] ram=");
+        print_hex(platform.ram_base() as u64);
+        uart_send_str(" size=");
+        print_dec((platform.ram_size() / (1024 * 1024)) as u64);
+        uart_send_str("MB\n");
+        uart_send_str("[hal] gic gicd=");
+        print_hex(platform.gicd_base() as u64);
+        uart_send_str(" gicc=");
+        print_hex(platform.gicc_base() as u64);
+        uart_send_str("\n");
+        uart_send_str("[hal] timer=");
+        print_dec(platform.timer_freq());
+        uart_send_str("Hz\n");
+        uart_send_str("[hal] display=");
+        match hal_display {
+            Some(d) => {
+                uart_send_str("显示 ");
+                print_dec(d.width as u64);
+                uart_send_str("x");
+                print_dec(d.height as u64);
             }
+            None => uart_send_str("无"),
         }
-        None => uart_send_str("none"),
+        uart_send_str("\n");
+        uart_send_str("[hal] net=");
+        match hal_net {
+            Some(n) => {
+                uart_send_str("virtio-net ");
+                for i in 0..6 {
+                    if i > 0 {
+                        uart_send_char(b':');
+                    }
+                    print_hex_byte(n.mac[i]);
+                }
+            }
+            None => uart_send_str("无"),
+        }
+        uart_send_str("\n");
     }
-    uart_send_str("\n");
 
     // ===== 3. 打印设备树信息 =====
-    uart_send_str("[FDT] device tree @ ");
-    print_hex(unsafe { DTB_ADDR } as u64);
-    uart_send_str("\n");
-    uart_send_str("[FDT] /chosen stdout-path = ");
-    match stdout_path {
-        Some(p) => uart_send_str(p),
-        None => uart_send_str("(none)"),
+    kinfo! {
+        uart_send_str("[FDT] 设备树 @ ");
+        print_hex(unsafe { DTB_ADDR } as u64);
+        uart_send_str("\n");
+        uart_send_str("[FDT] /chosen stdout-path = ");
+        match stdout_path {
+            Some(p) => uart_send_str(p),
+            None => uart_send_str("(无)"),
+        }
+        uart_send_str("\n");
+        uart_send_str("[FDT] /memory base=");
+        print_hex(mem_base as u64);
+        uart_send_str(" size=");
+        print_hex(mem_size as u64);
+        uart_send_str(" (");
+        print_dec((mem_size / (1024 * 1024)) as u64);
+        uart_send_str(" MB)\n");
+        uart_send_str("[FDT] uart base=");
+        print_hex(uart_base as u64);
+        uart_send_str(" irq=");
+        print_dec(uart_irq as u64);
+        uart_send_str(" clk=");
+        print_dec(uart_clk as u64);
+        uart_send_str("\n");
+        uart_send_str("[FDT] gic gicd=");
+        print_hex(gicd_base as u64);
+        uart_send_str(" gicc=");
+        print_hex(gicc_base as u64);
+        uart_send_str("\n");
     }
-    uart_send_str("\n");
-    uart_send_str("[FDT] /memory base=");
-    print_hex(mem_base as u64);
-    uart_send_str(" size=");
-    print_hex(mem_size as u64);
-    uart_send_str(" (");
-    print_dec((mem_size / (1024 * 1024)) as u64);
-    uart_send_str(" MB)\n");
-    uart_send_str("[FDT] uart base=");
-    print_hex(uart_base as u64);
-    uart_send_str(" irq=");
-    print_dec(uart_irq as u64);
-    uart_send_str(" clk=");
-    print_dec(uart_clk as u64);
-    uart_send_str("\n");
-    uart_send_str("[FDT] gic gicd=");
-    print_hex(gicd_base as u64);
-    uart_send_str(" gicc=");
-    print_hex(gicc_base as u64);
-    uart_send_str("\n");
 
     // ===== 4. 初始化物理页分配器 =====
     // 按 DTB 解析出的真实内存大小初始化分配器（QEMU 512MB），防超量分配
@@ -612,10 +884,23 @@ pub extern "C" fn rust_main() -> ! {
     mmu::init();
     // 信号蹦床页（所有用户空间共享的只读 sigreturn 存根）
     signal::trampoline_init();
-    uart_send_str("MMU enabled.\n");
+    kinfo! {
+        uart_send_str("MMU 已启用。\n");
+        // PAN（Privileged Access Never）内存硬化：v8.1+ 核启用，v8.0 核跳过
+        if mmu::pan_supported() {
+            uart_send_str("[hardening] PAN 已启用（EL1 访问用户内存受限）\n");
+        } else {
+            uart_send_str("[hardening] 本 CPU 不支持 PAN（ARMv8.0），跳过\n");
+        }
+    }
 
-    // ===== 5.5 自检：kmalloc/kfree 无泄漏、map/unmap 正确 =====
-    self_test();
+    // ===== 5.5 启动期自检（bootargs 含 "selftest" 才执行；默认跳过） =====
+    // 开发诊断：kmalloc/kfree 泄漏 + anim 曲线 + map/unmap + 符号链接 + 电源状态机。
+    // 每次开机固定跑会拖慢启动并刷屏 [test]/[symlink]/[power-selftest] 日志，
+    // 故与 perftest/wifitest 一样改由 QEMU `-append "selftest"` 触发。
+    if crate::bootargs_selftest() {
+        self_test();
+    }
 
     // ===== 5.6 初始化文件系统（Phase 5：块设备 + VFS + 简单文件系统 + 设备文件） =====
     fs_boot();
@@ -632,35 +917,61 @@ pub extern "C" fn rust_main() -> ! {
     // ===== 5.67 tmpfs：内存文件系统挂载 /tmp =====
     tmpfs::init();
 
-    // ===== 5.675 符号链接自检（绝对/相对/悬空/环路/子目录穿透） =====
-    symlink_selftest();
+    // ===== 5.675 符号链接自检（bootargs 含 "selftest" 才执行） =====
+    if crate::bootargs_selftest() {
+        symlink_selftest();
+    }
 
-    // ===== 5.68 音频：PCI AC97 控制器（QEMU virt；无设备时静默跳过） =====
-    if let Some(fdt) = fdt {
-        if ac97::init(&fdt) {
-            uart_send_str("[audio] AC97 enabled\n");
-            // 启动提示音（120ms，880Hz）：顺带验证 AC97 DMA 播放路径
-            // （调度器未启动，轮询循环为纯自旋，时长很短无影响）
-            if ac97::play_tone(880, 120) == 0 {
-                uart_send_str("[audio] startup beep OK\n");
+    // ===== 5.68 音频子系统：virtio-sound（首选）→ AC97（遗留回退） =====
+    // 新音频栈：/dev/audio + 软件环形缓冲 + IRQ 驱动补充（audio::init）。
+    // virtio-sound 不可用时回退到遗留 AC97 轮询音调路径（仅启动提示音，
+    // 不提供 /dev/audio 流式接口）。
+    let audio_ready = audio::init(&virtio_devs[..virtio_count]);
+    let mut ac97_tone_ok = false;
+    if !audio_ready {
+        if let Some(fdt) = fdt {
+            if ac97::init(&fdt) {
+                kinfo! { uart_send_str("[audio] AC97 回退已启用\n"); }
+                // 启动提示音有副作用（AC97 播放），在门控外执行
+                ac97_tone_ok = ac97::play_tone(880, 120) == 0;
             }
+        }
+    }
+    kinfo! {
+        if audio_ready {
+            uart_send_str("[audio] 音频子系统就绪（virtio-sound 后端）\n");
+        } else if ac97_tone_ok {
+            uart_send_str("[audio] 启动提示音正常（AC97）\n");
         } else {
-            uart_send_str("[audio] no AC97 device\n");
+            uart_send_str("[audio] 无音频设备\n");
         }
     }
 
     // ===== 5.7 输入子系统（/dev/input/event0 + UART 触摸协议帧解析） =====
     input::init(platform.input_init());
 
+    // ===== 5.75 传感器子系统（/dev/sensor0：IMU 原始样本） =====
+    // QEMU：软件模拟 IMU（确定性剧本：平放 → 抬腕 → 航向扫描 → 行走计步）；
+    // Pi4：BSC1 I2C + MPU6050/9250（探测失败回退模拟器）。
+    sensor_dev::init(platform.sensor_init());
+
+    // ===== 5.71 调制解调器子系统（/dev/modem + /dev/modemctl） =====
+    // QEMU：内置虚拟调制解调器（模拟 AT 响应，支持来电/短信事件注入）；
+    // Pi4：第二路 PL011（UART2）供外接 AT 调制解调器（如 Quectel EC25）。
+    modem::init();
+
     // ===== 5.8 初始化图形（Phase 6：帧缓冲 + 合成器 + 输入 + UI） =====
     gfx_boot(fwcfg_base);
 
     // ===== 6. 初始化中断控制器与定时器 =====
     gic::gic_init(gicd_base, gicc_base);
-    if virtio_input::init(&virtio_devs[..virtio_count]) {
-        uart_send_str("[input] virtio keyboard ready\n");
-    } else {
-        uart_send_str("[input] no virtio keyboard (touch only)\n");
+    let virtio_kbd = virtio_input::init(&virtio_devs[..virtio_count]);
+    kinfo! {
+        if virtio_kbd {
+            uart_send_str("[input] virtio 键盘就绪\n");
+        } else {
+            uart_send_str("[input] 无 virtio 键盘（仅触摸）\n");
+        }
     }
     timer::timer_init();
     timer::timer_set_interval(10_000); // 10ms 调度周期（CNTV，动态调整）
@@ -669,11 +980,11 @@ pub extern "C" fn rust_main() -> ! {
     // 调度 tick 只负责睡眠器唤醒与 CFS 切换
     timer::timer_register_handler(timer_rearm);
     timer::timer_register_handler(sched_cfs::tick);
-    // 动画帧推进走独立硬件通道（CNTP 物理定时器，固定 8ms = 125Hz），
-    // 与调度 tick 完全解耦：帧间隔不再被调度器上下文切换抖动污染
-    // timer2 动画帧 tick 已禁用（诊断：验证是否污染首批 IRQ 上下文）
-    // timer::timer2_set_interval(8_000);
-    // timer::timer2_register_handler(anim::frame_tick);
+    // 动画帧推进走独立硬件通道（CNTP 物理定时器，固定 8.33ms = 120Hz），
+    // 与调度 tick 完全解耦：帧间隔不再被调度器上下文切换抖动污染；
+    // 全屏手势动画依赖此通道驱动 anim::frame_tick（周期与文档一致：120Hz）
+    timer::timer2_set_interval(8_333);
+    timer::timer2_register_handler(anim::frame_tick);
 
     // ===== 7. 注册中断处理函数 =====
     interrupt::register_handler(timer::TIMER_IRQ, timer::timer_handle_irq);
@@ -683,20 +994,39 @@ pub extern "C" fn rust_main() -> ! {
     // ===== 8. 配置并使能 GIC 中断 =====
     gic::gic_enable_irq(timer::TIMER_IRQ);
     gic::gic_set_priority(timer::TIMER_IRQ, 0x80);
-    // gic::gic_enable_irq(timer::TIMER2_IRQ); // [实验] 禁用动画定时器，排查 FP 污染
+    gic::gic_enable_irq(timer::TIMER2_IRQ); // 动画帧 tick（手势动画渲染管线）
     gic::gic_set_priority(timer::TIMER2_IRQ, 0x80);
     gic::gic_enable_irq(uart_irq);
     gic::gic_set_priority(uart_irq, 0xA0);
     gic::gic_set_target(uart_irq, 0x01); // 目标 CPU0
 
+    // ===== 8.5 启动期动画管线性能测试（仅 bootargs 含 "perftest" 时执行） =====
+    // 默认跳过：该测试固定消耗约 1.5s 来宾时间（1s 120Hz 看门狗 + A/B/C 约 300 帧
+    // composite/present 基准），拖慢每次启动。需要测量/回归时用
+    // QEMU `-append "perftest"` 触发；运行时观察用 shell `perf on|stats`。
+    if crate::bootargs_perftest() {
+        anim::perf_test();
+    }
+
     // ===== 8.5 初始化网络（Phase 7：virtio-net + TCP/IP） =====
     net_boot(&virtio_devs[..virtio_count]);
 
-    // ===== 9. 初始化 Phase 4：调度器、IPC、进程 =====
+    // ===== 8.55 初始化 Wi-Fi（/dev/wifi：HAL 后端 + 扫描/握手状态机） =====
+    // QEMU：SimWifi（真实 4-way 密码学链路）；Pi4：CYW43455 SDIO 骨架。
+    // worker 线程在 init_main 中随调度器启动（service() 需调度器上下文）。
+    wifi::init();
+
+    // ===== 9. 初始化 Phase 4：调度器、电源管理、IPC、进程 =====
     sched_cfs::init();
+    // 电源管理：注册到调度 tick（10ms），负责负载采样 / DVFS / 热节流 /
+    // 电池模型。必须在调度器启动前调用（boot 上下文）。
+    power::init();
     ipc::init();
     bionic_shim::init();
+    kinfo! { uart_send_str("[boot] 进程初始化…\n"); }
     process::init(init_main);
+    kinfo! { uart_send_str("[boot] 初始化完成，启动调度器…\n"); }
+    crate::printk!(crate::log::LOG_INFO, "boot", "内核初始化完成，启动调度器");
 
     // ===== 10. 启动调度器（永不返回） =====
     // SMP：释放 secondary 核（它们等待此标志后初始化本核 GIC/定时器并
@@ -713,50 +1043,122 @@ pub extern "C" fn rust_main() -> ! {
 /// 退出；随后回退到内置交互式 Shell。
 ///
 /// 多进程模型：`/init` 以真正的 `fork`/`execve` 拉起系统守护进程
-/// （networkd / displayd / launcher），各进程持有独立页表，由调度器在
+/// （networkd / wifid / camerad / audiod / lifd / alarmd / sensord / rild
+///  + launcher；displayd 已废弃），各进程持有独立页表，由调度器在
 /// 上下文切换时切换 TTBR0_EL1。
 fn init_main(_: usize) -> ! {
+    // 启动提示音（880Hz / 120ms）：经 virtio-sound 低延迟路径播放，
+    // 顺带验证 IRQ 驱动补充与环形缓冲（无音频设备时静默跳过）。
+    audio::boot_beep();
+
+    // 电源管理逻辑自检（bootargs 含 "selftest" 才执行，默认跳过）：纯函数
+    // （governor/热模型/电池状态机），与其余启动期自检统一为可选诊断，
+    // 运行时仍可用 shell `power selftest` 单独触发（[power-selftest] OK/FAIL）。
+    if crate::bootargs_selftest() {
+        kinfo! { crate::uart_send_str("[kernel] 电源自检开始\n"); }
+        let power_fails = power::selftest();
+        kinfo! {
+            crate::uart_send_str("[kernel] 电源自检完成：");
+            crate::print_dec(power_fails as u64);
+            crate::uart_send_str(" 个失败\n");
+        }
+    }
+
+    // bootargs 含 "shell"（QEMU -append "shell"）：GUI 启动同时拉起内置
+    // 交互 shell，供 UART 驱动测试（power_test.py）。
+    if crate::bootargs_shell() {
+        kinfo! { crate::uart_send_str("[kernel] bootargs shell: 与 /init 并行启动 shell\n"); }
+        process::spawn("shell", shell::shell_main, 0, sched_cfs::PriorityClass::Normal, 0);
+    }
+
+    // Wi-Fi worker：周期推进扫描 / 4-way 握手 / 断链检测（/dev/wifi 的后端）。
+    // 必须在调度器启动后才能 spawn（依赖进程与上下文切换）。
+    // QEMU `-append "wifitest"`：先跑无头自检（扫描 → WPA2-PSK 4-way → 拒绝
+    // 错误口令），再拉起常驻 worker，避免自检与 worker 并发推进同一状态机。
+    if crate::bootargs_wifitest() {
+        wifi::selftest();
+    }
+    if wifi::initialized() {
+        process::spawn("wifi", wifi::wifi_worker, 0, sched_cfs::PriorityClass::Normal, 0);
+    }
+
     // 首次启动数据迁移：/data/oobe/.done 不存在时，把 /etc/oobe_default/ 的
     // 默认配置复制到 /data/oobe/（modules / modules_removed / lang / theme 等），
     // 供 OOBE 预填与 launcher 过滤应用。必须在调度器启动后执行，因为
     // copy_tree 经 vfs::open 分配 fd，fd 依赖「当前进程」上下文。
     if !file_exists("/data/oobe/.done") {
-        uart_send_str("[kernel] first boot: migrating /etc/oobe_default -> /data/oobe\n");
+        kinfo! { uart_send_str("[kernel] 首次启动：迁移 /etc/oobe_default -> /data/oobe\n"); }
         copy_tree("/etc/oobe_default", "/data/oobe");
-        uart_send_str("[kernel] /data/oobe defaults migrated\n");
+        kinfo! { uart_send_str("[kernel] /data/oobe 默认配置迁移完成\n"); }
     }
 
-    uart_send_str("[kernel] loading /init from ramdisk...\n");
+    kinfo! { uart_send_str("[kernel] 正在从 ramdisk 加载 /init…\n"); }
+    crate::printk!(crate::log::LOG_NOTICE, "boot", "正在加载 /init");
+
+    // 恢复模式：不启动正常用户态；挂载恢复 ramdisk 并运行恢复菜单。
+    if crate::bootargs_recovery() {
+        uart_send_str("[kernel] 恢复模式\n");
+        let (raddr, rsize) = crate::sec_recovery_ramdisk();
+        if ota::mount_recovery(raddr, rsize) == 0 {
+            uart_send_str("[kernel] 恢复 ramdisk 已挂载到 /mnt/recovery\n");
+            let pid = elf::spawn_from_path("/mnt/recovery/bin/recovery", &["recovery"]);
+            if pid >= 0 {
+                loop {
+                    let (rpid, _code) = process::wait(pid);
+                    if rpid < 0 {
+                        break;
+                    }
+                }
+            } else {
+                uart_send_str("[kernel] 未找到 /mnt/recovery/bin/recovery\n");
+            }
+        } else {
+            uart_send_str("[kernel] 恢复 ramdisk 挂载失败\n");
+        }
+        process::spawn("shell", shell::shell_main, 0, sched_cfs::PriorityClass::Normal, 0);
+        loop {
+            thread::yield_now();
+        }
+    }
+
     let pid = elf::spawn_from_path("/init", &["init"]);
     if pid >= 0 {
+        // 启动链确认：/init 成功拉起 → 内核记录 BCB 启动成功（尝试计数清零）。
+        ota::note_boot_success(crate::sec_build_version());
         // 等待 /init 退出（正常情况下 /init 常驻，循环 wait4 回收子进程）。
         loop {
             let (rpid, code) = process::wait(pid);
             if rpid < 0 {
                 break;
             }
-            uart_send_str("[kernel] /init (pid ");
-            print_dec(rpid as u64);
-            uart_send_str(") exited code=");
-            print_dec(code as u64);
-            uart_send_str("\n");
+            kinfo! {
+                uart_send_str("[kernel] /init (pid ");
+                print_dec(rpid as u64);
+                uart_send_str(") 退出 code=");
+                print_dec(code as u64);
+                uart_send_str("\n");
+            }
         }
         elf::release(pid as u32);
     } else {
-        uart_send_str("[kernel] /init not found, fallback to built-in shell\n");
+        uart_send_str("[kernel] 未找到 /init，回退到内置 shell\n");
     }
 
     // 回退：内置交互式 Shell（内核线程，独立进程槽位）。
     process::spawn("shell", shell::shell_main, 0, sched_cfs::PriorityClass::Normal, 0);
 
     // 按需分页 / COW 统计（诊断）：累计落地缺页数与 COW break 次数。
-    uart_send_str("[kernel] demand paging: page faults resolved=");
-    crate::print_dec(process::page_faults_resolved());
-    uart_send_str(" cow breaks=");
-    crate::print_dec(process::cow_breaks());
-    uart_send_str("\n");
+    kinfo! {
+        uart_send_str("[kernel] 按需分页：已解决缺页数=");
+        crate::print_dec(process::page_faults_resolved());
+        uart_send_str(" COW 拆页数=");
+        crate::print_dec(process::cow_breaks());
+        uart_send_str("\n");
+    }
 
     loop {
+        // 帧统计打印在 IRQ 侧只置标记，这里（线程上下文）冲刷。
+        anim::poll_deferred_stats();
         thread::yield_now();
     }
 }
@@ -783,11 +1185,11 @@ fn symlink_selftest() {
             if $cond {
                 uart_send_str("[symlink] ");
                 uart_send_str($name);
-                uart_send_str(" OK\n");
+                uart_send_str(" 通过\n");
             } else {
                 uart_send_str("[symlink] ");
                 uart_send_str($name);
-                uart_send_str(" FAIL\n");
+                uart_send_str(" 失败\n");
                 fails += 1;
             }
         };
@@ -795,95 +1197,95 @@ fn symlink_selftest() {
 
     // 准备目标文件 /tmp/hello，内容 "HelloSym"
     let fd = vfs::open("/tmp/hello", vfs::O_CREAT | vfs::O_WRONLY);
-    check!("create target", fd >= 0);
+    check!("创建目标文件", fd >= 0);
     if fd >= 0 {
         vfs::write(fd, b"HelloSym");
         vfs::close(fd);
     }
 
     // 1) 绝对符号链接：/tmp/link_abs -> /tmp/hello
-    check!("symlink abs", vfs::symlink("/tmp/hello", "/tmp/link_abs") == 0);
+    check!("创建绝对链接", vfs::symlink("/tmp/hello", "/tmp/link_abs") == 0);
     let mut tbuf = [0u8; 64];
     let n = vfs::readlink("/tmp/link_abs", &mut tbuf);
-    check!("readlink abs", n == 10 && &tbuf[..10] == b"/tmp/hello");
+    check!("读取绝对链接", n == 10 && &tbuf[..10] == b"/tmp/hello");
 
     // 2) 相对符号链接：/tmp/link_rel -> hello（相对 /tmp）
-    check!("symlink rel", vfs::symlink("hello", "/tmp/link_rel") == 0);
+    check!("创建相对链接", vfs::symlink("hello", "/tmp/link_rel") == 0);
     let n = vfs::readlink("/tmp/link_rel", &mut tbuf);
-    check!("readlink rel", n == 5 && &tbuf[..5] == b"hello");
+    check!("读取相对链接", n == 5 && &tbuf[..5] == b"hello");
 
     // 3) 经符号链接 open/read 读回目标内容
     let mut content = [0u8; 16];
     let fd = vfs::open("/tmp/link_abs", vfs::O_RDONLY);
-    check!("open via symlink", fd >= 0);
+    check!("经链接打开", fd >= 0);
     if fd >= 0 {
         let r = vfs::read(fd, &mut content);
         vfs::close(fd);
-        check!("read via symlink", r == 8 && &content[..8] == b"HelloSym");
+        check!("经链接读取", r == 8 && &content[..8] == b"HelloSym");
     }
     let fd = vfs::open("/tmp/link_rel", vfs::O_RDONLY);
-    check!("open rel symlink", fd >= 0);
+    check!("打开相对链接", fd >= 0);
     if fd >= 0 {
         let r = vfs::read(fd, &mut content);
         vfs::close(fd);
-        check!("read rel symlink", r == 8 && &content[..8] == b"HelloSym");
+        check!("经相对链接读取", r == 8 && &content[..8] == b"HelloSym");
     }
 
     // 4) 子目录中的符号链接：/tmp/d/l -> ../hello（相对目标含 ..）
-    check!("mkdir /tmp/d", vfs::mkdir("/tmp/d") == 0);
-    check!("symlink via dir", vfs::symlink("../hello", "/tmp/d/l") == 0);
+    check!("创建目录 /tmp/d", vfs::mkdir("/tmp/d") == 0);
+    check!("目录内创建链接", vfs::symlink("../hello", "/tmp/d/l") == 0);
     let fd = vfs::open("/tmp/d/l", vfs::O_RDONLY);
-    check!("resolve ../ target", fd >= 0);
+    check!("解析 ../ 目标", fd >= 0);
     if fd >= 0 {
         vfs::close(fd);
     }
 
     // 5) 悬空链接：解析失败（ENOENT 语义）
-    check!("symlink dangling", vfs::symlink("/tmp/not-exist", "/tmp/dangling") == 0);
-    check!("resolve dangling fails", {
+    check!("创建悬空链接", vfs::symlink("/tmp/not-exist", "/tmp/dangling") == 0);
+    check!("解析悬空链接失败", {
         let mut d = 0u32;
         let mut i = 0u32;
         vfs::resolve("/tmp/dangling", &mut d, &mut i) != 0
     });
 
     // 6) 环路检测：/tmp/loop_a -> loop_b，/tmp/loop_b -> loop_a
-    check!("symlink loop_a", vfs::symlink("loop_b", "/tmp/loop_a") == 0);
-    check!("symlink loop_b", vfs::symlink("loop_a", "/tmp/loop_b") == 0);
-    check!("resolve loop fails (hop limit)", {
+    check!("创建链接 loop_a", vfs::symlink("loop_b", "/tmp/loop_a") == 0);
+    check!("创建链接 loop_b", vfs::symlink("loop_a", "/tmp/loop_b") == 0);
+    check!("环路解析失败（跳数上限）", {
         let mut d = 0u32;
         let mut i = 0u32;
         vfs::resolve("/tmp/loop_a", &mut d, &mut i) != 0
     });
 
     // 7) 在符号链接指向的目录下创建文件：/tmp/dirlink -> /tmp/d
-    check!("symlink to dir", vfs::symlink("/tmp/d", "/tmp/dirlink") == 0);
+    check!("创建指向目录的链接", vfs::symlink("/tmp/d", "/tmp/dirlink") == 0);
     let fd = vfs::open("/tmp/dirlink/newfile", vfs::O_CREAT | vfs::O_WRONLY);
-    check!("create under symlinked dir", fd >= 0);
+    check!("在链接目录下创建文件", fd >= 0);
     if fd >= 0 {
         vfs::close(fd);
     }
-    check!("created in real dir", vfs::stat_path("/tmp/d/newfile").is_some());
+    check!("实际目录中已创建", vfs::stat_path("/tmp/d/newfile").is_some());
 
     // 8) 重命名/删除符号链接
-    check!("mv symlink", vfs::rename("/tmp/link_rel", "/tmp/link_rel2") == 0);
-    check!("unlink symlink", vfs::unlink("/tmp/link_rel2") == 0);
-    check!("unlinked gone", {
+    check!("重命名链接", vfs::rename("/tmp/link_rel", "/tmp/link_rel2") == 0);
+    check!("删除链接", vfs::unlink("/tmp/link_rel2") == 0);
+    check!("删除后链接已消失", {
         let mut d = 0u32;
         let mut i = 0u32;
         vfs::resolve("/tmp/link_rel2", &mut d, &mut i) != 0
     });
     // lstat 语义：链接自身类型为 T_SYM
-    check!("lstat is symlink", {
+    check!("lstat 为链接类型", {
         vfs::lstat_path("/tmp/link_abs").map(|(t, _)| t) == Some(crate::fs_simple::T_SYM)
     });
 
-    uart_send_str("[symlink] self-test ");
+    uart_send_str("[symlink] 自检 ");
     if fails == 0 {
-        uart_send_str("ALL PASS\n");
+        uart_send_str("全部通过\n");
     } else {
-        uart_send_str("FAILED (");
+        uart_send_str("失败（");
         print_dec(fails as u64);
-        uart_send_str(")\n");
+        uart_send_str("）\n");
     }
 }
 
@@ -928,15 +1330,15 @@ fn self_test() {
     }
 
     let after = allocator::used_pages();
-    uart_send_str("[test] heap: pages before=");
+    uart_send_str("[test] 堆：使用前页数=");
     print_dec(before as u64);
-    uart_send_str(" after=");
+    uart_send_str(" 使用后页数=");
     print_dec(after as u64);
     uart_send_str("\n");
     if ok && before == after {
-        uart_send_str("[test] kmalloc/kfree OK (no leak)\n");
+        uart_send_str("[test] kmalloc/kfree 通过（无泄漏）\n");
     } else {
-        uart_send_str("[test] kmalloc/kfree FAIL\n");
+        uart_send_str("[test] kmalloc/kfree 失败\n");
     }
 
     // ---- 2. 动画引擎自检（iOS/Android 缓动曲线与弹簧数值验证） ----
@@ -949,30 +1351,33 @@ fn self_test() {
     unsafe { *(pa as *mut u64) = 0xCAFE_BABE; }
 
     // 映射到 TEST_VA 并验证 VA/PA 指向同一物理页
-    vm::map_page(TEST_VA, pa, vm::FLAG_KERNEL_DATA);
+    if !vm::map_page(TEST_VA, pa, vm::FLAG_KERNEL_DATA) {
+        uart_send_str("[test] map_page 失败（页表 OOM）\n");
+        return;
+    }
     let via_va = unsafe { *(TEST_VA as *mut u64) };
     unsafe { *(TEST_VA as *mut u64) = 0x1122_3344_5566_7788; }
     let via_pa = unsafe { *(pa as *mut u64) };
 
     if via_va == 0xCAFE_BABE && via_pa == 0x1122_3344_5566_7788 {
-        uart_send_str("[test] map_page OK\n");
+        uart_send_str("[test] map_page 通过\n");
     } else {
-        uart_send_str("[test] map_page FAIL\n");
+        uart_send_str("[test] map_page 失败\n");
     }
 
     // 取消映射并归还物理页
     vm::unmap_page(TEST_VA);
     allocator::free_page(pa);
-    uart_send_str("[test] unmap_page OK\n");
+    uart_send_str("[test] unmap_page 通过\n");
 }
 
 // ==================== Phase 5：文件系统 ====================
 
 /// RAM 磁盘主设备号与大小。
 const RAMDISK_MAJOR: u32 = 1;
-/// RAM 磁盘块数（与 tools/mkfs_sfs.py 生成的镜像大小一致：192 × 4KB = 768KB，
-/// 容纳 6 个 stub 应用副本后仍有余量）。
-const RAMDISK_BLOCKS: usize = 192;
+/// RAM 磁盘块数（与 tools/mkfs_sfs.py 生成的镜像大小一致：1536 × 4KB = 6MB，
+/// 容纳全部应用 + cn.ttf 平滑字体子集）。
+const RAMDISK_BLOCKS: usize = 4096;
 
 /// 内嵌的 rootfs 镜像（由顶层 `make rootfs` 用 tools/mkfs_sfs.py 生成，
 /// 输出到 kunxcore/ramdisk.img，随内核一并编译进 .rodata）。
@@ -980,9 +1385,11 @@ const RAMDISK_IMG: &[u8] = include_bytes!("../ramdisk.img");
 
 /// 初始化块设备、设备文件与 VFS，并把内嵌 rootfs 镜像挂载到根目录。
 fn fs_boot() {
-    uart_send_str("[fs] Phase 5: filesystem\n");
+    kinfo! { uart_send_str("[fs] Phase 5: 文件系统\n"); }
 
-    // 1. 注册字符设备（/dev/null、/dev/zero、/dev/tty）
+    // 1. 注册字符设备（/dev/null、/dev/zero、/dev/tty、/dev/ttyN、/dev/ptmx）
+    //    并初始化 TTY/PTY 会话（图形终端会话 0 附接后镜像串口输出）。
+    tty::init();
     devfs::init();
 
     // 2. 创建 RAM 磁盘并注册为块设备
@@ -997,10 +1404,25 @@ fn fs_boot() {
         blkdev::blk_write(RAMDISK_MAJOR, i, &buf);
     }
 
+    // 3.1 安全启动链自校验：内嵌 rootfs 与 bootloader 验签的 RAMDISK 载荷摘要
+    // 一致才挂载（防编译链被替换；bootloader 直载路径（make run）无该属性 → 跳过）。
+    let prop_sha = crate::sec_ramdisk_sha();
+    let missing = prop_sha.iter().all(|&b| b == 0xEE);
+    if !missing {
+        let actual = kunxsec::sha256::sha256(RAMDISK_IMG);
+        if actual != *prop_sha {
+            uart_send_str("[sec] 失败：内嵌 ramdisk 的 SHA-256 不匹配！\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        kinfo! { uart_send_str("[sec] ramdisk 自检通过（sha256 与 bootloader 一致）\n"); }
+    }
+
     // 4. 挂载到 "/"（镜像含超级块，无需再 mkfs）
     vfs::init();
     if vfs::mount(RAMDISK_MAJOR, "/") != 0 {
-        uart_send_str("[fs] mount FAIL\n");
+        uart_send_str("[fs] 挂载失败\n");
         return;
     }
 
@@ -1008,8 +1430,38 @@ fn fs_boot() {
     vfs::mknod("/dev/null", vfs::FileType::Chr, devfs::MEM_MAJOR, devfs::NULL_MINOR);
     vfs::mknod("/dev/zero", vfs::FileType::Chr, devfs::MEM_MAJOR, devfs::ZERO_MINOR);
     vfs::mknod("/dev/tty", vfs::FileType::Chr, devfs::TTY_MAJOR, devfs::TTY_MINOR);
+    // PTY 分配器 /dev/ptmx：预留下一会话（多终端）。
+    vfs::mknod("/dev/ptmx", vfs::FileType::Chr, devfs::PTY_MAJOR, devfs::PTMX_MINOR);
+    // 会话终端 /dev/tty1..ttyN（图形终端主侧；会话 0 绑定内核 Shell）。
+    let mut tty_path = [0u8; 32];
+    tty_path[..8].copy_from_slice(b"/dev/tty");
+    for i in 1..=devfs::TTY_SESSION_MAX {
+        // no_std（无 alloc）：手写十进制，避免 `.to_string()`（no_std 不含 ToString）
+        let mut digits = [0u8; 8];
+        let mut v = i as usize;
+        let mut dlen = 0usize;
+        loop {
+            digits[dlen] = b'0' + (v % 10) as u8;
+            dlen += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let n = 8 + dlen;
+        for k in 0..dlen {
+            tty_path[8 + k] = digits[dlen - 1 - k];
+        }
+        tty_path[n] = 0;
+        let path = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(tty_path.as_ptr(), n))
+        };
+        vfs::mknod(path, vfs::FileType::Chr, devfs::TTY_MAJOR, devfs::TTY_SESSION_BASE + i - 1);
+    }
+    vfs::mknod("/dev/kmsg", vfs::FileType::Chr, devfs::KMSG_MAJOR, devfs::KMSG_MINOR);
 
-    uart_send_str("[fs] rootfs mounted from embedded ramdisk OK\n");
+    kinfo! { uart_send_str("[fs] 已从内嵌 ramdisk 挂载根文件系统\n"); }
+    crate::printk!(crate::log::LOG_INFO, "fs", "已挂载根文件系统（内嵌 ramdisk）");
 }
 
 // ==================== /data 持久化（virtio-blk + MBR 分区 + SFS） ====================
@@ -1021,18 +1473,18 @@ fn fs_boot() {
 fn data_boot(devs: &[net_virtio::MmioDev]) {
     // 1. 探测 virtio-blk（找不到则 /data 退回 ramdisk，不持久化）
     if !virtio_blk::init(devs) {
-        uart_send_str("[blk] no virtio-blk device, /data not persisted\n");
+        kinfo! { uart_send_str("[blk] 无 virtio-blk 设备，/data 未持久化\n"); }
         return;
     }
 
     // 2. 读取 MBR（扇区 0）
     let mut mbr = [0u8; 512];
     if blkdev::blk_read_sectors(virtio_blk::MAJOR, 0, 1, &mut mbr) != 512 {
-        uart_send_str("[blk] read MBR FAIL\n");
+        uart_send_str("[blk] 读取 MBR 失败\n");
         return;
     }
     if mbr[510] != 0x55 || mbr[511] != 0xAA {
-        uart_send_str("[blk] invalid MBR signature\n");
+        uart_send_str("[blk] MBR 签名无效\n");
         return;
     }
 
@@ -1057,18 +1509,20 @@ fn data_boot(devs: &[net_virtio::MmioDev]) {
         if major < 0 {
             continue;
         }
-        uart_send_str("[blk] /dev/sda");
-        print_dec(part_num as u64);
-        uart_send_str(" type=0x");
-        print_hex_byte(typ);
-        uart_send_str(" start=");
-        print_dec(start as u64);
-        uart_send_str(" sectors=");
-        print_dec(count as u64);
-        uart_send_str("\n");
+        kinfo! {
+            uart_send_str("[blk] /dev/sda");
+            print_dec(part_num as u64);
+            uart_send_str(" type=0x");
+            print_hex_byte(typ);
+            uart_send_str(" start=");
+            print_dec(start as u64);
+            uart_send_str(" sectors=");
+            print_dec(count as u64);
+            uart_send_str("\n");
+        }
         if part_num == 3 {
             if typ == blkdev::ENC_PART_TYPE {
-                uart_send_str("[blk] /dev/sda3 is ENCRYPTED (XOR demo key), wrapping\n");
+                kinfo! { uart_send_str("[blk] /dev/sda3 已加密（XOR 演示密钥），正在包装\n"); }
                 let enc = blkdev::wrap_encryption(major as u32);
                 if enc >= 0 {
                     data_major = enc as u32;
@@ -1078,42 +1532,53 @@ fn data_boot(devs: &[net_virtio::MmioDev]) {
             } else {
                 data_major = major as u32;
             }
-            uart_send_str("[blk] /dev/sda3 detected, type=SFS\n");
+            kinfo! { uart_send_str("[blk] 检测到 /dev/sda3，type=SFS\n"); }
         }
-        // 探测文件系统类型：FAT32 分区自动挂载到 /mnt/fat32（与宿主互操作）
+        // 探测文件系统类型：
+        // P1/P4 = FAT32 boot_a/boot_b（挂载 /mnt/fat32、/mnt/fat32b，OTA 写入非活动槽用）；
+        // P2 = SFS 系统暂存（/mnt/sys，OTA 下载缓存）。
         let fs_kind = crate::fsops::probe(major as u32);
-        if matches!(fs_kind, Some(crate::fsops::FsKind::Fat32)) {
-            uart_send_str("[fs] /dev/sda");
-            print_dec(part_num as u64);
-            uart_send_str(" is FAT32, mounting /mnt/fat32\n");
-            if vfs::mount(major as u32, "/mnt/fat32") != 0 {
-                uart_send_str("[fs] FAT32 mount FAIL\n");
+        match (part_num, fs_kind) {
+            (1, Some(crate::fsops::FsKind::Fat32)) => {
+                kinfo! { uart_send_str("[fs] /dev/sda1 FAT32 -> /mnt/fat32\n"); }
+                if vfs::mount(major as u32, "/mnt/fat32") != 0 {
+                    uart_send_str("[fs] 挂载 /mnt/fat32 失败\n");
+                }
             }
+            // sda2 = sys 暂存分区：避免重复挂载 SFS 导致 VFS 解析状态受扰（见 docs/ota.md），
+            // OTA 包改存 /data/ota/（/data 挂载与既有路径一致）。
+            (4, Some(crate::fsops::FsKind::Fat32)) => {
+                kinfo! { uart_send_str("[fs] /dev/sda4 FAT32 -> /mnt/fat32b（非活动槽）\n"); }
+                if vfs::mount(major as u32, "/mnt/fat32b") != 0 {
+                    uart_send_str("[fs] 挂载 /mnt/fat32b 失败\n");
+                }
+            }
+            _ => {}
         }
     }
 
     if data_major == 0 {
-        uart_send_str("[blk] data partition (sda3) not found, /data not persisted\n");
+        kinfo! { uart_send_str("[blk] 未找到数据分区（sda3），/data 未持久化\n"); }
         return;
     }
 
     // 4. 检查 /dev/sda3 的 SFS 签名：无则 mkfs
     if fs_simple::fs_probe(data_major) {
-        uart_send_str("[fs] /data has SFS signature\n");
+        kinfo! { uart_send_str("[fs] /data 含 SFS 签名\n"); }
     } else {
-        uart_send_str("[fs] /data not formatted, mkfs...\n");
+        kinfo! { uart_send_str("[fs] /data 未格式化，正在 mkfs...\n"); }
         if fs_simple::mkfs(data_major) != 0 {
-            uart_send_str("[fs] /data mkfs FAIL\n");
+            uart_send_str("[fs] /data mkfs 失败\n");
             return;
         }
     }
 
     // 5. 挂载到 /data
     if vfs::mount(data_major, "/data") != 0 {
-        uart_send_str("[fs] /data mount FAIL\n");
+        uart_send_str("[fs] 挂载 /data 失败\n");
         return;
     }
-    uart_send_str("[fs] /data mounted\n");
+    kinfo! { uart_send_str("[fs] /data 已挂载\n"); }
 
     // 数据迁移（首次持久化复制默认配置）在 init_main 中进行（见 init_main：
     // /data/oobe/.done 不存在时调用 copy_tree("/etc/oobe_default", "/data/oobe")），
@@ -1216,28 +1681,162 @@ fn buf_str(buf: &[u8]) -> &str {
 /// 开机 logo 停留时长（微秒）。
 const BOOT_SPLASH_HOLD_US: u64 = 1_200_000;
 
+// ==================== bootloader 启动画面交接 ====================
+
+/// bootloader 写入交接信息的物理地址（与 kunxboot/src/splash.rs 一致）。
+const SPLASH_HANDOFF_ADDR: usize = 0x46F0_0000;
+/// 交接信息魔数（"KNXS"）。
+const SPLASH_MAGIC: u32 = 0x4B4E_5853;
+/// 淡出时长（微秒）。
+const SPLASH_FADE_US: u64 = 150_000;
+/// 淡出步进（微秒）。
+const SPLASH_FADE_STEP_US: u64 = 16_000;
+
+/// bootloader 交接的启动画面信息。
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SplashHandoff {
+    magic: u32,
+    fb_addr: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    logo_x: u32,
+    logo_y: u32,
+    logo_w: u32,
+    logo_h: u32,
+    active: u8,
+    _pad: [u8; 3],
+}
+
+/// bootloader 渲染的整帧画面（供淡出），由 `splash_capture` 保存。
+static mut SPLASH_SAVE: *mut u32 = core::ptr::null_mut();
+static mut SPLASH_SAVE_PIXELS: usize = 0;
+
+/// 读取 bootloader 的启动画面交接信息（magic/active 校验通过才返回）。
+fn splash_handoff() -> Option<SplashHandoff> {
+    let ho = unsafe { &*(SPLASH_HANDOFF_ADDR as *const SplashHandoff) };
+    if ho.magic == SPLASH_MAGIC && ho.active != 0 {
+        Some(*ho)
+    } else {
+        None
+    }
+}
+
+/// 把当前帧缓冲内容（bootloader 渲染的启动画面）保存为淡出素材。
+fn splash_capture(_ho: &SplashHandoff) {
+    let fb = gpu_simple::fb_base();
+    let n = gpu_simple::fb_len() / 4;
+    if fb == 0 || n == 0 {
+        return;
+    }
+    let buf = heap::kmalloc(n * 4) as *mut u32;
+    if buf.is_null() {
+        return;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(fb as *const u32, buf, n);
+        SPLASH_SAVE = buf;
+        SPLASH_SAVE_PIXELS = n;
+    }
+}
+
+/// 线性淡出（150ms）：把 bootloader 的启动画面叠加在桌面首帧上，
+/// alpha 从 255 线性降到 0；由用户态在首帧渲染完成后经 `FBIO_FADE_SPLASH`
+/// 触发，仅执行一次（执行后释放保存的画面）。
+///
+/// 走合成器路径：底图取当前 front（已显示的桌面首帧），逐帧把混合结果写入
+/// 持久画布（`/dev/fb0` 映射目标）并经 `fb_present` 拷贝 + 页翻转上屏，
+/// 保证淡出期间双缓冲无撕裂。
+fn splash_fade() {
+    unsafe {
+        if SPLASH_SAVE.is_null() || SPLASH_SAVE_PIXELS == 0 {
+            return;
+        }
+        if !compositor::ready() {
+            return;
+        }
+        let n = SPLASH_SAVE_PIXELS;
+        let splash = SPLASH_SAVE;
+        // 捕获当前帧（front，桌面首帧 + 合成器覆盖层）作为底图，避免逐帧叠加累积误差
+        let desk = heap::kmalloc(n * 4) as *mut u32;
+        if desk.is_null() {
+            return;
+        }
+        core::ptr::copy_nonoverlapping(compositor::front_buffer() as *const u32, desk, n);
+        kinfo! { uart_send_str("[gpu] 启动画面淡出开始\n"); }
+
+        let t0 = timer::now_us();
+        loop {
+            let t = timer::now_us().saturating_sub(t0);
+            if t >= SPLASH_FADE_US {
+                break;
+            }
+            let a = (255 - (255 * t) / SPLASH_FADE_US) as u32;
+            // 混合结果写入持久画布（fb0 映射目标），再经 fb_present 拷贝上屏
+            let dst = compositor::fb_target() as *mut u32;
+            for i in 0..n {
+                *dst.add(i) = splash_blend(*desk.add(i), *splash.add(i), a);
+            }
+            compositor::fb_present(&[compositor::fb_full_rect()]);
+            let step = t + SPLASH_FADE_STEP_US;
+            while timer::now_us().saturating_sub(t0) < step {
+                core::hint::spin_loop();
+            }
+        }
+        // 末帧：桌面完整显示
+        let dst = compositor::fb_target() as *mut u32;
+        core::ptr::copy_nonoverlapping(desk, dst, n);
+        compositor::fb_present(&[compositor::fb_full_rect()]);
+
+        heap::kfree(desk as *mut u8);
+        heap::kfree(splash as *mut u8);
+        SPLASH_SAVE = core::ptr::null_mut();
+        SPLASH_SAVE_PIXELS = 0;
+        kinfo! { uart_send_str("[gpu] 启动画面淡出完成\n"); }
+    }
+}
+
+/// 直通 alpha 混合：`desk` 为底图，`splash` 为叠加画面，`alpha` 0..255。
+fn splash_blend(desk: u32, splash: u32, alpha: u32) -> u32 {
+    if alpha == 255 {
+        return splash;
+    }
+    if alpha == 0 {
+        return desk;
+    }
+    let a = alpha;
+    let sr = (splash >> 16) & 0xFF;
+    let sg = (splash >> 8) & 0xFF;
+    let sb = splash & 0xFF;
+    let dr = (desk >> 16) & 0xFF;
+    let dg = (desk >> 8) & 0xFF;
+    let db = desk & 0xFF;
+    let r = (sr * a + dr * (255 - a)) / 255;
+    let g = (sg * a + dg * (255 - a)) / 255;
+    let b = (sb * a + db * (255 - a)) / 255;
+    (r << 16) | (g << 8) | b
+}
+
 /// 开机 logo 步骤：在真实帧缓冲上绘制纯黑背景 + 白色加粗的 "KunxOS" logo
 /// 与其下方作者署名，停留片刻保证可见，随后由用户态 OOBE/launcher 覆盖。
 ///
-/// 粗体用「同一字形在 x 与 x+1 各绘制一次」模拟（8x8 点阵字体）。
+/// 粗体用「同一字形在 x 与 x+1 各绘制一次」模拟（cn.ttf 平滑字体）。
 fn boot_splash(fb_base: usize, w: u32, h: u32) {
     let s = compositor::Surface { pixels: fb_base as *mut u32, w, h };
     // 纯黑背景
     s.fill(compositor::Color::BLACK);
+    // 加载 cn.ttf 平滑字体（rootfs 已挂载）——调试:暂时跳过,排查内核堆损坏
+    // ui_framework::font_init();
     let logo = "KunxOS";
     let author = "欢迎使用 KunxOS";
-    // CJK 感知宽度：ASCII 8px、CJK 16px
-    let tw = |t: &str| -> i32 {
-        t.bytes()
-            .map(|b| if b >= 0x80 { 16 } else { 8 })
-            .sum::<i32>()
-    };
-    let lw = tw(logo);
-    let aw = tw(author);
+    let lw = ui_framework::text_width(logo);
+    let aw = ui_framework::text_width(author);
     let lx = (w as i32 - lw) / 2;
     let ax = (w as i32 - aw) / 2;
-    let ly = ((h as i32) - 26) / 2; // 两行 8px 字形 + 10px 间距
-    let ay = ly + 18;
+    let row_h = ui_framework::GLYPH_H; // 16px 字号行高
+    let ly = ((h as i32) - row_h * 2 - 10) / 2;
+    let ay = ly + row_h + 10;
     ui_framework::draw_text(&s, lx, ly, logo, compositor::Color::WHITE, 1);
     ui_framework::draw_text(&s, lx + 1, ly, logo, compositor::Color::WHITE, 1);
     ui_framework::draw_text(&s, ax, ay, author, compositor::Color::WHITE, 1);
@@ -1249,7 +1848,7 @@ fn boot_splash(fb_base: usize, w: u32, h: u32) {
     while timer::now_us().saturating_sub(t0) < BOOT_SPLASH_HOLD_US {
         core::hint::spin_loop();
     }
-    uart_send_str("[gpu] boot splash shown\n");
+    kinfo! { uart_send_str("[gpu] 开机画面已显示\n"); }
 }
 
 /// 初始化图形栈（帧缓冲 → /dev/fb0）。
@@ -1258,28 +1857,52 @@ fn boot_splash(fb_base: usize, w: u32, h: u32) {
 /// 使 `mmap` 能把显存映射到用户空间。launcher 等 EL0 进程直接 open/mmap
 /// `/dev/fb0` 绘制，无需再经过 displayd 合成器。
 fn gfx_boot(fwcfg_base: usize) {
-    uart_send_str("[gpu] Phase 6: graphics\n");
+    kinfo! { uart_send_str("[gpu] Phase 6: 图形\n"); }
     match gpu_simple::init(fwcfg_base) {
         Some((w, h)) => {
-            uart_send_str("[gpu] ramfb ");
-            print_dec(w as u64);
-            uart_send_str("x");
-            print_dec(h as u64);
-            uart_send_str(" ready\n");
+            kinfo! {
+                uart_send_str("[gpu] ramfb ");
+                print_dec(w as u64);
+                uart_send_str("x");
+                print_dec(h as u64);
+                uart_send_str(" 就绪\n");
+            }
+            // bootloader 启动画面交接：沿用其帧缓冲（不重新翻转，画面保持显示），
+            // 直到用户态渲染出桌面首帧后由 splash_fade 线性淡出
+            if let Some(ho) = splash_handoff() {
+                if ho.fb_addr != 0 && ho.width == w && ho.height == h {
+                    let fb_base = gpu_simple::fb_adopt(ho.fb_addr as usize);
+                    allocator::reserve_region(ho.fb_addr as usize, gpu_simple::fb_len());
+                    allocator::reserve_region(SPLASH_HANDOFF_ADDR, 4096);
+                    devfs::fb_init(fb_base, gpu_simple::fb_len(), w, h, gpu_simple::stride());
+                    vfs::mknod("/dev/fb0", vfs::FileType::Chr, devfs::FB_MAJOR, devfs::FB_MINOR);
+                    // 合成器接管 bootloader 显存作为 front（画面保持显示），
+                    // 另分配 back 供应用直绘；/dev/fb0 映射目标 = 当前 back
+                    compositor::init(fb_base);
+                    gesture::init();
+                    splash_capture(&ho);
+                    kinfo! { uart_send_str("[gpu] 已沿用 bootloader 的开机画面\n"); }
+                    return;
+                }
+            }
             let fb_base = gpu_simple::fb_init();
             devfs::fb_init(fb_base, gpu_simple::fb_len(), w, h, gpu_simple::stride());
             vfs::mknod("/dev/fb0", vfs::FileType::Chr, devfs::FB_MAJOR, devfs::FB_MINOR);
-            uart_send_str("[gpu] /dev/fb0 ready, framebuffer @ ");
-            print_hex(fb_base as u64);
-            uart_send_str("\n");
-            // 初始化合成器（动画/合成管线；初始化不接管扫描输出，
-            // 扫描输出仍由 /dev/fb0 的缓冲提供，直到动画运行时才翻转）
-            compositor::init();
+            kinfo! {
+                uart_send_str("[gpu] /dev/fb0 就绪，帧缓冲 @ ");
+                print_hex(fb_base as u64);
+                uart_send_str("\n");
+            }
+            // 初始化合成器：/dev/fb0 缓冲作为 front（扫描输出不中断），
+            // back 为应用直绘目标；应用首帧 present 后进入双缓冲翻转
+            compositor::init(fb_base);
+            // 全屏手势系统：Home Indicator + 多任务变暗层
+            gesture::init();
             // 开机 logo 步骤：黑底 + 白色加粗 logo 与作者署名，停留片刻
             boot_splash(fb_base, w, h);
         }
         None => {
-            uart_send_str("[gpu] no ramfb device (run with -device ramfb)\n");
+            kinfo! { uart_send_str("[gpu] 无 ramfb 设备（运行需加 -device ramfb）\n"); }
         }
     }
 }
@@ -1294,31 +1917,35 @@ const NET_DNS: u32 = 0x0A00_0203; // 10.0.2.3
 
 /// 初始化网络：驱动 virtio-net、配置协议栈与 socket 层。
 fn net_boot(devs: &[net_virtio::MmioDev]) {
-    uart_send_str("[net] Phase 7: networking\n");
+    kinfo! { uart_send_str("[net] Phase 7: 网络\n"); }
     if !net_virtio::init(devs) {
-        uart_send_str("[net] no virtio-net device (add -device virtio-net-device)\n");
+        kinfo! { uart_send_str("[net] 无 virtio-net 设备（可添加 -device virtio-net-device）\n"); }
         return;
     }
     let mac = net_virtio::mac();
-    uart_send_str("[net] virtio-net MAC = ");
-    for i in 0..6 {
-        if i > 0 {
-            uart_send_char(b':');
+    kinfo! {
+        uart_send_str("[net] virtio-net MAC = ");
+        for i in 0..6 {
+            if i > 0 {
+                uart_send_char(b':');
+            }
+            print_hex_byte(mac[i]);
         }
-        print_hex_byte(mac[i]);
+        uart_send_str("\n");
     }
-    uart_send_str("\n");
 
     socket::init();
     net_stack::init(mac, NET_IP, NET_GW, NET_MASK, NET_DNS);
 
-    uart_send_str("[net] ip=");
-    print_ip(NET_IP);
-    uart_send_str(" gateway=");
-    print_ip(NET_GW);
-    uart_send_str(" dns=");
-    print_ip(NET_DNS);
-    uart_send_str("\n");
+    kinfo! {
+        uart_send_str("[net] ip=");
+        print_ip(NET_IP);
+        uart_send_str(" gateway=");
+        print_ip(NET_GW);
+        uart_send_str(" dns=");
+        print_ip(NET_DNS);
+        uart_send_str("\n");
+    }
 }
 
 /// 打印点分十进制 IPv4 地址。
@@ -1352,14 +1979,53 @@ impl Write for UartWriter {
     }
 }
 
-/// panic 处理器：打印信息后死循环
+/// panic 处理器：打印信息（含寄存器/栈/任务诊断）后死循环。
+/// 与 `sync_exception_handler` 对齐：屏蔽 IRQ 防递归，输出 sp 与当前任务，
+/// 栈回溯前 64 字 + 返回地址扫描，便于定位 kmalloc OOM 等 panic 的调用链。
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    unsafe { asm!("msr daifset, #2") };
     uart_send_str("PANIC: ");
     let mut writer = UartWriter;
     // 格式化 panic 信息（含位置与消息）
     let _ = write!(writer, "{}", info);
+    uart_send_str(" pid=");
+    crate::print_dec(crate::sched_cfs::current_pid() as u64);
+    uart_send_str(" tid=");
+    crate::print_dec(crate::sched_cfs::current_tid() as u64);
+    uart_send_str(" name=");
+    uart_send_str(crate::sched_cfs::current_task_name());
+    uart_send_str(" sp=");
+    let sp: u64;
+    unsafe { asm!("mov {}, sp", out(reg) sp) };
+    crate::print_hex(sp);
+    // 栈回溯（前 64 个 8 字节）与返回地址扫描（.text 区内的字）
+    uart_send_str("\n[stack] ");
+    for i in 0..64usize {
+        let v = unsafe { *((sp as *const u64).add(i)) };
+        crate::print_hex(v);
+        uart_send_str(" ");
+    }
+    uart_send_str("\n[ret-scan] ");
+    for i in 0..256usize {
+        let v = unsafe { *((sp as *const u64).add(i)) };
+        if (0x4008_0000..0x400c_3000).contains(&v) {
+            uart_send_str("ret?=");
+            crate::print_hex(v);
+            uart_send_str(" ");
+        }
+    }
     uart_send_str("\n");
+    // [crash] 生成并落盘 tombstone（best-effort，VFS 不可用时仅控制台）
+    let fi = crate::crash::FaultInfo {
+        kind: "PANIC",
+        pid: crate::sched_cfs::current_pid(),
+        name: crate::sched_cfs::current_task_name(),
+        esr: 0,
+        elr: 0,
+        far: 0,
+    };
+    crate::crash::kernel_panic(&fi);
     // 死循环，不再返回
     loop {
         unsafe {
@@ -1379,7 +2045,7 @@ extern "C" fn sync_exception_handler() -> ! {
     static mut FIRST: bool = true;
     if unsafe { !FIRST } {
         let esr = unsafe { read_esr_el1() };
-        uart_send_str("PANIC (recurse) ESR=");
+        uart_send_str("PANIC（重入）ESR=");
         print_hex(esr);
         uart_send_str("\n");
         loop {
@@ -1392,12 +2058,20 @@ extern "C" fn sync_exception_handler() -> ! {
     let elr = unsafe { read_elr_el1() };
     let far: u64;
     unsafe { asm!("mrs {}, far_el1", out(reg) far) };
-    uart_send_str("PANIC: synchronous exception ESR=");
+    uart_send_str("PANIC: 同步异常 ESR=");
     print_hex(esr);
     uart_send_str(" ELR=");
     print_hex(elr);
     uart_send_str(" FAR=");
     print_hex(far);
+    // PAN 故障诊断：DFSC=permission fault（0b001001/0b001011/0b001101/0b001111）
+    // 且 FAR 落在用户地址范围、SCTLR_EL1.PAN 已置位 → 内核漏了 uaccess 包装
+    let dfsc = (esr & 0x3F) as u32;
+    let is_perm_fault = matches!(dfsc & 0b111001, 0b001001 | 0b010001);
+    if is_perm_fault && far < crate::vm::USER_VA_TOP as u64 && mmu::pan_supported() {
+        uart_send_str("\n[PAN] EL1 访问用户内存被 PAN 拦截（漏了 uaccess_begin/end 包装？）"
+            );
+    }
     uart_send_str(" pid=");
     crate::print_dec(crate::sched_cfs::current_pid() as u64);
     uart_send_str(" tid=");
@@ -1437,6 +2111,16 @@ extern "C" fn sync_exception_handler() -> ! {
     // 任务表转储：定位损坏的 TCB（elr/x30/sp 为 0 或越界即嫌疑）
     uart_send_str("\n[tasks]\n");
     crate::sched_cfs::dump_tasks();
+    // [crash] 生成并落盘 tombstone（best-effort）
+    let fi = crate::crash::FaultInfo {
+        kind: "SYNC-EXC",
+        pid: crate::sched_cfs::current_pid(),
+        name: crate::sched_cfs::current_task_name(),
+        esr,
+        elr,
+        far,
+    };
+    crate::crash::kernel_panic(&fi);
     // 死循环
     loop {
         unsafe {
@@ -1445,15 +2129,79 @@ extern "C" fn sync_exception_handler() -> ! {
     }
 }
 
+/// FIQ / SError / SP0 / AArch32 等未接线的异常入口：打印诊断后死循环。
+/// 由汇编 `unknown_fault_entry` 调用（无保存寄存器，仅读系统寄存器）。
+#[no_mangle]
+extern "C" fn unknown_exception_handler() -> ! {
+    let esr = unsafe { read_esr_el1() };
+    let elr = unsafe { read_elr_el1() };
+    let far: u64;
+    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
+    uart_send_str("PANIC: 未处理异常（FIQ/SError/SP0）ESR=");
+    crate::print_hex(esr);
+    uart_send_str(" ELR=");
+    crate::print_hex(elr);
+    uart_send_str(" FAR=");
+    crate::print_hex(far);
+    uart_send_str(" pid=");
+    crate::print_dec(crate::sched_cfs::current_pid() as u64);
+    uart_send_str(" name=");
+    uart_send_str(crate::sched_cfs::current_task_name());
+    uart_send_str("\n");
+    loop {
+        unsafe { wfi() };
+    }
+}
+
 /// EL0 用户程序故障处理器：打印故障信息后终止当前进程（SIGSEGV 语义），
-/// 由父进程/init 回收重启——用户程序崩溃不再拖垮整个内核。
-///
 /// 由汇编 `el0_fault` 入口调用（陷阱帧已保存在内核栈上，sp 传入）。
 #[no_mangle]
 extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     let esr = unsafe { read_esr_el1() };
     let elr = unsafe { read_elr_el1() };
+    let pid = crate::sched_cfs::current_pid();
+    // [crash] 生成并落盘 tombstone（SIGSEGV/SIGILL/SIGTRAP 语义，
+    // 含寄存器/内存映射/栈回溯/日志快照），随后继续打印详细诊断。
+    {
+        let far: u64;
+        unsafe { asm!("mrs {}, far_el1", out(reg) far) };
+        let sig = crate::crash::esr_describe(esr).0;
+        let fi = crate::crash::FaultInfo {
+            kind: crate::crash::signal_name(sig),
+            pid,
+            name: crate::sched_cfs::current_task_name(),
+            esr,
+            elr,
+            far,
+        };
+        crate::crash::el0_fault(&fi, frame as *const u64);
+    }
+    if pid < crate::process::MAX_PROC as u32 {
+        let root = crate::process::processes_pub_ttbr0(pid);
+        let mapped = crate::vm::user_range_mapped(root, elr as usize, 4096);
+        let rec = crate::process::processes_pub_find(pid, elr as usize);
+        kinfo! {
+            crate::uart_send_str("[fault] pid=");
+            crate::print_dec(pid as u64);
+            crate::uart_send_str(" elr=");
+            crate::print_hex(elr);
+            crate::uart_send_str(" mapped=");
+            crate::print_dec(mapped as u64);
+            crate::uart_send_str(" rec=");
+            crate::print_hex(rec as u64);
+            crate::uart_send_str("\n");
+        }
+    }
 
+    // [诊断] 跨进程物理页重复分配检查（双重分配 → 系统级损坏根源）；
+    // [诊断] 所有任务内核栈哨兵检查（栈溢出 → 破坏位图 → 分配重叠）。
+    // 检查本身必须在安静模式下也执行：失败时的错误输出不受门控。
+    crate::process::check_double_allocations();
+    crate::sched_cfs::check_all_stack_canaries();
+
+    // 以下为详细诊断转储（寄存器/物理页/系统调用轨迹/用户栈/回溯），
+    // 安静模式（默认）下不上串口；完整信息见 /var/crash tombstone。
+    kinfo! {
     // 转储陷阱帧中的 sp_el0/elr/spsr（frame 指向栈上的 TrapFrame）
     let (f_sp, f_elr, f_spsr) = unsafe {
         let p = frame as *const u64;
@@ -1528,19 +2276,18 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     uart_send_str("\n");
     crate::linux_compat::dump_sys_trace();
 
-    // [诊断] 跨进程物理页重复分配检查（双重分配 → 系统级损坏根源）
-    crate::process::check_double_allocations();
-    // [诊断] 所有任务内核栈哨兵检查（栈溢出 → 破坏位图 → 分配重叠）
-    crate::sched_cfs::check_all_stack_canaries();
-
     // 用户栈转储：故障点附近 [-256, +128) 的内容（定位「已保存 LR 被清零」
-    // 类损坏；页未映射的部分跳过）
+    // 类损坏；页未映射的部分跳过）。边界用 ASLR 随机化后的实际栈区。
     let root = crate::process::current_root();
+    let ustack_base = crate::elf::current_stack_base() as u64;
+    let ustack_top = crate::elf::current_stack_top() as u64;
     uart_send_str(" [user-stack]");
     let start = f_sp.saturating_sub(256);
+    unsafe { crate::mmu::uaccess_begin() };
     for off in (0..(384usize)).step_by(8) {
         let va = start + off as u64;
-        if va + 8 <= crate::vm::USER_STACK_TOP as u64
+        if va + 8 <= ustack_top
+            && va >= ustack_base
             && crate::vm::user_range_mapped(root, va as usize, 8)
         {
             let v = unsafe { *((va as usize) as *const u64) };
@@ -1550,6 +2297,7 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
             uart_send_str(" ..");
         }
     }
+    unsafe { crate::mmu::uaccess_end() };
     uart_send_str("\n");
 
     // 用户回溯：沿 x29 帧指针链（每帧 [fp]=prev_fp, [fp+8]=lr）打印调用栈，
@@ -1557,9 +2305,10 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     uart_send_str(" [user-bt]");
     let mut fp = x29;
     let mut steps = 0;
+    unsafe { crate::mmu::uaccess_begin() };
     while steps < 16 {
-        if fp < crate::vm::USER_STACK_BASE as u64
-            || fp + 16 > crate::vm::USER_STACK_TOP as u64
+        if fp < ustack_base
+            || fp + 16 > ustack_top
             || !crate::vm::user_range_mapped(root, fp as usize, 16)
             || (fp % 8) != 0
         {
@@ -1572,12 +2321,13 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
         uart_send_str(" lr=");
         print_hex(lr);
         uart_send_str("]");
-        if prev_fp <= fp || prev_fp > crate::vm::USER_STACK_TOP as u64 {
+        if prev_fp <= fp || prev_fp > ustack_top {
             break;
         }
         fp = prev_fp;
         steps += 1;
     }
+    unsafe { crate::mmu::uaccess_end() };
     uart_send_str("\n");
 
     // 内核栈溢出检测：栈底 16 字节应为 0xA5 填充模式
@@ -1610,13 +2360,15 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     }
 
     crate::sched_cfs::dump_tasks();
+    } // kinfo!（详细诊断转储结束）
+
     uart_send_str("[kernel] EL0 fault pid=");
     crate::print_dec(crate::process::current_pid() as u64);
     uart_send_str(" ESR=");
     print_hex(esr);
     uart_send_str(" ELR=");
     print_hex(elr);
-    uart_send_str(" (killing process)\n");
+    uart_send_str("（正在终止进程）\n");
     // 以 SIGSEGV（-11）语义退出；exit 内部屏蔽 IRQ 并切换任务，不返回。
     // 父进程/init 回收后按 inittab 策略重启，用户程序崩溃不再挂死内核。
     crate::process::exit(-11)
@@ -1783,42 +2535,49 @@ drop_to_el1:
     .balign 2048
     .global vector_table
 vector_table:
-    // 当前 EL + SP_EL0
-    b .                 // 0x000 同步异常
+    // 当前 EL + SP_EL0（内核不运行于 SP0，若触发说明配置错误：打印诊断）
+    b unknown_fault_entry  // 0x000 同步异常
     .balign 0x80
-    b .                 // 0x080 IRQ
+    b unknown_fault_entry  // 0x080 IRQ
     .balign 0x80
-    b .                 // 0x100 FIQ
+    b unknown_fault_entry  // 0x100 FIQ
     .balign 0x80
-    b .                 // 0x180 SError
+    b unknown_fault_entry  // 0x180 SError
     .balign 0x80
     // 当前 EL + SP_ELx
     b sync_entry        // 0x200 同步异常
     .balign 0x80
     b irq_entry         // 0x280 IRQ（使用 SP_EL1 时的 IRQ 入口）
     .balign 0x80
-    b .                 // 0x300 FIQ
+    b unknown_fault_entry  // 0x300 FIQ
     .balign 0x80
-    b .                 // 0x380 SError
+    b unknown_fault_entry  // 0x380 SError
     .balign 0x80
     // 低特权级 AArch64
     b lower_sync         // 0x400 同步异常（svc #0）
     .balign 0x80
     b irq_entry          // 0x480 IRQ（EL0 被定时器抢占时，复用 EL1 的 IRQ 处理入口）
     .balign 0x80
-    b .                 // 0x500 FIQ
+    b unknown_fault_entry  // 0x500 FIQ
     .balign 0x80
-    b .                 // 0x580 SError
+    b unknown_fault_entry  // 0x580 SError
     .balign 0x80
-    // 低特权级 AArch32
-    b .                 // 0x600 同步异常
+    // 低特权级 AArch32（本系统不运行 AArch32：打印诊断后停机）
+    b unknown_fault_entry  // 0x600 同步异常
     .balign 0x80
-    b .                 // 0x680 IRQ
+    b unknown_fault_entry  // 0x680 IRQ
     .balign 0x80
-    b .                 // 0x700 FIQ
+    b unknown_fault_entry  // 0x700 FIQ
     .balign 0x80
-    b .                 // 0x780 SError
+    b unknown_fault_entry  // 0x780 SError
     .balign 0x80
+
+    // ===== 未接线异常入口：屏蔽 IRQ 后调用 Rust 诊断处理器 =====
+    .type unknown_fault_entry, %function
+unknown_fault_entry:
+    msr daifset, #2
+    bl unknown_exception_handler
+    b .
 
     // ===== IRQ 处理入口：保存现场 -> 调用 Rust handler -> 恢复现场 -> eret =====
     .type irq_entry, %function
@@ -1995,9 +2754,44 @@ sync_entry:
     stp x26, x27, [x11, #0xd0]
     stp x28, x29, [x11, #0xe0]
     str x30, [x11, #0xf0]
+    // GDB 内核断点：BRK64（0x3C）与软件步进（0x33）from EL1 → 调试桩；
+    // 返回 0 = 恢复寄存器并 eret（继续内核执行），非 0 = 走 panic
+    mrs x9, esr_el1
+    lsr x10, x9, #26
+    cmp x10, #0x3c
+    b.eq 1f
+    cmp x10, #0x33
+    b.ne 2f
+1:
+    bl sync_gdb_entry
+    cbz x0, 3f
+2:
     // 直接调用 Rust 同步异常处理器（它读取 ESR/ELR 并死循环，不返回）
     bl sync_exception_handler
     b .
+3:
+    // GDB 继续：从 PANIC_REGS 恢复 x0-x30（x11 槽为基址标记，恢复后 x11
+    // 为基址地址——内核断点场景下 x11 原始值丢失，属已知限制）并 eret。
+    // elr_el1/spsr_el1 已由 sync_gdb_entry 写入。
+    adrp x11, PANIC_REGS
+    add x11, x11, :lo12:PANIC_REGS
+    ldp x0, x1, [x11, #0x00]
+    ldp x2, x3, [x11, #0x10]
+    ldp x4, x5, [x11, #0x20]
+    ldp x6, x7, [x11, #0x30]
+    ldp x8, x9, [x11, #0x40]
+    ldp x10, x11, [x11, #0x50]
+    ldp x12, x13, [x11, #0x60]
+    ldp x14, x15, [x11, #0x70]
+    ldp x16, x17, [x11, #0x80]
+    ldp x18, x19, [x11, #0x90]
+    ldp x20, x21, [x11, #0xa0]
+    ldp x22, x23, [x11, #0xb0]
+    ldp x24, x25, [x11, #0xc0]
+    ldp x26, x27, [x11, #0xd0]
+    ldp x28, x29, [x11, #0xe0]
+    ldr x30, [x11, #0xf0]
+    eret
 
     // ===== EL0 同步异常（svc）入口：保存完整寄存器现场，调用 Rust 分发后 eret =====
     .type lower_sync, %function
@@ -2066,7 +2860,14 @@ sync_entry:
     b.eq 1f
     // 非 SVC：是否为 EL0 data abort（按需分页候选）
     cmp x10, #0x24
-    b.ne el0_fault
+    b.eq 2f
+    // GDB 调试异常：BRK64（0x3C，软件断点）与软件步进（0x32）→ 调试桩
+    cmp x10, #0x3c
+    b.eq 3f
+    cmp x10, #0x32
+    b.eq 3f
+    b el0_fault
+2:
     // 尝试按需分页：x0 = 陷阱帧指针（保留，未处理时复用）
     mov x0, sp
     bl el0_page_fault_handler
@@ -2074,6 +2875,13 @@ sync_entry:
     cbnz x0, syscall_return_restore
     // 未处理（非预留页等）：走 el0_fault_handler 终止进程
     mov x0, sp
+    b el0_fault
+3:
+    // GDB 调试桩：x0 = 陷阱帧指针；返回 0 = 恢复现场继续（eret），
+    // 非 0（未注册断点的 BRK 等）= 走 el0_fault 终止进程
+    mov x0, sp
+    bl gdb_debug_entry
+    cbz x0, syscall_return_restore
     b el0_fault
 1:
     // 确认是 svc：恢复 IRQ（syscall 处理可被抢占）
@@ -2116,6 +2924,15 @@ syscall_return_restore:
     movz x24, #0x4000, lsl #16
     cmp x22, x24
     b.hs el0_fault
+    // ★ SPSR 白名单清洗：eret 把 SPSR 中的 M/DAIF/SS/IL 原样写入 PSTATE。
+    // AArch64 的 EL0 可直接 `msr daifset`，且 rt_sigreturn 等路径的帧内容
+    // 用户可控 —— 若不清洗，EL0 能以关中断状态运行（吞掉全部定时器 tick，
+    // 单核整机冻结）甚至伪造 EL1 特权位。此处强制：EL0t（M[3:0]=0）、
+    // 中断全开（DAIF bit9:6 清零）、SS/IL（bit21/20）清零；NZCV 等其余
+    // 标志保留。
+    bic x23, x23, #0xf
+    bic x23, x23, #0x3c0
+    bic x23, x23, #0x300000
     msr sp_el0, x21
     msr elr_el1, x22
     msr spsr_el1, x23

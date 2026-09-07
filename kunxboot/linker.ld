@@ -1,9 +1,10 @@
 /* QEMU virt AArch64 裸机 bootloader 链接脚本。
  *
- * bootloader 经 `-device loader,file=...,addr=0x40200000,cpu-num=0` 加载到
- * 0x40200000 并从此处开始执行。QEMU 会把机器 DTB 放在 RAM 起始 0x40000000
- * （1MB），内核镜像约定加载到 0x40080000，因此 bootloader 避开该区域，
- * 置于 0x40200000。
+ * bootloader 经 `-device loader,file=...,addr=0x46000000,cpu-num=0` 加载到
+ * 0x46000000 并从此处开始执行。内核镜像约定加载到 0x40080000，随内核增长
+ * （当前约 12.8MB，含静态进程表与内嵌字库）可延伸至 ~0x41000000；
+ * bootloader 置于 0x46000000（128MB RAM 高区，避开内核/DTB/ramdisk 与
+ * 启动画面帧缓冲），不再与内核镜像区域重叠。
  */
 
 ENTRY(_start)
@@ -11,9 +12,9 @@ ENTRY(_start)
 SECTIONS
 {
     /* 加载地址 */
-    . = 0x40200000;
+    . = 0x46000000;
 
-    /* 栈顶：启动栈从 0x40200000 向下增长（朝向 0x40100000） */
+    /* 栈顶：启动栈从 0x46000000 向下增长（朝向 0x45F00000） */
     _stack_top = .;
 
     .text : {

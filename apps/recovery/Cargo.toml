@@ -1,0 +1,18 @@
+[package]
+name = "recovery"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 恢复模式串口菜单（无 GUI，仅 UART 交互 + 内核 OTA 系统调用）"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

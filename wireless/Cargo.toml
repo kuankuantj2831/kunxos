@@ -1,0 +1,20 @@
+[package]
+name = "kunxwireless"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 无线协议栈共享库：Wi-Fi（802.11 管理帧 / EAPOL / WPA2-PSK / WPA3-SAE / 802.1X EAP）与蓝牙（HCI / L2CAP / ATT / GATT / SMP）+ GNSS（NMEA / 融合定位）。no_std、无堆、纯函数。"
+
+[dependencies]
+
+# 裸机环境：panic 直接中止；测试在宿主 x86_64 上运行。
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

@@ -29,19 +29,19 @@ jobs:
             cargo build --release --target "$TARGET" --manifest-path "$m"
           done
 
-      - name: cargo test (if any)
+      - name: cargo test (host-testable crates only)
         run: |
-          set -uo pipefail
-          # 仅当源码中存在测试代码时才运行 cargo test；
-          # 裸机 no_std crate（aarch64-unknown-none）无 libtest，跳过测试。
-          if grep -rqE '#\[test\]|#\[cfg\(test\)\]' --include='*.rs' . ; then
-            echo "检测到测试代码，运行 cargo test（宿主架构）"
-            for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
-              cargo test --manifest-path "$m"
-            done
-          else
-            echo "未发现测试代码，跳过 cargo test"
-          fi
+          set -euo pipefail
+          # 宿主可测 crate 清单：裸机 no_std bin（自定义 linker）与含 aarch64
+          # 内联汇编的 crate（kunxhal/kunxcore）无法在宿主跑 libtest，只对
+          # 纯逻辑 crate 运行 cargo test：
+          # - shared/jpeg：JPEG 编码器
+          # - wireless：Wi-Fi（扫描/连接/4-way/SAE/802.1X）与蓝牙（HCI/L2CAP/
+          #   ATT/GATT/SMP/RFCOMM/HFP/A2DP）协议栈，QEMU 逻辑测试（模拟扫描等）
+          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml; do
+            echo "==> cargo test $m"
+            cargo test --manifest-path "$m"
+          done
 
       # 代码尚未全量按 rustfmt 格式化，fmt 检查暂作非阻塞参考。
       - name: cargo fmt --check

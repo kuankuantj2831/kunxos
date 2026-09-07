@@ -1,0 +1,24 @@
+[package]
+name = "camerad"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["qemu"]
+qemu = ["kunxhal/qemu"]
+pi4 = ["kunxhal/pi4"]
+
+[dependencies]
+kunxhal = { path = "../../kunxhal", default-features = false }
+kunxjpeg = { path = "../../shared/jpeg" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

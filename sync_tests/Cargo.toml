@@ -1,0 +1,16 @@
+[package]
+name = "sync_tests"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS 日历/联系人同步栈宿主测试（单元 + mock DAV 集成）"
+
+[lib]
+name = "sync_tests"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

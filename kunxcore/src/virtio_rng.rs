@@ -170,7 +170,7 @@ pub fn init(devs: &[MmioDev]) -> bool {
         w32(REG_QUEUE_SEL, 0);
         let num_max = r32(REG_QUEUE_NUM_MAX);
         if (num_max as usize) < QUEUE_SIZE {
-            crate::uart_send_str("[rng] virtio-rng: queue depth < 8\n");
+            crate::uart_send_str("[rng] virtio-rng：队列深度 < 8\n");
             return false;
         }
         w32(REG_QUEUE_NUM, QUEUE_SIZE as u32);
@@ -191,7 +191,7 @@ pub fn init(devs: &[MmioDev]) -> bool {
         LAST_USED = used_idx();
         READY = true;
     }
-    crate::uart_send_str("[rng] virtio-rng ready\n");
+    crate::kinfo! { crate::uart_send_str("[rng] virtio-rng 就绪\n"); }
     true
 }
 
@@ -234,7 +234,7 @@ pub fn get_random(buf: &mut [u8]) -> i32 {
             }
             tries += 1;
             if tries > 100_000_000 {
-                crate::uart_send_str("[rng] get_random timeout\n");
+                crate::uart_send_str("[rng] get_random 超时\n");
                 return -1;
             }
             core::hint::spin_loop();
