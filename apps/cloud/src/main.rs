@@ -1397,6 +1397,49 @@ fn render_lock() {
     draw_text(tx, by + (bh - 8) / 2, "解锁".as_bytes(), C_ON_ACCENT);
 }
 
+/// 长按解锁的按压起点（0 = 未按）。
+static mut UNLOCK_PRESS_T0: u64 = 0;
+
+/// 墙钟微秒（失败返回 0，长按计时退化为不可用即不可解锁 —— 安全方向）。
+fn now_us() -> u64 {
+    let mut tv = [0u8; 16];
+    let r = unsafe { syscall3(169, tv.as_mut_ptr() as usize, 0, 0) } as isize;
+    if r < 0 {
+        return 0;
+    }
+    let sec = u64::from_le_bytes(tv[0..8].try_into().unwrap_or([0; 8]));
+    let usec = u64::from_le_bytes(tv[8..16].try_into().unwrap_or([0; 8])) as u64;
+    sec * 1_000_000 + usec
+}
+
+/// 追加写（审计日志）。目录不存在时先建。
+fn append_file(path: &str, data: &[u8]) -> bool {
+    unsafe {
+        // O_APPEND = 0x400（ARM64 asm-generic）；目录已存在时 mkdirat 失败忽略。
+        syscall3(34, 0xFFFF_FFFF_FFFF_FF9C, b"/data/cloud\0".as_ptr() as usize, 0o755);
+        // O_WRONLY | O_CREAT | O_APPEND
+        let fd = open(path, 1 | 0x40 | 0x400);
+        if fd < 0 {
+            return false;
+        }
+        let mut off = 0usize;
+        while off < data.len() {
+            let n = syscall3(
+                SYS_WRITE,
+                fd as usize,
+                data[off..].as_ptr() as usize,
+                data.len() - off,
+            ) as isize;
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+        syscall1(SYS_CLOSE, fd as usize);
+        off == data.len()
+    }
+}
+
 fn unlock_hit(x: i32, y: i32) -> bool {
     let bw = 200i32;
     let bx = (DISPLAY_W as i32 - bw) / 2;
@@ -1529,16 +1572,52 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 break;
             }
             if unsafe { LOCKED } {
+                // 解锁防误触 + 留痕：远程锁定的本地点按式解锁形同虚设。
+                // 现要求长按 2s（持续按在按钮上），并落一条审计记录。
+                // （完整鉴权需服务端 unlock 流程/文本输入 UI，产品侧待定。）
                 if unlock_hit(x, y) {
-                    unsafe { LOCKED = false; }
-                    if !write_file(F_LOCKED, b"0") {
-                        print("[cloud] 写入 F_LOCKED 失败\n");
-                        show_error("解锁状态保存失败".as_bytes());
+                    let now = now_us();
+                    let pressed_for = unsafe {
+                        if UNLOCK_PRESS_T0 == 0 {
+                            u64::MAX
+                        } else {
+                            now.saturating_sub(UNLOCK_PRESS_T0)
+                        }
+                    };
+                    if pressed_for > 3_000_000 {
+                        unsafe { UNLOCK_PRESS_T0 = now; }
+                    } else if pressed_for >= 2_000_000 {
+                        unsafe { UNLOCK_PRESS_T0 = 0; }
+                        unsafe { LOCKED = false; }
+                        if !write_file(F_LOCKED, b"0") {
+                            print("[cloud] 写入 F_LOCKED 失败\n");
+                            show_error("解锁状态保存失败".as_bytes());
+                        }
+                        let mut line = [0u8; 64];
+                        let la = read_oobe("local_account");
+                        let mut m = 0usize;
+                        let tag = b"[unlock] local long-press user=";
+                        for &c in tag {
+                            line[m] = c;
+                            m += 1;
+                        }
+                        for &c in &la[..la.len().min(line.len() - m - 1)] {
+                            if c == b':' || c == b'\n' {
+                                break;
+                            }
+                            line[m] = c;
+                            m += 1;
+                        }
+                        line[m] = b'\n';
+                        m += 1;
+                        append_file("/data/cloud/unlock.log", &line[..m]);
+                        set_status("设备已解锁（长按确认）".as_bytes());
+                        render();
+                        flip();
+                        cursor_overlay_redraw();
                     }
-                    set_status("设备已解锁".as_bytes());
-                    render();
-                    flip();
-                    cursor_overlay_redraw();
+                } else {
+                    unsafe { UNLOCK_PRESS_T0 = 0; }
                 }
                 continue;
             }

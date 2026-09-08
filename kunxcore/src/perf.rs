@@ -161,11 +161,18 @@ pub fn set_overlay(on: bool) {
     crate::uart_send_str(if on { "[perf] overlay 已启用\n" } else { "[perf] overlay 已关闭\n" });
 }
 
+/// 当前 overlay 矩形（None = 未启用/未绘制）。合成器据此把 overlay 区域
+/// 并入 clean 集（直写 back 的像素需回写缓存，真机可见），并联合上一帧
+/// 矩形恢复底图（文本长度逐帧变化，窄帧会在宽残影上叠加）。
+pub static mut OVERLAY_RECT: Option<(i32, i32, u32, u32)> = None;
+static mut PREV_OVERLAY_RECT: Option<(i32, i32, u32, u32)> = None;
+
 /// 在屏幕右上角绘制统计 overlay。由合成器每帧呈现前调用；无合成器时
 /// （未接 ramfb）跳过。文本 8x8 点阵放大 2x，半透明黑底。
 pub fn draw_overlay() {
     unsafe {
         if !OVERLAY_ENABLED {
+            OVERLAY_RECT = None;
             return;
         }
         let (fb, w, h) = if crate::compositor::ready() {
@@ -190,11 +197,21 @@ pub fn draw_overlay() {
         let th = 8 * scale as i32;
         let x = (w as i32) - tw - 6;
         let y = 6i32;
+        // 恢复集取当前 ∪ 上一帧矩形（宽度随统计文本长度变化）。
+        let prev = PREV_OVERLAY_RECT.take();
+        PREV_OVERLAY_RECT = Some((x, y, tw as u32, th as u32));
+        OVERLAY_RECT = Some((x, y, tw as u32, th as u32));
+        if let Some((px, py, pw, ph)) = prev {
+            let ux = x.min(px);
+            let uy = y.min(py);
+            let ux1 = (x + tw).max(px + pw as i32);
+            let uy1 = (y + th).max(py + ph as i32);
+            crate::compositor::restore_back_from_canvas(ux, uy, ux1 - ux, uy1 - uy);
+        } else {
+            crate::compositor::restore_back_from_canvas(x, y, tw, th);
+        }
         let s = Surface { pixels: fb as *mut u32, w, h };
-        // 先从 canvas 恢复该区域再叠加：back 每 2 帧轮回复用，且本区域
-        // 不在脏区 clean/copy 集内 —— 不恢复会把 40% 黑底逐帧累积成全黑。
-        crate::compositor::restore_back_from_canvas(x, y, tw, th);
-        // 半透明黑底（alpha 混合 40%）
+        // 半透明黑底（alpha 混合 40%；底图恢复见上：当前 ∪ 上一帧矩形）
         for row in 0..th {
             for col in 0..tw {
                 let px = x + col;

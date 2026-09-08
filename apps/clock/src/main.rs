@@ -1348,9 +1348,14 @@ fn tap_alarm_list(x: i32, y: i32) {
         if y < yy || y >= yy + row_h {
             continue;
         }
-        // 开关。
-        let _sx = DISPLAY_W as i32 - 26 - 48;
-        if y < yy + (row_h - 28) / 2 - 12 + 28 && y >= yy + (row_h - 28) / 2 - 12 {
+        // 开关（x 限定在开关绘制区：此前只判 y，行上半部任意 x 都会翻转
+        // 开关并落盘，行内「点击 = 编辑」永远不可达）。
+        let sx = DISPLAY_W as i32 - 26 - 48;
+        if x >= sx
+            && x < sx + 48
+            && y < yy + (row_h - 28) / 2 - 12 + 28
+            && y >= yy + (row_h - 28) / 2 - 12
+        {
             let on = unsafe { ALARMS[i] }.on;
             unsafe { ALARMS[i].on = !on };
             persist_alarms();

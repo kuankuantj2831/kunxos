@@ -302,7 +302,12 @@ fn render_day() {
     for i in 0..cnt.min(12) {
         let y = 90 + i as i32 * 62;
         draw_glass(12, y, DISPLAY_W as i32 - 24, 54, 14);
-        draw_text(24, y + 8, &sums[i], C_TEXT);
+        // 按 NUL 截断（160B 数组的填充区会让 utf8_next 产出 cp=0 notdef 字形）。
+        let sl = sums[i]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(sums[i].len());
+        draw_text(24, y + 8, &sums[i][..sl], C_TEXT);
         let mut tbuf = [0u8; 16];
         let mut tn = 0;
         let (_, _, _, h1, m1, _) = sync::util::civil_from_epoch(starts[i]);
@@ -467,8 +472,11 @@ fn save_new_event() {
             now_us: now_us(),
             resolve: RESOLVE_MANUAL,
         };
-        let mut blob = [0u8; 4096];
-        let mut s = store(&mut blob);
+        // 复用静态 256KB blob：4KB 缓冲在 events.blob > 4KB（约 10 个事件）
+        // 后 append 恒失败（误报「存储已满」），遇删除墓碑触发 compact 时
+        // 还会以截断内存半覆盖 blob 文件 → idx/blob 永久不一致。与 do_sync
+        // 的既有做法一致。
+        let mut s = store(&mut *core::ptr::addr_of_mut!(EV_BLOB));
         let mut pbuf = [0u8; 192];
         let mut pl = sync::util::copy_into(&mut pbuf, b"/");
         if let Some(c) = meta().collection(1) {
@@ -733,8 +741,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                         unsafe { PAGE = PAGE_MONTH; }
                     } else if btn_hit(x, y, 320, 420, 200, 48) || back_hit(x, y) {
                         unsafe { PAGE = PAGE_MONTH; }
-                    } else if y >= 120 && y < 260 {
-                        unsafe { F_FOCUS = ((y - 120) / 90) as u8; }
+                    } else if y >= 120 && y < 350 {
+                        // 三个输入框（y=120/210/300，步距 90）：此前命中区
+                        // 只到 260，时间框点不中，只能靠回车循环聚焦。
+                        unsafe { F_FOCUS = (((y - 120) / 90) as u8).min(2); }
                     }
                 }
                 PAGE_SYNC => {
@@ -745,8 +755,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                         do_sync();
                     } else if btn_hit(x, y, 356, 380, 160, 44) || back_hit(x, y) {
                         unsafe { PAGE = PAGE_MONTH; }
-                    } else if y >= 110 && y < 260 {
-                        unsafe { F_FOCUS = ((y - 110) / 90) as u8; }
+                    } else if y >= 110 && y < 290 {
+                        unsafe { F_FOCUS = (((y - 110) / 90) as u8).min(2); }
                     }
                 }
                 _ => {}

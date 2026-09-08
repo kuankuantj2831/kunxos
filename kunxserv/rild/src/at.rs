@@ -278,8 +278,12 @@ pub fn parse_num(s: &[u8]) -> Option<u32> {
 
 /// 提取一行中冒号后的内容（如 "+CRING: 138..." → "138..."），去引号去空白。
 pub fn after_colon(line: &[u8]) -> &[u8] {
-    let idx = line.iter().position(|&b| b == b':').unwrap_or(line.len());
-    let rest = &line[idx + 1..];
+    // 无冒号行（如 GSM 模块默认上报的无参数 "RING"）：idx+1 会越过行尾
+    // （start > end 切片 panic）—— 返回空切片。
+    let rest = match line.iter().position(|&b| b == b':') {
+        Some(i) => &line[i + 1..],
+        None => return &line[line.len()..],
+    };
     let rest = rest.trim_ascii();
     // 单个 '"'（len==1）时 starts_with 与 ends_with 同真，&rest[1..0] 会
     // panic —— 长度 >= 2 才做去引号

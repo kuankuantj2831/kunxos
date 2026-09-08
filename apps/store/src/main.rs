@@ -89,6 +89,7 @@ const SYS_WRITE: usize = 64;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_LSEEK: usize = 62;
+const SYS_FTRUNCATE: usize = 46;
 const SYS_MKDIRAT: usize = 34;
 const SYS_UNLINKAT: usize = 35;
 const SYS_RENAMEAT: usize = 38;
@@ -962,9 +963,10 @@ fn download_pkg_to_cache(cfg: &r2::R2Config, key: &[u8], out_path: &str) -> isiz
             print("[store] 下载重试 ");
             print_dec(attempt);
             print("\n");
-            // 重试时从文件头重写（无断点续传；续传由 s3_head + Range 预留）
-            let z = syscall3(SYS_LSEEK, fd as usize, 0, 0);
-            let _ = z;
+            // 重试时从文件头重写（无断点续传；续传由 s3_head + Range 预留）。
+            // 必须同时截断：上一次尝试的残留尾部（短包）会让整包验签失败。
+            let _ = syscall3(SYS_LSEEK, fd as usize, 0, 0);
+            syscall3(SYS_FTRUNCATE, fd as usize, 0, 0);
             sleep_ms(backoff);
         };
         syscall1(SYS_CLOSE, fd as usize);

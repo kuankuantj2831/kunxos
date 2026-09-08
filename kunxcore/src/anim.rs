@@ -635,6 +635,11 @@ fn report_frame_stats() {
             }
             buf[j] = key;
         }
+        if n == 0 {
+            // STATS_PENDING 跨上下文竞态：IRQ 侧在 report 的 UART 输出期间
+            // 再次置位、线程侧消费空窗口 —— n==0 时直接返回，防 n-1 下溢。
+            return;
+        }
         let p95 = buf[(n * 95 / 100).min(n - 1)];
         let avg = if s.count > 0 { s.sum / s.count as u64 } else { 0 };
         let ravg = if s.count > 0 { s.render_sum / s.count as u64 } else { 0 };
@@ -686,6 +691,7 @@ pub fn frame_tick() {
         };
         LAST_TICK_US = now;
 
+        let any_active_before = ANY_ACTIVE;
         let mut any = false;
         for a in ANIMS.iter_mut() {
             if !a.active {
@@ -714,6 +720,15 @@ pub fn frame_tick() {
         ANY_ACTIVE = any;
         // 统一执行完成回调（迭代外，见 FINISH_Q 注释）。
         run_finish_queue();
+
+        // 本 tick 有动画自然结束（任一 active→inactive）：终值 apply 只标记
+        // 了脏区，若就此停表返回，屏幕会停留在上一 tick 的中间值（如淡出
+        // 窗口的残影 alpha）直到下一次输入 —— 收尾帧立即合成并呈现一次。
+        if !ANY_ACTIVE && any_active_before && compositor::ready() && !compositor::fb_active() {
+            if compositor::composite() {
+                compositor::present();
+            }
+        }
 
         // 应用直绘接管后（compositor::fb_active），显示节奏由应用的
         // `fb_present` 决定（应用在帧边界提交脏区并请求翻转），本 tick 只

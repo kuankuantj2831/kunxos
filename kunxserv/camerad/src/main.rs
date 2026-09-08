@@ -258,7 +258,9 @@ fn build_path_num(buf: &mut [u8], dir: &str, prefix: &str, num: u32, suffix: &st
 /// 把十进制数写进 `out`，返回写入的字节数。
 fn fmt_dec(out: &mut [u8], mut v: u64) -> usize {
     let mut i = out.len();
-    loop {
+    // i > 0 下界护栏：v 的位数超过缓冲时 i 下溢回绕（右对齐定宽缓冲的
+    // 潜伏缺陷，调用点缓冲 8~12 字节）。
+    while i > 0 {
         i -= 1;
         out[i] = b'0' + (v % 10) as u8;
         v /= 10;

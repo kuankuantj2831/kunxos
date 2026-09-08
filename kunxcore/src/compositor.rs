@@ -1157,10 +1157,23 @@ pub fn present() {
         }
         // [perf] 性能 overlay：在待翻转的 back 上绘制（随每帧上屏），并计数
         crate::perf::draw_overlay();
-        gpu_simple::present_rects(
-            C.back as usize,
-            &C.last_dirty[..C.last_dirty_count],
-        );
+        // overlay 直写 back 但不在合成脏区集内：把其矩形并入 clean 集，
+        // 否则真机上 overlay 像素滞留缓存不上屏（QEMU 无缓存一致性影响）。
+        let overlay_clean = unsafe { crate::perf::OVERLAY_RECT }
+            .map(|(x, y, w, h)| Rect::new(x, y, w, h));
+        if let Some(r) = overlay_clean {
+            let mut rects: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
+            let cnt = C.last_dirty_count.min(MAX_DIRTY - 1);
+            rects[..cnt].copy_from_slice(&C.last_dirty[..cnt]);
+            let mut rc = cnt;
+            merge_rect(&mut rects, &mut rc, r);
+            gpu_simple::present_rects(C.back as usize, &rects[..rc]);
+        } else {
+            gpu_simple::present_rects(
+                C.back as usize,
+                &C.last_dirty[..C.last_dirty_count],
+            );
+        }
         core::mem::swap(&mut C.front, &mut C.back);
         crate::perf::note_frame();
     }

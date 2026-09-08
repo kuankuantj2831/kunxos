@@ -159,7 +159,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     // 5. COW 引用计数泄漏测试：反复 fork + exit（不 exec），验证共享页
     //    引用计数正确增减，物理内存不泄漏。
     print_str("[syscall-test] COW fork 循环测试\n");
-    for i in 0..8 {
+    for _i in 0..8 {
         let p = unsafe { syscall1(SYS_CLONE, SIGCHLD) } as i64;
         if p < 0 {
             fail("克隆循环");
@@ -170,7 +170,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         }
         let mut st = 0u32;
         let r2 = unsafe { syscall3(SYS_WAIT4, p as usize, (&mut st) as *mut u32 as usize, 0) };
-        if r2 < 0 || ((st >> 8) & 0xFF) != 0 {
+        if (r2 as isize) < 0 || ((st >> 8) & 0xFF) != 0 {
             fail("克隆循环等待");
         }
     }
@@ -190,7 +190,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         fail("truncate");
     }
     let fd = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/trunc_test"), O_RDONLY) };
-    if fd < 0 {
+    if (fd as isize) < 0 {
         fail("truncate 打开");
     }
     unsafe { syscall1(SYS_CLOSE, fd as usize) };
@@ -230,7 +230,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     // 4. procfs：读 /proc/version 与 /proc/meminfo
     {
         let fd = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/proc/version"), O_RDONLY) };
-        if fd >= 0 {
+        if (fd as isize) >= 0 {
             let mut b = [0u8; 128];
             let n = unsafe { syscall3(SYS_READ, fd as usize, b.as_mut_ptr() as usize, 128) };
             print_str("[syscall-test] /proc/version: ");
@@ -242,7 +242,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             print_str("[syscall-test] 打开 /proc/version 失败\n");
         }
         let fd2 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/proc/meminfo"), O_RDONLY) };
-        if fd2 >= 0 {
+        if (fd2 as isize) >= 0 {
             let mut b = [0u8; 256];
             let n = unsafe { syscall3(SYS_READ, fd2 as usize, b.as_mut_ptr() as usize, 256) };
             print_str("[syscall-test] /proc/meminfo: ");
@@ -254,7 +254,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             print_str("[syscall-test] 打开 /proc/meminfo 失败\n");
         }
         let fd3 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/proc/processes"), O_RDONLY) };
-        if fd3 >= 0 {
+        if (fd3 as isize) >= 0 {
             let mut b = [0u8; 256];
             let n = unsafe { syscall3(SYS_READ, fd3 as usize, b.as_mut_ptr() as usize, 256) };
             print_str("[syscall-test] /proc/processes:\n");
@@ -270,8 +270,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     // 7. tmpfs：写入 /tmp/tmpfs_test 再读回
     {
         let fd = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/tmpfs_test"), O_WRONLY | O_CREAT | O_TRUNC) };
-        if fd >= 0 {
-            let w = unsafe { syscall3(SYS_WRITE, fd as usize, b"TMPFS-OK\n".as_ptr() as usize, 9) };
+        if (fd as isize) >= 0 {
+            let _w = unsafe { syscall3(SYS_WRITE, fd as usize, b"TMPFS-OK\n".as_ptr() as usize, 9) };
             unsafe { syscall1(SYS_CLOSE, fd as usize) };
             let fd2 = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/tmpfs_test"), O_RDONLY) };
             let mut b = [0u8; 16];
@@ -312,8 +312,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         print_str(" 获取=");
         print_hex(rd as u64);
         print_str(" 数据=");
-        if rd > 0 {
-            print_str(core::str::from_utf8(&cb[..rd as usize]).unwrap_or("?"));
+        // 剪贴板空/失败返回负 errno（usize 巨大值）：按 isize 判正并钳制。
+        let rd_i = rd as isize;
+        if rd_i > 0 {
+            print_str(core::str::from_utf8(&cb[..(rd_i as usize).min(cb.len())]).unwrap_or("?"));
         }
         print_str("\n");
         if rd == 14 && &cb[..14] == b"clipboard-data" {
@@ -350,8 +352,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 print_str("[syscall-test] TCP 接收返回=");
                 print_hex(n as u64);
                 print_str(" 数据=");
-                if n > 0 {
-                    print_str(core::str::from_utf8(&b[..n as usize]).unwrap_or("?"));
+                // recvfrom 失败返回负 errno（对端重置等）：按 isize 判正。
+                let n_i = n as isize;
+                if n_i > 0 {
+                    print_str(core::str::from_utf8(&b[..(n_i as usize).min(b.len())]).unwrap_or("?"));
                 }
                 print_str("\n");
                 if n == 12 && &b[..12] == b"hello-kunxos" {

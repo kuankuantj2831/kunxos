@@ -690,7 +690,10 @@ fn synth_ring_chunk(chunk: u32, out: &mut [u8]) {
         let mut v = unsafe { SINE[phase as usize] as i32 };
         // 淡入淡出。
         let mut env = 32768;
-        let pos = seg_start as i32 * audio::CHUNK_FRAMES as i32 + i as i32;
+        // 段内位置 =（本块在段内的序号）× 块帧数 + 块内偏移。此前用
+        // seg_start（段起始块号）当序号：段 A 每块都命中淡入区间（全深度
+        // 颤音且无淡出），段 B 的 pos 恒超段尾（env ≈ 0.4%，不可闻）。
+        let pos = (off - seg_start) as i32 * audio::CHUNK_FRAMES as i32 + i as i32;
         if pos < fade {
             env = env * pos / fade;
         } else if pos >= seg_len as i32 * audio::CHUNK_FRAMES as i32 - fade {

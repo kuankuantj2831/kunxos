@@ -547,6 +547,15 @@ fn run_pipeline(p: &Pipeline) {
     for i in 0..p.n {
         let cmd = &p.cmds[i];
         let is_last = i == p.n - 1;
+        // source 作为管道段拒绝：cmd_source 会在本 run_pipeline 的栈帧内
+        // 逐行再入 run_pipeline，复用同一对静态 INPUT_BUF/OUTPUT_BUF ——
+        // 外层 exec_one(source) 持有的输出缓冲被嵌套管线原地改写
+        // （SOURCE_DEPTH 只防 source 套 source，防不住这条路径）。
+        if p.n > 1 && matches!(word_str(&cmd.argv[0]), "source" | "sh") {
+            crate::uart_send_str("source: 不支持作为管道段执行\n");
+            input_len = 0;
+            continue;
+        }
         let mut output: &mut [u8] = unsafe { &mut OUTPUT_BUF };
         let (out_len, redirected, truncated) =
             exec_one(cmd, unsafe { &INPUT_BUF[..input_len] }, &mut output);
@@ -1394,10 +1403,13 @@ fn cmd_power(cmd: &Command, sink: &mut Sink) {
         return;
     }
 
+    let is_selftest = n > 0 && args[0] == "selftest";
     let r = crate::power::handle_cmd(&args[..n]);
     if r < 0 {
         sink.emit_str("power: 参数错误\n");
-    } else {
+    } else if is_selftest {
+        // 仅 selftest 打印结论汇总（power.rs 的 UART 行打「N 个失败」，
+        // 此处不再重复打印，避免双份且措辞不一致的输出）。
         sink.emit_str("[power] 自检完成：");
         sink.emit_u32(r as u32);
         sink.emit_str(" 处失败\n");

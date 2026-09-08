@@ -312,7 +312,9 @@ fn try_framebuffer(w: u32, h: u32) -> Option<DisplayInfo> {
     let mut p = 2usize;
     let mut fb_bus = 0u32;
     let mut pitch = 0u32;
-    loop {
+    // 边界防护：畸形固件响应（val_size 巨大/越界 p）此前直接索引越界 panic，
+    // 且发生在 display_init 启动路径。
+    while p + 2 < buf.0.len() {
         let tag = buf.0[p];
         p += 1;
         if tag == 0 {
@@ -320,8 +322,14 @@ fn try_framebuffer(w: u32, h: u32) -> Option<DisplayInfo> {
         }
         let val_size = buf.0[p];
         p += 1;
+        if p >= buf.0.len() || val_size as usize > buf.0.len() * 4 {
+            break;
+        }
         let val_len = buf.0[p];
         p += 1;
+        if p + 1 >= buf.0.len() {
+            break;
+        }
         if tag == 0x0004_0001 && val_len >= 12 {
             fb_bus = buf.0[p + 1]; // [对齐, bus 地址, 大小]
         } else if tag == 0x0004_0008 && val_len >= 4 {

@@ -869,7 +869,9 @@ fn write_dec(buf: &mut [u8], mut v: u32) -> usize {
     let mut tmp = [0u8; 12];
     let mut i = tmp.len();
     if v == 0 {
-        tmp[i - 1] = b'0';
+        // v==0 也要产出 "0"（缺 i-=1 会写出空串，AT+CMGR 缺索引）。
+        i -= 1;
+        tmp[i] = b'0';
     } else {
         while v > 0 && i > 0 {
             i -= 1;
@@ -877,8 +879,10 @@ fn write_dec(buf: &mut [u8], mut v: u32) -> usize {
             v /= 10;
         }
     }
-    let n = tmp.len() - i;
-    buf[..n].copy_from_slice(&tmp[i..]);
+    // 有界：调用方缓冲尾可能小于完整十进制长度（cmd[8..] 仅 8 字节，
+    // idx ≥ 10^8 时 copy_from_slice 长度不匹配 panic）。
+    let n = (tmp.len() - i).min(buf.len());
+    buf[..n].copy_from_slice(&tmp[i..i + n]);
     n
 }
 

@@ -264,6 +264,7 @@ fn handle_request(fname: &[u8]) {
     if got == 0 {
         return;
     }
+    // 就绪窗口防护见下方 write 失败路径。
     // 内容 "<title>|<body>"（≤160B）
     let content = unsafe { &BUF[..got.min(BUF.len())] };
     let id = next_id();
@@ -278,7 +279,24 @@ fn handle_request(fname: &[u8]) {
     let k2 = content.len().min(cmd.len() - m);
     cmd[m..m + k2].copy_from_slice(&content[..k2]);
     m += k2;
-    let ok = write_file(cmd_path_str(), &cmd[..m]);
+    let mut ok = write_file(cmd_path_str(), &cmd[..m]);
+    if !ok {
+        // lifd 未就绪窗口（/data/life 由 lifd 创建，启动顺序不保证）：补建
+        // 目录后重试一次；仍失败则把请求文件原样写回，通知不丢。
+        mkdir("/data/life");
+        ok = write_file(cmd_path_str(), &cmd[..m]);
+        if !ok {
+            let mut rp = [0u8; 96];
+            let mut rn = 0usize;
+            copy_str(&mut rp, &mut rn, PUSH_IN);
+            rp[rn] = b'/';
+            rn += 1;
+            let k3 = fname.len().min(rp.len() - rn);
+            rp[rn..rn + k3].copy_from_slice(&fname[..k3]);
+            rn += k3;
+            write_file(core::str::from_utf8(&rp[..rn]).unwrap_or(""), content);
+        }
+    }
     log2("通知 id=", id as u64);
     print(" -> pid=");
     print_dec(pid);

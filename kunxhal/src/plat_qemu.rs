@@ -473,9 +473,12 @@ fn render_yuv420(dst: &mut [u8], w: usize, h: usize, seq: u32, ts_us: u64) {
                     16
                 }
 } else if in_ts {
-                // 简化：ts 低 16 位，自左向右
-                let idx = x - (w - 128);
-                let bitv = (ts_us as u32 >> (15 - idx / 4)) & 1;
+                // 简化：ts 低 16 位，自左向右。128px/4px每比特 = 32 位，
+                // 移位量应为 31 - idx/4（此前 15 - idx/4 在 idx ≥ 64 时
+                // usize 下溢：overflow-checks 构建每帧 panic，release 渲染
+                // 错误比特）；基址 saturating（与条件行一致）。
+                let idx = x.saturating_sub(w.saturating_sub(128));
+                let bitv = (ts_us as u32 >> (31 - (idx / 4).min(31))) & 1;
                 if bitv == 1 {
                     200
                 } else {
@@ -672,14 +675,17 @@ const fn ap_cfg(
 ) -> SimApCfg {
     let mut c = SimApCfg {
         ssid: [0; 32],
-        ssid_len: ssid.len() as u8,
+        // 长度字段必须按实际拷贝上限截断（消费者按 ssid_len 切片，超长
+        // 长度字段会让 ssid[..len] 越界 panic）。const fn 无 Ord::min，
+        // 用条件表达式。
+        ssid_len: if ssid.len() > 32 { 32 } else { ssid.len() } as u8,
         bssid,
         channel,
         rssi,
         auth,
         hidden,
         psk: [0; 64],
-        psk_len: psk.len() as u8,
+        psk_len: if psk.len() > 64 { 64 } else { psk.len() } as u8,
     };
     let mut i = 0;
     while i < ssid.len() && i < 32 {

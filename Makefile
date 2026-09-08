@@ -537,6 +537,7 @@ TEST_MODEM_LOG := /tmp/kunxos-modemtest.log
 
 test-modem: $(RILD_ELF) $(MODEMTEST_ELF)
 	@touch $(ROOTFS)/data/modemtest.flag
+	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
 	@$(MAKE) kernel
 	@rm -f $(TEST_MODEM_LOG)
 	@echo "== running modemtest in QEMU (headless) =="
@@ -554,6 +555,7 @@ TEST_SFSRACE_LOG := /tmp/kunxos-sfsrace.log
 
 test-sfsrace: $(SFSRACE_ELF)
 	@touch $(ROOTFS)/sfsrace-test
+	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
 	@$(MAKE) kernel
 	@rm -f $(TEST_SFSRACE_LOG)
 	@echo "== running sfsrace in QEMU (headless) =="
@@ -573,6 +575,7 @@ TEST_AUDIO_LOG := /tmp/kunxos-audio-test.log
 
 test-audio: $(AUDIOMIX_ELF) $(AUDIOLAT_ELF)
 	@touch $(ROOTFS)/etc/audio-test
+	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
 	@$(MAKE) kernel
 	@rm -f $(TEST_AUDIO_LOG)
 	@echo "== running audio test in QEMU (headless) =="

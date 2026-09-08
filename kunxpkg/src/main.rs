@@ -1114,6 +1114,12 @@ unsafe fn list_perms(name: &str) {
 
 /// 授予/撤销某权限（改写授权记录）。
 unsafe fn cmd_perms(name: &str, action: &str, perm: &str) {
+    // CLI 包名白名单（与 install 同款）：`pkg perms ../../etc/x grant FOO`
+    // 可把权限文件写到 PERMS_DIR 之外。
+    if !legacy_valid_name(name.as_bytes()) {
+        print("[pkg] 无效的包名\n");
+        return;
+    }
     if action.is_empty() {
         list_perms(name);
         return;
@@ -1122,6 +1128,8 @@ unsafe fn cmd_perms(name: &str, action: &str, perm: &str) {
         print("[pkg] 无效的权限名\n");
         return;
     }
+    // 注意：授权行匹配必须按完整字段（perm + ':'），前缀匹配会把
+    // STORAGE2 误改写成 STORAGE（静默篡改另一权限）。
     let mut p = [0u8; 160];
     let plen = fsio::path_join3(&mut p, PERMS_DIR, b"/", name.as_bytes());
     let rlen = fsio::read_path(&p[..plen], &mut TMP_BUF);
@@ -1135,7 +1143,11 @@ unsafe fn cmd_perms(name: &str, action: &str, perm: &str) {
             while ls < rlen {
                 let le = next_line(&TMP_BUF, ls);
                 let line = line_str(&TMP_BUF, ls, le);
-                if line.starts_with(perm.as_bytes()) {
+                let mut is_target = line.starts_with(perm.as_bytes());
+                if is_target && line.len() > perm.len() && line[perm.len()] != b':' {
+                    is_target = false; // STORAGE 前缀不得命中 STORAGE2
+                }
+                if is_target {
                     append_bounded(&mut rec, &mut off, perm.as_bytes());
                     append_bounded(&mut rec, &mut off, b": granted\n");
                     found = true;
@@ -1161,7 +1173,11 @@ unsafe fn cmd_perms(name: &str, action: &str, perm: &str) {
             while ls < rlen {
                 let le = next_line(&TMP_BUF, ls);
                 let line = line_str(&TMP_BUF, ls, le);
-                if !line.starts_with(perm.as_bytes()) {
+                let mut is_target = line.starts_with(perm.as_bytes());
+                if is_target && line.len() > perm.len() && line[perm.len()] != b':' {
+                    is_target = false;
+                }
+                if !is_target {
                     append_bounded(&mut rec, &mut off, line);
                     append_bounded(&mut rec, &mut off, b"\n");
                 }
@@ -1314,6 +1330,12 @@ unsafe fn remove_dir_contents(dir: &[u8]) {
 // ==================== 命令：remove / rollback ====================
 
 unsafe fn cmd_remove(name: &str, keep_data: bool) {
+    // CLI 包名白名单：`pkg remove ../..` 经 /res/../.. 清扫根目录文件
+    // （is_installed 用目录打开检查，目录路径会通过）。
+    if !legacy_valid_name(name.as_bytes()) {
+        print("[pkg] 无效的包名\n");
+        return;
+    }
     if !is_installed(name) {
         print("[pkg] 未安装: ");
         print(name);
@@ -1362,6 +1384,10 @@ unsafe fn cmd_remove(name: &str, keep_data: bool) {
 }
 
 unsafe fn cmd_rollback(name: &str) {
+    if !legacy_valid_name(name.as_bytes()) {
+        print("[pkg] 无效的包名\n");
+        return;
+    }
     if !is_installed(name) {
         print("[pkg] 未安装: ");
         print(name);
@@ -1764,8 +1790,11 @@ unsafe fn extract_entry(e: format::Entry, name: &str) -> Result<(), &'static str
 
 /// 把 payload 相对路径加入 files 记录（保留原相对路径）。
 fn append_path(files: &mut [u8], mut len: usize, p: &[u8]) -> usize {
+    // 分隔符必须与消费方一致：rollback_files 按 NUL 切分（与
+    // list_dir/remove_dir_contents 同约定）—— 此前写 ','，整个 files 串被
+    // 当成一个路径，卸载/回滚从不删除任何已解压文件。
     if len > 0 && len < files.len() {
-        files[len] = b',';
+        files[len] = 0;
         len += 1;
     }
     let c = p.len().min(files.len().saturating_sub(len));

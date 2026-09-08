@@ -27,7 +27,10 @@ use crate::uart;
 /// 即最大 0x3F80000（63.5MB）。实际内核已含内嵌 16MB ramdisk 约 58MB，
 /// 旧的 48MB 上限会把合法内核拒之门外（双槽全拒 → 误入 recovery）。
 pub const MAX_KERNEL_FILE: usize = 0x03F8_0000; // 63.5MB（紧贴 DTB 区下界）
-pub const MAX_DTB_FILE: usize = 0x0009_0000; // 512KB 载荷 + …
+// 必须与 dtb::SCRATCH_SIZE 一致：fixup 的 scratch 只有 128KB，超过即
+// 「DTB 修正失败」→ hang() —— 载荷上限 576KB 时 128KB~576KB 的合法 DTB
+// 会把启动锁死。编译期断言见下。
+pub const MAX_DTB_FILE: usize = 0x0002_0000;
 pub const MAX_RAMDISK_FILE: usize = 0x0101_0000; // 16MB 载荷 + …
 pub const MAX_RECOVRD_FILE: usize = 0x0101_0000; // 16MB 载荷 + …
 

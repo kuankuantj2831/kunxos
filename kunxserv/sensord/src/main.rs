@@ -287,24 +287,35 @@ fn bytes_starts_with(a: &[u8], prefix: &[u8]) -> bool {
 }
 
 /// 处理管道命令。
-fn handle_command(cmd: &[u8], steps: u32, raises: u32, have_mag: bool, quit: &mut bool) {
+fn handle_command(
+    cmd: &[u8],
+    steps: &mut StepDetector,
+    raises: &mut RaiseDetector,
+    have_mag: bool,
+    quit: &mut bool,
+) {
+    // RESET 需要检测器内部状态（峰值基准等）：以可变借用透传，原签名只给
+    // u32 拷贝、RESET 分支是空操作（打印后计数继续累加）。
     if bytes_starts_with(cmd, b"STATUS") {
         print("[sensord] STATUS: mode=");
         print(if have_mag { "geo" } else { "game" });
         print(" steps=");
-        print_dec(steps as u64);
+        print_dec(steps.count as u64);
         print(" raises=");
-        print_dec(raises as u64);
+        print_dec(raises.count as u64);
         print("\n");
     } else if bytes_starts_with(cmd, b"STEPS") {
         print("[sensord] steps=");
-        print_dec(steps as u64);
+        print_dec(steps.count as u64);
         print("\n");
     } else if bytes_starts_with(cmd, b"RAISE") {
         print("[sensord] raises=");
-        print_dec(raises as u64);
+        print_dec(raises.count as u64);
         print("\n");
     } else if bytes_starts_with(cmd, b"RESET") {
+        // 真正重置检测器内部状态（峰值基准等）：此前只打印，计数继续累加。
+        steps.reset();
+        raises.reset();
         print("[sensord] 计步器已重置\n");
     } else if bytes_starts_with(cmd, b"QUIT") {
         print("[sensord] 收到 QUIT 请求\n");
@@ -315,7 +326,7 @@ fn handle_command(cmd: &[u8], steps: u32, raises: u32, have_mag: bool, quit: &mu
 }
 
 /// 读取管道文件并逐行处理（普通文件模拟命名管道）。
-fn poll_pipe(steps: u32, raises: u32, have_mag: bool, quit: &mut bool) {
+fn poll_pipe(steps: &mut StepDetector, raises: &mut RaiseDetector, have_mag: bool, quit: &mut bool) {
     static mut BUF: [u8; 512] = [0u8; 512];
     static mut WARNED: bool = false;
     unsafe {
@@ -451,7 +462,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
         // 轮询命令管道（处理 STATUS / STEPS / RAISE / RESET / QUIT）。
         if tick % 100 == 0 {
-            poll_pipe(steps.count, raises.count, have_mag, &mut quit);
+            poll_pipe(&mut steps, &mut raises, have_mag, &mut quit);
         }
 
         if quit {

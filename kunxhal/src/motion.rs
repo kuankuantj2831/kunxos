@@ -155,6 +155,10 @@ pub struct RaiseDetector {
     pub timeout: f32,
     t: f32,
     raise_t: f32,
+            /// 上次事件时刻（冷却基准：raise_t 是本次 Raising 起点，
+            /// 与 1.5s 超时同源 —— 1.5 < cooldown 2.0，以它为基准冷却条件恒假，
+            /// 抬腕一生只触发一次）。
+            last_event_t: f32,
     state: RaiseState,
 }
 
@@ -176,8 +180,18 @@ impl RaiseDetector {
             timeout: 1.5,
             t: 0.0,
             raise_t: 0.0,
+            last_event_t: -1.0e9,
             state: RaiseState::Flat,
         }
+    }
+
+    /// 重置计数与状态机（保留阈值标定）。sensord 的 RESET 命令走此路径。
+    pub fn reset(&mut self) {
+        self.count = 0;
+        self.t = 0.0;
+        self.raise_t = 0.0;
+        self.last_event_t = -1.0e9;
+        self.state = RaiseState::Flat;
     }
 
     /// 喂入加速度（g）与陀螺（°/s），返回本次是否触发抬腕事件。
@@ -196,8 +210,11 @@ impl RaiseDetector {
             }
             RaiseState::Raising => {
                 if accel.z < self.raised_z && side > self.side_g {
-                    if self.t - self.raise_t >= self.cooldown || self.count == 0 {
+                    // 冷却相对「上次事件时刻」：此前相对 raise_t（≤1.5s 前，
+                    // 而冷却 2.0s）恒假 —— 首次之后永不计数。
+                    if self.count == 0 || self.t - self.last_event_t >= self.cooldown {
                         self.count += 1;
+                        self.last_event_t = self.t;
                         raised = true;
                     }
                     self.state = RaiseState::Raised;

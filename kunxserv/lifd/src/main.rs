@@ -698,7 +698,7 @@ fn handle_cmd(pid: u32, s: &[u8]) {
                 let (tpid, _) = parse_dec(f[2]);
                 if let Some(i) = find_by_pid(tpid as u32) {
                     let e = unsafe { &APPS[i] };
-                    log("应用已退出 ");
+                    log_raw("应用已退出 ");
                     print(name_as_str(&e.name, e.name_len));
                     print("\n");
                     remove_entry(i);
@@ -818,7 +818,7 @@ fn deliver_notify(target_pid: u32, payload: &[u8]) {
             let st = unsafe { APPS[i].state };
             if st == ST_RUNNING {
                 send_evt(target_pid, &evt[..n]);
-                log("通知已投递 pid=");
+                log_raw("通知已投递 pid=");
                 print_dec(target_pid as u64);
                 print("\n");
             } else {
@@ -876,7 +876,7 @@ fn on_pressure(level: u8) {
                     let e = &mut APPS[i];
                     if e.pid != 0 && e.state == ST_BACKGROUND && e.tasks == 0 {
                         e.state = ST_SUSPENDED;
-                        log("  已挂起 ");
+                        log_raw("  已挂起 ");
                         print(name_as_str(&e.name, e.name_len));
                         print("\n");
                     }
@@ -920,7 +920,7 @@ fn run_lmk() {
         }
         match best {
             Some((i, s)) => {
-                log("LMK: 正在击杀 score=");
+                log_raw("LMK: 正在击杀 score=");
                 print_dec(s);
                 print("\n");
                 terminate_app(i, b"KILLED");
@@ -1018,6 +1018,8 @@ fn handle_reg_file(fname: &[u8]) {
     }
     let (pid, consumed) = parse_dec(unsafe { &BUF[..got] });
     if pid == 0 || consumed == 0 {
+        // 畸形登记文件：删除（此前提前 return 不 unlink，每 50ms 永久重扫）。
+        unlink(p);
         return;
     }
     // 第二字段：FG（前台启动）或 BG

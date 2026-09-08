@@ -244,6 +244,108 @@
 - **后台事件轮询降频**：lifd launcher_evt 每 4 帧轮询一次（此前每帧一次
   open(ENOENT) 空 syscall）。
 
+### 2026-09-07 延长轮（四路并行审查 → 40+ 修复 + 构建系统根因）
+
+> 方法：4 个并行审查代理（kunxserv 全部服务 / 小应用群 / 内核 shell+pkg+ota+
+> anim+compositor / boot+HAL+pkg+tools）逐行读码。每批修复后构建验证。
+
+#### 构建系统（本回合多次「测试 FAIL」的真根因）
+
+- **`build.rs` 的 `rerun-if-changed=ramdisk.img` 遮蔽 include_bytes! 依赖
+  跟踪**：声明该路径后，ramdisk 内容变化时 cargo 实测会跳过重编译，objcopy
+  把陈旧 .rodata 重新包装成 kernel.img —— test-sfsrace 的标记间歇性丢失
+  （三复现）与「同镜像旧内核 PASS / 新内核 FAIL」的二分假象均源于此。移除
+  该行（标准 include_bytes 依赖跟踪足够）；test-sfsrace/test-modem/test-audio
+  配方改为显式 mkfs 重建镜像（双保险）。修复后 make test-sfsrace 连续 3/3 PASS。
+
+#### 内核
+
+- **ota `write_file_from` 在 close 之后 fsync**（fd 已释放 → fsync 恒 -1）：
+  OTA 安装写入完全成功也报失败，功能整体不可用。fsync 移到 close 前。
+- **ota `load_otp` 缓冲 2KB < 8 扇区(4KB)**：blk 层长度检查拒绝 → load_otp
+  永远失败，反降级楼层静默丢失。缓冲按磁盘几何（4KB）分配。
+- **ota `wipe_dir` 删除-前移**：unlink 后 idx 仍递增 → 隔一个删一个
+  （清除数据残留用户文件；/data/oobe/.done 落偶数位时 OOBE 不重置）。
+  改同位重读 + 失败护栏；顺带替换该函数的 from_utf8_unchecked。
+- **shell `cmd_power`**：所有成功子命令都附带打印「自检完成：N 处失败」，
+  且与 power.rs 的 UART 行（「N 个失败」）双份输出——改为仅 selftest 打印。
+- **anim `report_frame_stats` n==0 下溢**（STATS_PENDING 跨上下文消费窗口）：
+  dev 构建溢出 panic / release 打垃圾统计。加 n==0 早退。
+- **anim 收尾帧**：最后一个动画到期后不再合成呈现 → 终值只标脏区，屏幕
+  停在中间值（如淡出残影）直到下次输入。收尾帧立即 composite+present。
+- **shell `source` 作为管道段拒绝**：cmd_source 逐行再入 run_pipeline，
+  复用同一对静态 INPUT/OUTPUT_BUF，外层管道输出被嵌套改写。
+- **perf overlay**：恢复集取当前 ∪ 上一帧矩形（文本长度逐帧变化）；overlay
+  矩形并入 present clean 集（真机缓存一致性）。
+
+#### 服务
+
+- **rild `after_colon` 无冒号行必崩**（`&line[len+1..]` start>end）：真实
+  GSM 模块默认每 2s 上报无参数 `RING` → rild panic 退出，通话/短信全失效。
+- **rild `write_dec`**：v==0 写出空串（AT+CMGR 缺索引）+ 缓冲尾 8 字节对
+  9-10 位 idx 长度不匹配 panic。补 i-=1 + 按缓冲截断。
+- **lifd**：4 处漏网 `log()` 多段消息（应用已退出/通知已投递/压力挂起/LMK
+  击杀）改 log_raw；`find_by_pid(0)` 命中空槽哨兵（对 pid 0 发 SIGSTOP =
+  进程组语义殃及全部守护）加守卫；畸形 reg 文件提前 return 不 unlink →
+  每 50ms 永久重扫，补删除。
+- **alarmd 铃声包络基准错位**：段内位置误用段起始块号 —— 段 A 每块全深度
+  颤音、段 B 幅度 0.4% 不可闻。改（块序号-段起始）×块帧数+块内偏移。
+- **sensord `RESET` 空操作**：命令只打印，计数继续累加 —— handle_command
+  透传检测器可变引用，真正重置（kunxhal RaiseDetector 补 reset）。
+- **positiond 模拟路线把度当弧度传 cos**：经度漂移方向反转、速率偏差
+  ~30%。补角度转换。
+- **logd 环形截断永不发生**：file_size 负返回按 usize 加法回绕。按 isize
+  判负 + saturating。
+- **camerad `fmt_dec` 下溢护栏**（定宽缓冲位数超限时 i 回绕）。
+- **pushd 通知丢失窗口**：lifd 未就绪时 /data/life 不存在 → 写命令信箱
+  失败且请求文件已删。补建目录重试 + 仍失败写回请求文件。
+
+#### 应用
+
+- **calendar `save_new_event` 用 4KB 栈缓冲开 Store**：events.blob >4KB
+  （约 10 个事件）后保存恒失败（误报存储已满）；遇墓碑 compact 时以截断
+  内存半覆盖 blob 文件 → idx/blob 永久不一致。复用静态 256KB blob。
+  另修：新建/同步页第三个输入框点不中（命中区扩到 y<350/290）；日视图
+  标题按 NUL 截断绘制（160B 填充区产出 notdef 字形）。
+- **cloud `ensure_credentials` seed 无界追加**：账号+设备 ID 超长即索引
+  越界 panic。补上界断开。
+- **cloud 远程锁定被本地点按解锁绕过**：现要求长按 2s 确认 + 落审计记录
+  /data/cloud/unlock.log（完整鉴权需服务端 unlock 流程，产品侧待定）。
+- **recovery 菜单 reboot 用错系统调用号与命令**（169=gettimeofday、
+  0x4321FEDC=POWER_OFF）→ 永不重启。改 142 + 0x1234567。
+- **probe**：剪贴板/TCP recvfrom 的 `usize > 0` 判正（负 errno 巨大值 →
+  切片 panic）+ 一组恒真/恒假死检查（wait4/openat 失败检测失效）按 isize。
+- **clock 闹钟行开关只判 y 不判 x**：行上半部任意 x 都翻转开关并落盘。
+- **store 下载重试只 lseek 不截断**：上次尝试的残留尾部让整包验签必败。
+  重试前 ftruncate。
+
+#### HAL / boot / pkg / tools
+
+- **kunxhal plat_qemu `render_yuv420` 时间戳条位移下溢**（15 - idx/4 在
+  idx≥64 时 usize 下溢）：overflow-checks 构建每帧 panic，release 花屏。
+  改 31 - min(idx/4,31) + saturating 基址；同文件 ap_cfg 的 ssid_len/psk_len
+  在截断拷贝**之前**赋值（消费者按 len 切片越界），改按上限截断。
+- **kunxhal plat_pi4 mailbox 响应解析无边界**：畸形 val_size 令 p 越过
+  64 项缓冲 → display_init 启动路径 panic。补边界与单 tag 上限。
+- **kunxhal motion RaiseDetector 冷却恒假**（以本次 Raising 起点为基准，
+  1.5s 超时 < 2.0s 冷却）→ 抬腕一生只触发一次。新增 last_event_t 基准。
+- **kunxboot DTB 容量不一致**：MAX_DTB_FILE=576KB vs fixup scratch 128KB
+  —— 128KB~576KB 的合法 DTB 启动卡死。收紧上限 + 编译期断言；`#cells`
+  属性 len<4 越界读补检查。
+- **kunxpkg `append_path` 用逗号、`rollback_files` 按 NUL 切分**：整个
+  files 串被当成一个路径 —— 卸载/回滚从不删除已解压文件。统一 NUL。
+- **kunxpkg remove/perms/rollback 的 CLI 包名无白名单**：`pkg remove ../..`
+  经 /res/../.. 清扫根目录文件。三个入口补 valid_name。
+- **kunxpkg perms 授权/撤销前缀匹配**：STORAGE 前缀误命中 STORAGE2 行并
+  改写。改完整字段（perm+':'）匹配。
+- **kunxpkg fsio `list_dir` 单次 getdents64**：>170 项目录静默漏项，改
+  循环读至 EOF。
+- **tools/mkfs_sfs.py `layout()` 收敛振荡**（特定 total 死循环）改单调
+  推进；MAX_BLOCKS 按写入端实际能力（直接+一级间接）封顶（此前按二三级
+  间接数学容量放行，>4.29MB 文件 pack_into 越界）。验证：输出与提交镜像
+  逐字节一致。
+- **tools/mkdisk.py** 分区容量文案与实际几何对齐。
+
 ### 动画渲染提速（2026-09-07 轮）
 
 动画帧的三大逐像素热点改为缓存/整块拷贝，输出逐位一致：

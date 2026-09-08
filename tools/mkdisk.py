@@ -3,10 +3,10 @@
 MBR + boot_a(FAT32) + sys(SFS) + data(SFS/ENC) + boot_b(FAT32) + misc 原始区。
 
 分区布局（512MB 磁盘，1MB 对齐，扇区 512B，与文档 docs/secure-boot.md §3 一致）：
-    P1 boot_a  FAT32 64MB active   （当前槽：KERNEL.IMG / KUNXOS.DTB / RAMDISK.IMG / RECOVRD.IMG）
+    P1 boot_a  FAT32 96MB active   （当前槽：KERNEL.IMG / KUNXOS.DTB / RAMDISK.IMG / RECOVRD.IMG）
     P2 sys     SFS   124MB         （OTA 暂存 / 离线全量包）
-    P3 data    SFS   256MB (ENC)   （/data，内核启动时 mkfs）
-    P4 boot_b  FAT32 64MB          （非活动槽，出厂预置同签名镜像）
+    P3 data    SFS   192MB (ENC)   （/data，内核启动时 mkfs）
+    P4 boot_b  FAT32 96MB          （非活动槽，出厂预置同签名镜像）
     misc       3MB 裸区（非分区）：
        @+0  BCB 主（512B）  @+1  BCB 备（512B）  @+2..+9 OTP（4KB）
 

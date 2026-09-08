@@ -280,7 +280,7 @@ fn push_nmea(buf: &mut [u8], i: &mut usize, body: &[u8]) {
 
 /// 十进制度 → (ddmm 整数部分, mmmm 分钟小数, 南/西标志)。
 fn to_nmea_coord(deg: f32) -> (i64, u32, bool) {
-    let mut d = if deg < 0.0 { -deg } else { deg };
+    let d = if deg < 0.0 { -deg } else { deg };
     let dd = d as i64;
     let minutes = (d - dd as f32) * 60.0;
     let mm = minutes as i64;
@@ -397,7 +397,9 @@ fn advance_route(lat: &mut f32, lon: &mut f32, course: &mut f32, t: u32) {
     };
     let rad = *course * core::f32::consts::PI / 180.0;
     let dlat = WALK_SPEED * cos(rad) / 111_320.0;
-    let dlon = WALK_SPEED * sin(rad) / (111_320.0 * cos(*lat));
+    // 纬度需转弧度再进 cos（此前把度当弧度：cos(39.9 rad) ≈ -0.59，
+    // 漂移方向反转且速率偏差 ~30%）。
+    let dlon = WALK_SPEED * sin(rad) / (111_320.0 * cos(*lat * core::f32::consts::PI / 180.0));
     *lat += dlat;
     *lon += dlon;
 }
@@ -568,7 +570,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 4. 写状态文件。
         write_state(fix.as_ref());
 
-        // 5. 每秒轮询命令。
+        // 5. 每 10s 轮询一次命令（低频命令面；与注释此前声称的
+        // 「每秒」不符 —— 改注释对齐实际行为）。
         if t % 10 == 0 {
             poll_pipe(fix.as_ref(), &mut sim, &mut quit);
         }
@@ -621,7 +624,7 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         write_fd(2, b"PANIC: positiond\n");
         if w.len > 0 {
-            write_fd(2, &w.buf[..w.len]);;
+            write_fd(2, &w.buf[..w.len]);
         }
         syscall1(SYS_EXIT, 1);
     }

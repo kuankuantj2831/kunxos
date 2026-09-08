@@ -196,9 +196,18 @@ pub fn list_dir(dir: &[u8], out: &mut [u8]) -> usize {
     }
     let mut total = 0usize;
     unsafe {
+        // 循环读至 EOF：单次 getdents64 只返回缓冲能装下的条目（约 170 项），
+        // 超过即静默漏项（pkg list / alloc_uid / installed_provides）。
+        // getdents64 自带目录流偏移，批次间直接续读（不可 lseek 回 0，
+        // 否则从头重复列出）。
+        loop {
         let n = syscall3(SYS_GETDENTS64, fd as usize, DIR_BUF.as_ptr() as usize, DIR_BUF.len())
             as isize;
-        if n > 0 {
+        if n <= 0 {
+            break;
+        }
+        {
+            let n = n as usize;
             let mut off = 0usize;
             while off + 19 <= n as usize {
                 let reclen = u16::from_le_bytes([DIR_BUF[off + 16], DIR_BUF[off + 17]]) as usize;
@@ -229,6 +238,7 @@ pub fn list_dir(dir: &[u8], out: &mut [u8]) -> usize {
                 }
                 off += reclen;
             }
+        }
         }
         syscall1(SYS_CLOSE, fd as usize);
     }

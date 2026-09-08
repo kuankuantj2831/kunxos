@@ -24,3 +24,4 @@ subprocess
 .video_agent/
 .audit_draft.md
 null
+*cleanup2.sh*

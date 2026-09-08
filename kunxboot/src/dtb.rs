@@ -14,9 +14,14 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 
-/// scratch 缓冲大小（远大于精简后的 DTB）。
+/// scratch 缓冲大小（须 ≥ sec_boot::MAX_DTB_FILE，否则合法 DTB 修正时
+/// 被拒并 hang —— 两处容量此前不一致）。
 const SCRATCH_SIZE: usize = 128 * 1024;
 static mut SCRATCH: [u8; SCRATCH_SIZE] = [0; SCRATCH_SIZE];
+const _: () = assert!(
+    SCRATCH_SIZE >= crate::sec_boot::MAX_DTB_FILE,
+    "SCRATCH_SIZE must be >= MAX_DTB_FILE"
+);
 
 /// 解析后的 FDT 头（绝对地址）。
 struct Hdr {
@@ -174,12 +179,18 @@ unsafe fn walk_node(
                     node_reg_len = len;
                 }
                 if cstr_eq(prop_name, b"#address-cells", name_max) {
-                    child_ac = read_be32(value_off);
-                    child_cells_known = true;
+                    // len < 4 时 value_off 已贴近缓冲尾：越界读（畸形 DTB
+                    // 恰好填满 scratch 时最多读 3 字节越界）。
+                    if len >= 4 {
+                        child_ac = read_be32(value_off);
+                        child_cells_known = true;
+                    }
                 }
                 if cstr_eq(prop_name, b"#size-cells", name_max) {
-                    child_sc = read_be32(value_off);
-                    child_cells_known = true;
+                    if len >= 4 {
+                        child_sc = read_be32(value_off);
+                        child_cells_known = true;
+                    }
                 }
                 p = align4(value_off + len);
             }

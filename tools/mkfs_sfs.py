@@ -31,7 +31,10 @@ INODES_PER_BLOCK = BLK_SIZE // INODE_SIZE  # 16
 INODE_BLOCKS = (MAX_INODES + INODES_PER_BLOCK - 1) // INODES_PER_BLOCK  # 8
 NDIRECT = 24
 NINDIRECT = BLK_SIZE // 4  # 1024
-MAX_BLOCKS = NDIRECT + NINDIRECT + NINDIRECT * NINDIRECT + NINDIRECT ** 3
+# 写入端只实现 直接块 + 一级间接（ind_buf 单块 1024 项）：容量按此封顶。
+# 此前按二级/三级间接的数学容量放行 —— >24+1024 块（≈4.29MB）的文件会在
+# struct.pack_into 处越界抛未处理异常。
+MAX_BLOCKS = NDIRECT + NINDIRECT
 MAX_NAME = 27
 DIRENT_SIZE = 32
 BITS_PER_BLOCK = BLK_SIZE * 8  # 32768
@@ -107,6 +110,9 @@ def crc32(data: bytes) -> int:
 def layout(total: int):
     jlog = max(JLOG_MIN, min(JLOG_MAX, total // 8))
     bmap = 1
+    # 单调推进：bmap 增大 → data_start 后移 → ndata/need 减小，可能来回
+    # 振荡不收敛（如 total=33805 时在两值间死循环）。取历史最大值逼近。
+    best = bmap
     while True:
         inode_start = BMAP_START + bmap
         jlog_start = inode_start + INODE_BLOCKS
@@ -115,7 +121,10 @@ def layout(total: int):
         need = max(1, (ndata + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK)
         if need == bmap:
             return bmap, inode_start, jlog_start, jlog, data_start
-        bmap = need
+        bmap = need = max(need, bmap) if need < bmap else need
+        best = max(best, bmap)
+        if bmap == best and need == bmap:
+            continue
 
 
 def inode_crc(rec: bytearray) -> int:

@@ -230,8 +230,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 let n = (r as usize).min(buf.len());
                 // 超长截断（理论上单条记录 ≤ 144B）
                 let n = n.min(buf.len());
-                // 环形文件：超 256KB 截断
-                if file_size(log_fd as usize) as usize + n > MAX_LOG_BYTES {
+                // 环形文件：超 256KB 截断。file_size 失败返回负 errno ——
+                // 按 usize 参与加法会回绕（截断永不发生 → 日志无限增长）。
+                let fsz = file_size(log_fd as usize);
+                if fsz < 0 || (fsz as usize).saturating_add(n) > MAX_LOG_BYTES {
                     syscall2(SYS_FTRUNCATE, log_fd as usize, 0);
                 }
                 // 定位末尾并写入
