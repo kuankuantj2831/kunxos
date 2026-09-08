@@ -262,6 +262,9 @@ const SYS_KUNX_PM_SET_GOVERNOR: usize = 411;
 const SYS_KUNX_PM_SET_CPU_CAP: usize = 412;
 /// 冻结 / 解冻进程（Doze）：x0 = pid，x1 = 0/1。
 const SYS_KUNX_PM_FREEZE: usize = 413;
+/// 自定义：当前任务设置一次性调度 deadline（x0 = 相对期限 µs，0 = 清除）。
+/// 统一响应 deadline 体系的用户态入口（渲染线程把帧预算显式告知调度器）。
+const SYS_KUNX_SCHED_SET_DEADLINE: usize = 414;
 
 // ==================== Linux 常量 ====================
 
@@ -648,6 +651,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             let freeze = f.x[1] != 0;
             crate::sched_cfs::set_task_cpu_cap(pid, if freeze { 0 } else { 100 }) as i64
         }
+        SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[0] as u64),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         _ => ENOSYS,

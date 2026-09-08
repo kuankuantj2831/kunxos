@@ -444,6 +444,9 @@ pub fn print_stats() {
     crate::print_dec(mem_used_kb() as u64);
     crate::uart_send_str("kB total_frames=");
     crate::print_dec(total_frames());
+    // 调度 deadline miss（帧错过归因：期限已过才被调度选中的次数）
+    crate::uart_send_str(" dl_miss=");
+    crate::print_dec(crate::sched_cfs::deadline_misses());
     // 当前报告窗口的 t2f 汇总（不冲刷；完整分布见周期性 [perf] 帧/t2f 行）
     unsafe {
         if T2F_COUNT > 0 {

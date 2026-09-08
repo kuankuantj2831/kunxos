@@ -334,6 +334,10 @@ pub fn push_event(ev: InputEvent) {
             if DEV.reader_tid != 0 && now.saturating_sub(DEV.last_boost_us) >= 2_000 {
                 DEV.last_boost_us = now;
                 sched_cfs::boost_tid(DEV.reader_tid);
+                // 一次性调度 deadline：最近读者须在本帧内（60Hz 预算 16.7ms）
+                // 被调度并消费期限——期限语义保证即使 boost 后中途阻塞、
+                // 再唤醒也保持下一调度决策的优先权。
+                sched_cfs::set_tid_deadline(DEV.reader_tid, now + 16_667);
             }
         }
     }

@@ -14,7 +14,7 @@
 
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::allocator;
 use crate::allocator::alloc_pages_contig;
@@ -193,6 +193,15 @@ pub struct Task {
     pub cpu_cap: u16,
     /// 累计调度 tick 数（`top` 的 CPU 用量列；10ms/tick）。
     pub cpu_ticks: u64,
+    /// 一次性调度 deadline（µs 绝对时刻；0 = 无）。
+    ///
+    /// 「统一响应 deadline」维度（ColorOS 极光引擎思想的自研落地）：输入等
+    /// 交互事件到达时给最近读者设置 `now + 一帧` 的期限，`pick_next` 在同
+    /// 优先级类内先选带有效期限的任务（按期限早晚），期限在**被选中一次后
+    /// 消费清零**——单次授权、有界提升，不改变 CFS 长期公平性，也不会饿死
+    /// 后台任务。已过期仍被选中时计一次 miss（`deadline_misses`，帧错过
+    /// 归因数据）。
+    pub deadline_us: u64,
     /// SMP 终止请求：kill_pid 对**正在他核运行**的任务不直接置 `Exited`
     /// （否则 reap 会在它仍执行时释放 256KB 内核栈 → 跨任务栈损坏），而是
     /// 置此标志；目标核下次 tick（本任务现场已由 IRQ 帧保存完整）兑现为
@@ -216,6 +225,7 @@ impl Task {
             pid: 0,
             cpu_cap: 100,
             cpu_ticks: 0,
+            deadline_us: 0,
             kill_req: false,
         }
     }
@@ -278,6 +288,10 @@ unsafe fn sleepers_clear_tid(tid: u32) {
 }
 static mut LAST_SLICE_US: [u64; MAX_CPUS] = [0; MAX_CPUS];
 static mut NEED_RESCHED: [bool; MAX_CPUS] = [false; MAX_CPUS];
+
+/// deadline miss 计数：任务带过期 deadline 被 `pick_next` 选中的次数。
+/// 帧错过归因数据（`deadline_misses`），由 shell/perf 读取。
+static DEADLINE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// 启动时切换用的临时上下文（每核一份；保存后丢弃，不再切回）。
 static mut BOOT_CTX: [TaskContext; MAX_CPUS] = [const { TaskContext::empty() }; MAX_CPUS];
@@ -457,7 +471,10 @@ fn wakeup_preempt(woken: usize) {
         if cur >= MAX_TASKS || cur == woken {
             return;
         }
+        // 带 deadline 的唤醒（交互事件跟随）无条件请求抢占：期限语义下
+        // 不应再被当前任务的 vruntime 余量推迟一拍。
         if class_rank(TASKS[woken].class) < class_rank(TASKS[cur].class)
+            || TASKS[woken].deadline_us != 0
             || TASKS[woken].vruntime + WAKEUP_GRAN_NS < TASKS[cur].vruntime
         {
             NEED_RESCHED[cpu] = true;
@@ -488,6 +505,48 @@ pub fn boost_tid(tid: u32) {
     sched_unlock();
 }
 
+/// 为指定任务设置一次性调度 deadline（µs 绝对时刻；0 = 清除）。
+///
+/// 供输入栈在设备 IRQ 上下文（IRQ 已屏蔽）调用：交互事件到达后，最近
+/// 读者在下一个调度决策即被优先选中，直到其首次被调度（消费）或被更高
+/// 优先级类抢占。与 [`boost_tid`] 配对使用：boost 保证 vruntime 全局最小，
+/// deadline 保证期限语义（即使中途阻塞再唤醒也保持优先）。
+///
+/// IRQ 屏蔽与 spawn 同模式：本函数也可经 syscall 414 从进程上下文调用，
+/// 持锁窗口必须屏蔽 tick 抢占（否则 tick 在 IRQ 上下文自旋等锁、被中断
+/// 任务永远无法释放 → 单核死锁）。
+pub fn set_tid_deadline(tid: u32, deadline_us: u64) {
+    let t = tid as usize;
+    if t >= MAX_TASKS {
+        return;
+    }
+    let saved = unsafe { read_daif() };
+    unsafe { asm!("msr daifset, #2") };
+    sched_lock();
+    unsafe {
+        if TASKS[t].state != TaskState::Empty && TASKS[t].state != TaskState::Exited {
+            TASKS[t].deadline_us = deadline_us;
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
+/// 当前任务为自己设置调度 deadline（syscall 414）：`rel_us` 为相对期限
+/// （µs，0 = 清除，上限 1s 防滥用）。渲染线程可在处理输入事件前设置
+/// 「本帧期限」，把帧预算显式告知调度器。成功返回 0。
+pub fn set_current_deadline(rel_us: u64) -> i64 {
+    let rel = rel_us.min(1_000_000);
+    let dl = if rel == 0 { 0 } else { timer::now_us().saturating_add(rel) };
+    set_tid_deadline(current_tid(), dl);
+    0
+}
+
+/// 累计 deadline miss 次数（带过期 deadline 被选中的次数；帧错过归因）。
+pub fn deadline_misses() -> u64 {
+    DEADLINE_MISSES.load(Ordering::Relaxed)
+}
+
 /// 分配一个空闲任务槽位；表满返回 `None`（不再 panic，防 fork 炸弹 DoS）。
 fn alloc_tid() -> Option<usize> {
     for i in 0..MAX_TASKS {
@@ -514,11 +573,19 @@ pub fn alloc_stack() -> Option<usize> {
     Some(base + STACK_SIZE)
 }
 
-/// 挑选下一个要运行的任务（就绪任务中 vruntime 最小、优先级最高）。
+/// 挑选下一个要运行的任务。
+///
+/// 排序键（依次比较）：优先级类 → 一次性 deadline → vruntime。
+/// 同类内带有效 deadline 的任务先于无 deadline 任务（按期限早晚排序）；
+/// 都无 deadline 时退化为原 CFS vruntime 语义。deadline 在被选中时消费
+/// 清零：单次授权、有界提升——交互任务在下一调度决策即被优先，同时不会
+/// 持续饿死后台负载（CFS 长期公平性不变）。
+///
 /// 无就绪任务时返回 `None`（调用方回退到本核 idle 任务）。
 fn pick_next() -> Option<usize> {
     let mut best = usize::MAX;
     let mut best_rank = u8::MAX;
+    let mut best_dl = 0u64;
     let mut best_vr = u64::MAX;
     let my_idle = idle_slot();
     unsafe {
@@ -535,12 +602,28 @@ fn pick_next() -> Option<usize> {
                 continue;
             }
             let rank = class_rank(TASKS[i].class);
+            let dl = TASKS[i].deadline_us;
             let vr = TASKS[i].vruntime;
-            if rank < best_rank || (rank == best_rank && vr < best_vr) {
+            let better = rank < best_rank
+                || (rank == best_rank
+                    && (if best_dl != 0 {
+                        dl != 0 && dl < best_dl
+                    } else {
+                        dl != 0 || vr < best_vr
+                    }));
+            if better {
                 best = i;
                 best_rank = rank;
+                best_dl = dl;
                 best_vr = vr;
             }
+        }
+        // 消费 deadline：期限已过仍被选中 = 一次帧错过（归因计数）
+        if best != usize::MAX && best_dl != 0 {
+            if timer::now_us() > best_dl {
+                DEADLINE_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+            TASKS[best].deadline_us = 0;
         }
     }
     if best == usize::MAX {
@@ -664,6 +747,7 @@ pub fn spawn(
         t.stack_top = stack_top;
         t.pid = pid;
         t.context = TaskContext::new_thread(entry, arg, stack_top, ttbr0);
+        t.deadline_us = 0;
         t.kill_req = false;
     }
     sched_unlock();
@@ -701,6 +785,7 @@ pub fn insert(
         t.stack_top = stack_top;
         t.pid = pid;
         t.context = ctx;
+        t.deadline_us = 0;
         t.kill_req = false;
     }
     sched_unlock();
