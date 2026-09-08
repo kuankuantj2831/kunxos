@@ -119,6 +119,18 @@ struct InputDevice {
 const EMPTY_EVENT: InputEvent =
     InputEvent { tv_sec: 0, tv_usec: 0, etype: 0, code: 0, value: 0 };
 
+/// 最近一次指针/触摸事件到达时刻（µs，单调时钟）。
+///
+/// 触控→上屏延迟（t2f）度量的采样起点：呈现路径用 `now − 该值` 估计输入
+/// 跟随延迟（perf.rs 的 t2f 统计）。事件本身已带时间戳（evdev timeval），
+/// 此处冗余记录最近一拍，呈现侧无需解析事件缓冲。
+static mut LAST_PTR_US: u64 = 0;
+
+/// 最近一次指针/触摸事件到达时刻（µs；尚无事件为 0）。t2f 度量数据源。
+pub fn last_input_us() -> u64 {
+    unsafe { LAST_PTR_US }
+}
+
 static mut DEV: InputDevice = InputDevice {
     name: [0; 32],
     name_len: 0,
@@ -318,6 +330,7 @@ pub fn push_event(ev: InputEvent) {
             || (ev.etype == EV_KEY && (ev.code == BTN_TOUCH || ev.code == BTN_LEFT))
         {
             let now = timer::now_us();
+            LAST_PTR_US = now;
             if DEV.reader_tid != 0 && now.saturating_sub(DEV.last_boost_us) >= 2_000 {
                 DEV.last_boost_us = now;
                 sched_cfs::boost_tid(DEV.reader_tid);

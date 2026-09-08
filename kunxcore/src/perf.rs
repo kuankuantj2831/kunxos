@@ -20,7 +20,7 @@ static mut FPS_VAL: u32 = 0;
 /// 累计呈现帧数（自启动）。
 static mut TOTAL_FRAMES: u64 = 0;
 
-/// 每呈现一帧调用一次（IRQ 安全）。
+/// 每呈现一帧调用一次（IRQ 安全；呈现热路径只做整数运算与标记置位）。
 pub fn note_frame() {
     unsafe {
         TOTAL_FRAMES += 1;
@@ -37,6 +37,52 @@ pub fn note_frame() {
             WINDOW_FRAMES = 0;
         }
         WINDOW_FRAMES += 1;
+
+        // 帧间隔采样（全局：内核动画路径 + 应用直绘路径都经 present()）
+        if FS_LAST_PRESENT_US != 0 {
+            let iv = now.saturating_sub(FS_LAST_PRESENT_US);
+            if iv < FS_MIN {
+                FS_MIN = iv;
+            }
+            if iv > FS_MAX {
+                FS_MAX = iv;
+            }
+            FS_SUM += iv;
+            if iv > FS_DROP_US {
+                FS_DROPS += 1;
+            }
+            if iv > FS_SPIKE_US {
+                FS_SPIKES += 1;
+            }
+            if FS_N < FS_WINDOW {
+                FS_SAMPLES[FS_N] = iv;
+                FS_N += 1;
+            }
+        }
+        FS_LAST_PRESENT_US = now;
+        FS_COUNT += 1;
+        if FS_COUNT >= FS_REPORT_EVERY {
+            FS_PENDING = true;
+        }
+        // t2f：本帧是否为输入跟随帧（差值在 2 个 60Hz 帧内）
+        let last_in = crate::input::last_input_us();
+        if last_in != 0 {
+            let d = now.saturating_sub(last_in);
+            if d <= T2F_WINDOW_US {
+                T2F_COUNT += 1;
+                if d < T2F_MIN {
+                    T2F_MIN = d;
+                }
+                if d > T2F_MAX {
+                    T2F_MAX = d;
+                }
+                T2F_SUM += d;
+                if T2F_N < T2F_SAMPLES.len() {
+                    T2F_SAMPLES[T2F_N] = d;
+                    T2F_N += 1;
+                }
+            }
+        }
     }
 }
 
@@ -48,6 +94,154 @@ pub fn fps() -> u32 {
 /// 累计帧数。
 pub fn total_frames() -> u64 {
     unsafe { TOTAL_FRAMES }
+}
+
+// ==================== 帧间隔与触控→上屏延迟（t2f） ====================
+//
+// anim::FrameStats 只度量内核驱动的动画管线（frame_tick → composite+present）；
+// 应用接管显示（FB_ACTIVE）后呈现节奏由应用的 FBIO_PRESENT 驱动。本节在
+// note_frame（每次真实呈现都调用，双路径覆盖）补齐全局度量：
+//   - 帧间隔 min/avg/p95/max、掉帧(>12ms)/尖峰(>20ms)——阈值与
+//     docs/perf-baseline.md §2 判定标准一致；
+//   - 应用直绘路径合成+呈现耗时（note_app_render，fb_present 计时上报）；
+//   - t2f：最近指针事件（input::last_input_us）到本帧呈现的延迟。仅当差值
+//     ≤ 2 个 60Hz 帧（33.3ms）时计入——超过该窗口的呈现（时钟刷新等后台
+//     重绘）与本次输入无跟随关系，计入会污染分布。
+// 报告打印（数百字符串口输出在 115200 波特下忙等 >10ms）绝不在呈现热路径
+// 执行：note_* 只做无分配整数运算并置 PENDING，由内核主循环线程上下文
+// 调 poll_report() 冲刷（与 anim::poll_deferred_stats 同模式）。
+
+const FS_WINDOW: usize = 64;
+const FS_REPORT_EVERY: u64 = 120;
+const FS_DROP_US: u64 = 12_000;
+const FS_SPIKE_US: u64 = 20_000;
+const T2F_WINDOW_US: u64 = 33_333;
+
+static mut FS_LAST_PRESENT_US: u64 = 0;
+static mut FS_COUNT: u64 = 0;
+static mut FS_MIN: u64 = u64::MAX;
+static mut FS_MAX: u64 = 0;
+static mut FS_SUM: u64 = 0;
+static mut FS_SAMPLES: [u64; FS_WINDOW] = [0; FS_WINDOW];
+static mut FS_N: usize = 0;
+static mut FS_DROPS: u64 = 0;
+static mut FS_SPIKES: u64 = 0;
+static mut FS_RENDER_SUM: u64 = 0;
+static mut FS_RENDER_MAX: u64 = 0;
+static mut FS_RENDER_N: u64 = 0;
+static mut T2F_COUNT: u64 = 0;
+static mut T2F_MIN: u64 = u64::MAX;
+static mut T2F_MAX: u64 = 0;
+static mut T2F_SUM: u64 = 0;
+static mut T2F_SAMPLES: [u64; 32] = [0; 32];
+static mut T2F_N: usize = 0;
+static mut FS_PENDING: bool = false;
+
+/// 应用直绘路径合成+呈现耗时上报（compositor::fb_present 成功呈现时调用）。
+pub fn note_app_render(render_us: u64) {
+    unsafe {
+        FS_RENDER_SUM += render_us;
+        FS_RENDER_N += 1;
+        if render_us > FS_RENDER_MAX {
+            FS_RENDER_MAX = render_us;
+        }
+    }
+}
+
+/// 冲刷帧统计报告（内核主循环线程上下文调用；呈现/IRQ 路径只置标记）。
+pub fn poll_report() {
+    unsafe {
+        if !FS_PENDING {
+            return;
+        }
+        FS_PENDING = false;
+        let n = FS_N;
+        if n == 0 {
+            // 报告标记跨窗口竞态（同 anim::report_frame_stats 的 n==0 防御）
+            return;
+        }
+        let mut buf = [0u64; FS_WINDOW];
+        buf[..n].copy_from_slice(&FS_SAMPLES[..n]);
+        for i in 1..n {
+            let key = buf[i];
+            let mut j = i;
+            while j > 0 && buf[j - 1] > key {
+                buf[j] = buf[j - 1];
+                j -= 1;
+            }
+            buf[j] = key;
+        }
+        let p95 = buf[(n * 95 / 100).min(n - 1)];
+        let avg = FS_SUM / FS_COUNT.max(1);
+        crate::uart_send_str("[perf] 帧(n=");
+        crate::print_dec(FS_COUNT);
+        crate::uart_send_str(" 间隔(min=");
+        crate::print_dec(FS_MIN);
+        crate::uart_send_str(",avg=");
+        crate::print_dec(avg);
+        crate::uart_send_str(",p95=");
+        crate::print_dec(p95);
+        crate::uart_send_str(",max=");
+        crate::print_dec(FS_MAX);
+        crate::uart_send_str(")us 掉帧(>12ms)=");
+        crate::print_dec(FS_DROPS);
+        crate::uart_send_str(" 尖峰(>20ms)=");
+        crate::print_dec(FS_SPIKES);
+        if FS_RENDER_N > 0 {
+            crate::uart_send_str(" 直绘渲染(avg=");
+            crate::print_dec(FS_RENDER_SUM / FS_RENDER_N);
+            crate::uart_send_str(",max=");
+            crate::print_dec(FS_RENDER_MAX);
+            crate::uart_send_str(")us");
+        }
+        crate::uart_send_str("\n");
+
+        // t2f：触控→上屏延迟分布（输入跟随帧）
+        let tn = T2F_N;
+        if tn > 0 {
+            let mut tb = [0u64; 32];
+            tb[..tn].copy_from_slice(&T2F_SAMPLES[..tn]);
+            for i in 1..tn {
+                let key = tb[i];
+                let mut j = i;
+                while j > 0 && tb[j - 1] > key {
+                    tb[j] = tb[j - 1];
+                    j -= 1;
+                }
+                tb[j] = key;
+            }
+            let tp95 = tb[(tn * 95 / 100).min(tn - 1)];
+            crate::uart_send_str("[perf] t2f(n=");
+            crate::print_dec(T2F_COUNT);
+            crate::uart_send_str(" min=");
+            crate::print_dec(T2F_MIN);
+            crate::uart_send_str(" avg=");
+            crate::print_dec(T2F_SUM / T2F_COUNT.max(1));
+            crate::uart_send_str(" p95=");
+            crate::print_dec(tp95);
+            crate::uart_send_str(" max=");
+            crate::print_dec(T2F_MAX);
+            crate::uart_send_str("us\n");
+        }
+        // 复位报告窗口（保留 FS_LAST_PRESENT_US 保证跨窗口间隔连续）
+        FS_COUNT = 0;
+        FS_MIN = u64::MAX;
+        FS_MAX = 0;
+        FS_SUM = 0;
+        FS_SAMPLES = [0; FS_WINDOW];
+        FS_N = 0;
+        FS_DROPS = 0;
+        FS_SPIKES = 0;
+        FS_RENDER_SUM = 0;
+        FS_RENDER_MAX = 0;
+        FS_RENDER_N = 0;
+        T2F_COUNT = 0;
+        T2F_MIN = u64::MAX;
+        T2F_MAX = 0;
+        T2F_SUM = 0;
+        T2F_SAMPLES = [0; 32];
+        T2F_N = 0;
+    }
 }
 
 // ==================== CPU 占用 ====================
@@ -250,5 +444,17 @@ pub fn print_stats() {
     crate::print_dec(mem_used_kb() as u64);
     crate::uart_send_str("kB total_frames=");
     crate::print_dec(total_frames());
+    // 当前报告窗口的 t2f 汇总（不冲刷；完整分布见周期性 [perf] 帧/t2f 行）
+    unsafe {
+        if T2F_COUNT > 0 {
+            crate::uart_send_str(" t2f(n=");
+            crate::print_dec(T2F_COUNT);
+            crate::uart_send_str(" avg=");
+            crate::print_dec(T2F_SUM / T2F_COUNT.max(1));
+            crate::uart_send_str(" max=");
+            crate::print_dec(T2F_MAX);
+            crate::uart_send_str("us)");
+        }
+    }
     crate::uart_send_str("\n");
 }

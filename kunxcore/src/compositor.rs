@@ -595,6 +595,8 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         if C.width == 0 {
             return false;
         }
+        // [perf] 应用直绘路径合成+呈现耗时度量（perf::note_app_render）
+        let t0 = crate::timer::now_us();
         // ★ 全程屏蔽 IRQ：C.dirty/prev_app/app_dirty 在 fb_damage 与 composite
         // 之间的读写窗口若被触摸 IRQ 侧 composite() 插入，会消费「旧数组 +
         // 新 count」的撕裂组合并把 dirty_count 清 0（本帧覆盖层丢失/残影）。
@@ -651,6 +653,7 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         C.prev_app[..copy_count].copy_from_slice(&copy[..copy_count]);
         C.app_dirty_count = 0;
         present();
+        crate::perf::note_app_render(crate::timer::now_us().saturating_sub(t0));
         irq_restore(_saved);
         true
     }

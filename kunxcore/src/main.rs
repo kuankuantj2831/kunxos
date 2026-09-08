@@ -1171,6 +1171,8 @@ fn init_main(_: usize) -> ! {
     loop {
         // 帧统计打印在 IRQ 侧只置标记，这里（线程上下文）冲刷。
         anim::poll_deferred_stats();
+        // 应用直绘帧统计 / t2f 报告（perf 侧同样只置标记，此处冲刷）。
+        crate::perf::poll_report();
         thread::yield_now();
     }
 }
