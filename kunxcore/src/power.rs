@@ -154,6 +154,15 @@ pub const T_EMERGENCY_C: u32 = 90;
 /// Hot 级别下的频率上限（Hz）：压到 900MHz（表内最接近且 ≤ 它的频点）。
 pub const HOT_CAP_HZ: u32 = 900_000_000;
 
+/// 帧时钟档位（µs）：120Hz / 90Hz / 60Hz（CNTP 动画定时器周期）。
+///
+/// 热—功耗—流畅联动（稳态帧率而非短时冲刺）：热/低电时按档位降帧时钟，
+/// 而非让合成器硬扛预算失败（每帧超时 → 抖动比低帧率更差）。anim 内部
+/// 按实际 dt 积分，变帧率天然兼容。
+pub const FRAME_120_US: u64 = 8_333;
+pub const FRAME_90_US: u64 = 11_111;
+pub const FRAME_60_US: u64 = 16_667;
+
 /// ondemand 调速阈值（%）。
 const OND_UP: u8 = 75;
 const OND_DOWN: u8 = 35;
@@ -365,6 +374,26 @@ fn thermal_cap_hz(table: &[FreqPoint], level: ThermalLevel) -> u32 {
         ThermalLevel::Normal | ThermalLevel::Warm => table[table.len() - 1].hz,
         ThermalLevel::Hot => clamp_to_table(table, HOT_CAP_HZ),
         ThermalLevel::Critical | ThermalLevel::Emergency => table[0].hz,
+    }
+}
+
+/// 当前帧时钟周期（µs）——热/低电降档的唯一定策点。
+///
+/// 动画帧时钟（CNTP）按此周期驱动：热级别 Hot 压到 90Hz、Critical+
+/// 压到 60Hz；低电量未充电封顶 60Hz。恢复后回到 120Hz。`anim.rs` 的
+/// 帧时钟启动/刷新统一取本值，热/电池采样在档位边沿调用
+/// `anim::refresh_frame_clock()` 立即生效（动画不活动时下次启动生效）。
+pub fn anim_frame_interval_us() -> u64 {
+    let base = match unsafe { THERMAL_LEVEL } {
+        ThermalLevel::Critical | ThermalLevel::Emergency => FRAME_60_US,
+        ThermalLevel::Hot => FRAME_90_US,
+        ThermalLevel::Normal | ThermalLevel::Warm => FRAME_120_US,
+    };
+    // 低电量（≤15% 未充电，battery-low 事件已触发）：稳态 60Hz，省电优先
+    if unsafe { BATT_LOW_EVENTED } && base < FRAME_60_US {
+        FRAME_60_US
+    } else {
+        base
     }
 }
 
@@ -650,6 +679,8 @@ fn sample_thermal(now: u64) {
             ThermalLevel::Normal => push_event(PowerEventKind::ThermalRecover),
             _ => {}
         }
+        // 热—帧联动：档位边沿立即把新帧时钟周期生效（见 anim_frame_interval_us）
+        crate::anim::refresh_frame_clock();
     }
 
     // 热节流：Hot+ 立即把频率压到上限（force 绕过切换间隔）。
@@ -717,8 +748,11 @@ fn sample_battery(now: u64) {
         crate::uart_send_str("[power] battery-low 告警: ");
         crate::print_dec(pct as u64);
         crate::uart_send_str("%\n");
+        // 电—帧联动：低电封顶 60Hz（见 anim_frame_interval_us）
+        crate::anim::refresh_frame_clock();
     } else if pct > BATTERY_LOW_PCT + 5 && low_evented {
         unsafe { BATT_LOW_EVENTED = false }; // +5% 迟滞复位
+        crate::anim::refresh_frame_clock();
     }
 }
 

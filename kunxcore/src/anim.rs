@@ -332,7 +332,7 @@ pub fn tween(
                 ANY_ACTIVE = true;
                 // 按需点亮 CNTP：空闲时动画定时器已停（frame_tick 无活动时停），
                 // 有新动画立即重新启动 120Hz 帧节拍。
-                crate::timer::timer2_start();
+                frame_clock_start();
                 irq_restore(saved);
                 return true;
             }
@@ -374,7 +374,7 @@ pub fn spring(
                 };
                 apply(window, prop, from);
                 ANY_ACTIVE = true;
-                crate::timer::timer2_start();
+                frame_clock_start();
                 irq_restore(saved);
                 return true;
             }
@@ -668,6 +668,24 @@ uart(" 间隔(min=");
         s.spike_count = 0;
         s.render_sum = 0;
         s.render_max = 0;
+    }
+}
+
+/// 按当前电源/热策略点亮帧时钟（动画启动统一入口）。
+///
+/// 周期取 `power::anim_frame_interval_us()`：热级别 Hot→90Hz、Critical+→60Hz、
+/// 低电封顶 60Hz、常态 120Hz。已有定时器重复调用等价一次平滑 reload。
+fn frame_clock_start() {
+    crate::timer::timer2_set_interval(crate::power::anim_frame_interval_us());
+}
+
+/// 电源/热档位变化后由 power 调用：有活动动画时立即把新帧率生效；
+/// 无活动动画时不动作（下次 frame_clock_start 取新策值）。
+pub fn refresh_frame_clock() {
+    unsafe {
+        if ANY_ACTIVE {
+            crate::timer::timer2_set_interval(crate::power::anim_frame_interval_us());
+        }
     }
 }
 

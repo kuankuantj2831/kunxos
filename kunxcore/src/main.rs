@@ -989,7 +989,7 @@ pub extern "C" fn rust_main() -> ! {
     // 动画帧推进走独立硬件通道（CNTP 物理定时器，固定 8.33ms = 120Hz），
     // 与调度 tick 完全解耦：帧间隔不再被调度器上下文切换抖动污染；
     // 全屏手势动画依赖此通道驱动 anim::frame_tick（周期与文档一致：120Hz）
-    timer::timer2_set_interval(8_333);
+    timer::timer2_set_interval(crate::power::anim_frame_interval_us());
     timer::timer2_register_handler(anim::frame_tick);
 
     // ===== 7. 注册中断处理函数 =====
