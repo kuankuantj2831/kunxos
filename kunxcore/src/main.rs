@@ -1132,6 +1132,18 @@ fn init_main(_: usize) -> ! {
     if pid >= 0 {
         // 启动链确认：/init 成功拉起 → 内核记录 BCB 启动成功（尝试计数清零）。
         ota::note_boot_success(crate::sec_build_version());
+        // 帧统计/诊断报告线程：anim 与 perf 的延迟报告在 IRQ/呈现热路径只置
+        // 标记，需要线程上下文冲刷。kmain 此后阻塞于 wait4 不能承担，故由
+        // 本低优先级内核线程常驻轮询（GUI 正常启动路径的唯一冲刷点）。
+        // 注意不能用 Idle 类：pick_next 把 Idle 类任务一律视为每核 idle 循环
+        // （非本核 idle 槽位即跳过），Idle 类普通任务永远不会被选中。
+        process::spawn(
+            "perflog",
+            perf_log_main,
+            0,
+            sched_cfs::PriorityClass::Normal,
+            5,
+        );
         // 等待 /init 退出（正常情况下 /init 常驻，循环 wait4 回收子进程）。
         loop {
             let (rpid, code) = process::wait(pid);
@@ -1174,6 +1186,18 @@ fn init_main(_: usize) -> ! {
         // 应用直绘帧统计 / t2f 报告（perf 侧同样只置标记，此处冲刷）。
         crate::perf::poll_report();
         thread::yield_now();
+    }
+}
+
+/// 帧统计/诊断报告线程（Idle 类内核线程，正常 GUI 启动路径也会拉起）：
+/// 冲刷 anim 与 perf 在 IRQ/呈现热路径置位的延迟统计标记。打印约 200 字符
+/// 在 115200 波特下忙等 ~17ms，绝不能出现在呈现/IRQ 路径——本线程以
+/// 200ms 周期轮询，有标记才打印，无标记时完全让出 CPU。
+fn perf_log_main(_: usize) -> ! {
+    loop {
+        anim::poll_deferred_stats();
+        crate::perf::poll_report();
+        sched_cfs::sleep_until(timer::now_us() + 200_000);
     }
 }
 
