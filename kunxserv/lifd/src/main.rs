@@ -842,8 +842,61 @@ fn deliver_notify(target_pid: u32, payload: &[u8]) {
 
 // ==================== 内存压力 / LMK ====================
 
+/// /proc/processes 快照：pid → 用户页数（LMK 内存项评分数据源）。
+/// run_lmk 每轮开始时刷新；容量 32 与内核 MAX_PROC 一致。
+static mut PAGES_SNAP: [(u32, u64); 32] = [(0, 0); 32];
+static mut PAGES_SNAP_N: usize = 0;
+
+/// 读 /proc/processes（"PID  STATE  PAGES  NAME" 行）解析 pid→pages 快照。
+fn snapshot_pages() {
+    let mut buf = [0u8; 2048];
+    let n = read_file("/proc/processes", &mut buf);
+    unsafe { PAGES_SNAP_N = 0 };
+    let mut i = 0usize;
+    while i < n {
+        let mut end = i;
+        while end < n && buf[end] != b'\n' {
+            end += 1;
+        }
+        let line = &buf[i..end];
+        // 字段：pid（十进制）→ state（R/T 单字母，跳过）→ pages（十进制）
+        let (pid, c1) = parse_dec(line);
+        if c1 > 0 {
+            let rest = &line[c1..];
+            // 跳过状态字段（非数字段）
+            let mut j = 0usize;
+            while j < rest.len() && rest[j] != b' ' && rest[j] != b'\t' {
+                j += 1;
+            }
+            let (pages, _) = parse_dec(&rest[j..]);
+            unsafe {
+                if PAGES_SNAP_N < PAGES_SNAP.len() {
+                    PAGES_SNAP[PAGES_SNAP_N] = (pid as u32, pages);
+                    PAGES_SNAP_N += 1;
+                }
+            }
+        }
+        i = end + 1;
+    }
+}
+
+/// 查询 pid 的用户页数（快照未覆盖时返回 0）。
+fn pages_of(pid: u32) -> u64 {
+    unsafe {
+        for i in 0..PAGES_SNAP_N {
+            if PAGES_SNAP[i].0 == pid {
+                return PAGES_SNAP[i].1;
+            }
+        }
+    }
+    0
+}
+
 /// LMK 评分：越小越先杀。
-/// score = 状态基准 + LRU 老化（秒）+ 后台任务罚分。
+/// score = 状态基准 + LRU 老化（秒）+ 后台任务罚分 + 内存项。
+/// 内存项：pages × 100 / 31500 封顶 100 分（31500 页 ≈ 两次 CJK 字体解析，
+/// bump 堆不回收的单应用最坏情况）——同状态同年龄段先杀内存大户，
+/// 提高每次击杀的实际回收收益（此前评分不含内存量，杀小应用不减压）。
 fn lmk_score(e: &App, now: u64) -> u64 {
     let base: u64 = match e.state {
         ST_SUSPENDED => 0,
@@ -855,7 +908,8 @@ fn lmk_score(e: &App, now: u64) -> u64 {
     for t in 0..e.tasks.min(MAX_TASKS_PER_APP) {
         task_penalty += 5 + e.task_type[t] as u64; // download(3)=8 … audio(0)=5
     }
-    base + age + task_penalty
+    let mem_term = (pages_of(e.pid).saturating_mul(100) / 31_500).min(100);
+    base + age + task_penalty + mem_term
 }
 
 /// 内存压力响应（在 poll_pressure 中调用）。
@@ -897,6 +951,7 @@ fn on_pressure(level: u8) {
 
 /// LMK：按评分升序击杀，直到压力低于 Critical 或无候选。
 fn run_lmk() {
+    snapshot_pages();
     loop {
         let level = unsafe { syscall1(SYS_LC_MEMPRESSURE, 0) } as u8;
         if level < 2 {
