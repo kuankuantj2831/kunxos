@@ -514,12 +514,15 @@ fn create_child_process(
         (*dst).uid = PROCESSES[parent_pid as usize].uid;
         (*dst).gid = PROCESSES[parent_pid as usize].gid;
         {
-            let dstq = &mut (*dst).pt as *mut vm::ProcPageTable as *mut u64;
-            let srcq = child_pt as *const vm::ProcPageTable as *const u64;
-            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
-            for i in 0..n {
-                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
-            }
+            // 移动语义转入 PCB：ProcPageTable 内含堆上记录表（Pages Box），
+            // u64 字拷贝会复制 Box 指针 → PCB 与 child_pt 双释放。read 进槽位
+            // 后把源复位为空表：fork_parent 后续（失败回收路径）只能见到惰性
+            // 空表，其 Box drop 不再触碰已移交的堆内存。
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*dst).pt),
+                core::ptr::read(child_pt as *const vm::ProcPageTable),
+            );
+            core::ptr::write(child_pt as *mut vm::ProcPageTable, vm::ProcPageTable::empty());
         }
     }
     (pid, ttbr0)
@@ -747,6 +750,8 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
             PROCESSES[child_pid as usize].pt.free_user_pages();
             vm::free_process_tables(PROCESSES[child_pid as usize].pt.ttbr0);
                     {
+            // 先归还 pt 的堆记录表（清零只写 null 不 drop，会泄漏 1.5MB）
+            PROCESSES[child_pid as usize].pt.user_pages.release();
             let n = core::mem::size_of::<Process>() / 8;
             let p = &mut PROCESSES[child_pid as usize] as *mut Process as *mut u64;
             for j in 0..n {
@@ -813,7 +818,9 @@ pub fn init(init_entry: fn(usize) -> !) {
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
         crate::kinfo! { crate::uart_send_str("[pinit] fields\n"); }
-        core::ptr::copy_nonoverlapping(&*pt as *const vm::ProcPageTable, &mut (*dst).pt, 1);
+        // 移动语义转入 PCB（pt 内含堆记录表 Box）：deref-move 消费 Box，
+        // 防止 u64 字拷贝复制 Box 指针 + 随后 pt drop 造成的双释放。
+        core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
         crate::kinfo! { crate::uart_send_str("[pinit] ptcopy\n"); }
     }
     crate::kinfo! { crate::uart_send_str("[pinit] D\n"); }
@@ -865,7 +872,8 @@ pub fn spawn(
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
-        core::ptr::copy_nonoverlapping(&*pt as *const vm::ProcPageTable, &mut (*dst).pt, 1);
+        // 移动语义转入 PCB（pt 内含堆记录表 Box，deref-move 消费 Box 防双释放）
+        core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
     }
     set_name(pid, name);
     if sched_cfs::spawn(pid, name, entry, arg, class, nice, ttbr0) == u32::MAX {
@@ -873,6 +881,8 @@ pub fn spawn(
         unsafe {
             vm::free_process_tables(ttbr0);
                     {
+            // 先归还 pt 的堆记录表（清零循环只写 null 不 drop，会泄漏 1.5MB）
+            PROCESSES[pid as usize].pt.user_pages.release();
             let n = core::mem::size_of::<Process>() / 8;
             let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
             for j in 0..n {
@@ -921,14 +931,8 @@ pub fn create_process(mut pt: alloc::boxed::Box<vm::ProcPageTable>, name: &str) 
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
-        {
-            let dstq = &mut (*dst).pt as *mut vm::ProcPageTable as *mut u64;
-            let srcq = &*pt as *const vm::ProcPageTable as *const u64;
-            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
-            for i in 0..n {
-                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
-            }
-        }
+        // 移动语义转入 PCB（pt 内含堆记录表 Box，deref-move 消费 Box 防双释放）
+        core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
     }
     set_name(pid, name);
     pid
@@ -1107,17 +1111,16 @@ pub fn replace_address_space(pid: u32, new_pt: alloc::boxed::Box<vm::ProcPageTab
         // 1) 先释放旧地址空间的**用户数据页**（物理页归还）。
         //    此刻仍运行在旧/新根表共有的内核恒等映射上，不触碰用户区，安全。
         p.pt.free_user_pages();
-        // 2) 把新页表记录整体覆盖进进程表（含新 ttbr0）。新页表已转移给进程，
-        //    Box 用 forget 防二次释放。
+        // 2) 把新页表整体移入进程表（含新 ttbr0）。移动语义：旧值（其堆记录
+        //    表 Box 在 free_user_pages 清空记录后仍占 1.5MB）先 read 出来，
+        //    新值 deref-move 写入（消费 new_pt 的 Box，不复制指针），再 drop
+        //    旧值归还其堆内存 —— u64 字拷贝会复制 Box 指针，导致旧表泄漏 +
+        //    新表双释放。
         {
-            let dstq = &mut p.pt as *mut vm::ProcPageTable as *mut u64;
-            let srcq = &*new_pt as *const vm::ProcPageTable as *const u64;
-            let n = core::mem::size_of::<vm::ProcPageTable>() / 8;
-            for i in 0..n {
-                core::ptr::write_volatile(dstq.add(i), core::ptr::read_volatile(srcq.add(i)));
-            }
+            let old = core::ptr::read(core::ptr::addr_of!(p.pt));
+            core::ptr::write(core::ptr::addr_of_mut!(p.pt), *new_pt);
+            drop(old);
         }
-        core::mem::forget(new_pt);
         // 3) **先把硬件 TTBR0 切到新根表**（新根表同样继承内核恒等映射，指令
         //    取指/数据访问在新根表上继续成立），再做 TLB 全清。此后内核不再
         //    通过旧根表做任何翻译。
@@ -1193,6 +1196,8 @@ pub fn reap_forced(pid: u32) {
         // 会被 current_stack_base()/current_brk() 当作新进程的值使用。
         crate::elf::release(pid);
         {
+            // 先归还 pt 的堆记录表（清零只写 null 不 drop，会泄漏 1.5MB）
+            PROCESSES[pid as usize].pt.user_pages.release();
             let n = core::mem::size_of::<Process>() / 8;
             let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
             for j in 0..n {
@@ -1247,6 +1252,8 @@ FdKind::File => crate::vfs::close_ref(e.index),
         // launcher 复用同一 pid），遗留的未对齐断点会让新进程堆分配写越界。
         crate::bionic_shim::reset_brk_state(pid as usize);
                 {
+            // 先归还 pt 的堆记录表（清零只写 null 不 drop，会泄漏 1.5MB）
+            PROCESSES[pid as usize].pt.user_pages.release();
             let n = core::mem::size_of::<Process>() / 8;
             let p = &mut PROCESSES[pid as usize] as *mut Process as *mut u64;
             for j in 0..n {

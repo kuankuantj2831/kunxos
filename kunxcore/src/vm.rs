@@ -312,18 +312,95 @@ pub const LAZY_PAGE: PhysAddr = usize::MAX;
 /// - `ttbr0`：本进程页表根（TTBR0_EL1 值）。
 /// - `user_pages`：本进程用户空间已建立的页映射（用于 fork 完整复制、
 ///   exit/exec 时释放物理页）。内核恒等映射不在其中（跨进程共享）。
+///
+/// ★ 内存布局（1.0 内核镜像治理）：`user_pages` 的 65536×24B ≈ 1.5MB 记录
+/// 数组放在**堆**（`Pages` = `Option<Box<UserPageArray>>`），`ProcPageTable`
+/// 本体仅 24B——此前每个 PCB 内嵌 1.5MB 数组，`PROCESSES[24]` 在 .data 撑出
+/// 37.6MB、kernel.img 达 62MB。记录表惰性分配：从未登记用户映射的进程
+/// （内核线程、纯内核态任务）零堆占用；首次 `add_page/reserve_page` 落地。
+/// 经 `Deref/DerefMut` 保持 `pt.user_pages[i]` 既有访问语法。
 pub struct ProcPageTable {
     pub ttbr0: PhysAddr,
-    pub user_pages: [UserPage; MAX_USER_PAGES],
+    pub user_pages: Pages,
     pub count: usize,
 }
 
+/// 用户映射记录数组（`[UserPage; MAX_USER_PAGES]`，约 1.5MB）的堆承载。
+pub struct UserPageArray {
+    pub entries: [UserPage; MAX_USER_PAGES],
+}
+
+/// 记录表句柄：堆上数组的单一所有权（`Option<Box<UserPageArray>>`）。
+///
+/// - `None`：从未登记用户映射（空表，读侧返回空切片）。
+/// - `Some`：已分配；`count > 0` 恒蕴含 `Some`。
+/// - `Option<Box<_>>` 利用 null niche，大小 8B；全零字节即合法 `None`——
+///   进程槽位的 u64 清零循环天然产出合法空值。
+pub struct Pages(Option<alloc::boxed::Box<UserPageArray>>);
+
+impl Pages {
+    /// 空句柄（const：供 `ProcPageTable::empty`）。
+    pub const NONE: Pages = Pages(None);
+
+    /// 分配并清零记录表。走裸 `alloc_zeroed` + null 检查而非 `Box::new_uninit`：
+    /// 后者在 OOM 时触发 `handle_alloc_error`（内核默认 panic），而记录表
+    /// 分配失败必须按「可回滚的 false」上报——用户 brk/mmap 在内存压力下
+    /// 可以随时触达本路径。
+    fn alloc_zeroed() -> Option<alloc::boxed::Box<UserPageArray>> {
+        use core::alloc::Layout;
+        let layout = Layout::new::<UserPageArray>();
+        let raw = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut UserPageArray;
+        if raw.is_null() {
+            return None;
+        }
+        // GlobalAlloc::alloc_zeroed 默认实现保证 null 之外的区域已清零。
+        Some(unsafe { alloc::boxed::Box::from_raw(raw) })
+    }
+
+    /// 惰性分配记录表（push 路径首次调用）。OOM 返回 false，调用方回滚。
+    fn ensure(&mut self) -> bool {
+        if self.0.is_none() {
+            match Pages::alloc_zeroed() {
+                Some(b) => self.0 = Some(b),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// 归还堆上记录表（None 化）。进程槽位 u64 清零**之前**必须调用：
+    /// 清零只把 Box 指针写成 null，不会释放 —— 跳过本调用 = 每次 1.5MB 堆泄漏。
+    pub fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl core::ops::Deref for Pages {
+    type Target = [UserPage];
+    fn deref(&self) -> &[UserPage] {
+        match &self.0 {
+            Some(b) => &b.entries,
+            None => &[],
+        }
+    }
+}
+
+impl core::ops::DerefMut for Pages {
+    fn deref_mut(&mut self) -> &mut [UserPage] {
+        match self.0.as_deref_mut() {
+            Some(b) => &mut b.entries,
+            // 写侧只在 `index < count`（蕴含 Some）时触达；空表写 = 调用方 bug。
+            None => panic!("vm：user_pages 写访问未分配的记录表"),
+        }
+    }
+}
+
 impl ProcPageTable {
-    /// 空页表（无根表，无用户映射）。
+    /// 空页表（无根表，无用户映射；记录表不占堆）。
     pub const fn empty() -> Self {
         ProcPageTable {
             ttbr0: 0,
-            user_pages: [EMPTY_USER_PAGE; MAX_USER_PAGES],
+            user_pages: Pages::NONE,
             count: 0,
         }
     }
@@ -331,22 +408,18 @@ impl ProcPageTable {
     /// 新建页表：分配清零根表并继承内核恒等映射。
     /// 根表（单页）分配失败直接 panic——进程创建路径，非用户可直接触发的
     /// OOM 增长点（中间级页表/任务栈的 OOM 已改为错误上抛）。
+    /// 记录表不在构造时分配（惰性，首次登记用户映射时落地）。
     pub fn new() -> Self {
-        let root = new_table().expect("vm：根页表物理内存不足");
-        inherit_kernel_mapping(root);
-        ProcPageTable {
-            ttbr0: root,
-            user_pages: [EMPTY_USER_PAGE; MAX_USER_PAGES],
-            count: 0,
+        match ProcPageTable::try_new_boxed() {
+            Some(b) => *b,
+            None => panic!("vm：根页表物理内存不足"),
         }
     }
 
-    /// 在堆上新建页表（`Box`），**不在栈上构造 96KB 临时对象**。
+    /// 在堆上新建页表（`Box`），**不在栈上构造大临时对象**。
     ///
-    /// `user_pages[4096]` 约 96KB；`Box::new(Self::new())` 会在栈上先构造
-    /// 完整的 `Self` 再移入堆，叠加 fork/execve 深调用链会使内核任务栈
-    /// （256KB）溢出并破坏相邻内存。本函数用 `Box::new_uninit` + 直接写
-    /// 字段的方式初始化，全程不产生栈上大对象。
+    /// `ProcPageTable` 本体现在仅 24B（记录表在堆上惰性分配），但保持本
+    /// 接口与调用方不变；fork/execve 深调用链不再有任何栈上大对象。
     pub fn new_boxed() -> alloc::boxed::Box<ProcPageTable> {
         match ProcPageTable::try_new_boxed() {
             Some(b) => b,
@@ -364,12 +437,8 @@ impl ProcPageTable {
             let p: *mut ProcPageTable = b.as_mut_ptr();
             let root = new_table()?;
             ptr::write(&mut (*p).ttbr0, root);
+            ptr::write(&mut (*p).user_pages, Pages::NONE);
             ptr::write(&mut (*p).count, 0usize);
-            let up = &mut (*p).user_pages as *mut [UserPage; MAX_USER_PAGES] as *mut u8;
-            let up_len = core::mem::size_of::<[UserPage; MAX_USER_PAGES]>();
-            for b in 0..up_len {
-                ptr::write_volatile(up.add(b), 0u8);
-            }
             inherit_kernel_mapping((*p).ttbr0);
             // 安全性：所有字段均已初始化。
             Some(b.assume_init())
@@ -378,12 +447,18 @@ impl ProcPageTable {
 
     /// 建立 `vaddr → paddr` 的用户页映射并记录，返回是否成功。
     ///
-    /// 失败（地址越界或记录表已满）时**不建立映射**并返回 `false`——若只建
-    /// 映射不记录，会导致：该页 exit/exec 永不释放（泄漏）、fork 父子地址空间
-    /// 不一致（子进程缺页）、回滚逻辑释放仍被映射的旧页（use-after-free）。
-    /// 拒绝映射到内核恒等映射区（`vaddr >= USER_VA_TOP`），防止改写共享内核页表。
+    /// 失败（地址越界、记录表已满或记录表堆分配 OOM）时**不建立映射**并返回
+    /// `false`——若只建映射不记录，会导致：该页 exit/exec 永不释放（泄漏）、
+    /// fork 父子地址空间不一致（子进程缺页）、回滚逻辑释放仍被映射的旧页
+    /// （use-after-free）。拒绝映射到内核恒等映射区（`vaddr >= USER_VA_TOP`），
+    /// 防止改写共享内核页表。
     pub fn add_page(&mut self, vaddr: VirtAddr, paddr: PhysAddr, flags: MapFlags) -> bool {
         if !user_va_range_ok(vaddr, PAGE_SIZE) || self.count >= MAX_USER_PAGES {
+            return false;
+        }
+        // 记录表先落地（惰性）：映射建立后记录堆分配失败 = 有映射无记录的
+        // 不一致状态，故在 map_page_in 之前分配。
+        if !self.user_pages.ensure() {
             return false;
         }
         // 映射失败（中间级页表 OOM）时同样不记录，避免记录与映射不一致。
@@ -410,6 +485,9 @@ impl ProcPageTable {
         if !user_va_range_ok(vaddr, PAGE_SIZE) || self.count >= MAX_USER_PAGES {
             return false;
         }
+        if !self.user_pages.ensure() {
+            return false;
+        }
         // 映射失败（中间级页表 OOM）时不记录。
         if !map_page_in(self.ttbr0, vaddr, paddr, pte_flags) {
             return false;
@@ -422,10 +500,13 @@ impl ProcPageTable {
     /// 预留 `vaddr` 一页（按需分页）：仅记录地址空间占用，**不分配物理页、
     /// 不建页表映射**，记录 `paddr = LAZY_PAGE` 作标记。
     ///
-    /// 首次访问该页时由内核 page fault 处理器落地。失败（地址越界/记录表满）
-    /// 时返回 `false`，调用方须回滚已预留的页。
+    /// 首次访问该页时由内核 page fault 处理器落地。失败（地址越界、记录表满
+    /// 或记录表堆分配 OOM）时返回 `false`，调用方须回滚已预留的页。
     pub fn reserve_page(&mut self, vaddr: VirtAddr, flags: MapFlags) -> bool {
         if !user_va_range_ok(vaddr, PAGE_SIZE) || self.count >= MAX_USER_PAGES {
+            return false;
+        }
+        if !self.user_pages.ensure() {
             return false;
         }
         self.user_pages[self.count] = UserPage { vaddr, paddr: LAZY_PAGE, flags };

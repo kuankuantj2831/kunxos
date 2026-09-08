@@ -265,12 +265,16 @@ const EMPTY_DEV: DevState = DevState {
     root_ino: 0,
     free_inodes: 0,
     free_blocks: 0,
-    ino_hint: 1,
+    // ★ ino_hint/next_seq 必须保持 0：EMPTY_DEV 全零才能让 DEVS 数组落 .bss
+    // （此前常量 1 把 4×~1MB 的位图数组钉在 .data，kernel.img 多 4.2MB）。
+    // 两者只在 mount（从超级块/jlog 装载）与 mkfs（置 1）时初始化，槽位
+    // 分配（fs_register）到 mount/mkfs 之间无消费方，0 不会被读到。
+    ino_hint: 0,
     blk_hint: 0,
     jlog_head_seq: 0,
     jlog_head_abs: 0,
     jlog_next_abs: 0,
-    next_seq: 1,
+    next_seq: 0,
     imap: [0; BLK_SIZE],
     bmap: [[0; BLK_SIZE]; MAX_BMAP_BLOCKS],
 };
