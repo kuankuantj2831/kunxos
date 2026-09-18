@@ -224,6 +224,9 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             // 读一条 kmsg 记录（内核 log_read_next：无新记录返回 0）
             let mut buf = [0u8; 256];
             let r = syscall3(SYS_READ, kmsg_fd as usize, buf.as_mut_ptr() as usize, buf.len());
+            // 本轮排空后睡眠标记（见循环尾：读空才睡 100ms —— 单条/轮在
+            // 开机风暴等 >10 条/秒的突发下会跟不上，内核环形日志被覆盖、
+            // 持久化侧静默缺记录）
             // 读失败 -1（usize 天文数字）按 isize 判负：否则每 100ms 往日志
             // 文件写 256 字节零（把读错误当数据持久化，且日志被垃圾灌满）
             if (r as isize) > 0 {
@@ -248,6 +251,9 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     print_dec(wrote);
                     print(" 条记录\n");
                 }
+                // 读到记录：立即继续排空（不睡）—— 突发日志（开机风暴
+                // >10 条/秒）下单条/轮跟不上，内核环形日志被覆盖。
+                continue;
             }
             sleep_ms(POLL_MS);
         }

@@ -1,0 +1,23 @@
+[package]
+name = "tlstest"
+version = "0.1.0"
+edition = "2021"
+
+# 浏览器 TLS 栈的来宾侧端到端自测：复用 apps/browser/src/tls/ 同一份源码，
+# 在 KunxOS EL0 上对真实站点做完整 TLS 1.2 握手 + 证书链验证 + 取页，
+# 验证 virtio-net / DNS / getrandom / RTC 时钟等来宾侧依赖。
+# 经 shell `run /bin/tlstest [host]` 启动；串口断言 [tls-selftest] PASS。
+
+[dependencies]
+kunxsec = { path = "../../kunxsec" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unused_unsafe = "allow"
+unsafe_op_in_unsafe_fn = "allow"

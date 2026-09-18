@@ -384,10 +384,15 @@ fn irq_handler() {
     if unsafe { BASE } == 0 {
         return;
     }
-    // 只处理 used-ring 更新中断
+    // ★ 无条件 ACK 全部 cause：virtio-mmio InterruptStatus bit0=used ring、
+    // bit1=config change。此前只 ACK bit0 —— 设备发纯 config-change
+    // （st=0b10）时永不写 ACK 寄存器，电平中断被 GIC 立即重投递 → 风暴
+    // 护栏触发把整块网卡禁掉。drain 仍只在真有 used 更新时执行。
     let st = r32(REG_IRQ_STATUS);
+    if st != 0 {
+        w32(REG_IRQ_ACK, st);
+    }
     if st & IRQ_USED != 0 {
-        w32(REG_IRQ_ACK, IRQ_USED);
         unsafe { drain_impl() };
     }
 }
@@ -631,4 +636,89 @@ pub fn recv_into(buf: &mut [u8]) -> Option<usize> {
         asm!("msr daifclr, #2");
         r
     }
+}
+
+// ==================== DMA 缓存行隔离诊断（netdiag 观测点，只读） ====================
+//
+// 技术债「DMA 64B 缓存行隔离（Pi4/KVM）」的确定性观测：dcache_clean /
+// dcache_invalidate 按整条 64B 行生效（首末行向下/向上取整）。若维护区间
+// 与「不参与本次维护的所有者」共享行，真实缓存平台（Pi4 / ARM KVM）上：
+//   - 环内：avail 尾部与 used 头部共享行时（USED_OFF 非 64 对齐），
+//     clean(avail) 的行回写会把 CPU 缓存中陈旧的 used 头字节写回内存，
+//     覆盖设备 DMA 写入的 used ring → TX 回收/RX 收包丢失（TCG 无缓存
+//     仿真，不可复现；KVM/Pi4 必现前提）；
+//   - 缓冲：kmalloc 默认 16B 对齐的 RX 缓冲首末行可能与相邻分配共享，
+//     invalidate(RX buf) 会丢弃共享行上相邻所有者的脏数据 → 堆内存损坏。
+// 本诊断输出「隔离前提是否成立」的运行时事实（任何平台可跑），修复决策
+// 以此为据，不做盲改。
+
+/// DMA 缓存行隔离审计快照（`cache_line_diag` 产出，shell `netdiag` 格式化）。
+pub struct CacheLineDiag {
+    /// 网卡是否就绪（未就绪时其余字段为 0）。
+    pub ready: bool,
+    /// RX/TX 环基址（页分配，恒等映射）。
+    pub rx_ring: usize,
+    pub tx_ring: usize,
+    /// used ring 在环页内偏移（当前布局常量 USED_OFF）。
+    pub used_off: usize,
+    /// used 头部是否与 avail 尾部共享 64B 行（USED_OFF % 64 != 0）。
+    pub used_line_shared: bool,
+    /// clean(avail) 区间按行取整后是否越过 avail 末尾侵入 used 头部。
+    pub avail_clean_overreach: bool,
+    /// 投递中的 RX DMA 缓冲总数 / 其中 64B 对齐的数量。
+    pub rx_buf_total: usize,
+    pub rx_buf_aligned: usize,
+    /// 投递中的 TX DMA 缓冲总数 / 其中 64B 对齐的数量。
+    pub tx_buf_total: usize,
+    pub tx_buf_aligned: usize,
+}
+
+/// 采集缓存行隔离审计快照（关中断，避免与 IRQ 侧回收竞态读到中间态）。
+pub fn cache_line_diag() -> CacheLineDiag {
+    let mut d = CacheLineDiag {
+        ready: ready(),
+        rx_ring: 0,
+        tx_ring: 0,
+        used_off: USED_OFF,
+        used_line_shared: false,
+        avail_clean_overreach: false,
+        rx_buf_total: 0,
+        rx_buf_aligned: 0,
+        tx_buf_total: 0,
+        tx_buf_aligned: 0,
+    };
+    if !d.ready {
+        return d;
+    }
+    unsafe {
+        let saved: u64;
+        asm!("mrs {}, daif", out(reg) saved);
+        asm!("msr daifset, #2");
+        d.rx_ring = RX_RING;
+        d.tx_ring = TX_RING;
+        // avail 占 [AVAIL_OFF, AVAIL_OFF+6+2*Q)，used 从 USED_OFF 起；
+        // 二者共享行 ⟺ USED_OFF 不在 64B 边界上（avail 恰结束于 USED_OFF）。
+        d.used_line_shared = USED_OFF & 63 != 0;
+        // clean(AVAIL_OFF, 6+2*Q) 末尾按行上取整：(avail_end + 63) & !63
+        let avail_end = AVAIL_OFF + 6 + 2 * QUEUE_SIZE;
+        d.avail_clean_overreach = ((avail_end + 63) & !63) > USED_OFF;
+        for i in 0..QUEUE_SIZE {
+            let rb = RX_BUFS[i];
+            if rb != 0 {
+                d.rx_buf_total += 1;
+                if rb & 63 == 0 {
+                    d.rx_buf_aligned += 1;
+                }
+            }
+            let tb = TX_BUFS[i];
+            if tb != 0 {
+                d.tx_buf_total += 1;
+                if tb & 63 == 0 {
+                    d.tx_buf_aligned += 1;
+                }
+            }
+        }
+        asm!("msr daif, {}", in(reg) saved);
+    }
+    d
 }

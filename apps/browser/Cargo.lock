@@ -13,6 +13,7 @@ name = "browser"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "kunxsec",
 ]
 
 [[package]]
@@ -56,6 +57,10 @@ dependencies = [
  "equivalent",
  "foldhash",
 ]
+
+[[package]]
+name = "kunxsec"
+version = "0.1.0"
 
 [[package]]
 name = "libm"

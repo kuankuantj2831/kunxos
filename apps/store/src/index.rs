@@ -140,14 +140,25 @@ pub fn parse(data: &[u8]) -> bool {
     unsafe { IDX_COUNT > 0 }
 }
 
+/// name/version 字符白名单（与 kunxpkg format::valid_path 同级防线）：
+/// 只允许字母数字与 `_-.+`。name/version 会被拼进下载路径
+/// `/data/store/cache/<name>-<version>.kunx`，此前无字符校验 —— 恶意索引
+/// 可用 `../x` 让 store 在任意目录创建/截断 `.kunx` 后缀文件（失败路径
+/// 还会 unlink）。
+fn ident_ok(s: &[u8]) -> bool {
+    !s.is_empty()
+        && s.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.' || c == b'+')
+}
+
 fn parse_pkg(name: &[u8], v: &crate::json::Json<'_>, p: &mut StorePkg) -> bool {
-    if name.is_empty() || name.len() > p.name.len() {
+    if !ident_ok(name) || name.len() > p.name.len() {
         return false;
     }
     let Some(version) = v.get("version").and_then(|x| x.as_str()) else {
         return false;
     };
-    if version.is_empty() || version.len() > p.version.len() {
+    if !ident_ok(version) || version.len() > p.version.len() {
         return false;
     }
     p.name_len = fill(&mut p.name, name);

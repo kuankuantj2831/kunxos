@@ -725,6 +725,12 @@ fn mount_unlocked(major: u32) -> i32 {
     if spc == 0 || !spc.is_power_of_two() || fat_size == 0 || root_cluster < 2 {
         return -1;
     }
+    // ★ 畸形 BPB 防护：reserved==0 时 FAT1 覆盖引导扇区（首次 set_fat 即毁
+    // BPB）；num_fats==0 时数据区与 FAT1 重叠（alloc_cluster 清零直接抹掉
+    // FAT 表）。配合 fsops 的自动探测挂载，特制镜像插入即自毁卷。
+    if reserved < 1 || (num_fats != 1 && num_fats != 2) {
+        return -1;
+    }
     let data_base = reserved as u64 + num_fats as u64 * fat_size as u64;
     // 总簇数：从分区大小推算（分区相对：num_sectors - data_base）
     let num_sectors = match blkdev::get_blkdev(major) {
@@ -824,7 +830,7 @@ fn fs_lookup_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
                     continue;
                 }
                 if e[0..11] == short[..] {
-                    let cluster = le16(&e[20..22]) as u32 | (le16(&e[26..28]) as u32) << 16;
+                    let cluster = le16(&e[26..28]) as u32 | (le16(&e[20..22]) as u32) << 16;
                     let size = le32(&e[28..32]);
                     match entry_for(major, dir.cluster, slot, cluster, size, e[11]) {
                         Some(ino) => return ino as i32,
@@ -875,8 +881,8 @@ fn fs_create_unlocked(major: u32, dir_ino: u32, name: &str, _typ: u16, _rdev: u3
     let mut ent = [0u8; 32];
     ent[0..11].copy_from_slice(&short_name(name));
     ent[11] = ATTR_ARCHIVE;
-    put_le16(&mut ent[20..22], 0); // 首簇低 16 位（空文件）
-    put_le16(&mut ent[26..28], 0); // 首簇高 16 位
+    put_le16(&mut ent[26..28], 0); // 首簇低 16 位（空文件；规范：26=LO）
+    put_le16(&mut ent[20..22], 0); // 首簇高 16 位（规范：20=HI）
     put_le32(&mut ent[28..32], 0); // 大小 0
     if !write_dir_entry(&vol, dir.cluster, slot, &ent) {
         return -1;
@@ -919,15 +925,15 @@ fn fs_mkdir_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
     let mut dot = [0u8; 32];
     dot[0..11].copy_from_slice(b".          ");
     dot[11] = ATTR_DIRECTORY;
-    put_le16(&mut dot[20..22], cluster as u16);
-    put_le16(&mut dot[26..28], (cluster >> 16) as u16);
+    put_le16(&mut dot[26..28], cluster as u16);
+    put_le16(&mut dot[20..22], (cluster >> 16) as u16);
     let mut dotdot = [0u8; 32];
     dotdot[0..11].copy_from_slice(b"..         ");
     dotdot[11] = ATTR_DIRECTORY;
     // ".." 指向父目录（即 dir 所在的目录簇）
     let parent_cluster = dir.cluster;
-    put_le16(&mut dotdot[20..22], parent_cluster as u16);
-    put_le16(&mut dotdot[26..28], (parent_cluster >> 16) as u16);
+    put_le16(&mut dotdot[26..28], parent_cluster as u16);
+    put_le16(&mut dotdot[20..22], (parent_cluster >> 16) as u16);
     let base = cluster_sector(&vol, cluster);
     let mut tmp = [0u8; SECTOR_SIZE];
     if !read_sectors(major, base, 1, &mut tmp) {
@@ -951,8 +957,10 @@ fn fs_mkdir_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
     let mut ent = [0u8; 32];
     ent[0..11].copy_from_slice(&short_name(name));
     ent[11] = ATTR_DIRECTORY;
-    put_le16(&mut ent[20..22], cluster as u16);
-    put_le16(&mut ent[26..28], (cluster >> 16) as u16);
+    // ★ FAT32 规范：偏移 20-21 = FstClusHI、26-27 = FstClusLO（此前与
+    // mkdisk 同向写反、内部自洽掩盖；标准 mkfs.vfat 卷挂载即全部读空）。
+    put_le16(&mut ent[26..28], cluster as u16);
+    put_le16(&mut ent[20..22], (cluster >> 16) as u16);
     put_le32(&mut ent[28..32], 0);
     if !write_dir_entry(&vol, dir.cluster, slot, &ent) {
         free_chain(&vol, cluster);
@@ -1257,8 +1265,8 @@ fn update_dir_cluster(vol: &FatVol, e: &FatEntry) {
         return; // 根目录无目录项
     }
     if let Some(mut ent) = dir_entry_at(vol, e.parent, e.slot) {
-        put_le16(&mut ent[20..22], e.cluster as u16);
-        put_le16(&mut ent[26..28], (e.cluster >> 16) as u16);
+        put_le16(&mut ent[26..28], e.cluster as u16);
+        put_le16(&mut ent[20..22], (e.cluster >> 16) as u16);
         let _ = write_dir_entry(vol, e.parent, e.slot, &ent);
     }
 }
@@ -1303,8 +1311,8 @@ fn fs_truncate_unlocked(major: u32, ino: u32) -> i32 {
     }
     if e.parent != 0 {
         if let Some(mut ent) = dir_entry_at(&vol, e.parent, e.slot) {
-            put_le16(&mut ent[20..22], 0);
             put_le16(&mut ent[26..28], 0);
+            put_le16(&mut ent[20..22], 0);
             put_le32(&mut ent[28..32], 0);
             let _ = write_dir_entry(&vol, e.parent, e.slot, &ent);
         }
@@ -1485,7 +1493,7 @@ fn fs_readdir_unlocked(major: u32, ino: u32, index: usize, name: &mut [u8]) -> i
                         if n < name.len() {
                             name[n] = 0;
                         }
-                        let cluster = le16(&ent[20..22]) as u32 | (le16(&ent[26..28]) as u32) << 16;
+                        let cluster = le16(&ent[26..28]) as u32 | (le16(&ent[20..22]) as u32) << 16;
                         let size = le32(&ent[28..32]);
                         return match entry_for(major, e.cluster, slot, cluster, size, ent[11]) {
                             Some(i) => i as i32,

@@ -33,6 +33,17 @@ EXTRA = set("，。！？；：、（）《》「」『』【】·—…～￥×
 # 缓慢的主因。将来接入 IME 时删除本排除并重建字体。
 RUNTIME_TEXT_EXCLUDES = ("pinyin_dict.rs",)
 
+# 扫描范围（运行期会往屏幕渲染文本的源码）：
+#   apps/**    应用 UI 文案；shared/** 共享 UI 底座（l10n/app_kit/error_ui…）；
+#   kunxcore/src/{main,ui_framework}.rs 内核启动 logo/窗口标题；
+#   tools/kunxrepo 包仓库描述（store 界面渲染）。
+# 内核/守护进程的串口日志、注释、测试代码从不上屏，不再进子集 ——
+# 此前整文件扫描把全仓库中文注释的汉字都收进了 cn.ttf（~1500 字形
+# 761KB），是 fontdue 每次应用启动都要秒级解析的主因。
+SCAN_RS_DIRS = ("apps", "shared")
+SCAN_RS_FILES = ("kunxcore/src/main.rs", "kunxcore/src/ui_framework.rs")
+SCAN_DATA_DIRS = (("tools", "kunxrepo"),)
+
 def decode_escapes(text):
     """把源码中的 \\xNN 字节转义序列按 UTF-8 解出（中文文案常以
     b"\\xE7\\xBD\\x91..." 形式书写，直接扫文本只会扫到转义字面量）。"""
@@ -47,47 +58,140 @@ def decode_escapes(text):
         out.add(chr(int(m.group(1), 16)))
     return out
 
+def rust_literal_chars(text):
+    """从 Rust 源码提取字符串/字符字面量里的字符（状态机跳过注释与代码）。
+    转义序列原文保留在输出里，由 decode_escapes 统一解码。"""
+    out = set()
+    i, n = 0, len(text)
+    in_str = in_chr = in_lc = in_bc = False
+    while i < n:
+        c = text[i]
+        if in_lc:
+            if c == "\n":
+                in_lc = False
+            i += 1
+        elif in_bc:
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                in_bc = False
+                i += 2
+            else:
+                i += 1
+        elif in_str:
+            if c == "\\":
+                # 转义序列：保留原文（含引号转义），跳过下一字符
+                out.add(c)
+                if i + 1 < n:
+                    out.add(text[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            elif c == '"':
+                in_str = False
+                i += 1
+            else:
+                out.add(c)
+                i += 1
+        elif in_chr:
+            if c == "\\":
+                if i + 1 < n and text[i + 1] == "u":
+                    j = text.find("}", i)
+                    if j != -1:
+                        out.update(decode_escapes(text[i:j + 1]))
+                        i = j + 1
+                        in_chr = False
+                        continue
+                out.update(decode_escapes(text[i:i + 4]))
+                i += 2
+            elif c == "'":
+                in_chr = False
+                i += 1
+            else:
+                out.add(c)
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            in_lc = True
+            i += 2
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            in_bc = True
+            i += 2
+        elif c == '"':
+            in_str = True
+            i += 1
+        elif c == "'":
+            # 字符字面量 vs 生命周期标注（&'static / 'a）：只有「' 后 1~2 个
+            # 字符即闭合」的形态才按字符字面量处理，避免生命周期吞掉代码。
+            if i + 2 < n and text[i + 2] == "'" and text[i + 1] != " ":
+                in_chr = True
+                i += 1
+            elif i + 3 < n and text[i + 1] == "\\" and text[i + 3] == "'":
+                in_chr = True
+                i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+    return out
+
+def _walk_rs_files():
+    for d in SCAN_RS_DIRS:
+        base = os.path.join(ROOT, d)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [x for x in dirnames if x not in {"target", "__pycache__"}]
+            for fn in filenames:
+                if fn.endswith(".rs") and not any(fn.endswith(e) or fn == e for e in RUNTIME_TEXT_EXCLUDES):
+                    yield os.path.join(dirpath, fn)
+    for rel in SCAN_RS_FILES:
+        p = os.path.join(ROOT, rel)
+        if os.path.exists(p):
+            yield p
+
 def source_chars():
     chars = set()
-    skip_dirs = {".git", "target", "node_modules", ".agent_backup", "tools/fonts", ".kilo", "kunxcore/ramdisk.img", "__pycache__"}
-    for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-        for fn in filenames:
-            p = os.path.join(dirpath, fn)
-            # 运行期文本只来自应用/Rust 源码字符串与包仓库生成器（store 显示
-            # 的 Packages 描述由 tools/kunxrepo 生成）；文档/日志等大文件
-            # 里的字不参与子集，避免 CHANGELOG/BUG_REPORT 撑大字体。
-            if fn.endswith(".rs"):
-                pass
-            elif p.startswith(os.path.join(ROOT, "tools", "kunxrepo")) and fn.endswith((".py", ".json")):
-                pass
-            else:
-                continue
-            if any(fn.endswith(e) or fn == e for e in RUNTIME_TEXT_EXCLUDES):
-                continue
-            try:
-                with open(p, encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-            except OSError:
-                pass
-            else:
-                chars.update(text)
-                chars.update(decode_escapes(text))
+    for p in _walk_rs_files():
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+        chars.update(rust_literal_chars(text))
+        chars.update(decode_escapes(text))
+    for d0, d1 in SCAN_DATA_DIRS:
+        base = os.path.join(ROOT, d0, d1)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [x for x in dirnames if x not in {"__pycache__"}]
+            for fn in filenames:
+                if not fn.endswith((".py", ".json")):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, fn), encoding="utf-8", errors="ignore") as f:
+                        chars.update(f.read())
+                except OSError:
+                    pass
     return chars
+
+def subset_options():
+    """子集化选项：fontdue 只读 cmap/glyf/loca/head/hhea/hmtx/maxp，其余表
+    （name 记录、TrueType hinting 字节码、GSUB/GPOS 整形、post 字形名）全部
+    丢弃 —— 同字形数下文件显著变小，应用启动的字体 I/O 与解析同步提速。"""
+    from fontTools import subset
+    opts = subset.Options()
+    opts.retain_gids = False
+    opts.notdef_outline = True
+    opts.recalc_bounds = True
+    opts.name_IDs = []
+    opts.name_legacy = False
+    opts.recommended_glyphs = False
+    opts.hinting = False
+    opts.layout_features = []
+    opts.drop_tables += ["GSUB", "GPOS", "GDEF", "BASE", "post"]
+    return opts
 
 def subset_font(src, dst, tag):
     from fontTools import subset
     chars = source_chars() | EXTRA
     chars = {c for c in chars if 0x20 <= ord(c) <= 0xFFFF}
     print(f"[{tag}] {len(chars)} unique chars")
-    opts = subset.Options()
-    opts.retain_gids = False
-    opts.notdef_outline = True
-    opts.recalc_bounds = True
-    opts.name_IDs = ["*"]
-    opts.name_legacy = True
-    opts.recommended_glyphs = False
-    opts.drop_tables = ["FFTM", "FFTM"]
+    opts = subset_options()
     subsetter = subset.Subsetter(options=opts)
     subsetter.populate(text="".join(sorted(chars)))
     from fontTools.ttLib import TTFont
@@ -121,20 +225,15 @@ def build_oobe():
              glob.glob(os.path.join(ROOT, "apps", "oobe", "src", "widgets", "*.rs")):
         try:
             with open(f, encoding="utf-8", errors="ignore") as fh:
-                chars.update(fh.read())
+                text = fh.read()
         except OSError:
-            pass
+            continue
+        chars.update(rust_literal_chars(text))
+        chars.update(decode_escapes(text))
     chars = {c for c in chars if 0x20 <= ord(c) <= 0xFFFF}
     print(f"[oobe] {len(chars)} unique chars")
     from fontTools import subset
-    opts = subset.Options()
-    opts.retain_gids = False
-    opts.notdef_outline = True
-    opts.recalc_bounds = True
-    opts.name_IDs = ["*"]
-    opts.name_legacy = True
-    opts.recommended_glyphs = False
-    opts.drop_tables = ["FFTM", "FFTM"]
+    opts = subset_options()
     from fontTools.ttLib import TTFont
     for (src, dst, tag) in (
         (os.path.join(ROOT, "fonts", "uiputong.ttf"), os.path.join(OUT, "oobe-cn-subset.ttf"), "oobe-cn"),
@@ -234,20 +333,15 @@ def build_launcher():
     for f in glob.glob(os.path.join(ROOT, "apps", "launcher", "src", "**", "*.rs"), recursive=True):
         try:
             with open(f, encoding="utf-8", errors="ignore") as fh:
-                chars.update(fh.read())
+                text = fh.read()
         except OSError:
-            pass
+            continue
+        chars.update(rust_literal_chars(text))
+        chars.update(decode_escapes(text))
     chars = {c for c in chars if 0x20 <= ord(c) <= 0xFFFF}
     print(f"[launcher] {len(chars)} unique chars")
     from fontTools import subset
-    opts = subset.Options()
-    opts.retain_gids = False
-    opts.notdef_outline = True
-    opts.recalc_bounds = True
-    opts.name_IDs = ["*"]
-    opts.name_legacy = True
-    opts.recommended_glyphs = False
-    opts.drop_tables = ["FFTM", "FFTM"]
+    opts = subset_options()
     from fontTools.ttLib import TTFont
     for (src, dst, tag) in (
         (os.path.join(ROOT, "fonts", "uiputong.ttf"), os.path.join(OUT, "launcher-cn-subset.ttf"), "launcher-cn"),

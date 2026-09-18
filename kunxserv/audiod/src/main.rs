@@ -42,6 +42,8 @@ const SYS_NANOSLEEP: usize = 101;
 const SYS_MKDIRAT: usize = 34;
 const SYS_EXIT: usize = 93;
 const SYS_KILL: usize = 129;
+const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 const O_RDONLY: usize = 0;
@@ -138,6 +140,9 @@ struct Client {
     state: u32,
     last_seq: u32,
     has_chunk: bool,
+    /// 同一块被混合的连续周期数（客户端停写不 CLOSE 时限次重播，防最后
+    /// 10ms 块无限循环）。
+    chunk_age: u32,
     chunk: [u8; CHUNK_BYTES],
 }
 
@@ -150,6 +155,7 @@ const EMPTY_CLIENT: Client = Client {
     state: FOCUS_FOCUSED,
     last_seq: 0,
     has_chunk: false,
+    chunk_age: 0,
     chunk: [0; CHUNK_BYTES],
 };
 
@@ -206,6 +212,41 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         options(nostack)
     );
     ret
+}
+
+/// renameat 四参调用（命令信箱认领 / 状态文件原子发布）。
+#[inline(always)]
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
+        options(nostack)
+    );
+    ret
+}
+
+/// 同目录改名：目标已存在时内核按 POSIX 语义原子替换。成功 0。
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 96];
+    let mut q = [0u8; 96];
+    let on = old.len().min(95);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(95);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
 }
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
@@ -346,9 +387,16 @@ fn cmd_open(pid: i32, usage: u8) {
         if pid <= 0 {
             return;
         }
-        // 已存在：更新用途
+        // 已存在：更新用途。★ 同 pid 重开 = 新音频流（原进程被杀后 pid 槽
+        // 被新进程复用、或同进程重新 open）：不重置 last_seq 的话，新进程
+        // 的 seq 从 0 起，`seq.wrapping_sub(last_seq) ≥ 2^31` 全部被拒收
+        // —— 旧进程播了多久，新实例就静默多久才追平。
         if let Some(i) = find_client(pid) {
             CLIENTS[i].usage = usage.min(3);
+            CLIENTS[i].last_seq = 0;
+            CLIENTS[i].has_chunk = false;
+            // pid 复用时新实例不继承旧实例的焦点
+            CLIENTS[i].focused = false;
             return;
         }
         for i in 0..MAX_CLIENTS {
@@ -452,30 +500,48 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
     }
 }
 
-/// 轮询控制文件并逐行分发命令。
+/// 轮询控制文件并逐行分发命令（rename 认领取走）。
+///
+/// 旧的「read → ftruncate 清空」两步之间写入方追加的命令会被 ftruncate
+/// 一并抹掉；认领（ctl → ctl.r 原子改名）后新追加落在重生的 ctl 文件上，
+/// 留待下一轮。信箱文件常驻（读后立即重建，主循环 open 不失败）。
 fn poll_ctl() {
     unsafe {
-        let mut p = [0u8; 64];
-        for (i, c) in CTL_PATH.as_bytes().iter().enumerate() {
-            p[i] = *c;
+        // 认领名 "/var/run/audiod.ctl.r"
+        let mut taken = [0u8; 32];
+        let cb = CTL_PATH.as_bytes();
+        taken[..cb.len()].copy_from_slice(cb);
+        taken[cb.len()] = b'.';
+        taken[cb.len() + 1] = b'r';
+        // 清掉上次崩溃残留（存在则 rename 失败）
+        syscall3(SYS_UNLINKAT, AT_FDCWD, taken.as_ptr() as usize, 0);
+        if rename_path(CTL_PATH, core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("")) != 0
+        {
+            return; // 无命令文件
         }
-        p[CTL_PATH.len()] = 0;
-        let fd = syscall3(
-            SYS_OPENAT,
-            AT_FDCWD,
-            p.as_ptr() as usize,
-            O_RDWR | O_CREAT,
-        ) as i32;
-        if fd < 0 {
-            return;
+        let mut p = [0u8; 32];
+        p[..cb.len() + 2].copy_from_slice(&taken[..cb.len() + 2]);
+        p[cb.len() + 2] = 0;
+        let fd = syscall3(SYS_OPENAT, AT_FDCWD, p.as_ptr() as usize, O_RDWR) as i32;
+        let mut n = 0usize;
+        if fd >= 0 {
+            syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+            let r = syscall3(SYS_READ, fd as usize, CTL_BUF.as_mut_ptr() as usize, CTL_BUF.len());
+            syscall1(SYS_CLOSE, fd as usize);
+            if r > 0 && r <= CTL_BUF.len() {
+                n = r;
+            }
         }
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        let n = syscall3(SYS_READ, fd as usize, CTL_BUF.as_mut_ptr() as usize, CTL_BUF.len());
-        // 清空控制文件
-        syscall2_ftruncate(fd);
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        syscall1(SYS_CLOSE, fd as usize);
-        if n == 0 || n > CTL_BUF.len() {
+        syscall3(SYS_UNLINKAT, AT_FDCWD, p.as_ptr() as usize, 0);
+        // 重建空命令文件（无 O_TRUNC：认领后写入方的新命令不截断）
+        let mut q = [0u8; 32];
+        q[..cb.len()].copy_from_slice(cb);
+        q[cb.len()] = 0;
+        let fd2 = syscall3(SYS_OPENAT, AT_FDCWD, q.as_ptr() as usize, O_RDWR | O_CREAT) as i32;
+        if fd2 >= 0 {
+            syscall1(SYS_CLOSE, fd2 as usize);
+        }
+        if n == 0 {
             return;
         }
         // 按行分发
@@ -565,7 +631,10 @@ fn pull_client(i: usize) {
             return;
         }
         let last_seq = CLIENTS[i].last_seq;
-        let mut best_seq = 0u32;
+        // 基准取 last_seq 而非 0：初始化为 0 时 `seq.wrapping_sub(best_seq)
+        // < 2^31` 只接受 seq < 2^31 —— 客户端 100Hz 计数约 248 天越过后
+        // 两个槽位全部被拒收，该客户端音频永久静默。
+        let mut best_seq = last_seq;
         let mut best_slot = usize::MAX;
         for slot in 0..2 {
             let off = slot * SLOT_BYTES;
@@ -604,6 +673,7 @@ fn pull_client(i: usize) {
             CLIENTS[i].chunk.copy_from_slice(&PULL_BUF[off + 8..off + 8 + CHUNK_BYTES]);
             CLIENTS[i].last_seq = best_seq;
             CLIENTS[i].has_chunk = true;
+            CLIENTS[i].chunk_age = 0;
         }
     }
 }
@@ -617,12 +687,18 @@ fn mix() {
             *a = 0;
         }
         for i in 0..MAX_CLIENTS {
-            let c = &CLIENTS[i];
+            let c = unsafe { &mut *core::ptr::addr_of_mut!(CLIENTS[i]) };
             if !c.active || !c.has_chunk || c.gain == 0 {
                 continue;
             }
             let gain = c.gain;
             let src = &c.chunk;
+            // 陈旧块限次重播：连续 3 个混音周期无新 seq 即停（客户端停写
+            // 不 CLOSE 时不再无限循环最后 10ms；新块到达自动恢复）。
+            if c.chunk_age > 3 {
+                continue;
+            }
+            c.chunk_age += 1;
             for s in 0..CHUNK_FRAMES * 2 {
                 let v = i16::from_le_bytes([src[s * 2], src[s * 2 + 1]]) as i32;
                 ACC[s] += (v * gain) >> 15;
@@ -686,13 +762,42 @@ fn write_status() {
             n += 1;
 
             build_audio_path(".st", c.pid);
-            let fd = open_at(O_RDWR | O_CREAT);
-            if fd < 0 {
-                continue;
+            // 临时文件 + rename 原子发布：.st 状态文件被读方整读，就地重写
+            // 会拿到半行（pid/state 序列错位）。rename 覆盖后要么全旧、要么
+            // 全新；失败（读方恰好持打开）退回就地写，.tmp 下轮被 O_TRUNC
+            // 复用，不累积。
+            unsafe {
+                let plen = PATH_BUF.iter().position(|&c| c == 0).unwrap_or(0);
+                let mut tbuf = [0u8; 64];
+                tbuf[..plen].copy_from_slice(&PATH_BUF[..plen]);
+                tbuf[plen..plen + 4].copy_from_slice(b".tmp");
+                let fd = syscall3(
+                    SYS_OPENAT,
+                    AT_FDCWD,
+                    tbuf.as_ptr() as usize,
+                    O_RDWR | O_CREAT | 0x200, // O_TRUNC
+                ) as i32;
+                if fd < 0 {
+                    continue;
+                }
+                syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+                syscall3(SYS_WRITE, fd as usize, STATUS_BUF.as_ptr() as usize, n);
+                syscall1(SYS_CLOSE, fd as usize);
+                if rename_path(
+                    core::str::from_utf8(&tbuf[..plen + 4]).unwrap_or(""),
+                    core::str::from_utf8(&PATH_BUF[..plen]).unwrap_or(""),
+                ) != 0
+                {
+                    // 回退就地写必须截断：状态行长度会缩短（gain 被 duck 到
+                    // 个位数），不 O_TRUNC 会留旧尾，读方多解析垃圾行。
+                    let fd2 = open_at(O_RDWR | O_CREAT | 0x200);
+                    if fd2 >= 0 {
+                        syscall3(SYS_LSEEK, fd2 as usize, 0, SEEK_SET);
+                        syscall3(SYS_WRITE, fd2 as usize, STATUS_BUF.as_ptr() as usize, n);
+                        syscall1(SYS_CLOSE, fd2 as usize);
+                    }
+                }
             }
-            syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-            syscall3(SYS_WRITE, fd as usize, STATUS_BUF.as_ptr() as usize, n);
-            syscall1(SYS_CLOSE, fd as usize);
         }
     }
 }
@@ -814,8 +919,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             }
             if any {
                 mix();
-                let n = unsafe { syscall3(SYS_WRITE, afd as usize, OUT.as_ptr() as usize, CHUNK_BYTES) };
-                if (n as usize) < CHUNK_BYTES {
+                let n = unsafe { syscall3(SYS_WRITE, afd as usize, OUT.as_ptr() as usize, CHUNK_BYTES) } as isize;
+                // ★ isize 判负：-errno 的 usize 原值是巨值，`(n as usize)
+                // < CHUNK_BYTES` 对真错误恒假（被当成功吞掉）。
+                if n >= 0 && (n as usize) < CHUNK_BYTES {
                     // 内核环形缓冲满（audiod 快于硬件消费）：整块跳过，下周期再写。
                     // 丢弃计数由内核 STATS 的 late_writes 提供，这里不重复计数。
                 }
@@ -861,7 +968,7 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         write_fd(2, b"PANIC: audiod\n");
         if w.len > 0 {
-            write_fd(2, &w.buf[..w.len]);;
+            write_fd(2, &w.buf[..w.len]);
         }
         syscall1(SYS_EXIT, 1);
     }

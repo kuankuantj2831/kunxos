@@ -301,8 +301,20 @@ pub fn push_event(ev: InputEvent) {
             }
         }
         if DEV.count == EV_BUF_SIZE {
-            DEV.head = (DEV.head + 1) % EV_BUF_SIZE;
-            DEV.count -= 1;
+            // 缓冲全满：丢弃最旧的一个**完整帧**（到第一个 SYN 含）而不是
+            // 单个事件 —— 单事件丢弃可能把 DOWN 帧劈开（BTN_TOUCH=1 与它
+            // 的 ABS_X/ABS_Y 分离），用户态在 BTN_TOUCH 时记录的按下点退化
+            // 为悬停旧位置。最多丢一帧触点（积压场景可恢复），不破坏帧界。
+            let mut k = 0usize;
+            while k < DEV.count {
+                let e = DEV.ev_buf[(DEV.head + k) % EV_BUF_SIZE];
+                k += 1;
+                if e.etype == EV_SYN {
+                    break;
+                }
+            }
+            DEV.head = (DEV.head + k) % EV_BUF_SIZE;
+            DEV.count -= k;
         }
         DEV.ev_buf[DEV.tail] = ev;
         DEV.tail = (DEV.tail + 1) % EV_BUF_SIZE;

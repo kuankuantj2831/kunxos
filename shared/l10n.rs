@@ -301,8 +301,6 @@ fn parse_cmp(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
             b"!=" => Some(i + 2),
             b"<=" => Some(i + 2),
             b">=" => Some(i + 2),
-            b"&&" => Some(i + 2),
-            b"||" => Some(i + 2),
             _ => None,
         };
         if let Some(j) = j {
@@ -312,8 +310,6 @@ fn parse_cmp(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
                 b"!=" => (lhs != rhs) as i64,
                 b"<=" => (lhs <= rhs) as i64,
                 b">=" => (lhs >= rhs) as i64,
-                b"&&" => ((lhs != 0) && (rhs != 0)) as i64,
-                b"||" => ((lhs != 0) || (rhs != 0)) as i64,
                 _ => 0,
             };
             return Some((v, k));
@@ -327,9 +323,43 @@ fn parse_cmp(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
     Some((lhs, i))
 }
 
+/// && 链（左结合，高于 ?: 低于 ||）：此前 && 在 parse_cmp 内只消费一次，
+/// 阿拉伯语 `n%100>=3 && n%100<=10` 解析后剩余字节使 eval 失败 → 恒回退
+/// 形态 0（六种复数形态全部退化）。
+fn parse_and(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
+    let (mut v, mut i) = parse_cmp(b, i, n)?;
+    loop {
+        let j = skip_ws(b, i);
+        if j + 1 < b.len() && &b[j..j + 2] == b"&&" {
+            let (rhs, k) = parse_cmp(b, j + 2, n)?;
+            v = ((v != 0) && (rhs != 0)) as i64;
+            i = k;
+        } else {
+            break;
+        }
+    }
+    Some((v, i))
+}
+
+/// || 链（左结合，低于 &&）。
+fn parse_or(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
+    let (mut v, mut i) = parse_and(b, i, n)?;
+    loop {
+        let j = skip_ws(b, i);
+        if j + 1 < b.len() && &b[j..j + 2] == b"||" {
+            let (rhs, k) = parse_and(b, j + 2, n)?;
+            v = ((v != 0) || (rhs != 0)) as i64;
+            i = k;
+        } else {
+            break;
+        }
+    }
+    Some((v, i))
+}
+
 fn parse_expr(b: &[u8], i: usize, n: i64) -> Option<(i64, usize)> {
-    // 三元 ?: 右结合；先解析条件，再看是否跟 ?
-    let (cond, i) = parse_cmp(b, i, n)?;
+    // 三元 ?: 右结合；优先级 ?: < || < && < 比较
+    let (cond, i) = parse_or(b, i, n)?;
     let i = skip_ws(b, i);
     if i < b.len() && b[i] == b'?' {
         let (a, j) = parse_expr(b, i + 1, n)?;

@@ -38,6 +38,8 @@ const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_MKDIRAT: usize = 34;
 const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
+const SYS_FSYNC: usize = 82;
 const SYS_GETDENTS64: usize = 61;
 const SYS_IOCTL: usize = 29;
 
@@ -284,15 +286,57 @@ fn read_file(path: &str, buf: &mut [u8]) -> isize {
     }
 }
 
+/// 同目录改名：目标已存在时内核按 POSIX 语义原子替换。成功 0。
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 128];
+    let mut q = [0u8; 128];
+    let on = old.len().min(127);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(127);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
+}
+
+/// 写整个文件（临时文件 + fsync + rename 原子提交）。
+///
+/// 就地 O_TRUNC 重写已保存网络的配置文件，掉电会留下半份 psk 丢失的
+/// 配置；rename 覆盖后任一时刻磁盘上都是完整旧文件或完整新文件。
 fn write_file(path: &str, data: &[u8]) -> bool {
     unsafe {
-        let fd = sys_open(path, O_CREAT | O_WRONLY | O_TRUNC);
+        let mut tmp = [0u8; 128];
+        let n = path.len().min(122);
+        tmp[..n].copy_from_slice(&path.as_bytes()[..n]);
+        tmp[n..n + 4].copy_from_slice(b".tmp");
+        let tpath = core::str::from_utf8(&tmp[..n + 4]).unwrap_or("");
+        let fd = sys_open(tpath, O_CREAT | O_WRONLY | O_TRUNC);
         if fd < 0 {
             return false;
         }
-        let n = write_fd(fd as usize, data);
+        let w = write_fd(fd as usize, data);
+        syscall1(SYS_FSYNC, fd as usize);
         syscall1(SYS_CLOSE, fd as usize);
-        n == data.len()
+        if w != data.len() {
+            return false;
+        }
+        if rename_path(tpath, path) == 0 {
+            return true;
+        }
+        // 极小概率 EBUSY（读方恰好持有目标打开）：退回就地写
+        let fd2 = sys_open(path, O_CREAT | O_WRONLY | O_TRUNC);
+        if fd2 < 0 {
+            return false;
+        }
+        let w2 = write_fd(fd2 as usize, data);
+        syscall1(SYS_CLOSE, fd2 as usize);
+        w2 == data.len()
     }
 }
 
@@ -595,7 +639,10 @@ fn load_all_networks() {
             let mut off = 0usize;
             while off + 18 < n as usize {
                 let reclen = u16::from_le_bytes([buf[off + 16], buf[off + 17]]) as usize;
-                if reclen == 0 {
+                // reclen<19 或末记录越界：目录流异常，防御性 break（对齐
+                // lifd/pushd 的解析守卫 —— 否则下方切片起点越过终点或越出
+                // buf 边界直接 panic）。
+                if reclen < 19 || off + reclen > n as usize {
                     break;
                 }
                 let name = &buf[off + 19..(off + reclen).min(off + 19 + 64)];
@@ -643,7 +690,42 @@ fn save_network(ssid: &[u8], psk: &[u8], auth: u8, priority: u8) -> bool {
     n += write_dec_kv(&mut text[n..], b"priority", priority as usize);
     text[n] = b'\n';
     n += 1;
-    write_file(p, &text[..n])
+    let ok = write_file(p, &text[..n]);
+    if ok {
+        // 内存表同步：wifid 常驻后 NETS 不会从磁盘重载 —— 同 ssid 必须就地
+        // 更新（重新 SAVE 换 psk 才能生效），否则只有空闲槽能吸收新条目。
+        let sl = ssid.len().min(32);
+        unsafe {
+            let mut e = NetEntry {
+                active: true,
+                ssid: [0; 32],
+                ssid_len: sl as u8,
+                psk: [0; 64],
+                psk_len: psk.len().min(64) as u8,
+                auth: if auth == 0 { 0 } else { 1 },
+                priority,
+            };
+            e.ssid[..sl].copy_from_slice(&ssid[..sl]);
+            e.psk[..e.psk_len as usize].copy_from_slice(&psk[..e.psk_len as usize]);
+            let mut done = false;
+            for s in NETS.iter_mut() {
+                if s.active && s.ssid_len as usize == sl && s.ssid[..sl] == e.ssid[..sl] {
+                    *s = e;
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                for s in NETS.iter_mut() {
+                    if !s.active {
+                        *s = e;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    ok
 }
 
 fn write_kv(dst: &mut [u8], key: &[u8], val: &[u8]) -> usize {
@@ -698,7 +780,21 @@ fn write_dec_kv(dst: &mut [u8], key: &[u8], val: usize) -> usize {
 fn forget_network(ssid: &[u8]) -> bool {
     let mut path = [0u8; 128];
     let p = net_conf_path(ssid, &mut path);
-    unsafe { sys_unlink(p) == 0 }
+    let ok = unsafe { sys_unlink(p) == 0 };
+    // 内存表同步失活：此前只删文件 —— NETS 条目一旦加载永不变 inactive，
+    // best_saved() 仍会选中「已忘记」的网络被 AUTO 开机自连；同 ssid 重新
+    // SAVE 时 load_network 也只在空闲槽吸收新条目，旧 psk 一直留在内存。
+    if ok {
+        let sl = ssid.len().min(32);
+        unsafe {
+            for s in NETS.iter_mut() {
+                if s.active && s.ssid_len as usize == sl && s.ssid[..sl] == ssid[..sl] {
+                    s.active = false;
+                }
+            }
+        }
+    }
+    ok
 }
 
 fn list_networks() {
@@ -898,23 +994,44 @@ fn handle_command(cmd: &[u8]) {
     }
 }
 
-/// 读取管道文件内容并逐行处理（普通文件模拟命名管道，同 networkd）。
+/// 读取管道文件内容并逐行处理（rename 认领取走，同 networkd）。
+///
+/// 旧的「read → ftruncate 清空」两步之间写入方追加的命令会被 ftruncate
+/// 一并抹掉；认领（pipe → pipe.r 原子改名）后新命令落在重生的管道文件
+/// 上，留待下一轮。管道文件常驻（读后立即重建）。
 fn poll_pipe() {
     static mut BUF: [u8; 1024] = [0u8; 1024];
+    // 认领名 "/var/run/wifid.pipe.r"
+    let mut taken = [0u8; 32];
+    let cb = PIPE_PATH.as_bytes();
+    taken[..cb.len()].copy_from_slice(cb);
+    taken[cb.len()] = b'.';
+    taken[cb.len() + 1] = b'r';
+    let tpath = core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("");
+    // 清掉上次崩溃残留的认领文件（存在则 rename 失败）
+    unsafe { syscall3(SYS_UNLINKAT, AT_FDCWD, taken.as_ptr() as usize, 0) };
+    if rename_path(PIPE_PATH, tpath) != 0 {
+        return; // 无命令文件
+    }
     unsafe {
-        let fd = sys_open(PIPE_PATH, O_RDWR);
-        if fd < 0 {
-            return;
+        let fd = sys_open(tpath, O_RDWR);
+        let mut n: isize = 0;
+        if fd >= 0 {
+            syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+            n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len()) as isize;
+            syscall1(SYS_CLOSE, fd as usize);
         }
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len());
-        syscall2(SYS_FTRUNCATE, fd as usize, 0);
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+        syscall3(SYS_UNLINKAT, AT_FDCWD, taken.as_ptr() as usize, 0);
+        // 重建空管道文件（无 O_TRUNC：认领后写入方的新命令不截断）
+        let fd2 = sys_open(PIPE_PATH, O_CREAT | O_RDWR);
+        if fd2 >= 0 {
+            syscall1(SYS_CLOSE, fd2 as usize);
+        }
         if n > 0 {
             // 防御：syscall 返回原始寄存器值，read 失败（-1）会被误读为
             // 天文数字，直接循环会越界 panic（实测发生：index 1024/1024）。
             // 超长返回值按缓冲上限截断，只处理已读入的部分。
-            let m = if n <= BUF.len() { n } else { BUF.len() };
+            let m = if n <= BUF.len() as isize { n as usize } else { BUF.len() };
             let mut start = 0usize;
             for i in 0..m {
                 if BUF[i] == b'\n' {
@@ -925,7 +1042,6 @@ fn poll_pipe() {
                 }
             }
         }
-        syscall1(SYS_CLOSE, fd as usize);
     }
 }
 

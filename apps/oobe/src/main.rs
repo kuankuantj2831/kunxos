@@ -48,6 +48,10 @@ mod cursor_sprite;
 #[path = "widgets/button.rs"]
 mod button;
 
+// 共享对话框组件（选择步骤的 OriginOS 风格单选列表卡用）。
+#[path = "../../../shared/dialog.rs"]
+mod dialog;
+
 // OOBE -> 桌面过渡（预加载 + 进度条 + 资源释放），完成页点击「进入系统」时调用。
 mod finish;
 
@@ -132,15 +136,15 @@ const GAP_AFTER_HINT: i32 = 32;  // 1.5 × 21.0
 // 底部为「上一步 / 下一步」；右上角「跳过」胶囊直达完成页。
 
 /// 模块网格通栏区左缘（网格整体水平居中：24 + 240 + 12 + 240 = 516）。
-/// 步骤图标（72x72 圆角方块）顶部 y（上方偏下）。
+/// 步骤图标（无底座大号矢量字形，~90px 墨迹）垂直中心所在区域顶部 y。
 const ICON_Y: i32 = 84;
-const ICON_SIZE: i32 = 72;
+const ICON_SIZE: i32 = 100;
 /// 页面标题（28px 加粗）顶部 y（图标正下方）。
-const PAGE_TITLE_Y: i32 = ICON_Y + ICON_SIZE + 24; // 180
+const PAGE_TITLE_Y: i32 = ICON_Y + ICON_SIZE + 24; // 208
 /// 副标题/说明（17px 常规）顶部 y。
-const PAGE_DESC_Y: i32 = PAGE_TITLE_Y + 42; // 222
+const PAGE_DESC_Y: i32 = PAGE_TITLE_Y + 42; // 250
 /// 输入/选择控件区顶部 y。
-const WIDGET_Y: i32 = PAGE_DESC_Y + 44;     // 266
+const WIDGET_Y: i32 = PAGE_DESC_Y + 44;     // 294
 
 // ==================== 输入框布局 ====================
 
@@ -1616,13 +1620,17 @@ fn draw_progress() {
 }
 
 /// 转场期间的进度点动画：当前点由小放大、已推进点亮。（`e` ∈ [0,1]）
+/// 放大走 back-out（末端轻微过冲后回落，§4 打磨：进度点弹性过冲）。
 fn draw_progress_anim(to: usize, e: f32) {
     let total = 13;
     let gap = 18;
     let total_w = (total - 1) * gap;
     let start = (DISPLAY_W as i32 - total_w) / 2;
     let cy = NAV_Y + 10;
-    let grow = (3.0 * e) as i32;
+    // back-out：1 + c3·(t-1)³ + c1·(t-1)²，c1=1.70158、c3=c1+1
+    let t = e - 1.0;
+    let back = 1.0 + 2.70158 * t * t * t + 1.70158 * t * t;
+    let grow = (3.0 * back).max(0.0) as i32;
     for i in 0..total {
         let cx = start + i * gap;
         if i as usize == to {
@@ -1665,162 +1673,230 @@ fn draw_error_banner() {
     draw_text_px(tx, 10, msg, FONT_BODY_PX, 0x00_FF_FF_FF);
 }
 
-// ==================== 步骤图标与页头（HyperOS 3 / ColorOS 15 风格） ====================
+// ==================== 步骤图标（澎湃 OS 3 风格：大号矢量字形 + 光锥扫光） ====================
 
-/// 图标渐变（顶部亮绿 → 底部深绿，`dy` 为相对图标顶部的偏移；与 Hero 同色系）。
-fn icon_grad(dy: i32) -> u32 {
-    let k = (dy.clamp(0, ICON_SIZE) * 255 / ICON_SIZE) as u32;
-    blend_px(0x00_45_E0_8B, 0x00_09_9E_58, k)
-}
+/// 图标主色：深青蓝垂直渐变（无底座，澎湃 3 OOBE 观感；比参考亮青更深）。
+const ICON_TOP: u32 = 0x00_2A_AE_DC;
+const ICON_BOTTOM: u32 = 0x00_0A_6E_B4;
+/// 字形栅格化字号（Phosphor em px；墨迹约 90px）。
+const ICON_GLYPH_PX: f32 = 124.0;
+/// 光锥高光带半宽（对角坐标 s = x+y 上的 px）。
+const CONE_BAND: i32 = 46;
+/// 光锥动效恢复区域半宽（≥ 字形 bbox 半宽 + 裕量）。
+const CONE_AREA_HALF: i32 = 76;
 
-/// 白色 2px 圆环（图标字形用）。
-fn icon_ring(cx: i32, cy: i32, r: i32) {
-    for dy in -r..=r {
-        for dx in -r..=r {
-            let d = dx * dx + dy * dy;
-            if d <= r * r && d >= (r - 2) * (r - 2) {
-                put_pixel(cx + dx, cy + dy, C_WHITE);
-            }
-        }
-    }
-}
+/// 已播放过光锥动效的步骤（同页重绘不重播，只画终态）。
+static mut CONE_STEP: i32 = -1;
+/// 待播光锥动效的步骤（页面渲染提交后由 play_pending_cone 消费）。
+static mut PENDING_CONE: i32 = -1;
 
-/// 当前步骤图标：72x72 渐变绿圆角方块 + 白色几何字形（纯原语绘制，无字库依赖）。
-fn draw_step_icon(step: usize) {
-    let x = (DISPLAY_W as i32 - ICON_SIZE) / 2;
-    let y = ICON_Y;
-    for dy in 0..ICON_SIZE {
-        for dx in 0..ICON_SIZE {
-            if sys_nav::glass::in_round_rect(dx, dy, ICON_SIZE, ICON_SIZE, 22) {
-                put_pixel(x + dx, y + dy, icon_grad(dy));
-            }
-        }
-    }
-    let cx = x + ICON_SIZE / 2;
-    let cy = y + ICON_SIZE / 2;
+/// 步骤 → Phosphor-Bold 图标码点（shared/icons.rs；与设置行图标同引擎同风格）。
+fn step_icon_cp(step: usize) -> u32 {
+    use ttf_text::font_render::icons::settings as si;
+    use ttf_text::font_render::icons::ui as ui_ic;
     match step {
-        // 1 语言：地球（圆环 + 赤道 + 经线椭圆）。
-        1 => {
-            icon_ring(cx, cy, 19);
-            draw_line_thick(cx - 19, cy, cx + 19, cy, C_WHITE);
-            for dy in -19..=19 {
-                for dx in -9..=9 {
-                    let v = dx * dx * 361 + dy * dy * 81;
-                    if v <= 81 * 361 && v >= 81 * 361 - 7300 {
-                        put_pixel(cx + dx, cy + dy, C_WHITE);
-                    }
-                }
-            }
-        }
-        // 2 应用：2x2 圆角方格。
-        2 => {
-            for (ox, oy) in [(-21, -21), (3, -21), (-21, 3), (3, 3)] {
-                fill_rounded(cx + ox, cy + oy, 18, 18, 5, C_WHITE);
-            }
-        }
-        // 3 时区：时钟（圆环 + 时针分针）。
-        3 => {
-            icon_ring(cx, cy, 19);
-            draw_line_thick(cx, cy, cx, cy - 11, C_WHITE);
-            draw_line_thick(cx, cy, cx + 8, cy + 5, C_WHITE);
-        }
-        // 4 网络：Wi-Fi（三段上弧 + 圆点）。
-        4 => {
-            for r in [19i32, 13, 7] {
-                for dy in -r..=0 {
-                    for dx in -r..=r {
-                        let d = dx * dx + dy * dy;
-                        if d <= r * r && d >= (r - 2) * (r - 2) {
-                            put_pixel(cx + dx, cy + 8 + dy, C_WHITE);
-                        }
-                    }
-                }
-            }
-            fill_circle(cx, cy + 8, 3, C_WHITE);
-        }
-        // 5 协议：文档（白色圆角纸 + 绿色行）。
-        5 => {
-            fill_rounded(cx - 14, cy - 19, 28, 38, 6, C_WHITE);
-            for i in 0..3 {
-                let ly = cy - 9 + i * 9;
-                draw_line_thick(cx - 8, ly, cx + 8, ly, C_ACCENT_STRONG);
-            }
-        }
-        // 6 账号：人像（头 + 肩）。
-        6 => {
-            fill_circle(cx, cy - 9, 8, C_WHITE);
-            for dy in -12..=4 {
-                for dx in -12..=12 {
-                    if dx * dx + dy * dy <= 144 {
-                        put_pixel(cx + dx, cy + 14 + dy, C_WHITE);
-                    }
-                }
-            }
-        }
-        // 7 锁屏方式：挂锁（锁环 + 锁体 + 绿锁孔）。
-        7 => {
-            for dy in -10..=0 {
-                for dx in -10..=10 {
-                    let d = dx * dx + dy * dy;
-                    if d <= 100 && d >= 36 {
-                        put_pixel(cx + dx, cy - 8 + dy, C_WHITE);
-                    }
-                }
-            }
-            fill_rounded(cx - 13, cy - 6, 26, 22, 7, C_WHITE);
-            fill_circle(cx, cy + 3, 3, C_ACCENT_STRONG);
-            draw_line_thick(cx, cy + 3, cx, cy + 8, C_ACCENT_STRONG);
-        }
-        // 8 密码：钥匙（环 + 柄 + 齿）。
-        8 => {
-            icon_ring(cx - 10, cy - 2, 7);
-            draw_line_thick(cx - 4, cy - 2, cx + 18, cy - 2, C_WHITE);
-            draw_line_thick(cx - 4, cy - 1, cx + 18, cy - 1, C_WHITE);
-            draw_line_thick(cx + 12, cy - 1, cx + 12, cy + 6, C_WHITE);
-            draw_line_thick(cx + 17, cy - 1, cx + 17, cy + 4, C_WHITE);
-        }
-        // 9 胁迫密码：盾牌 + 绿色感叹号。
-        9 => {
-            for dy in -19..=19 {
-                let hw = if dy < 0 { 18 } else { isqrt(361 - dy * dy) };
-                fill_rect(cx - hw, cy + dy, hw * 2, 1, C_WHITE);
-            }
-            fill_rect(cx - 1, cy - 10, 3, 13, C_ACCENT_STRONG);
-            fill_rect(cx - 1, cy + 7, 3, 3, C_ACCENT_STRONG);
-        }
-        // 10 胁迫动作：闪电。
-        10 => {
-            draw_line_thick(cx + 4, cy - 18, cx - 7, cy + 2, C_WHITE);
-            draw_line_thick(cx + 5, cy - 18, cx - 6, cy + 2, C_WHITE);
-            draw_line_thick(cx - 7, cy + 2, cx + 5, cy + 2, C_WHITE);
-            draw_line_thick(cx - 7, cy + 3, cx + 5, cy + 3, C_WHITE);
-            draw_line_thick(cx + 5, cy + 2, cx - 5, cy + 18, C_WHITE);
-            draw_line_thick(cx + 4, cy + 3, cx - 4, cy + 18, C_WHITE);
-        }
-        // 11 外观：月牙（白圆被背景色圆咬去一角）。
-        11 => {
-            for dy in -15..=15 {
-                for dx in -15..=15 {
-                    if dx * dx + dy * dy <= 225 {
-                        put_pixel(cx - 3 + dx, cy + dy, C_WHITE);
-                    }
-                }
-            }
-            let (bx, by) = (cx + 7, cy - 6);
-            for dy in -15..=15 {
-                for dx in -15..=15 {
-                    if dx * dx + dy * dy <= 225 {
-                        put_pixel(bx + dx, by + dy, icon_grad(by + dy - y));
-                    }
-                }
-            }
-        }
-        // 兜底：对勾。
-        _ => {
-            draw_line_thick(cx - 9, cy + 1, cx - 2, cy + 8, C_WHITE);
-            draw_line_thick(cx - 2, cy + 8, cx + 10, cy - 6, C_WHITE);
+        1 => ui_ic::GLOBE,      // 语言：地球
+        2 => si::APPS,          // 应用：四方格
+        3 => ui_ic::CLOCK,      // 时区：时钟
+        4 => si::WIFI,          // 网络：Wi-Fi
+        5 => ui_ic::FILE,       // 协议：文档
+        6 => ui_ic::USER,       // 账号：人像
+        7 => ui_ic::LOCK,       // 锁屏方式：挂锁
+        8 => ui_ic::KEY,        // 密码：钥匙
+        9 => si::VPN,           // 胁迫密码：盾牌
+        10 => ui_ic::LIGHTNING, // 胁迫动作：闪电
+        11 => ui_ic::MOON,      // 外观：月牙
+        _ => ui_ic::CHECK,      // 兜底：对勾
+    }
+}
+
+/// 当前步骤图标：白底上大号深青蓝矢量字形（Phosphor-Bold，笔画加粗）。
+/// 首次进入该步骤时只登记待播动效（PENDING_CONE），扫光由
+/// play_pending_cone 在页面渲染提交后播放——扫光的同时页面已在屏上。
+fn draw_step_icon(step: usize) {
+    let cx = DISPLAY_W as i32 / 2;
+    let cy = ICON_Y + ICON_SIZE / 2;
+    let cp = step_icon_cp(step);
+    unsafe {
+        if CONE_STEP != step as i32 {
+            PENDING_CONE = step as i32;
         }
     }
+    restore_icon_bg();
+    if !draw_icon_gradient(cx, cy, cp, None) {
+        draw_icon_fallback(cx, cy);
+    }
+}
+
+/// 页面渲染提交后调用：有待播光锥动效则播放（页面此刻已完整可见）。
+fn play_pending_cone() {
+    let st = unsafe { PENDING_CONE };
+    if st < 0 {
+        return;
+    }
+    unsafe {
+        PENDING_CONE = -1;
+        CONE_STEP = st;
+    }
+    if !ttf_text::font_render::icon_ready(false) {
+        return; // 图标已由 draw_step_icon 画过兜底
+    }
+    let cp = step_icon_cp(st as usize);
+    play_icon_cone(cp);
+}
+
+/// 兜底：深青蓝实心圆 + 白芯（图标字体未就绪时）。
+fn draw_icon_fallback(cx: i32, cy: i32) {
+    fill_circle(cx, cy, 30, ICON_BOTTOM);
+    fill_circle(cx, cy, 11, C_WHITE);
+}
+
+/// 恢复图标区域背景（与 draw_background 同一渐变公式，仅填矩形）。
+fn restore_icon_bg() {
+    let cx = DISPLAY_W as i32 / 2;
+    let cy = ICON_Y + ICON_SIZE / 2;
+    let x0 = (cx - CONE_AREA_HALF).max(0);
+    let x1 = (cx + CONE_AREA_HALF).min(DISPLAY_W as i32 - 1);
+    let y0 = (cy - CONE_AREA_HALF).max(0);
+    // 下缘钳到标题行上方：restore 在整页（含标题）已入 BACK_BUF 后每帧
+    // 运行，不钳会擦掉标题最上几行墨迹并随终态 flip 一直驻留。
+    let y1 = (cy + CONE_AREA_HALF)
+        .min(PAGE_TITLE_Y - 1)
+        .min(DISPLAY_H as i32 - 1);
+    for y in y0..=y1 {
+        let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
+        let inv = 255 - t;
+        let r = (0xF9u32 * inv + 0xE9u32 * t) / 255;
+        let g = (0xFBu32 * inv + 0xF1u32 * t) / 255;
+        let b = (0xFDu32 * inv + 0xF4u32 * t) / 255;
+        let row = (r << 16) | (g << 8) | b;
+        for x in x0..=x1 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] = row };
+        }
+    }
+}
+
+/// 光锥扫光：高光带沿对角方向（左上 → 右下）扫过字形一次，~550ms。
+/// 每帧只重绘图标区域背景 + 字形（渐变 + 高光带），整屏 flip 呈现。
+fn play_icon_cone(cp: u32) {
+    let cx = DISPLAY_W as i32 / 2;
+    let cy = ICON_Y + ICON_SIZE / 2;
+    // 字形整段动效只栅格化一次：ICON_GLYPH_PX 级加粗字形位图 ~17KB，远超
+    // 1KB 字形缓存上限，逐帧栅格化等于每帧一次全量栅格化 + 膨胀 pass。
+    // 栅格化失败（字体未就绪等）直接返回 —— 静态图标已由 draw_step_icon 画过。
+    let Some(g) = ttf_text::font_render::rasterize_icon_thick(false, cp, ICON_GLYPH_PX) else {
+        return;
+    };
+    let frames = 13;
+    let span = 2 * CONE_AREA_HALF; // 对角坐标 s=gx+gy 在区域内的变化范围
+    let base = cx + cy;
+    for f in 0..=frames {
+        let p = f as f32 / frames as f32;
+        // 光带中心从区域左上外扫到右下外。
+        let s = base - span - CONE_BAND
+            + ((2.0 * (span + CONE_BAND) as f32) * p) as i32;
+        // 高光强度：前 55% 渐满、后 45% 淡出（光锥离去）。
+        let k = if p < 0.55 { p / 0.55 } else { (1.0 - (p - 0.55) / 0.45).max(0.0) };
+        let fade = (k * 255.0) as u32;
+        restore_icon_bg();
+        blit_icon_gradient(cx, cy, &g, Some((s, fade)));
+        flip();
+        sleep_ms(36);
+    }
+    // 终态：无高光的纯渐变字形。
+    restore_icon_bg();
+    blit_icon_gradient(cx, cy, &g, None);
+    flip();
+}
+
+/// Phosphor-Bold 图标字形（笔画加粗）按墨迹包围盒居中绘制到 (cx, cy)，
+/// 填充为深青蓝垂直渐变；`cone` 提供光锥高光带（对角中心 s、强度 0..=255）。
+/// 灰度 alpha 与背景混合。字形不可用返回 false（调用方画兜底）。
+fn draw_icon_gradient(cx: i32, cy: i32, cp: u32, cone: Option<(i32, u32)>) -> bool {
+    if !ttf_text::font_render::icon_ready(false) {
+        return false;
+    }
+    let Some(g) = ttf_text::font_render::rasterize_icon_thick(false, cp, ICON_GLYPH_PX) else {
+        return false;
+    };
+    blit_icon_gradient(cx, cy, &g, cone)
+}
+
+/// 把已栅格化的加粗字形按深青蓝垂直渐变（+可选光锥高光带）绘制到
+/// BACK_BUF。字形借用共享栅格缓冲 —— 调用期间不得再触发栅格化。
+fn blit_icon_gradient(
+    cx: i32,
+    cy: i32,
+    g: &ttf_text::font_render::ThickGlyph,
+    cone: Option<(i32, u32)>,
+) -> bool {
+    if g.width == 0 || g.height == 0 {
+        return false;
+    }
+    let x0 = cx - g.width as i32 / 2;
+    let y0 = cy - g.height as i32 / 2;
+    let hmax = (g.height as u32 - 1).max(1);
+    for row in 0..g.height {
+        let t = row as u32 * 255 / hmax;
+        let base = blend_px(ICON_TOP, ICON_BOTTOM, t);
+        for col in 0..g.width {
+            let a = g.data[row * g.width + col] as u32;
+            if a == 0 {
+                continue;
+            }
+            let gx = x0 + col as i32;
+            let gy = y0 + row as i32;
+            if gx < 0 || gy < 0 || gx >= DISPLAY_W as i32 || gy >= DISPLAY_H as i32 {
+                continue;
+            }
+            let mut c = base;
+            if let Some((s, fade)) = cone {
+                if fade > 0 {
+                    let d = (gx + gy - s).abs();
+                    if d < CONE_BAND {
+                        // 带内白光：三角形衰减 × 动效包络，峰值约 55% 白。
+                        let kk = ((CONE_BAND - d) as i32 * 140 / CONE_BAND as i32
+                            * fade as i32
+                            / 255)
+                            .clamp(0, 255) as u32;
+                        c = blend_px(c, 0x00_FF_FF_FF, kk);
+                    }
+                }
+            }
+            let idx = gy as usize * DISPLAY_W + gx as usize;
+            unsafe {
+                BACK_BUF[idx] = blend_px(BACK_BUF[idx], c, a);
+            }
+        }
+    }
+    true
+}
+
+/// Phosphor-Bold 图标字形（笔画加粗）按墨迹包围盒居中绘制到 (cx, cy)，
+/// 灰度 alpha 经 OobeSmooth 与背景混合。字形不可用返回 false。
+pub(crate) fn draw_icon_thick(cx: i32, cy: i32, cp: u32, px: f32, color: u32) -> bool {
+    use crate::sys_nav::glass::SmoothTarget;
+    if !ttf_text::font_render::icon_ready(false) {
+        return false;
+    }
+    let Some(g) = ttf_text::font_render::rasterize_icon_thick(false, cp, px) else {
+        return false;
+    };
+    if g.width == 0 || g.height == 0 {
+        return false;
+    }
+    let x0 = cx - g.width as i32 / 2;
+    let y0 = cy - g.height as i32 / 2;
+    for row in 0..g.height {
+        for col in 0..g.width {
+            let a = g.data[row * g.width + col] as u32;
+            if a == 0 {
+                continue;
+            }
+            OobeSmooth.put_aa(x0 + col as i32, y0 + row as i32, color, a);
+        }
+    }
+    true
 }
 
 /// 页头：步骤图标（上方偏下）+ 图标下方居中标题 + 副标题。
@@ -2199,6 +2275,62 @@ fn render_duress() {
     );
 }
 
+// ==================== OriginOS 风格选择列表卡（胁迫动作 / 外观步骤共用） ====================
+
+/// BACK_BUF 抗锯齿绘制目标（列表卡描边 / 单选圈混合用）。
+struct OobeDlg;
+
+impl dialog::DialogUi for OobeDlg {
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+    fn back(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+    fn text(&mut self, x: i32, y: i32, s: &[u8], px: f32, color: u32) {
+        draw_text_px(x, y, s, px, color);
+    }
+    fn text_bold(&mut self, x: i32, y: i32, s: &[u8], px: f32, color: u32) {
+        draw_text_semibold_px(x, y, s, px, color);
+    }
+    fn text_w(&self, s: &[u8], px: f32) -> i32 {
+        text_width_px(s, px)
+    }
+    fn text_top(&self, px: f32, cy: i32) -> i32 {
+        cy - (px as i32) / 2
+    }
+}
+
+/// 单张 OriginOS 选择列表卡：白底大圆角 + 行间发丝分割线 + 右侧单选圈。
+/// 行高与行距一致（无缝拼接），命中测试沿用 `WIDGET_Y + i * rh` 行矩形。
+fn draw_option_list(items: &[&[u8]], selected: usize) {
+    let rh = CARD_PITCH; // 行高 = 行距：行与行无缝
+    let ch = items.len() as i32 * rh;
+    fill_rounded(CARD_X, WIDGET_Y, CARD_W, ch, 24, C_WHITE);
+    card_border(CARD_X, WIDGET_Y, CARD_W, ch, 24, C_CARD_BORDER);
+    let mut ui = OobeDlg;
+    for (i, item) in items.iter().enumerate() {
+        let ry = WIDGET_Y + i as i32 * rh;
+        if i > 0 {
+            for dx in 0..CARD_W {
+                put_pixel(CARD_X + dx, ry, C_CARD_BORDER);
+            }
+        }
+        dialog::draw_radio(&mut ui, OPT_RX + 12, ry + rh / 2, selected == i);
+        draw_text_px(
+            CARD_X + 20,
+            ry + (rh - 17) / 2,
+            item,
+            FONT_BODY_PX,
+            if selected == i { C_TEXT } else { C_DIM },
+        );
+    }
+}
+
 /// 胁迫密码触发动作（伪装系统 / 静默擦除 / 发送警报）。
 fn render_duress_action() {
     let (title, desc): (&[u8], &[u8]) = if unsafe { LANG == 0 } {
@@ -2218,13 +2350,7 @@ fn render_duress_action() {
         (if unsafe { LANG == 0 } { "静默擦除（恢复出厂）" } else { "Wipe data (factory reset)" }).as_bytes(),
         (if unsafe { LANG == 0 } { "发送警报（上报安全中心）" } else { "Send alert" }).as_bytes(),
     ];
-    for i in 0..3 {
-        let y = WIDGET_Y + i as i32 * CARD_PITCH;
-        let selected = unsafe { DURESS_ACTION == i };
-        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
-        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
-        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, acts[i], FONT_BODY_PX, C_TEXT);
-    }
+    draw_option_list(&acts, unsafe { DURESS_ACTION });
 }
 
 fn render_theme() {
@@ -2234,30 +2360,32 @@ fn render_theme() {
         ("Appearance".as_bytes(), "Light or dark theme".as_bytes())
     };
     draw_page_header(11, title, desc);
+    let sel = if unsafe { THEME_DARK } { 1 } else { 0 };
+    let labels: [&[u8]; 2] = [
+        (if unsafe { LANG == 0 } { "浅色" } else { "Light" }).as_bytes(),
+        (if unsafe { LANG == 0 } { "深色" } else { "Dark" }).as_bytes(),
+    ];
+    draw_option_list(&labels, sel);
+    // 颜色预览圆（浅色=白圈灰边；深色=近黑圈），位于文字左侧。
+    let rh = CARD_PITCH;
     for i in 0..2 {
-        let y = WIDGET_Y + i as i32 * CARD_PITCH;
-        let selected = unsafe { (i == 1) == THEME_DARK };
-        let label: &[u8] = if i == 0 { "浅色".as_bytes() } else { "深色".as_bytes() };
-        draw_option_card(CARD_X, y, CARD_W, CARD_H, selected);
-        // 颜色预览圆（浅色=白圈灰边；深色=近黑圈）。
-        let sx = OPT_RX - 20 - 26;
-        let sy = y + OPT_RY;
+        let ry = WIDGET_Y + i as i32 * rh;
+        let sx = CARD_X + CARD_W - 220;
+        let sy = ry + rh / 2;
         if i == 0 {
-            fill_circle(sx + 13, sy + 12, 12, C_WHITE);
+            fill_circle(sx, sy, 12, C_WHITE);
             let r = 12;
             for dy in -r..=r {
                 for dx in -r..=r {
                     let d = dx * dx + dy * dy;
                     if d <= r * r && d >= (r - 2) * (r - 2) {
-                        put_pixel(sx + 13 + dx, sy + 12 + dy, C_CARD_BORDER);
+                        put_pixel(sx + dx, sy + dy, C_CARD_BORDER);
                     }
                 }
             }
         } else {
-            fill_circle(sx + 13, sy + 12, 12, C_BTN_PRIMARY);
+            fill_circle(sx, sy, 12, C_BTN_PRIMARY);
         }
-        draw_radio(OPT_RX, y + OPT_RY, selected, C_TEXT);
-        draw_text_px(CARD_X + 20, y + (CARD_H - 17) / 2, label, FONT_BODY_PX, C_TEXT);
     }
 }
 
@@ -2520,6 +2648,11 @@ fn move_cursor_fb() {
 fn render_and_flip() {
     render();
     flip();
+    // 页面已完整呈现在屏上，此时才播图标光锥扫光（扫光同时页面可见）。
+    play_pending_cone();
+    // 光锥每帧 flip() 整屏覆盖拷贝 BACK_BUF，会把 overlay 写进 FB 的光标
+    // 抹掉 —— 光标 overlay 必须在动效结束后重画（同 pulse_selection 收尾），
+    // 否则鼠标会话每次步骤切换后光标凭空消失，直到再次移动/点击。
     cursor_overlay_init();
 }
 
@@ -3949,14 +4082,14 @@ fn tap_duress(x: i32, y: i32) -> i32 {
     0
 }
 
-/// 胁迫动作步骤：三个动作卡片单选（右侧 绿圆点）。
+/// 胁迫动作步骤：单选列表卡（行高与行距一致，见 draw_option_list）。
 fn tap_duress_action(x: i32, y: i32) -> i32 {
     if x >= CARD_X && x < CARD_X + CARD_W {
         for i in 0..3 {
             let ry = WIDGET_Y + i as i32 * CARD_PITCH;
-            if y >= ry && y < ry + CARD_H {
+            if y >= ry && y < ry + CARD_PITCH {
                 unsafe { DURESS_ACTION = i; }
-                pulse_target(CARD_X, ry, CARD_W, CARD_H);
+                pulse_target(CARD_X, ry, CARD_W, CARD_PITCH);
                 return 2;
             }
         }
@@ -3964,14 +4097,14 @@ fn tap_duress_action(x: i32, y: i32) -> i32 {
     0
 }
 
-/// 主题步骤：浅色 / 深色外观卡片单选（含颜色预览圆）。
+/// 主题步骤：浅色 / 深色单选列表卡（含颜色预览圆）。
 fn tap_theme(x: i32, y: i32) -> i32 {
     if x >= CARD_X && x < CARD_X + CARD_W {
         for i in 0..2 {
             let ry = WIDGET_Y + i as i32 * CARD_PITCH;
-            if y >= ry && y < ry + CARD_H {
+            if y >= ry && y < ry + CARD_PITCH {
                 unsafe { THEME_DARK = i == 1; }
-                pulse_target(CARD_X, ry, CARD_W, CARD_H);
+                pulse_target(CARD_X, ry, CARD_W, CARD_PITCH);
                 return 2;
             }
         }
@@ -4274,8 +4407,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         if step == 12 {
             // 完成页：真实输入时等待用户点击「进入系统」（BTN_ENTER，
             // handle_tap 已接线）；30 秒无输入自动进入，保证无人值守可推进。
-            if !simulated {
-                let _ = wait_for_tap_next_button();
+            // 「上一步」按钮在本页仍绘制（STEP>0 恒可命中），返回 -1 必须
+            // 回退到上一步 —— 此前返回值被忽略，点「上一步」照样进桌面。
+            if !simulated && wait_for_tap_next_button() < 0 {
+                from = step;
+                reverse = true;
+                step = 11;
+                continue;
             }
             // 进入系统（预加载桌面资源 -> 写 .done -> 退出）。
             print("[oobe] 正在保存配置

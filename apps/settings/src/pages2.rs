@@ -1532,9 +1532,8 @@ unsafe fn tap_update(_x: i32, y: i32) -> crate::pages::TapEffect {
                 TapEffect::Redraw
             }
             3 => {
-                page_push(PG_CONFIRM);
-                unsafe { CURR_CTX = crate::pages::Ctx::ConfirmRestart; }
-                TapEffect::Redraw
+                // 重启确认：居中模态对话框（不再走页栈）。
+                return crate::pages::open_confirm(crate::pages::Ctx::ConfirmRestart);
             }
             _ => TapEffect::None,
         }

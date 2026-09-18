@@ -704,13 +704,27 @@ fn poll_input() -> (Option<(i32, i32)>, sys_nav::NavAction, bool) {
                     if code == BTN_LEFT {
                         if value == 1 {
                             MOUSE_DOWN = true;
+                            // QEMU GUI（virtio-tablet）以 BTN_LEFT 上报：补齐手势
+                            // 状态，全面屏手势在鼠标/数位板下与触摸同规则。
+                            TOUCH_PX = CUR_X;
+                            TOUCH_PY = CUR_Y;
+                            TOUCH_US = now_us();
                         } else if value == 0 && MOUSE_DOWN {
                             MOUSE_DOWN = false;
-                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, sys_nav::nav_mode());
+                            let mode = sys_nav::nav_mode();
+                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, mode);
                             if a != sys_nav::NavAction::None {
                                 nav = a;
                             } else {
-                                click = Some((CUR_X, CUR_Y));
+                                let dur = now_us().saturating_sub(TOUCH_US) / 1000;
+                                let g = sys_nav::classify_swipe(
+                                    TOUCH_PX, TOUCH_PY, CUR_X, CUR_Y, dur, mode,
+                                );
+                                if g != sys_nav::NavAction::None {
+                                    nav = g;
+                                } else {
+                                    click = Some((CUR_X, CUR_Y));
+                                }
                             }
                         }
                     } else if code == BTN_TOUCH {

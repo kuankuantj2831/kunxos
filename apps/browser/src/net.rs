@@ -1,9 +1,11 @@
-//! 网络层：URL 获取（kunxos:// 内置页 / file:// 文件 / http:// HTTP/1.1）。
+//! 网络层：URL 获取（kunxos:// 内置页 / file:// 文件 / http:// HTTP/1.1 / https:// TLS 1.2）。
 //!
 //! - HTTP/1.1 客户端：GET + Host 头 + Connection: close，重定向跟随
-//!   （301/302/303/307/308，≤5 跳），Content-Length 或 EOF 定界
+//!   （301/302/303/307/308，≤5 跳），Content-Length / EOF 定界，
+//!   chunked 传输编码解码
 //! - 内存缓存：成功 200 响应按 URL 缓存（≤8 条、单条 ≤256KB）
-//! - HTTPS 预留：报错提示 TLS 未实现
+//! - HTTPS：TLS 1.2 客户端（ECDHE_RSA_AES128_GCM_SHA256），证书链验证、
+//!   SNI、主机名校验；证书根库见 tls/roots.rs
 //! - 安全基线：无 Cookie、无插件、无脚本执行；图片仅同源加载（shell 侧执行）
 
 extern crate alloc;
@@ -12,6 +14,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::image;
+use crate::tls;
 use crate::kit::*;
 use crate::pages;
 use crate::url::{Scheme, Url};
@@ -74,8 +77,7 @@ pub fn fetch(url: &Url) -> FetchResult {
             Some(bytes) => FetchResult::Ok { bytes, final_url: url.display() },
             None => FetchResult::Err { msg: format!("无法读取文件：{}", url.path) },
         },
-        Scheme::Http => fetch_http(url, 0),
-        Scheme::Https => FetchResult::Err { msg: "HTTPS 暂不支持（TLS 预留）".into() },
+        Scheme::Http | Scheme::Https => fetch_http(url, 0),
         Scheme::Unknown => FetchResult::Err { msg: "无法识别的地址".into() },
     }
 }
@@ -167,10 +169,6 @@ fn fetch_http(url: &Url, depth: u32) -> FetchResult {
             if (300..400).contains(&status) {
                 if let Some(loc) = location {
                     if let Some(next) = crate::url::resolve(url, &loc) {
-                        // 跨协议重定向：https → 报错
-                        if next.scheme == Scheme::Https {
-                            return FetchResult::Err { msg: "重定向到 HTTPS（TLS 预留）".into() };
-                        }
                         return fetch_http(&next, depth + 1);
                     }
                 }
@@ -228,23 +226,30 @@ fn http_request(url: &Url) -> Result<Resp, String> {
             sock_close(fd);
             return Err(format!("连接失败：{}:{}", url.host, url.port));
         }
-        let mut sent = 0usize;
-        while sent < req.len() {
-            let n = sock_send(fd, &req[sent..]);
-            if n <= 0 {
-                sock_close(fd);
-                return Err("发送请求失败".into());
+        // https：先做 TLS 握手；失败时统一转为可读错误
+        let mut wire = if url.scheme == Scheme::Https {
+            match Wire::tls(fd, &url.host) {
+                Ok(w) => w,
+                Err(e) => {
+                    sock_close(fd);
+                    return Err(format!("TLS 握手失败：{}", e));
+                }
             }
-            sent += n as usize;
+        } else {
+            Wire::plain(fd)
+        };
+        if wire.send_all(&req).is_err() {
+            wire.close();
+            return Err("发送请求失败".into());
         }
         // 读响应头
         let mut head: Vec<u8> = Vec::with_capacity(4096);
         let mut buf = [0u8; 4096];
         let mut header_end: Option<usize> = None;
         while head.len() < 8192 {
-            let n = sock_recv(fd, &mut buf);
+            let n = wire.recv(&mut buf);
             if n < 0 {
-                sock_close(fd);
+                wire.close();
                 return Err("接收响应失败".into());
             }
             if n == 0 {
@@ -268,7 +273,7 @@ fn http_request(url: &Url) -> Result<Resp, String> {
             }
         }
         let Some(he) = header_end else {
-            sock_close(fd);
+            wire.close();
             return Err("响应头不完整".into());
         };
         // 终止符长度：\r\n\r\n=4，\n\n=2（\n\n 命中时多吞 2 字节 body）。
@@ -279,15 +284,9 @@ fn http_request(url: &Url) -> Result<Resp, String> {
         let content_length = header_value(&head[..he], "content-length")
             .and_then(|v| v.trim().parse::<usize>().ok());
         let location = header_value(&head[..he], "location").map(|v| v.trim().to_string());
-        // chunked 传输编码：HTTP/1.1 服务器在无 Content-Length 时普遍使用，
-        // 不解码会把分块元数据当页面内容呈现 —— 明确报错优于乱码。
-        if header_value(&head[..he], "transfer-encoding")
+        let chunked = header_value(&head[..he], "transfer-encoding")
             .map(|v| v.trim().eq_ignore_ascii_case("chunked"))
-            .unwrap_or(false)
-        {
-            sock_close(fd);
-            return Err("暂不支持 chunked 传输编码".into());
-        }
+            .unwrap_or(false);
         // 读响应体
         let mut body: Vec<u8> = Vec::new();
         let body_start = he + sep;
@@ -295,10 +294,34 @@ fn http_request(url: &Url) -> Result<Resp, String> {
         if remaining > 0 {
             body.extend_from_slice(&head[body_start..]);
         }
+        if chunked {
+            // chunked 传输编码：分块大小为十六进制行前缀。Connection: close
+            // 下以 EOF 定界 —— 先把原始分块流读全，再剥掉分块元数据。
+            // 原始流上限 = 解码上限 + 每块 ~6B 元数据的余量。
+            let raw_limit = (MAX_BODY + 64 * 1024).min(512 * 1024);
+            let mut buf = [0u8; 4096];
+            while body.len() < raw_limit {
+                let n = wire.recv(&mut buf);
+                if n <= 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..n as usize]);
+            }
+            wire.close();
+            let raw = core::mem::take(&mut body);
+            return match decode_chunked(&raw) {
+                Some(decoded) => {
+                    let mut decoded = decoded;
+                    decoded.truncate(MAX_BODY);
+                    Ok(Resp { status, location, body: decoded })
+                }
+                None => Err("chunked 分块格式错误".into()),
+            };
+        }
         let limit = content_length.unwrap_or(MAX_BODY).min(MAX_BODY);
         while body.len() < limit {
             let want = (limit - body.len()).min(4096);
-            let n = sock_recv(fd, &mut buf[..want]);
+            let n = wire.recv(&mut buf[..want]);
             if n < 0 {
                 break;
             }
@@ -310,8 +333,170 @@ fn http_request(url: &Url) -> Result<Resp, String> {
                 break;
             }
         }
-        sock_close(fd);
+        wire.close();
         Ok(Resp { status, location, body })
+    }
+}
+
+// ==================== 连接抽象（明文 / TLS） ====================
+
+/// HTTP/HTTPS 统一读写接口：明文直用 socket，HTTPS 套一层 TLS 1.2。
+enum Wire {
+    Plain(isize),
+    /// TLS 连接 + 底层 socket fd：`TlsConn::close` 只发 close_notify 警报，
+    /// 不关 fd —— fd 必须单独保存并在 close 时释放（内核 socket 表仅 16
+    /// 槽，每个 HTTPS 请求泄漏 1 个 fd，十几次后全系统无法再联网）。
+    Tls(tls::TlsConn<FdTls>, isize),
+}
+
+struct FdTls {
+    fd: isize,
+}
+
+impl tls::Transport for FdTls {
+    fn send_all(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        unsafe {
+            let mut sent = 0usize;
+            while sent < data.len() {
+                let n = sock_send(self.fd, &data[sent..]);
+                if n <= 0 {
+                    return Err("TLS 传输发送失败");
+                }
+                sent += n as usize;
+            }
+        }
+        Ok(())
+    }
+    fn recv_some(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        unsafe {
+            let n = sock_recv(self.fd, buf);
+            if n < 0 {
+                return Err("TLS 传输接收失败");
+            }
+            Ok(n as usize)
+        }
+    }
+}
+
+impl Wire {
+    fn plain(fd: isize) -> Wire {
+        Wire::Plain(fd)
+    }
+
+    fn tls(fd: isize, host: &str) -> Result<Wire, &'static str> {
+        let mut rng = SysRng;
+        // 墙钟（秒）用于证书有效期校验；RTC 不可用时 now=0 会判定"尚未生效"
+        let now = (unsafe { crate::kit::now_us() } / 1_000_000) as i64;
+        let conn = tls::TlsConn::connect(FdTls { fd }, host, &mut rng, now)?;
+        Ok(Wire::Tls(conn, fd))
+    }
+
+    fn send_all(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        match self {
+            Wire::Plain(fd) => unsafe {
+                let mut sent = 0usize;
+                while sent < data.len() {
+                    let n = sock_send(*fd, &data[sent..]);
+                    if n <= 0 {
+                        return Err("发送失败");
+                    }
+                    sent += n as usize;
+                }
+            },
+            Wire::Tls(c, _) => c.send(data)?,
+        }
+        Ok(())
+    }
+
+    /// 返回 <0 = 错误，0 = 对端关闭，>0 = 字节数（与 sock_recv 语义一致）。
+    fn recv(&mut self, buf: &mut [u8]) -> isize {
+        match self {
+            Wire::Plain(fd) => unsafe { sock_recv(*fd, buf) },
+            Wire::Tls(c, _) => match c.recv(buf) {
+                Ok(n) => n as isize,
+                Err(_) => -1,
+            },
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Wire::Plain(fd) => unsafe { sock_close(*fd) },
+            Wire::Tls(c, fd) => {
+                c.close();
+                // close_notify 只是告警，socket 必须显式释放（防 fd 泄漏）。
+                unsafe { sock_close(*fd) };
+            }
+        }
+    }
+}
+
+/// 内核 getrandom（SYS_GETRANDOM=278，virtio-rng 硬件熵源）。
+struct SysRng;
+
+impl tls::Rng for SysRng {
+    fn fill(&mut self, buf: &mut [u8]) {
+        unsafe {
+            let n = syscall3(278, buf.as_mut_ptr() as usize, buf.len(), 0);
+            if (n as isize) < 0 {
+                // 熵源不可用：退化为时间+地址混合（演示系统可接受）
+                let t = crate::kit::now_us();
+                let mut seed = t.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (buf.as_ptr() as u64).rotate_left(32);
+                for b in buf.iter_mut() {
+                    seed = seed
+                        .wrapping_mul(6364_1362_2384_6793_005)
+                        .wrapping_add(1442_6950_4088_8963_407);
+                    *b = (seed >> 33) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// 解码 chunked 传输编码（RFC 9112 §7.1）：`<hex-size>[;ext]\r\n <data>\r\n`
+/// 序列，以 0 块结尾（其后为可选 trailer，直到流结束）。
+/// 格式不合法返回 None。`buf` 需为完整原始分块流（EOF 定界）。
+fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        // 解析一行分块大小（十六进制，忽略 ;ext 扩展）。
+        let line_end = find_bytes(&raw[i..], b"\r\n")? + i;
+        let size_str_raw = &raw[i..line_end];
+        let semi = size_str_raw.iter().position(|&b| b == b';').unwrap_or(size_str_raw.len());
+        let size_str = core::str::from_utf8(&size_str_raw[..semi]).ok()?.trim();
+        if size_str.is_empty() {
+            return None;
+        }
+        let size = usize::from_str_radix(size_str, 16).ok()?;
+        i = line_end + 2;
+        if size == 0 {
+            // 最后一块：其后是 trailer（直到流结束 / 空行），全部忽略。
+            return Some(out);
+        }
+        // size 来自对端可控的十六进制串："FFFF…" 可解析为 usize::MAX，
+        // 裸加法回绕会绕过下面的边界检查、切片终点小于起点直接 panic
+        // （no_std 应用即 abort）。先做总量上限与 checked 加法。
+        if size > MAX_BODY {
+            return None;
+        }
+        if i.checked_add(size).map_or(true, |e| e > raw.len())
+            || out.len().checked_add(size).map_or(true, |e| e > MAX_BODY * 2)
+        {
+            return None;
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        i += size;
+        // 每块数据后必须跟 CRLF。
+        if raw.get(i) == Some(&b'\r') {
+            i += 1;
+        }
+        if raw.get(i) == Some(&b'\n') {
+            i += 1;
+        } else {
+            return None;
+        }
     }
 }
 

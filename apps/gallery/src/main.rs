@@ -20,7 +20,11 @@ mod cjk_font;
 #[path = "../../../shared/app_kit.rs"]
 mod kit;
 
+#[path = "../../../shared/motion.rs"]
+mod motion;
+
 use kit::*;
+use motion::{progress, Easing};
 
 // ==================== 布局与配色 ====================
 
@@ -49,6 +53,136 @@ static mut VIEWING: u32 = u32::MAX;
 /// 由文件管理器打开时传入的图片路径（argv[1] 的 basename）。
 static mut OPEN_NAME: [u8; 64] = [0; 64];
 static mut OPEN_NAME_LEN: usize = 0;
+
+// ==================== 一镜到底（P1-2 geometryTransition） ====================
+
+/// 查看页大图矩形。
+const VIEW_X: i32 = 20;
+const VIEW_Y: i32 = 90;
+const VIEW_H: i32 = 560;
+/// 转场时长（`Emphasized` 300ms，roadmap P1-2 规范）。
+const ZOOM_DUR: u64 = 300_000;
+
+/// 缩略图→大图共享元素转场：矩形补间 x/y/w/h，中点（150ms）底页切换
+/// （grid→view），可中途打断（反向从当前矩形续跑）。
+struct ZoomAnim {
+    active: bool,
+    /// true = 打开方向（网格 → 查看页）。
+    open: bool,
+    idx: u32,
+    t0: u64,
+    fx: i32,
+    fy: i32,
+    fw: i32,
+    fh: i32,
+    tx: i32,
+    ty: i32,
+    tw: i32,
+    th: i32,
+}
+
+static mut ZOOM: ZoomAnim = ZoomAnim {
+    active: false,
+    open: true,
+    idx: 0,
+    t0: 0,
+    fx: 0,
+    fy: 0,
+    fw: 0,
+    fh: 0,
+    tx: VIEW_X,
+    ty: VIEW_Y,
+    tw: 0,
+    th: VIEW_H,
+};
+
+fn tile_rect(i: i32) -> (i32, i32) {
+    let r = i / COLS;
+    let c = i % COLS;
+    (GRID_X + c * (TILE_W + GAP), GRID_Y + r * (TILE_H + GAP))
+}
+
+/// 发起打开转场（网格点击缩略图）。
+fn zoom_open(idx: u32, now: u64) {
+    let (tx, ty) = tile_rect(idx as i32);
+    unsafe {
+        ZOOM = ZoomAnim {
+            active: true,
+            open: true,
+            idx,
+            t0: now,
+            fx: tx,
+            fy: ty,
+            fw: TILE_W,
+            fh: TILE_H,
+            tx: VIEW_X,
+            ty: VIEW_Y,
+            tw: DISPLAY_W as i32 - VIEW_X * 2,
+            th: VIEW_H,
+        };
+    }
+}
+
+/// 发起返回转场：从当前矩形（支持打断时的中间矩形）缩回缩略图位。
+fn zoom_close(idx: u32, now: u64, cx: i32, cy: i32, cw: i32, ch: i32) {
+    let (tx, ty) = tile_rect(idx as i32);
+    unsafe {
+        ZOOM = ZoomAnim {
+            active: true,
+            open: false,
+            idx,
+            t0: now,
+            fx: cx,
+            fy: cy,
+            fw: cw,
+            fh: ch,
+            tx,
+            ty,
+            tw: TILE_W,
+            th: TILE_H,
+        };
+    }
+}
+
+/// 转场帧渲染：返回转场是否仍在进行。
+fn zoom_render(now: u64) -> bool {
+    unsafe {
+        let p = progress(ZOOM.t0, ZOOM_DUR, now);
+        let e = Easing::Emphasized.eval(p);
+        // 中点切换底页：打开方向前半程看网格、后半程看查看页；返回反向。
+        let view_base = if ZOOM.open { e >= 0.5 } else { e < 0.5 };
+        if view_base {
+            render_view(ZOOM.idx);
+        } else {
+            render_grid();
+        }
+        if p < 1.0 {
+            let zx = ZOOM.fx as f32 + (ZOOM.tx - ZOOM.fx) as f32 * e;
+            let zy = ZOOM.fy as f32 + (ZOOM.ty - ZOOM.fy) as f32 * e;
+            let zw = ZOOM.fw as f32 + (ZOOM.tw - ZOOM.fw) as f32 * e;
+            let zh = ZOOM.fh as f32 + (ZOOM.th - ZOOM.fh) as f32 * e;
+            draw_photo(zx as i32, zy as i32, zw.max(1.0) as i32, zh.max(1.0) as i32, ZOOM.idx);
+        } else {
+            ZOOM.active = false;
+        }
+        p < 1.0
+    }
+}
+
+/// 当前转场矩形（打断时续跑的起点）。
+fn zoom_rect() -> (i32, i32, i32, i32) {
+    unsafe {
+        let p = progress(ZOOM.t0, ZOOM_DUR, kit::now_us());
+        let e = Easing::Emphasized.eval(p);
+        let l = |a: i32, b: i32| a as f32 + (b - a) as f32 * e;
+        (
+            l(ZOOM.fx, ZOOM.tx) as i32,
+            l(ZOOM.fy, ZOOM.ty) as i32,
+            l(ZOOM.fw, ZOOM.tw) as i32,
+            l(ZOOM.fh, ZOOM.th) as i32,
+        )
+    }
+}
 
 // ==================== 渲染 ====================
 
@@ -104,8 +238,8 @@ fn render_view(idx: u32) {
     }
 
     // 大图（上下留边）：液态玻璃面板容器 + 照片内容原样
-    draw_glass(20, 90, DISPLAY_W as i32 - 40, 560, 24);
-    draw_photo(20, 90, DISPLAY_W as i32 - 40, 560, idx);
+    draw_glass(VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H, 24);
+    draw_photo(VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H, idx);
 
     // 上一张 / 下一张（液态玻璃按钮）
     draw_glass_button(30, 700, 96, 44, "上一张".as_bytes(), false);
@@ -213,21 +347,27 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                 }
                 // 网格点击
                 for i in 0..PHOTO_COUNT {
-                    let r = (i as i32) / COLS;
-                    let c = (i as i32) % COLS;
-                    let tx = GRID_X + c * (TILE_W + GAP);
-                    let ty = GRID_Y + r * (TILE_H + GAP);
+                    let (tx, ty) = tile_rect(i as i32);
                     if x >= tx && x < tx + TILE_W && y >= ty && y < ty + TILE_H {
                         unsafe { VIEWING = i; }
                         print("[gallery] 打开照片 ");
                         print_dec(i as u64);
                         print("\n");
+                        zoom_open(i, kit::now_us());
                         dirty = true;
                         break;
                     }
                 }
             } else {
                 if back_hit(x, y) {
+                    // 返回：共享元素缩回缩略图位（转场中打断则从当前矩形续跑）。
+                    let now = kit::now_us();
+                    let (cx, cy, cw, ch) = if unsafe { ZOOM.active } {
+                        zoom_rect()
+                    } else {
+                        (VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H)
+                    };
+                    zoom_close(viewing, now, cx, cy, cw, ch);
                     unsafe { VIEWING = u32::MAX; }
                     dirty = true;
                 } else if x >= 30 && x < 126 && y >= 700 && y < 744 {
@@ -258,12 +398,23 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
             print("[gallery] ESC -> 退出\n");
             break;
         }
+        if unsafe { ZOOM.active } {
+            dirty = true;
+        }
+        // 光随指动：玻璃高光缓动中则重绘。
+        if kit::light_animating() {
+            dirty = true;
+        }
         if dirty {
-            let viewing = unsafe { VIEWING };
-            if viewing == u32::MAX {
-                render_grid();
+            if unsafe { ZOOM.active } {
+                zoom_render(kit::now_us());
             } else {
-                render_view(viewing);
+                let viewing = unsafe { VIEWING };
+                if viewing == u32::MAX {
+                    render_grid();
+                } else {
+                    render_view(viewing);
+                }
             }
             flip();
             cursor_overlay_redraw();

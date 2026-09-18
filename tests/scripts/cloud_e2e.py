@@ -159,11 +159,20 @@ try:
         time.sleep(0.8)
     shot("00_desktop_page0.ppm")
 
-    # 第 1 页：云服务图标（第 18 个应用，slot 5 → 图标中心 (410, 228)）
+    # 第 1 页：云服务在「系统工具」文件夹内（launcher 硬编码布局：
+    # FOLDER_KEYS = calculator/clock/files/terminal/cloud/mail，3 列网格，
+    # 面板 396x500 居中 → cloud 位于第 2 行中列，中心 (270,378)；
+    # 文件夹图标在页面网格 (0,0)，中心 ≈ (150,272)）。
     swipe(400, 500, 120, 500)
     time.sleep(1.0)
     shot("01_desktop_page1.ppm")
-    tap(410, 228)
+    tap(150, 178)              # 打开「系统工具」文件夹（第二页网格 (0,0)）
+    if not wait_for("[launcher] 已打开文件夹", 10):
+        print("FAIL: could not open system tools folder")
+        sys.exit(1)
+    time.sleep(0.8)
+    tap(206, 378)              # 文件夹内 cloud 图标（"calculator" 键不匹配被跳过，
+                               #  实际内容 clock/files/terminal/cloud/mail → cloud 在第 2 行左列）
     if not wait_for("[cloud] 已就绪", 30):
         print("FAIL: cloud app did not start")
         sys.exit(1)
@@ -172,8 +181,8 @@ try:
 
     # 立即同步（注册 + 备份）→ 按钮中心 (150, 503)
     tap(150, 503)
-    ok_reg = wait_for("[cloud] register ok", 40)
-    ok_bak = wait_for("[cloud] backup ok", 40)
+    ok_reg = wait_for("[cloud] 注册成功", 40)
+    ok_bak = wait_for("[cloud] 备份成功", 40)
     check(ok_reg, "device registered (serial)")
     check(ok_bak, "backup uploaded (serial)")
     time.sleep(0.8)
@@ -199,8 +208,17 @@ try:
     time.sleep(0.8)
     shot("04_cloud_locked.ppm")
 
-    # 解锁
-    tap(270, 492)
+    # 解锁：真实长按语义 —— 短按不解锁（负向断言），按住解锁按钮 ≥2s 才解锁。
+    tap(270, 492)  # 短按解锁按钮
+    time.sleep(1.0)
+    check("长按解锁成功".encode() not in log, "short tap does NOT unlock")
+    send_frame(frame(FRAME_MOVE, 270, 492))
+    time.sleep(0.03)
+    send_frame(frame(FRAME_DOWN, 270, 492))
+    time.sleep(2.4)  # 按住 2.4s（阈值 2s）
+    send_frame(frame(FRAME_UP))
+    ok_unlock = wait_for("[cloud] 长按解锁成功", 10)
+    check(ok_unlock, "long-press (hold >=2s) unlocks")
     time.sleep(0.6)
     shot("05_cloud_unlocked.ppm")
 
@@ -211,7 +229,7 @@ try:
     tap(390, 503)
     ok_wipe = wait_for("type=wipe", 40)
     check(ok_wipe, "device received wipe command")
-    ok_ack = wait_for("[cloud] wipe: wiped", 30)
+    ok_ack = wait_for("[cloud] wipe：已擦除", 30)
     check(ok_ack, "wipe executed on device")
     time.sleep(0.8)
     shot("06_cloud_wiped.ppm")

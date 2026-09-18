@@ -28,6 +28,7 @@ const LAUNCHER_EVT: &str = "/data/life/launcher_evt";
 // 生命周期所需系统调用（AArch64 asm-generic）。
 const SYS_GETPID: usize = 172;
 const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 
 /// WNOHANG（wait4 options）。
 const WNOHANG: usize = 0x1;
@@ -165,15 +166,24 @@ pub fn in_resuming() -> bool {
 
 /// 返回动画完成（由 app_launch::motion_advance 调用）：
 /// 后台化原因为 RECENTS 时打开最近任务面板。
+/// （壁纸偏好同步已挪到 start_return：转场开始时预渲染桌面，
+/// 结束后无需再整屏重绘 —— 原路径会拖出 50~150ms 的退出尾巴。）
 pub fn return_animation_done() {
     unsafe {
-        // 回前台时同步设置应用的偏好改动（壁纸/主题变化触发 300ms 交叉淡化）。
-        wallpaper_sync_from_prefs();
         if BG_RECENTS {
             BG_RECENTS = false;
             recents_open();
             SHADE_OPEN = false;
         }
+    }
+}
+
+/// 返回转场被新启动打断（app_launch::start_launch 连续启动路径）：
+/// return_animation_done 不会再触发，这里清掉其挂起状态 —— BG_RECENTS
+/// 若残留，会在下次返回转场完成时误开最近任务面板。
+pub fn return_interrupted() {
+    unsafe {
+        BG_RECENTS = false;
     }
 }
 
@@ -215,6 +225,30 @@ pub fn poll_background_events() -> bool {
         if APP_STATE == ST_FOREGROUND {
             return false;
         }
+        // ★ 后台应用被外部杀死（shell kill -9 / 其它 root 进程）时无人回收：
+        // launcher 只在前台态 waitpid；lifd 的 alive()=kill(pid,0) 对 Zombie
+        // 恒为真（process_exists 对 Zombie 返回 true）→ 双方互等，僵尸占
+        // 内核进程槽 + lifd 注册表占 MAX_APPS 槽，泄漏几次后全部新应用
+        // 登记失败，生命周期子系统整体失效。后台态补一次非阻塞 waitpid：
+        // 回收成功即清 launcher 侧状态并通知 lifd 摘除注册（不走
+        // handle_app_exit —— 它假设 fb0 仍是应用末帧并播放返回动画，
+        // 后台被杀时屏上已是桌面）。
+        if APP_STATE == ST_BACKGROUND && APP_PID > 0 {
+            let mut status = 0i32;
+            let r = waitpid_nohang(APP_PID, &mut status);
+            if r == APP_PID {
+                let idx = APP_IDX;
+                let pid = APP_PID;
+                APP_STATE = ST_NONE;
+                APP_PID = -1;
+                SNAP_VALID = false;
+                print("[launcher] 后台应用 '");
+                print(APPS[idx].name);
+                print("' 被终止，已回收\n");
+                report_exited(idx, pid);
+                return true;
+            }
+        }
         let got = read_launcher_evt();
         if got > 0 {
             return handle_launcher_evt(got);
@@ -223,11 +257,41 @@ pub fn poll_background_events() -> bool {
     }
 }
 
-/// 读 launcher_evt（读后清空）。返回内容长度（0 = 无事件）。
+/// 读 launcher_evt（rename 取走后读，读完删除）。返回内容长度（0 = 无事件）。
+///
+/// 取走与读取之间 lifd 新发布的事件落在重生的 launcher_evt 上，不会被
+/// 本次 unlink 吞掉（此前「读 → unlink」与 lifd 的 O_TRUNC 覆盖写存在
+/// 交错丢事件窗口；lifd 侧已同步改为 .new + rename 发布）。
 fn read_launcher_evt() -> usize {
     unsafe {
-        let fd = open(LAUNCHER_EVT, O_RDONLY);
+        // 原子改名取走。
+        let mut taken = [0u8; PATH_CAP];
+        let tn = LAUNCHER_EVT.len().min(PATH_CAP - 3);
+        taken[..tn].copy_from_slice(&LAUNCHER_EVT.as_bytes()[..tn]);
+        taken[tn..tn + 2].copy_from_slice(b".r");
+        let mut cur = [0u8; PATH_CAP];
+        cur[..tn].copy_from_slice(&LAUNCHER_EVT.as_bytes()[..tn]);
+        let r = syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            cur.as_ptr() as usize,
+            AT_FDCWD,
+            taken.as_ptr() as usize,
+        ) as isize;
+        if r != 0 {
+            return 0;
+        }
+        let tpath = core::str::from_utf8(&taken[..tn + 2]).unwrap_or("");
+        let fd = open(tpath, O_RDONLY);
         if fd < 0 {
+            // 改名成功、open 失败：改名回原名让下轮重取（事件不丢）。
+            syscall4(
+                SYS_RENAMEAT,
+                AT_FDCWD,
+                taken.as_ptr() as usize,
+                AT_FDCWD,
+                cur.as_ptr() as usize,
+            );
             return 0;
         }
         let n = syscall3(
@@ -237,8 +301,7 @@ fn read_launcher_evt() -> usize {
             EVT_BUF.len(),
         ) as isize;
         syscall1(SYS_CLOSE, fd as usize);
-        // 清空
-        unlink_path(LAUNCHER_EVT);
+        unlink_path(tpath);
         if n <= 0 {
             0
         } else {
@@ -258,7 +321,10 @@ fn handle_launcher_evt(len: usize) -> bool {
                 // 快照应用末帧（此刻 fb0 仍是应用最后绘制的帧）
                 snapshot_frame();
                 SNAP_VALID = true;
-                BG_RECENTS = s.windows(8).any(|w| w == b"RECENTS");
+                // "RECENTS" 是 7 字节（lifd k2 = reason.len().min(8)）——
+                // windows(8) 的 8 字节窗口与 7 字节模式永不相等，恒 false，
+                // 从最近任务手势返回后返回动画结束不会打开最近任务面板。
+                BG_RECENTS = s.windows(7).any(|w| w == b"RECENTS");
                 let idx = APP_IDX;
                 APP_STATE = ST_BACKGROUND;
                 RECENT_APP = idx; // 最近任务列表首位
@@ -359,6 +425,12 @@ pub fn resume_app_at(app_idx: usize, anchor: Option<(i32, i32)>) -> bool {
         m.t0 = now_us();
         m.launch_t = now_us();
         m.launch_spring = Spring::launch();
+        // Spring::launch() 的 pos/target 均为 0：不赋值的话 step_ms 首调即
+        // settled，恢复转场零帧播完（返回中途点后台应用图标时尤其显眼），
+        // 屏幕停在旧帧直到被恢复应用 SIGCONT 后自行重绘。与 start_launch
+        // 的写法对齐：从图标原位（SCALE_1）放大到覆盖全屏。
+        m.launch_spring.pos = SCALE_1 as f32;
+        m.launch_spring.target = target as f32;
         APP_STATE = ST_RESUMING;
         NEEDS_REDRAW = true;
         true
@@ -375,37 +447,62 @@ pub fn resume_animation_done() {
     }
 }
 
-/// 向 lifd 请求把 pid 置为前台（cmd_<launcher_pid> = "FG <pid>"）。
+/// 命令序号（每消息一文件的唯一名）。
+static mut CMD_SEQ: u64 = 0;
+
+/// 发布命令到 cmd_<launcher_pid>_<seq>（写 .tmp 后 rename 发布）。
+/// 每消息一文件消除「O_TRUNC 覆盖 × lifd 读后删除」的丢命令竞态；
+/// lifd 侧目录扫描 + parse_dec 到非数字停止，命名兼容零改动。
+fn publish_cmd(content: &[u8]) {
+    unsafe {
+        CMD_SEQ = CMD_SEQ.wrapping_add(1);
+        let mut base = [0u8; PATH_CAP];
+        let mut n = 0usize;
+        copy_bytes(&mut base, &mut n, CMD_PREFIX.as_bytes());
+        n = push_dec(&mut base, n, SELF_PID as u64);
+        if n + 1 < base.len() {
+            base[n] = b'_';
+            n += 1;
+        }
+        n = push_dec(&mut base, n, CMD_SEQ);
+        let mut tmp = [0u8; PATH_CAP];
+        tmp[..n].copy_from_slice(&base[..n]);
+        tmp[n..n + 4].copy_from_slice(b".tmp");
+        if !write_file(core::str::from_utf8(&tmp[..n + 4]).unwrap_or(""), content) {
+            return;
+        }
+        let mut newp = [0u8; PATH_CAP];
+        newp[..n].copy_from_slice(&base[..n]);
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            tmp.as_ptr() as usize,
+            AT_FDCWD,
+            newp.as_ptr() as usize,
+        );
+    }
+}
+
+/// 向 lifd 请求把 pid 置为前台（cmd_<launcher_pid>_<seq> = "FG <pid>"）。
 fn request_fg(pid: isize) {
     if pid <= 0 {
         return;
     }
     unsafe {
-        let mut path = [0u8; PATH_CAP];
-        let mut n = 0usize;
-        copy_bytes(&mut path, &mut n, CMD_PREFIX.as_bytes());
-        n = push_dec(&mut path, n, SELF_PID as u64);
         let mut content = [0u8; 24];
         let mut c = 0usize;
         copy_bytes(&mut content, &mut c, b"FG ");
         c = push_dec(&mut content, c, pid as u64);
-        write_file(
-            core::str::from_utf8(&path[..n]).unwrap_or(""),
-            &content[..c],
-        );
+        publish_cmd(&content[..c]);
     }
 }
 
-/// 报告应用已退出（cmd_<launcher_pid> = "EXITED <key> <pid>"）。
+/// 报告应用已退出（cmd_<launcher_pid>_<seq> = "EXITED <key> <pid>"）。
 fn report_exited(app_idx: usize, pid: isize) {
     if !unsafe { LIFD_READY } || pid <= 0 {
         return;
     }
     unsafe {
-        let mut path = [0u8; PATH_CAP];
-        let mut n = 0usize;
-        copy_bytes(&mut path, &mut n, CMD_PREFIX.as_bytes());
-        n = push_dec(&mut path, n, SELF_PID as u64);
         let app = &APPS[app_idx];
         let mut content = [0u8; 48];
         let mut c = 0usize;
@@ -414,10 +511,7 @@ fn report_exited(app_idx: usize, pid: isize) {
         content[c] = b' ';
         c += 1;
         c = push_dec(&mut content, c, pid as u64);
-        write_file(
-            core::str::from_utf8(&path[..n]).unwrap_or(""),
-            &content[..c],
-        );
+        publish_cmd(&content[..c]);
     }
 }
 

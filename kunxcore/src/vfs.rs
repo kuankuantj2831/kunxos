@@ -29,6 +29,7 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x40;
 pub const O_TRUNC: u32 = 0x200;
+pub const O_APPEND: u32 = 0x400;
 pub const O_NONBLOCK: u32 = 0x800;
 
 // ==================== seek 起点 ====================
@@ -623,17 +624,30 @@ pub fn write(fd: i32, buf: &[u8]) -> i32 {
     if (of.flags & 0x3) == O_RDONLY {
         return -1; // 只读不可写
     }
+    // O_APPEND 写时追加（Linux 语义）：open 时 seek 到尾只能保证独占写者，
+    // 多写者各自持有「打开时刻」的尾偏移并发写会互相覆盖——文件信箱
+    //（audiod.ctl / rild.cmd 等多写者管道）将丢消息。fs_write_append 在
+    // 同一 FS 临界区内完成「取尾 + 写入」，对并发追加原子。
+    let append = of.flags & 0x400 != 0;
     let n = match of.typ {
         T_CHR => devfs::chr_write(rdev_major(of.rdev), rdev_minor(of.rdev), buf),
-        T_REG => fsops::fs_write(of.dev, of.ino, of.offset, buf),
+        T_REG => {
+            if append {
+                fsops::fs_write_append(of.dev, of.ino, buf)
+            } else {
+                fsops::fs_write(of.dev, of.ino, of.offset, buf)
+            }
+        }
         _ => -1,
     };
     if n > 0 {
         unsafe {
-            // 同 read：写回偏移前重验槽位身份（防 close/复用竞态）
+            // 同 read：写回偏移前重验槽位身份（防 close/复用竞态）。
+            // 追加路径下 offset 仅作进度记录：下次写仍以文件实际尾为准
+            //（O_WRONLY fd 不消费 offset，lseek 返回值不影响信箱语义）。
             let cur = &mut OPEN_FILES[entry.index];
             if cur.used && cur.dev == of.dev && cur.ino == of.ino && cur.typ == of.typ {
-                cur.offset += n as usize;
+                cur.offset = cur.offset.wrapping_add(n as usize);
             }
         }
     }
@@ -724,7 +738,9 @@ pub fn unlink(path: &str) -> i32 {
 }
 
 /// 重命名（移动）文件：`old_path` → `new_path`，可跨目录（SFS 迁移同一 inode）。
-/// 目标已存在或源为目录时失败。返回 0；失败 -1；跨文件系统 -EXDEV(-18)。
+/// POSIX 语义：目标已存在（普通文件/符号链接）时在同一事务内原子替换。
+/// 源为目录、目标为目录或目标 inode 仍被打开时失败。
+/// 返回 0；失败 -1（目标被打开 -16/EBUSY）；跨文件系统 -EXDEV(-18)。
 pub fn rename(old_path: &str, new_path: &str) -> i32 {
     let Some((od, oi, on)) = resolve_parent(old_path) else { return -1 };
     let Some((nd, ni, nn)) = resolve_parent(new_path) else { return -1 };
@@ -734,7 +750,27 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
     if od != nd {
         return -18;
     }
-    fsops::fs_rename(od, oi, on, ni, nn)
+    // 目标仍被打开时拒绝替换（EBUSY 语义，与 unlink 的守护同源）：替换会
+    // 回收目标 inode，而打开中的 fd 仍指向该 inode 号——之后 fs_create
+    // 复用该号即与新文件别名（H-6 同类缺陷）。
+    // ★ 检查与 fs_rename 封进同一 FS 临界区（TID 令牌可重入）：锁外检查
+    // 存在 TOCTOU——检查通过到 fs_rename 取锁之间目标被打开，守护即失效。
+    crate::fs_simple::fs_lock();
+    let mut r = 0;
+    let tgt = fsops::fs_lookup(nd, ni, nn);
+    if tgt >= 0 {
+        let t = tgt as u32;
+        if fsops::fs_type(nd, t) == fsops::T_DIR {
+            r = -1;
+        } else if is_open(nd, t) {
+            r = -16;
+        }
+    }
+    if r == 0 {
+        r = fsops::fs_rename(od, oi, on, ni, nn);
+    }
+    crate::fs_simple::fs_unlock();
+    r
 }
 
 /// 创建设备文件（或 FIFO），返回 0；失败 -1。
@@ -765,14 +801,17 @@ pub fn symlink(target: &str, path: &str) -> i32 {
 ///
 /// 目标非符号链接返回 -1（EINVAL 语义）；`buf` 不足时截断（Linux 语义）。
 pub fn readlink(path: &str, buf: &mut [u8]) -> i32 {
-    let Some((d, pino, name)) = resolve_parent(path) else { return -1 };
+    // Linux 语义：路径不存在 → ENOENT；存在但非符号链接 → EINVAL。
+    // musl realpath 逐组件调 readlink 并容忍 EINVAL——返回其他错误码
+    // （如 -EPERM）会导致 realpath 对一切路径失败。
+    let Some((d, pino, name)) = resolve_parent(path) else { return -2 };
     let ino = fsops::fs_lookup(d, pino, name);
     if ino < 0 {
-        return -1;
+        return -2;
     }
     let ino = ino as u32;
     if fsops::fs_type(d, ino) != fsops::T_SYM {
-        return -1;
+        return -22;
     }
     fsops::fs_readlink(d, ino, buf)
 }
@@ -844,6 +883,22 @@ pub fn readdir_next(fd: i32, name: &mut [u8]) -> (i32, u16) {
         cur.offset = idx + 1;
     }
     (ino, fsops::fs_type(of.dev, ino as u32))
+}
+
+/// 把目录流位置回退一个条目（getdents64 缓冲装不下「刚被消费」的条目时
+/// 调用）：readdir_next 是消费式读取，不回退的话该条目被静默跳过，
+/// 目录枚举从此丢项。
+pub fn readdir_back(fd: i32) {
+    let entry = match process::get_fd(fd) {
+        Some(e) if e.kind == FdKind::File => e,
+        _ => return,
+    };
+    unsafe {
+        let of = &mut OPEN_FILES[entry.index];
+        if of.used && of.typ == T_DIR && of.offset > 0 {
+            of.offset -= 1;
+        }
+    }
 }
 
 /// 返回已打开文件的 (类型码, 大小)，失败返回 None。

@@ -201,6 +201,201 @@ impl Spring {
     }
 }
 
+// ==================== 下拉刷新 ====================
+
+/// 下拉刷新阶段（docs/animations-roadmap.md P1-6）。
+#[derive(Clone, Copy, PartialEq)]
+pub enum PrState {
+    /// 空闲（无手势、无动画）。
+    Idle,
+    /// 跟手下拉中。
+    Pulling,
+    /// 越过阈值松手，正在刷新（三圆点 loader 期）。
+    Loading,
+    /// 回弹中（弹簧拉回 0）。
+    Settling,
+}
+
+/// 通用下拉刷新：跟手 1:1 → 越界 0.35x 阻尼（与翻页橡皮筋一致）→
+/// 松手弹簧回弹；Loading 期三圆点错峰缩放（周期 900ms，错峰 300ms）。
+///
+/// 应用侧接线（无分配、每帧几十条指令）：
+/// 1. 每帧 `frame(TOUCH_DOWN && 起点在列表区, CUR_Y, TOUCH_PY, now)`；
+/// 2. `just_triggered()` 为真的那帧执行数据刷新并 `mark_ready()`；
+/// 3. `step(now)` 推进 Loading/Settling（返回是否仍需重绘）；
+/// 4. 松手帧先问 `ate_tap()`，为真则吞掉本帧 tap（下拉不是点击）。
+#[derive(Clone, Copy)]
+pub struct PullRefresh {
+    pub state: PrState,
+    /// 当前下拉位移（px，>= 0；Loading/Settling 期为动画中的位移）。
+    pub pull: f32,
+    /// 触发刷新的下拉阈值（px）。
+    pub trigger: f32,
+    /// Loading 最短展示时长（us）：数据就绪后也要播完 loader。
+    pub loading_min_us: u64,
+    /// Loading 吸附的展示位移（px）。
+    pub hold: f32,
+    ready: bool,
+    t0: u64,
+    last: u64,
+    spring: Spring,
+    ate: bool,
+    triggered: bool,
+}
+
+impl PullRefresh {
+    /// damping = 2·√(k·m)·ζ = 2·√280·0.9 ≈ 30.12（const fn 不能调 fsqrt，
+    /// 预计算常数，与 `Spring::ios(0.9, 0.0)` 等价）。
+    pub const fn new() -> Self {
+        PullRefresh {
+            state: PrState::Idle,
+            pull: 0.0,
+            trigger: 64.0,
+            loading_min_us: 900_000,
+            hold: 56.0,
+            ready: false,
+            t0: 0,
+            last: 0,
+            spring: Spring {
+                stiffness: 280.0,
+                damping: 30.12,
+                mass: 1.0,
+                target: 0.0,
+                pos: 0.0,
+                vel: 0.0,
+            },
+            ate: false,
+            triggered: false,
+        }
+    }
+
+    /// 每帧喂触摸状态；返回本帧是否需要重绘。
+    /// `down` 由应用按「按下且起点在可下拉区域」给出。
+    pub fn frame(&mut self, down: bool, cur_y: i32, press_y: i32, now: u64) -> bool {
+        // ★ last 只在手势期（Idle/Pulling）stamp：Loading/Settling 期由
+        // step() 独占推进——应用按文档「每帧 frame + step」接线时两次
+        // now_us() 仅隔几微秒，若 frame 也盖 last，step 的帧间隔恒被钳到
+        // 下限 1ms（真实帧周期 16ms），弹簧以 ~1/16 实时速度积分。
+        // 另：按下即清残留吞击标记（不论状态——Loading 期的陈旧 ate 会
+        // 吞掉后续独立手势的 tap）。
+        if down {
+            self.ate = false;
+        }
+        match self.state {
+            PrState::Idle => {
+                if down && cur_y - press_y > 12 {
+                    self.state = PrState::Pulling;
+                    self.last = now;
+                    self.pull = (cur_y - press_y) as f32;
+                    return true;
+                }
+                false
+            }
+            PrState::Pulling => {
+                if down {
+                    self.last = now;
+                    let raw = (cur_y - press_y).max(0) as f32;
+                    // 跟手 1:1，越过阈值后 0.35x 阻尼（橡皮筋）。
+                    let d = if raw <= self.trigger {
+                        raw
+                    } else {
+                        self.trigger + (raw - self.trigger) * 0.35
+                    };
+                    if (d - self.pull).abs() >= 0.75 {
+                        self.pull = d;
+                        return true;
+                    }
+                    false
+                } else {
+                    // 松手：越过阈值进 Loading，否则直接回弹。
+                    self.ate = self.pull >= 6.0;
+                    self.last = now;
+                    if self.pull >= self.trigger {
+                        self.state = PrState::Loading;
+                        self.ready = false;
+                        self.triggered = true;
+                        self.t0 = now;
+                        self.spring.retarget(self.hold, self.pull, 0.0);
+                    } else {
+                        self.begin_settle(now);
+                    }
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// 本帧是否刚触发刷新（应用执行数据重载后调 `mark_ready`）。
+    pub fn just_triggered(&mut self) -> bool {
+        let t = self.triggered;
+        self.triggered = false;
+        t
+    }
+
+    /// 数据刷新完成（Loading 至少播满 `loading_min_us` 才回弹）。
+    pub fn mark_ready(&mut self) {
+        if self.state == PrState::Loading {
+            self.ready = true;
+        }
+    }
+
+    /// 松手帧是否应吞掉 tap（下拉激活，不是点击）。读后自清。
+    pub fn ate_tap(&mut self) -> bool {
+        let a = self.ate;
+        self.ate = false;
+        a
+    }
+
+    fn begin_settle(&mut self, now: u64) {
+        self.state = PrState::Settling;
+        // 速度接续：从 Loading 吸附位平滑转入回弹（P2-4 同思想）。
+        let v = self.spring.vel;
+        self.spring.retarget(0.0, self.pull, v);
+        self.t0 = now;
+    }
+
+    /// 推进 Loading/Settling 动画；返回是否仍需逐帧重绘。
+    pub fn step(&mut self, now: u64) -> bool {
+        // 帧间隔（钳 1..40ms：停顿后跳变不产生大步长积分）。
+        let h = now.saturating_sub(self.last).clamp(1_000, 40_000);
+        self.last = now;
+        match self.state {
+            PrState::Loading => {
+                let _ = self.spring.step(h as f32 / 1_000_000.0);
+                self.pull = self.spring.pos;
+                let elapsed = now.saturating_sub(self.t0);
+                if self.ready
+                    && elapsed >= self.loading_min_us
+                    && (self.spring.pos - self.hold).abs() < 1.0
+                {
+                    self.begin_settle(now);
+                }
+                true
+            }
+            PrState::Settling => {
+                if self.spring.step(h as f32 / 1_000_000.0) {
+                    self.pull = 0.0;
+                    self.state = PrState::Idle;
+                } else {
+                    self.pull = self.spring.pos;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Loading 三圆点相位（0..1..0 三角波，`dot` 0..=2 错峰 300ms）。
+    pub fn loader_phase(&self, now: u64, dot: usize) -> f32 {
+        if self.t0 == 0 {
+            return 0.0;
+        }
+        let ph = now.saturating_sub(self.t0).saturating_add(dot as u64 * 300_000);
+        triangle(ph, 900_000)
+    }
+}
+
 // ==================== 时间辅助 ====================
 
 /// 时间型动画进度：`(now − t0) / dur`，钳制到 [0, 1]。`dur_us` 为 0 时直接返回 1。

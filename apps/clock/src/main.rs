@@ -1340,6 +1340,7 @@ fn tap_alarm_list(x: i32, y: i32) {
             EDIT_FOCUS = 0;
             APAGE = APAGE_EDIT;
         }
+        print("[clock] 进入闹钟编辑（新建）\n");
         return;
     }
     let row_h = 92;
@@ -1389,6 +1390,7 @@ fn tap_alarm_list(x: i32, y: i32) {
             EDIT_FOCUS = 0;
             APAGE = APAGE_EDIT;
         }
+        print("[clock] 进入闹钟编辑\n");
         return;
     }
 }
@@ -1690,56 +1692,102 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
 
     loop {
+        print("[ckdbg] loop top\n");
         let ev = poll_input();
+        print("[ckdbg] poll done\n");
         if ev.moved {
+            print("[ckdbg] moved\n");
             cursor_overlay_move();
+            print("[ckdbg] moved done\n");
         }
+        print("[ckdbg] nav check\n");
         if ev.nav != NavAction::None {
-            print("[nav] 系统导航 → 退出\n");
-            unsafe { exit(nav_exit_code(ev.nav)); }
+            // 编辑子页内系统返回（手势/三键）= 回闹钟列表，与标题栏返回、
+            // ESC 一致；桌面/最近任务仍退出应用。
+            if ev.nav == NavAction::Back
+                && unsafe { TAB == TAB_ALARM && APAGE == APAGE_EDIT }
+            {
+                print("[clock] 系统返回 → 闹钟列表\n");
+                unsafe {
+                    APAGE = APAGE_LIST;
+                    EDIT_FOCUS = 0;
+                }
+                dirty = true;
+            } else {
+                print("[nav] 系统导航 → 退出\n");
+                unsafe { exit(nav_exit_code(ev.nav)); }
+            }
         }
+        print("[ckdbg] key check\n");
         if ev.key != KeyAction::None {
             handle_key(ev.key);
         }
+        print("[ckdbg] tap check\n");
         if let Some((x, y)) = ev.tap {
             if back_hit(x, y) {
-                print("[clock] 返回 → 退出\n");
-                break;
-            }
-            let ringing = unsafe { ASTATE } == 1;
-            if ringing {
-                tap_ringing(x, y);
-            } else if y >= TAB_Y && y < TAB_Y + TAB_H {
-                unsafe {
-                    let nt = (x / (DISPLAY_W as i32 / 4)).min(3) as u8;
-                    if nt != TAB {
-                        // 标签切换：指示药丸从旧位滑向新位
-                        TAB_PREV = TAB;
-                        TAB_ANIM_START = now_us();
-                        TAB = nt;
-                    }
-                    if TAB != TAB_ALARM {
+                // 编辑子页的标题栏返回 = 回闹钟列表（与 calendar/contacts 的
+                // 逐级返回一致），避免编辑中误触丢掉整个应用。
+                if unsafe { TAB == TAB_ALARM && APAGE == APAGE_EDIT } {
+                    unsafe {
                         APAGE = APAGE_LIST;
+                        EDIT_FOCUS = 0;
                     }
-                    SCROLL = 0;
+                    print("[clock] 返回 → 闹钟列表\n");
+                    dirty = true;
+                } else {
+                    print("[clock] 返回 → 退出\n");
+                    break;
                 }
             } else {
-                match unsafe { TAB } {
-                    TAB_WORLD => tap_world(x, y),
-                    TAB_ALARM => {
-                        if unsafe { APAGE } == APAGE_EDIT {
-                            tap_edit(x, y);
-                        } else {
-                            tap_alarm_list(x, y);
+                let ringing = unsafe { ASTATE } == 1;
+                if ringing {
+                    tap_ringing(x, y);
+                } else if y >= TAB_Y && y < TAB_Y + TAB_H {
+                    unsafe {
+                        let nt = (x / (DISPLAY_W as i32 / 4)).min(3) as u8;
+                        if nt != TAB {
+                            // 标签切换：指示药丸从旧位滑向新位
+                            TAB_PREV = TAB;
+                            TAB_ANIM_START = now_us();
+                            TAB = nt;
                         }
+                        if TAB != TAB_ALARM {
+                            APAGE = APAGE_LIST;
+                        }
+                        SCROLL = 0;
                     }
-                    TAB_TIMER => tap_timer(x, y),
-                    _ => tap_stopwatch(x, y),
+                } else {
+                    match unsafe { TAB } {
+                        TAB_WORLD => tap_world(x, y),
+                        TAB_ALARM => {
+                            if unsafe { APAGE } == APAGE_EDIT {
+                                tap_edit(x, y);
+                            } else {
+                                tap_alarm_list(x, y);
+                            }
+                        }
+                        TAB_TIMER => tap_timer(x, y),
+                        _ => tap_stopwatch(x, y),
+                    }
                 }
             }
         }
-        if ev.key == KeyAction::Esc || poll_tty_esc() {
-            print("[clock] ESC → 退出\n");
+        if ev.key == KeyAction::Esc {
+            // 编辑子页 ESC = 回列表（逐级返回）；根页 ESC 才退出应用。
+            if unsafe { TAB == TAB_ALARM && APAGE == APAGE_EDIT } {
+                unsafe {
+                    APAGE = APAGE_LIST;
+                    EDIT_FOCUS = 0;
+                }
+                print("[clock] ESC → 闹钟列表\n");
+                dirty = true;
+            } else {
+                print("[clock] ESC → 退出\n");
+                break;
+            }
+        }
+        if poll_tty_esc() {
+            print("[clock] ESC(tty) → 退出\n");
             break;
         }
         let (_, _, s) = now_hms();
@@ -1768,8 +1816,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             dirty = true;
         }
         if dirty {
+            print("[ckdbg] render...\n");
             render();
+            print("[ckdbg] render done, flip...\n");
             flip();
+            print("[ckdbg] flip done\n");
             cursor_overlay_redraw();
             dirty = false;
             kit::font_init_checked();

@@ -493,14 +493,20 @@ pub fn boost_tid(tid: u32) {
     if t >= MAX_TASKS {
         return;
     }
-    sched_lock();
+    // ★ IRQ 上下文（输入加速）try-lock：锁被任务上下文持有时被打断者
+    // 永远无法释放 → EL1 自旋死锁（整机静默冻结）。boost 是纯优化，
+    // 竞争即放弃（下一个输入事件会重试）。
+    if !SCHED_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        return;
+    }
     unsafe {
-        if TASKS[t].state == TaskState::Empty || TASKS[t].state == TaskState::Exited {
-            sched_unlock();
-            return;
+        if TASKS[t].state != TaskState::Empty && TASKS[t].state != TaskState::Exited {
+            TASKS[t].vruntime = min_vruntime();
+            wakeup_preempt(t);
         }
-        TASKS[t].vruntime = min_vruntime();
-        wakeup_preempt(t);
     }
     sched_unlock();
 }
@@ -591,6 +597,14 @@ fn pick_next() -> Option<usize> {
     unsafe {
         for i in 0..MAX_TASKS {
             if TASKS[i].state != TaskState::Ready {
+                continue;
+            }
+            // ★ SMP：带 kill_req 的 Ready 任务（被标记时在他核运行、随后
+            // 阻塞又唤醒）不再拉回运行——在此兑现为 Exited（与 tick 路径
+            // 同语义），否则其将在 execve 替换后的地址空间上执行旧映像 PC。
+            if TASKS[i].kill_req {
+                TASKS[i].kill_req = false;
+                TASKS[i].state = TaskState::Exited;
                 continue;
             }
             // 软冻结（cpu_cap == 0）的任务保持 Ready 但永不被选中。
@@ -1110,6 +1124,11 @@ pub fn sleep_until(deadline_us: u64) {
     if deadline_us <= timer::now_us() {
         return;
     }
+    // 保存进入时 DAIF：此前入口无条件 daifset 且所有返回路径都不恢复，
+    // 调用方从此永久运行在关中断态（fs_lock 退避把整个后续 FS 临界区拖进
+    // 关中断窗口；perflog 线程第一次睡眠后恒关中断）。与 yield_now 同模式
+    // 保存/恢复。
+    let saved_daif = unsafe { read_daif() };
     let tid = current_tid();
     let mut registered = false;
     unsafe { asm!("msr daifset, #2") };
@@ -1137,12 +1156,15 @@ pub fn sleep_until(deadline_us: u64) {
             }
         }
         sched_unlock();
+        // 恢复进入时的中断状态（阻塞前屏蔽是临界区需要，返回调用方时
+        // 必须回到原状态）。
+        unsafe { write_daif(saved_daif) };
     } else {
         // 槽位数量与任务数相同，正常情况下不会到达；保留可工作的降级路径。
-        // 保持当前 DAIF（syscall 上下文为屏蔽态），yield_now 会正确保存恢复。
         while timer::now_us() < deadline_us {
             yield_now();
         }
+        unsafe { write_daif(saved_daif) };
     }
 }
 
@@ -1579,6 +1601,8 @@ pub fn kill_pid(pid: u32) {
             crate::net_stack::net_cleanup_tid(TASKS[i].tid);
             // 同理：清掉其睡眠/超时登记（nanosleep / 定时 futex_wait）。
             sleepers_clear_tid(TASKS[i].tid);
+            // 同理：清 CLONE_CHILD_CLEARTID 登记（tid 复用后新任务退出会向
+            // 陈旧用户地址清零 + 误触 futex）。
             if TASKS[i].state == TaskState::Running {
                 // ★ SMP：正在某核运行的任务不能就地置 Exited——reap 会把它还
                 // 在使用的 256KB 内核栈释放并复用，导致他核继续在已归还的栈上
@@ -1618,6 +1642,7 @@ pub fn kill_siblings_of(pid: u32) {
             crate::bionic_shim::futex_cleanup_tid(TASKS[i].tid);
             crate::net_stack::net_cleanup_tid(TASKS[i].tid);
             sleepers_clear_tid(TASKS[i].tid);
+            crate::bionic_shim::clear_tid_slot(TASKS[i].tid);
             if TASKS[i].state == TaskState::Running {
                 // SMP 兜底：他核正在运行的任务置 kill_req，由该核下次 tick 兑现。
                 TASKS[i].kill_req = true;
@@ -1628,6 +1653,39 @@ pub fn kill_siblings_of(pid: u32) {
     }
     sched_unlock();
     unsafe { write_daif(saved) };
+
+    // ★ SMP 静默等待：他核 Running 的兄弟此刻只带了 kill_req，须等其在
+    // 所在核 tick 兑现并切走（离开 Running）后，execve 才能释放旧地址空
+    // 间（replace_address_space 归还旧页表）——否则兄弟在最长一个 tick
+    // 周期（10ms）内仍执行在旧页表上（use-after-free）。被标记后阻塞/
+    // 唤醒的兄弟由 pick_next 的 kill_req 兑现兜住，不会再回到 Running。
+    // 上界 1s（正常数十 ms 内静默）：超时说明他核异常，打印诊断后继续
+    // （退化为旧行为，好过 execve 永久挂死）。
+    let deadline = crate::timer::now_us() + 1_000_000;
+    loop {
+        let saved2 = unsafe { read_daif() };
+        unsafe { asm!("msr daifset, #2") };
+        sched_lock();
+        let busy = unsafe {
+            (0..MAX_TASKS).any(|i| {
+                i != cur && TASKS[i].pid == pid && TASKS[i].state == TaskState::Running
+            })
+        };
+        sched_unlock();
+        unsafe { write_daif(saved2) };
+        if !busy {
+            return;
+        }
+        if crate::timer::now_us() > deadline {
+            crate::kinfo! {
+                crate::uart_send_str("[smp] kill_siblings_of pid=");
+                crate::print_dec(pid as u64);
+                crate::uart_send_str(" 兄弟静默超时（他核未兑现 kill_req），继续\n");
+            }
+            return;
+        }
+        sleep_until(crate::timer::now_us() + 1000);
+    }
 }
 
 /// 回收属于指定进程的全部已退出任务：复位 TCB 槽位并归还 64KB 内核栈。
@@ -1665,7 +1723,7 @@ pub fn reap_pid(pid: u32) {
                 }
                 // 收尾：清掉可能残留的睡眠登记（兜底 kill 路径的遗漏）
                 sleepers_clear_tid(TASKS[i].tid);
-                TASKS[i] = Task::empty();
+                    TASKS[i] = Task::empty();
             }
         }
     }
@@ -1812,6 +1870,7 @@ pub fn exit_thread_current() -> bool {
         crate::bionic_shim::futex_cleanup_tid(tid);
         crate::net_stack::net_cleanup_tid(tid);
         sleepers_clear_tid(tid);
+        crate::bionic_shim::clear_tid_slot(tid);
         TASKS[cur].kill_req = false;
         TASKS[cur].state = TaskState::Exited;
     }

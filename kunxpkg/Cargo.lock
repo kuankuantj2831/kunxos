@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "kunxpkg"
 version = "0.1.0"
+dependencies = [
+ "kunxsec",
+]
+
+[[package]]
+name = "kunxsec"
+version = "0.1.0"

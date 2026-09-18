@@ -154,7 +154,9 @@ unsafe fn cam_send(id: u32, cmd: &[u8]) -> bool {
     buf[n] = b'#';
     n += 1;
     let mut v = id;
-    let mut digits = [0u8; 4];
+    // u32 十进制至多 10 位：数组按 10 位开（此前 [0u8;4]，REQ_ID 累计到
+    // 10000 后 digits[4] 越界 panic）。
+    let mut digits = [0u8; 10];
     let mut d = 0;
     loop {
         digits[d] = b'0' + (v % 10) as u8;
@@ -205,13 +207,14 @@ unsafe fn cam_poll_resp(id: u32) -> usize {
         return 0;
     }
     let data = &RESP_BUF[..n as usize];
-    // 找 "#<id> "
-    let mut prefix = [0u8; 8];
+    // 找 "#<id> "（'#' + 至多 10 位数字 + 空格 = 12）
+    let mut prefix = [0u8; 12];
     let mut pn = 0;
     prefix[pn] = b'#';
     pn += 1;
     let mut v = id;
-    let mut digits = [0u8; 4];
+    // 与 cam_send 同款：10 位十进制（[0u8;4] 在 REQ_ID ≥ 10000 时越界）
+    let mut digits = [0u8; 10];
     let mut d = 0;
     loop {
         digits[d] = b'0' + (v % 10) as u8;
@@ -303,7 +306,9 @@ unsafe fn read_preview_frame(seq: u32) -> bool {
     path[n..n + 4].copy_from_slice(b".yuv");
     n += 4;
     path[n] = 0;
-    let fd = open(core::str::from_utf8(&path[..n - 1]).unwrap_or(""), O_RDONLY);
+    // 注意 n 此时是完整路径长度（NUL 不计入）—— 此前 &path[..n-1] 会把
+    // 结尾 'v' 切掉，open 的永远是 /tmp/cam/frame_X.yu，取景器恒黑。
+    let fd = open(core::str::from_utf8(&path[..n]).unwrap_or(""), O_RDONLY);
     if fd < 0 {
         return false;
     }
@@ -631,6 +636,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         }
         if ev.nav != NavAction::None {
             print("[nav] 系统导航 -> 退出\n");
+            // 手势/三键导航走 exit() 前必须先停预览流：否则 camerad 侧
+            // 环形帧文件被持续覆写（与 break 路径的 camera_stop 对齐）。
+            unsafe {
+                if CAM_OK {
+                    camera_stop();
+                }
+            }
             unsafe { exit(nav_exit_code(ev.nav)); }
         }
 

@@ -356,8 +356,27 @@ static mut C: Compositor = EMPTY;
 /// 在应用绘制中途翻转导致撕裂/半帧上屏。
 static mut FB_ACTIVE: bool = false;
 
-/// 缩放合成用的源 X 坐标预计算表（宽 ≤ 屏幕宽 540，留余量防越界）。
-static mut SX_TABLE: [u32; 1024] = [0; 1024];
+/// 进程侧 `fb_present` 正处于「像素搬运阶段」（IRQ 开放）的标志。
+///
+/// 该阶段 back 缓冲由进程独占写入；IRQ 侧（frame_tick / gesture flush）的
+/// composite 必须让路（见 [`composite`]），否则会与像素阶段的 canvas→back
+/// 拷贝并发写同一缓冲。置位/复位均在 fb_present 的关中断窗口内完成。
+///
+/// 记录属主 tid 而非裸 bool：像素阶段开中断运行，tick 兑现 kill_req 可把
+/// 当前任务直接置 Exited 切走（多线程兄弟 exit / launcher kill 应用），
+/// 死亡属主永远走不到提交阶段的复位 → BUSY 永久卡死、所有后续呈现弃帧、
+/// composite 恒让路，整机画面冻结。属主已死时后来者复位接管（与 fs_lock
+/// 死持有者自愈同模式）。
+static mut BUSY_TID: u32 = 0;
+
+/// 缩放合成用的源 X 坐标预计算表：`init` 时按屏幕宽度堆分配（每列一项）。
+///
+/// composite 的子矩形恒先与屏幕求交（sub ⊆ screen），列数 ≤ 屏幕宽，因此
+/// 表长 = 屏幕宽即可覆盖全部列。旧实现的 1024 固定上限在宽屏（>1024 列，
+/// 如未来 1080p 横屏 / 外接显示）下会静默截断窗口右缘（`sw.min(table_len)`
+/// 之外的列不绘制）。分配失败（表长 0）时回退为行内逐像素计算（慢但正确）。
+static mut SX_TABLE: *mut u32 = null_mut();
+static mut SX_TABLE_LEN: usize = 0;
 
 // ==================== 脏区域 ====================
 
@@ -452,6 +471,23 @@ pub fn init(adopt_front: usize) {
     };
     let back = gpu_simple::alloc_fb();
     let canvas = gpu_simple::alloc_fb();
+    // 缩放查表按屏宽分配（见 SX_TABLE 注释）；失败保留空表 → 逐像素回退
+    let cols = w as usize;
+    let tbl = heap::kmalloc(cols * 4) as *mut u32;
+    unsafe {
+        SX_TABLE = tbl;
+        SX_TABLE_LEN = if tbl.is_null() { 0 } else { cols };
+    }
+    // 一次性观测行：确认表长跟随分辨率（旧实现固定 1024）
+    crate::kinfo! {
+        if tbl.is_null() {
+            crate::uart_send_str("[compositor] 缩放查表分配失败（回退逐像素）\n");
+        } else {
+            crate::uart_send_str("[compositor] 缩放查表 ");
+            crate::print_dec(cols as u64);
+            crate::uart_send_str(" 列（=屏宽）\n");
+        }
+    }
     unsafe {
         C.width = w;
         C.height = h;
@@ -581,13 +617,17 @@ pub fn fb_damage(rects: &[Rect]) {
 
 /// 应用请求呈现（`FBIO_PRESENT`）：脏区拷贝 + 覆盖窗口合成 + 页翻转。
 ///
-/// 流程：
-///   1. 合并本帧应用脏区（`app_dirty`）；
-///   2. 拷贝区 = 上一帧应用脏区 ∪ 本帧应用脏区（2 帧并集，覆盖 back 缓冲
-///      自上次使用以来的全部陈旧区域，保证移动内容无残影）；
-///   3. 把拷贝区从 canvas 逐矩形拷入 back（**脏区拷贝，非整屏**）；
-///   4. 合成区 = 拷贝区 ∪ 内核失效区（窗口移动/透明度动画），混合覆盖窗口；
-///   5. 页翻转（front/back 交换），返回是否实际翻转。
+/// 三阶段结构（关中断窗口只覆盖元数据与提交，像素搬运在开放 IRQ 下进行）：
+///   1. **元数据阶段**（IRQ 关）：合并本帧应用脏区、快照拷贝区/合成区、
+///      置 BUSY。此前本函数全程屏蔽 IRQ —— 整屏 2MB 级 canvas→back 拷贝 +
+///      合成 + 翻转期间触摸 IRQ（gesture flush）、调度 tick 全部被拖延，
+///      输入→画面延迟与调度抖动直接叠加每帧呈现耗时。
+///   2. **像素阶段**（恢复调用方 IRQ 状态）：canvas→back 逐矩形拷贝。只读
+///      canvas 与快照，不触及共享元数据；IRQ 侧 composite 见 BUSY 让路
+///      （见 [`composite`]），本阶段对 back 的写独占。
+///   3. **提交阶段**（IRQ 关）：阶段 2 期间 IRQ 侧新增的失效区先补 canvas
+///      拷贝（canvas 是权威底图）再并入合成区；覆盖窗口合成、记录
+///      prev_app、页翻转、清 BUSY。
 ///
 /// 首次调用后进入应用驱动模式（`FB_ACTIVE = true`），定时器 IRQ 不再自行翻转。
 pub fn fb_present(rects: &[Rect]) -> bool {
@@ -597,22 +637,53 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         }
         // [perf] 应用直绘路径合成+呈现耗时度量（perf::note_app_render）
         let t0 = crate::timer::now_us();
-        // ★ 全程屏蔽 IRQ：C.dirty/prev_app/app_dirty 在 fb_damage 与 composite
-        // 之间的读写窗口若被触摸 IRQ 侧 composite() 插入，会消费「旧数组 +
-        // 新 count」的撕裂组合并把 dirty_count 清 0（本帧覆盖层丢失/残影）。
-        let _saved = irq_save();
+        // ---- 阶段 1：元数据（IRQ 关）----
+        // C.dirty/prev_app/app_dirty 与 IRQ 侧 composite()/invalidate() 的
+        // 交错会消费「旧数组 + 新 count」的撕裂组合并把 dirty_count 清 0
+        //（本帧覆盖层丢失/残影）。BUSY 的查检与置位也在本窗口：像素阶段
+        // 允许定时器抢占调度，另一任务重入 fb_present 时见 BUSY 直接放弃
+        // 本帧（其脏区留在 app_dirty，无丢失，下一次呈现消费）。
+        let saved = irq_save();
+        if BUSY_TID != 0 {
+            // 属主已死（像素阶段被 kill）：复位接管，否则 BUSY 永久卡死。
+            if crate::sched_cfs::tid_alive(BUSY_TID) {
+                irq_restore(saved);
+                return false;
+            }
+            BUSY_TID = 0;
+        }
         FB_ACTIVE = true;
         fb_damage(rects);
+        // 临时诊断：launcher 的前 6 次 + 非 launcher 全打
+        static mut FBDG_N: u32 = 0;
+        let fbdg = unsafe {
+            let n = FBDG_N;
+            FBDG_N = n.wrapping_add(1);
+            n < 6 || crate::process::current_pid() != 13
+        };
+        if fbdg {
+            let pid = crate::process::current_pid();
+            let cw = C.width as usize;
+            crate::uart_send_str("[fbdg] pid=");
+            crate::print_dec(pid as u64);
+            crate::uart_send_str(" canvas[0]=0x");
+            crate::print_hex(*C.canvas as u64);
+            crate::uart_send_str(" canvas[mid]=0x");
+            crate::print_hex(*C.canvas.add(cw * (C.height as usize / 2) + cw / 2) as u64);
+            crate::uart_send_str(" ndirty=");
+            crate::print_dec(C.app_dirty_count as u64);
+            crate::uart_send_str("\n");
+        }
         // 无应用脏区、无内核失效、无上一帧残留 → 无需呈现
         if C.app_dirty_count == 0 && C.dirty_count == 0 && C.prev_app_count == 0 {
-            irq_restore(_saved);
+            irq_restore(saved);
             return false;
         }
-        // 1. 拷贝区 = prev_app ∪ app_dirty ∪ 内核失效区（2 帧并集 + 内核动画）。
-        //    canvas 是应用内容的权威底图：内核失效区（窗口移动/透明度/缩放）
-        //    若不先从 canvas 回填，composite 只把窗口像素混合到上一帧的合成
-        //    结果上 —— alpha 窗口每 2 帧在同一 back 上重复混合（透明度逐帧
-        //    加深），窗口移走后旧位置残留到应用恰好重绘该区域为止。
+        // 拷贝区 = prev_app ∪ app_dirty ∪ 内核失效区（2 帧并集 + 内核动画）。
+        // canvas 是应用内容的权威底图：内核失效区（窗口移动/透明度/缩放）
+        // 若不先从 canvas 回填，composite 只把窗口像素混合到上一帧的合成
+        // 结果上 —— alpha 窗口每 2 帧在同一 back 上重复混合（透明度逐帧
+        // 加深），窗口移走后旧位置残留到应用恰好重绘该区域为止。
         let mut copy: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
         let mut copy_count = 0usize;
         for i in 0..C.prev_app_count {
@@ -624,7 +695,7 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         for i in 0..C.dirty_count {
             merge_rect(&mut copy, &mut copy_count, C.dirty[i]);
         }
-        // 2. 合成区 = 拷贝区 ∪ 内核失效区（窗口动画等）
+        // 合成区 = 拷贝区 ∪ 内核失效区（窗口动画等）
         let mut comp: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
         let mut comp_count = 0usize;
         for i in 0..copy_count {
@@ -633,28 +704,54 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         for i in 0..C.dirty_count {
             merge_rect(&mut comp, &mut comp_count, C.dirty[i]);
         }
-        // 3. canvas → back 脏区拷贝
+        // 本帧应用脏区已并入拷贝区快照，此处清零（语义同旧实现：由 prev_app
+        // 记录拷贝区）。C.dirty 保留：阶段 2 的 IRQ 侧失效继续累加，阶段 3
+        // 一并消费。
+        C.app_dirty_count = 0;
+        BUSY_TID = crate::sched_cfs::current_tid();
+        // 像素阶段的稳定参数快照（present 前 back 不会交换：IRQ 侧被 BUSY
+        // 挡住，进程侧重入被 BUSY 拒绝）
         let cw = C.width as usize;
+        let canvas = C.canvas;
+        let back = C.back;
+        irq_restore(saved);
+
+        // ---- 阶段 2：像素搬运（IRQ 状态 = 调用方进入时状态；IRQ 上下文
+        // 调用时 DAIF.I 本就置位，irq_restore 恢复原状，不会中途开中断）----
         for i in 0..copy_count {
-            copy_rect_pixels(C.canvas, C.back, copy[i], cw);
+            copy_rect_pixels(canvas, back, copy[i], cw);
         }
-        // 4. 覆盖窗口合成（composite 消费 comp 作为脏区）
+
+        // ---- 阶段 3：提交（IRQ 关）----
+        let t3 = crate::timer::now_us();
+        let saved = irq_save();
+        // 阶段 2 期间 IRQ 侧（gesture flush 的窗口移动 / frame_tick 动画）
+        // 新增的失效区：先补 canvas→back 拷贝，再并入拷贝区/合成区。
+        for i in 0..C.dirty_count {
+            copy_rect_pixels(canvas, back, C.dirty[i], cw);
+            merge_rect(&mut copy, &mut copy_count, C.dirty[i]);
+        }
+        for i in 0..copy_count {
+            merge_rect(&mut comp, &mut comp_count, copy[i]);
+        }
+        // 覆盖窗口合成（composite 消费 comp 作为脏区）
         C.dirty_count = comp_count;
         C.dirty[..comp_count].copy_from_slice(&comp[..comp_count]);
-        composite();
-        // 5. 记录上一帧拷贝区并清空本帧
-        // ★ prev_app 必须始终保留上一帧的拷贝区：present() 会交换 front/back，
-        // 下一次呈现写入的 back 是 2 帧前的旧缓冲，2 帧并集负责补齐这两帧间
-        // 的全部变化。清空 prev_app 会让 back 的陈旧区域被整缓冲翻转到扫描
-        // 输出（ramfb 指向整个 back），表现为全屏闪烁/光标周围残影。
-        // ★ 拷贝区现包含内核失效区：内核动画（如透明度）在下一帧也必须
-        // 回填 canvas，否则 back 在两帧间回退到旧 alpha（可见闪变）。
+        composite_locked();
+        // ★ prev_app 必须覆盖本帧实际写入 back 的全部区域（拷贝区 ∪ 阶段 2
+        // 新增失效区）：present() 交换 front/back 后，下一次呈现写入的 back
+        // 是 2 帧前的旧缓冲，2 帧并集负责补齐这两帧间的全部变化。清空
+        // prev_app 会让 back 的陈旧区域被整缓冲翻转到扫描输出（ramfb 指向
+        // 整个 back），表现为全屏闪烁/光标周围残影。
         C.prev_app_count = copy_count;
         C.prev_app[..copy_count].copy_from_slice(&copy[..copy_count]);
-        C.app_dirty_count = 0;
         present();
-        crate::perf::note_app_render(crate::timer::now_us().saturating_sub(t0));
-        irq_restore(_saved);
+        BUSY_TID = 0;
+        // [perf] 总耗时 + 关中断临界区耗时（元数据/提交阶段不含像素搬运，
+        // 即 IRQ 被屏蔽的实际时长）
+        let now = crate::timer::now_us();
+        crate::perf::note_app_render(now.saturating_sub(t0), now.saturating_sub(t3));
+        irq_restore(saved);
         true
     }
 }
@@ -974,6 +1071,21 @@ pub fn window_z(id: usize) -> Option<i32> {
     }
 }
 
+/// 目标列 `x` 的源列坐标（最近邻采样：四舍五入 + 钳制到源宽内）。
+///
+/// 查表构建与「查表不可用」（`SX_TABLE` 分配失败）时的行内回退共用此式。
+/// 钳制防取整落到 `src_w`（首行越界 1 像素）；i64 中间量：极端窗口几何
+/// （16M 宽表面 × scale 1024）下 `(x - vr.x) * 256` 的 i32 乘法回绕。
+#[inline]
+fn src_x(x: i32, win_x: i32, vr_x: i32, scale: i32, src_w: u32) -> u32 {
+    if scale == 256 {
+        (x - win_x) as u32
+    } else {
+        ((((x - vr_x) as i64) * 256 + (scale as i64) / 2).div_euclid(scale as i64) as u32)
+            .min(src_w - 1)
+    }
+}
+
 /// 把脏区域内的内核覆盖窗口（Home Indicator / 变暗层等）合成到 `back`。
 ///
 /// 返回是否实际合成了内容（供调用方决定是否 `present`）。
@@ -987,10 +1099,28 @@ pub fn window_z(id: usize) -> Option<i32> {
 /// 快速路径（动画期间的主要开销优化）：
 /// - `alpha == 0` 的窗口直接跳过；
 /// - `alpha == 255 && scale == 256`（1:1 不透明）：行级 `copy_nonoverlapping`；
-/// - `scale != 256`：最近邻采样改为**按子矩形预计算一次源 X 映射表**，
-///   每行只做一次整数除法求 `sy`，不再每像素除法；
+/// - `scale != 256`：最近邻采样按子矩形预计算一次源 X 映射表（表长 = 屏宽，
+///   恒覆盖子矩形全部列；表不可用时回退行内计算），每行只做一次整数除法求
+///   `sy`，不再每像素除法；
 /// - `alpha in (0,255)`：保留逐像素 alpha 混合（仍复用 X 映射表）。
+///
+/// IRQ 上下文调用时若进程侧 `fb_present` 处于像素搬运阶段（BUSY），直接
+/// 让路返回 false —— 脏区不丢（留在 `C.dirty`），由 fb_present 提交阶段
+/// 或下一次呈现消费；避免与像素阶段并发写 back。
 pub fn composite() -> bool {
+    unsafe {
+        if BUSY_TID != 0 && crate::sched_cfs::tid_alive(BUSY_TID) {
+            return false;
+        }
+        // 属主已死（像素阶段被 kill 中断）：视为空闲放行合成——back 可能
+        // 停在半更新状态，但 canvas 是权威底图，下一次 fb_present 会从
+        // canvas 回填补齐；卡死让路才会让整机画面永久停更。
+        composite_locked()
+    }
+}
+
+/// [`composite`] 的主体（调用方保证不与 fb_present 像素阶段并发写 back）。
+fn composite_locked() -> bool {
     unsafe {
         if C.dirty_count == 0 || C.width == 0 {
             return false;
@@ -1055,28 +1185,14 @@ pub fn composite() -> bool {
                         copy_nonoverlapping(src, dst, sw);
                     }
                 } else {
-                    // scale != 256：预计算源 X 映射（每子矩形一次），
-                    // 行内逐像素只做查表，无整数除法
-                    let table_len = sw.min(SX_TABLE.len());
-                    if scale == 256 {
+                    // scale != 256 或半透明：源 X 映射优先走预计算查表（每子
+                    // 矩形构建一次，行内逐像素查表无除法）。表长 = 屏宽且
+                    // sub ⊆ screen，列数必然被覆盖；表未分配（init 分配失败，
+                    // 防御路径）时回退行内逐像素计算。
+                    let use_table = sw <= SX_TABLE_LEN;
+                    if use_table {
                         for (xi, x) in (sub.x..sub.right()).enumerate() {
-                            if xi >= table_len {
-                                break;
-                            }
-                            SX_TABLE[xi] = (x - w.x) as u32;
-                        }
-                    } else {
-                        for (xi, x) in (sub.x..sub.right()).enumerate() {
-                            if xi >= table_len {
-                                break;
-                            }
-                            // 钳制到源宽内：取整可能落到 w.w（首行越界 1 像素），
-                            // 在查表构建时钳一次，行内逐像素不再做边界分支。
-                            // i64 中间量：极端窗口几何（16M 宽表面 × scale
-                            // 1024）下 (x - vr.x) * 256 的 i32 乘法回绕。
-                            SX_TABLE[xi] = ((((x - vr.x) as i64) * 256 + (scale as i64) / 2)
-                                .div_euclid(scale as i64) as u32)
-                                .min(w.w - 1);
+                            *SX_TABLE.add(xi) = src_x(x, w.x, vr.x, scale, w.w);
                         }
                     }
                     let alpha = w.alpha;
@@ -1092,16 +1208,29 @@ pub fn composite() -> bool {
                         }
                         let dst_row = C.back.add(y as usize * width + sub.x as usize);
                         let src_row_base = w.surface.pixels.add(sy as usize * w.w as usize);
-                        for xi in 0..sw.min(table_len) {
-                            // sx 已在查表构建时钳制到 w.w-1，行内免边界检查
-                            let sx = SX_TABLE[xi];
-                            let src = *src_row_base.add(sx as usize);
-                            let d = dst_row.add(xi);
-                            *d = if alpha == 255 {
-                                src
-                            } else {
-                                blend_pixel(*d, src, alpha)
-                            };
+                        if use_table {
+                            for xi in 0..sw {
+                                // sx 已在查表构建时钳制到 w.w-1，行内免边界检查
+                                let sx = *SX_TABLE.add(xi);
+                                let src = *src_row_base.add(sx as usize);
+                                let d = dst_row.add(xi);
+                                *d = if alpha == 255 {
+                                    src
+                                } else {
+                                    blend_pixel(*d, src, alpha)
+                                };
+                            }
+                        } else {
+                            for (xi, x) in (sub.x..sub.right()).enumerate() {
+                                let sx = src_x(x, w.x, vr.x, scale, w.w);
+                                let src = *src_row_base.add(sx as usize);
+                                let d = dst_row.add(xi);
+                                *d = if alpha == 255 {
+                                    src
+                                } else {
+                                    blend_pixel(*d, src, alpha)
+                                };
+                            }
                         }
                     }
                 }

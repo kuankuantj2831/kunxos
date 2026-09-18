@@ -25,6 +25,15 @@ mod kit;
 
 use kit::*;
 
+#[path = "../../../shared/motion.rs"]
+mod motion;
+
+use motion::Easing;
+
+// 共享对话框组件（VIVO OriginOS 风格：居中白卡 + 细分割线 + 文字按钮）。
+#[path = "../../../shared/dialog.rs"]
+mod dialog;
+
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
 const SYS_CLONE: usize = 220;
@@ -128,6 +137,94 @@ static mut SEG_X: [usize; 8] = [0; 8];
 static mut SEG_W: [usize; 8] = [0; 8];
 static mut SEG_OFF: [usize; 8] = [0; 8]; // 段在 CWD 中的起始字节
 static mut SEG_N: usize = 0;
+
+// ==================== 页面切换转场（P0-2，settings/sms 同款整页滑动） ====================
+
+/// 离场页整帧快照（2MB BSS，与 BACK_BUF 同级）。
+static mut SNAP_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+/// 转场起始时刻；0 = 无转场。
+static mut TRANS_T0: u64 = 0;
+/// true = 推入（进入子目录/查看器）；false = 弹出（返回上级）。
+static mut TRANS_PUSH: bool = false;
+/// 转场时长（鸿蒙页面转场 240ms FastOutSlowIn）。
+const TRANS_DUR: u64 = 240_000;
+
+/// 向黑色压暗 `a/255`。
+fn shade(c: u32, a: u32) -> u32 {
+    let r = ((c >> 16) & 0xFF) * a / 255;
+    let g = ((c >> 8) & 0xFF) * a / 255;
+    let b = (c & 0xFF) * a / 255;
+    (r << 16) | (g << 8) | b
+}
+
+/// 把离场页整帧从 BACK_BUF 拷贝到 SNAP_BUF（切换目录/视图前调用）。
+fn snapshot_page() {
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            BACK_BUF.as_ptr(),
+            SNAP_BUF.as_mut_ptr(),
+            DISPLAY_W * DISPLAY_H,
+        );
+    }
+}
+
+/// 发起转场：记录时刻与方向。
+fn begin_transition(push: bool) {
+    unsafe {
+        TRANS_PUSH = push;
+        TRANS_T0 = kit::now_us();
+    }
+}
+
+/// 转场是否仍在进行（主循环据此逐帧重绘）。
+fn transition_active() -> bool {
+    unsafe { TRANS_T0 != 0 && kit::now_us() < TRANS_T0 + TRANS_DUR }
+}
+
+/// 页面转场合成（行级平移 + 快照补底 + 10px 接缝阴影，settings 同款）。
+fn compose_transition(e: f32) {
+    if e >= 1.0 {
+        return;
+    }
+    unsafe {
+        let w = DISPLAY_W;
+        let off = ((1.0 - e) * w as f32) as usize;
+        if off == 0 {
+            return;
+        }
+        for y in 0..DISPLAY_H {
+            let row = y * w;
+            if TRANS_PUSH {
+                for x in (off..w).rev() {
+                    BACK_BUF[row + x] = BACK_BUF[row + x - off];
+                }
+                for x in 0..off {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x];
+                }
+                for s in 0..10 {
+                    if s < off {
+                        let x = off - 1 - s;
+                        BACK_BUF[row + x] = shade(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            } else {
+                for x in 0..w - off {
+                    BACK_BUF[row + x] = BACK_BUF[row + x + off];
+                }
+                for x in (w - off)..w {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x - (w - off)];
+                }
+                let c = w - off;
+                for s in 0..10 {
+                    if s < off && c > s {
+                        let x = c - 1 - s;
+                        BACK_BUF[row + x] = shade(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ---- 输入对话框 ----
 static mut INPUT_ACTION: u8 = ACT_NEW_FOLDER;
@@ -895,6 +992,8 @@ fn open_viewer(full: &[u8]) {
         syscall1(SYS_CLOSE, fd as usize);
         VIEW_LEN = total;
         VIEW_SCROLL = 0;
+        snapshot_page();
+        begin_transition(true);
         UI_MODE = MODE_VIEW;
         VIEW_PATH[n] = 0;
     }
@@ -1399,115 +1498,197 @@ fn draw_viewer() {
     }
 }
 
-fn dim_overlay() {
-    // 半透明遮罩。
-    for y in 0..DISPLAY_H as i32 {
-        for x in 0..DISPLAY_W as i32 {
-            let bg = unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] };
-            let r = ((bg >> 16) & 0xFF) * 96 / 255;
-            let g = ((bg >> 8) & 0xFF) * 96 / 255;
-            let b = (bg & 0xFF) * 96 / 255;
-            put_pixel(x, y, 0x00_00_00_00 | (r << 16) | (g << 8) | b);
+// ==================== 对话框（shared/dialog OriginOS 风格） ====================
+
+/// 对话框几何高度（绘制与命中测试共用，永不漂移）。
+const DLG_INPUT_H: i32 =
+    dialog::DLG_TITLE_H + dialog::DLG_FIELD_ROW_H + dialog::DLG_MSG_H + dialog::DLG_BTN_H;
+const DLG_CONFIRM_H: i32 =
+    dialog::DLG_TITLE_H + dialog::DLG_MSG_H * 2 + dialog::DLG_BTN_H + 8;
+const DLG_PROGRESS_H: i32 =
+    dialog::DLG_TITLE_H + dialog::DLG_MSG_H * 2 + dialog::DLG_PROG_ROW_H + dialog::DLG_BTN_H;
+
+/// app_kit 管线适配（像素写 BACK_BUF，文本走 TTF 固定字号）。
+struct DlgUi;
+
+impl dialog::DialogUi for DlgUi {
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+    fn back(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+    fn text(&mut self, x: i32, y: i32, s: &[u8], _px: f32, color: u32) {
+        draw_text(x, y, s, color);
+    }
+    fn text_bold(&mut self, x: i32, y: i32, s: &[u8], _px: f32, color: u32) {
+        draw_text_bold(x, y, s, color);
+    }
+    fn text_w(&self, s: &[u8], _px: f32) -> i32 {
+        text_width(s)
+    }
+    fn text_top(&self, _px: f32, cy: i32) -> i32 {
+        // app_kit 文本以字形顶部为 y；16px 字形垂直居中的经验偏移（与
+        // 旧 draw_center_y 的 (40-20)/2 一致）。
+        cy - 10
+    }
+    fn fill_row(&mut self, y: i32, x0: i32, x1: i32, color: u32, alpha: u32) {
+        if y < 0 || y >= DISPLAY_H as i32 || x1 <= x0 {
+            return;
+        }
+        let xa = x0.max(0);
+        let xb = x1.min(DISPLAY_W as i32);
+        if xb <= xa {
+            return;
+        }
+        unsafe {
+            let base = y as usize * DISPLAY_W;
+            for idx in base + xa as usize..base + xb as usize {
+                BACK_BUF[idx] = dialog::blend_into(BACK_BUF[idx], color, alpha);
+            }
         }
     }
 }
 
-/// 对话框面板（居中）。
-fn dlg_panel(w: i32, h: i32) -> (i32, i32) {
-    let x = (DISPLAY_W as i32 - w) / 2;
-    let y = (DISPLAY_H as i32 - h) / 2;
-    draw_glass(x, y, w, h, 20);
-    (x, y)
+/// glass 抗锯齿圆角矩形适配（shared/dialog RrFn 签名）。
+fn dlg_fill(
+    _ui: &mut dyn dialog::DialogUi,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    c: u32,
+    _a: u32,
+) {
+    aa_fill_round_rect(x, y, w, h, r, c);
+}
+
+fn dlg_stroke(
+    _ui: &mut dyn dialog::DialogUi,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    c: u32,
+    a: u32,
+) {
+    aa_stroke_round_rect(x, y, w, h, r, c, a);
 }
 
 fn draw_input_dialog() {
     unsafe {
-        dim_overlay();
-        let w = 420i32;
-        let h = 250i32;
-        let (x, y) = dlg_panel(w, h);
+        let sw = DISPLAY_W as i32;
+        let sh = DISPLAY_H as i32;
+        let w = dialog::DLG_W;
+        let h = DLG_INPUT_H;
+        let (x, y) = dialog::center_rect(sw, sh, w, h);
+        let mut ui = DlgUi;
+        dialog::scrim(&mut ui, sw, sh, 115);
+        dialog::draw_card(&mut ui, dlg_fill, dlg_stroke, x, y, w, h);
         let title: &[u8] = if INPUT_ACTION == ACT_NEW_FOLDER {
             "新建文件夹".as_bytes()
         } else {
             "重命名".as_bytes()
         };
-        draw_center(y + 16, title, C_TEXT);
-        draw_text(x + 24, y + 60, "名称：".as_bytes(), C_DIM);
-        draw_glass(x + 24, y + 86, w - 48, 40, 10);
-        draw_text(x + 34, y + 98, &INPUT_BUF[..INPUT_LEN], C_TEXT);
-        // 光标。
-        let cw = text_width(&INPUT_BUF[..INPUT_LEN]);
-        fill_rect(x + 34 + cw, y + 98, 2, 16, C_ACCENT);
-        draw_text(x + 24, y + 140, "使用键盘输入名称".as_bytes(), C_DIM);
-        // 取消 / 确定。
-        let bw = 140i32;
-        let bx2 = x + w - 24 - bw;
-        let by = y + h - 52;
-        draw_glass(x + 24, by, bw, 40, 10);
-        draw_center_y(x + 24, by, bw, "取消".as_bytes(), C_DIM);
-        draw_glass_style(bx2, by, bw, 40, 10, &STYLE_ACCENT);
-        draw_center_y(bx2, by, bw, "确定".as_bytes(), C_ON_ACCENT);
+        dialog::draw_title(&mut ui, x, y, w, title);
+        dialog::draw_input_field(
+            &mut ui,
+            dlg_fill,
+            x + 24,
+            y + dialog::DLG_TITLE_H + 8,
+            w - 48,
+            &INPUT_BUF[..INPUT_LEN],
+        );
+        dialog::draw_message(
+            &mut ui,
+            x,
+            y + dialog::DLG_TITLE_H + dialog::DLG_FIELD_ROW_H,
+            w,
+            "使用键盘输入名称".as_bytes(),
+            14.0,
+        );
+        dialog::draw_buttons(
+            &mut ui,
+            x,
+            y + h - dialog::DLG_BTN_H,
+            w,
+            "取消".as_bytes(),
+            Some(("确定".as_bytes(), false)),
+        );
     }
 }
 
 fn draw_confirm_dialog() {
     unsafe {
-        dim_overlay();
-        let w = 440i32;
-        let h = 230i32;
-        let (x, y) = dlg_panel(w, h);
-        draw_center(y + 18, "确认删除".as_bytes(), C_TEXT);
+        let sw = DISPLAY_W as i32;
+        let sh = DISPLAY_H as i32;
+        let w = dialog::DLG_W;
+        let h = DLG_CONFIRM_H;
+        let (x, y) = dialog::center_rect(sw, sh, w, h);
+        let mut ui = DlgUi;
+        dialog::scrim(&mut ui, sw, sh, 115);
+        dialog::draw_card(&mut ui, dlg_fill, dlg_stroke, x, y, w, h);
+        dialog::draw_title(&mut ui, x, y, w, "确认删除".as_bytes());
+        // 将删除：<短名>。
+        let plen = nul_len(&CONFIRM_PATH);
+        let name_start = CONFIRM_PATH[..plen]
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let mut msg = [0u8; 96];
         let mut n = 0usize;
         for &c in "将删除：".as_bytes() {
             msg[n] = c;
             n += 1;
         }
-        let plen = nul_len(&CONFIRM_PATH);
-        let mut off = 0usize;
-        while off < plen {
-            let (_, step) = ttf_text::font_render::utf8_next(&CONFIRM_PATH[..plen], off);
-            off += step;
-        }
-        let name_start = CONFIRM_PATH[..plen]
-            .iter()
-            .rposition(|&c| c == b'/')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        // 显示短名。
         let nm = &CONFIRM_PATH[name_start..plen];
         for &c in nm.iter().take(24) {
             msg[n] = c;
             n += 1;
         }
-        draw_center(y + 56, &msg[..n], C_TEXT);
-        draw_center(y + 86, "此操作不可恢复".as_bytes(), C_DIM);
-        let bw = 140i32;
-        let by = y + h - 56;
-        draw_glass(x + 24, by, bw, 40, 10);
-        draw_center_y(x + 24, by, bw, "取消".as_bytes(), C_DIM);
-        draw_glass_style(x + w - 24 - bw, by, bw, 40, 10, &STYLE_DANGER);
-        draw_center_y(x + w - 24 - bw, by, bw, "删除".as_bytes(), C_ON_ACCENT);
+        dialog::draw_message(&mut ui, x, y + dialog::DLG_TITLE_H, w, &msg[..n], 15.0);
+        dialog::draw_message(
+            &mut ui,
+            x,
+            y + dialog::DLG_TITLE_H + dialog::DLG_MSG_H,
+            w,
+            "此操作不可恢复".as_bytes(),
+            14.0,
+        );
+        dialog::draw_buttons(
+            &mut ui,
+            x,
+            y + h - dialog::DLG_BTN_H,
+            w,
+            "取消".as_bytes(),
+            Some(("删除".as_bytes(), true)),
+        );
     }
-}
-
-fn draw_center_y(x: i32, y: i32, w: i32, s: &[u8], color: u32) {
-    let tw = text_width(s);
-    draw_text(x + (w - tw) / 2, y + (40 - 20) / 2, s, color);
 }
 
 fn draw_progress_dialog() {
     unsafe {
-        dim_overlay();
-        let w = 440i32;
-        let h = 260i32;
-        let (x, y) = dlg_panel(w, h);
+        let sw = DISPLAY_W as i32;
+        let sh = DISPLAY_H as i32;
+        let w = dialog::DLG_W;
+        let h = DLG_PROGRESS_H;
+        let (x, y) = dialog::center_rect(sw, sh, w, h);
+        let mut ui = DlgUi;
+        dialog::scrim(&mut ui, sw, sh, 115);
+        dialog::draw_card(&mut ui, dlg_fill, dlg_stroke, x, y, w, h);
         let (stage, done, total) = read_progress();
         let label: &[u8] = match PROG_KIND {
             PROG_MOVE => "正在移动".as_bytes(),
             _ => "正在复制".as_bytes(),
         };
-        draw_center(y + 18, label, C_TEXT);
+        dialog::draw_title(&mut ui, x, y, w, label);
         // 文件名。
         let mut nm = [0u8; 48];
         let mut n = 0usize;
@@ -1515,37 +1696,46 @@ fn draw_progress_dialog() {
             nm[n] = c;
             n += 1;
         }
-        draw_center(y + 48, &nm[..n], C_DIM);
-        // 进度条。
-        let bw = w - 64;
-        let bx = x + 32;
-        let by = y + 84;
-        draw_glass(bx, by, bw, 16, 8);
+        dialog::draw_message(&mut ui, x, y + dialog::DLG_TITLE_H, w, &nm[..n], 14.0);
+        // 进度条 + 百分比（失败 = 红 0% + 红字提示由下方 pct 行承载）。
         let frac = if total > 0 && stage == 0 {
-            ((done * bw as u64 / total) as i32).min(bw)
+            ((done * 100 / total) as u32).min(100)
         } else if stage == 0 {
             0
         } else {
-            bw
+            100
         };
-        if frac > 0 {
-            fill_rect(bx + 2, by + 2, frac - 2, 12, C_ACCENT);
-        }
+        let bar_y = y + dialog::DLG_TITLE_H + dialog::DLG_MSG_H + 14;
+        dialog::draw_progress(&mut ui, dlg_fill, x + 32, bar_y, w - 64, if stage == 2 { 0 } else { frac });
+        // 百分比 / 失败提示行。
+        let mut pct = [0u8; 24];
+        let mut pn = 0usize;
         if stage == 2 {
-            draw_center(y + 118, "操作失败".as_bytes(), C_DANGER);
+            for &c in "操作失败".as_bytes() {
+                pct[pn] = c;
+                pn += 1;
+            }
         } else {
-            let mut pct = [0u8; 24];
-            let mut pn = 0usize;
-            pn = push_dec_u32(&mut pct, pn, if total > 0 { (done * 100 / total) as u32 } else { 0 });
+            pn = push_dec_u32(&mut pct, pn, frac);
             pct[pn] = b'%';
             pn += 1;
-            draw_center(y + 118, &pct[..pn], if stage == 1 { C_ACCENT } else { C_TEXT });
         }
-        // 取消按钮。
-        let bw2 = 140i32;
-        let by2 = y + h - 56;
-        draw_glass(x + w / 2 - bw2 / 2, by2, bw2, 40, 10);
-        draw_center_y(x + w / 2 - bw2 / 2, by2, bw2, "取消".as_bytes(), C_TEXT);
+        dialog::draw_message(
+            &mut ui,
+            x,
+            y + dialog::DLG_TITLE_H + dialog::DLG_MSG_H + dialog::DLG_PROG_ROW_H,
+            w,
+            &pct[..pn],
+            14.0,
+        );
+        dialog::draw_buttons(
+            &mut ui,
+            x,
+            y + h - dialog::DLG_BTN_H,
+            w,
+            "取消".as_bytes(),
+            None,
+        );
     }
 }
 
@@ -1567,6 +1757,15 @@ fn render() {
             }
             _ => draw_browse(),
         }
+        // 页面转场合成（目标页已画进 BACK_BUF，叠加滑动 + 快照补底）。
+        if TRANS_T0 != 0 {
+            let now = kit::now_us();
+            let p = motion::progress(TRANS_T0, TRANS_DUR, now);
+            compose_transition(Easing::FastOutSlowIn.eval(p));
+            if p >= 1.0 {
+                TRANS_T0 = 0;
+            }
+        }
     }
 }
 
@@ -1583,6 +1782,8 @@ fn enter_dir(name: &[u8]) {
     unsafe {
         let cwd = &CWD[..nul_len(&CWD)];
         if join_into(cwd, name, &mut nb) > 0 && nb[0] != 0 {
+            snapshot_page();
+            begin_transition(true);
             CWD.fill(0);
             let mut n = 0usize;
             while n < nb.len() && nb[n] != 0 {
@@ -1596,6 +1797,8 @@ fn enter_dir(name: &[u8]) {
 
 fn go_up() {
     unsafe {
+        snapshot_page();
+        begin_transition(false);
         let mut plen = nul_len(&CWD);
         while plen > 1 && CWD[plen - 1] == b'/' {
             plen -= 1;
@@ -1693,7 +1896,16 @@ fn do_delete() {
 
 /// 递归删除：文件直接删；目录先递归删子项再删自己。
 fn del_tree(path: &[u8]) -> bool {
+    del_tree_depth(path, 0)
+}
+
+/// 深度上限与 dir_total/copy_tree 对齐（每层栈帧含 raw[2048] ≈ 2.3KB，
+/// 无上限的深目录链会打穿 1MB 用户栈）。
+fn del_tree_depth(path: &[u8], depth: usize) -> bool {
     unsafe {
+        if depth > 10 {
+            return false;
+        }
         let fd = open_path(path, O_RDONLY);
         if fd < 0 {
             return unlink_path(path) == 0;
@@ -1716,7 +1928,7 @@ fn del_tree(path: &[u8]) -> bool {
                     let mut child = [0u8; MAX_PATH];
                     let cl = join_into(path, &name[..elen], &mut child);
                     if cl > 0 {
-                        del_tree(&child[..cl]);
+                        del_tree_depth(&child[..cl], depth + 1);
                     }
                 }
                 off += reclen;
@@ -2163,6 +2375,8 @@ fn handle_browse_click(x: i32, y: i32) -> bool {
 fn handle_viewer_click(x: i32, y: i32) {
     unsafe {
         if back_hit(x, y) {
+            snapshot_page();
+            begin_transition(false);
             UI_MODE = MODE_BROWSE;
             return;
         }
@@ -2181,73 +2395,65 @@ fn handle_viewer_click(x: i32, y: i32) {
 
 fn handle_input_click(x: i32, y: i32) {
     unsafe {
-        // 对话框按钮：取消 / 确定。
-        let w = 420i32;
-        let h = 250i32;
-        let px = (DISPLAY_W as i32 - w) / 2;
-        let py = (DISPLAY_H as i32 - h) / 2;
-        let bw = 140i32;
-        let by = py + h - 52;
-        if y >= by && y < by + 40 {
-            if x >= px + 24 && x < px + 24 + bw {
-                UI_MODE = MODE_BROWSE;
+        let w = dialog::DLG_W;
+        let h = DLG_INPUT_H;
+        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
+            Some(false) => {
                 // 取消。
+                UI_MODE = MODE_BROWSE;
                 redraw();
-                return;
             }
-            let bx2 = px + w - 24 - bw;
-            if x >= bx2 && x < bx2 + bw {
+            Some(true) => {
                 // 确定。
                 do_input_action();
                 redraw();
-                return;
             }
-        }
-        // 点面板外 = 取消。
-        if x < px || x >= px + w || y < py || y >= py + h {
-            UI_MODE = MODE_BROWSE;
-            redraw();
+            None => {
+                // 点卡片外 = 取消。
+                if dialog::outside(x, y, px, py, w, h) {
+                    UI_MODE = MODE_BROWSE;
+                    redraw();
+                }
+            }
         }
     }
 }
 
 fn handle_confirm_click(x: i32, y: i32) {
     unsafe {
-        let w = 440i32;
-        let h = 230i32;
-        let px = (DISPLAY_W as i32 - w) / 2;
-        let py = (DISPLAY_H as i32 - h) / 2;
-        let bw = 140i32;
-        let by = py + h - 56;
-        if y >= by && y < by + 40 {
-            if x >= px + 24 && x < px + 24 + bw {
+        let w = dialog::DLG_W;
+        let h = DLG_CONFIRM_H;
+        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
+            Some(false) => {
                 UI_MODE = MODE_BROWSE;
                 redraw();
-                return;
             }
-            let bx2 = px + w - 24 - bw;
-            if x >= bx2 && x < bx2 + bw {
+            Some(true) => {
                 do_delete();
                 redraw();
-                return;
             }
-        }
-        if x < px || x >= px + w || y < py || y >= py + h {
-            UI_MODE = MODE_BROWSE;
-            redraw();
+            None => {
+                if dialog::outside(x, y, px, py, w, h) {
+                    UI_MODE = MODE_BROWSE;
+                    redraw();
+                }
+            }
         }
     }
 }
 
 fn handle_progress_click(x: i32, y: i32) {
     unsafe {
-        let w = 440i32;
-        let h = 260i32;
-        let px = (DISPLAY_W as i32 - w) / 2;
-        let py = (DISPLAY_H as i32 - h) / 2;
-        let bw = 140i32;
-        let by2 = py + h - 56;
-        if x >= px + w / 2 - bw / 2 && x < px + w / 2 + bw / 2 && y >= by2 && y < by2 + 40 {
+        let w = dialog::DLG_W;
+        let h = DLG_PROGRESS_H;
+        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        // 进度进行中仅响应「取消」按钮（单按钮行：整行宽均命中）。
+        if matches!(
+            dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y),
+            Some(_)
+        ) {
             progress_cancel();
         }
     }
@@ -2350,7 +2556,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             KeyAction::Esc => {
                 match unsafe { UI_MODE } {
                     MODE_VIEW => {
-                        unsafe { UI_MODE = MODE_BROWSE; }
+                        unsafe {
+                            snapshot_page();
+                            begin_transition(false);
+                            UI_MODE = MODE_BROWSE;
+                        }
                         redraw();
                     }
                     MODE_INPUT | MODE_CONFIRM => {
@@ -2374,6 +2584,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             }
             _ => {}
         }
+        // 页面转场进行中：逐帧重绘推进（240ms FastOutSlowIn）。
+        if transition_active() {
+            redraw();
+        }
         sleep_ms(16);
     }
 
@@ -2389,6 +2603,8 @@ fn ui_mode_back(nav: NavAction) -> bool {
     unsafe {
         match UI_MODE {
             MODE_VIEW => {
+                snapshot_page();
+                begin_transition(false);
                 UI_MODE = MODE_BROWSE;
             }
             MODE_INPUT | MODE_CONFIRM => {

@@ -1,0 +1,13 @@
+{
+  "name": "libbase",
+  "version": "1.2.0",
+  "api_level": 1,
+  "description": "依赖链示例：基础库（多级依赖的底层）",
+  "author": "KunxOS Team",
+  "main": "bin/libbase",
+  "permissions": [],
+  "dependencies": {"libc": ">=1.0.0"},
+  "provides": [],
+  "conflicts": [],
+  "_elf": "kunxpkg/target/aarch64-unknown-none/release/kunxpkg"
+}

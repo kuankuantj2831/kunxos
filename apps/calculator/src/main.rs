@@ -1173,14 +1173,28 @@ fn poll_input() -> (Option<(i32, i32)>, sys_nav::NavAction, bool) {
                     } else if code == BTN_LEFT {
                         if value == 1 {
                             MOUSE_DOWN = true;
+                            // QEMU GUI（virtio-tablet）以 BTN_LEFT 上报：补齐手势
+                            // 状态，全面屏手势在鼠标/数位板下与触摸同规则。
+                            TOUCH_PX = CUR_X;
+                            TOUCH_PY = CUR_Y;
+                            TOUCH_US = now_us();
                             press_feedback_begin();
                         } else if value == 0 && MOUSE_DOWN {
                             MOUSE_DOWN = false;
-                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, sys_nav::nav_mode());
+                            let mode = sys_nav::nav_mode();
+                            let a = sys_nav::nav_hit(CUR_X, CUR_Y, mode);
                             if a != sys_nav::NavAction::None {
                                 nav = a;
                             } else {
-                                click = Some((CUR_X, CUR_Y));
+                                let dur = now_us().saturating_sub(TOUCH_US) / 1000;
+                                let g = sys_nav::classify_swipe(
+                                    TOUCH_PX, TOUCH_PY, CUR_X, CUR_Y, dur, mode,
+                                );
+                                if g != sys_nav::NavAction::None {
+                                    nav = g;
+                                } else {
+                                    click = Some((CUR_X, CUR_Y));
+                                }
                             }
                         }
                     }
@@ -1290,7 +1304,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 redraw();
             } else {
                 unsafe {
-                    HOLD_BTN = -1;
+                    if HOLD_BTN != -1 {
+                        // 释放落空（按住拖出网格后松开，鼠标路径现在也会走到）：
+                        // 必须置变更标志，否则按钮画面停在下沉态直到下一次
+                        // 点击/动画才自愈。
+                        HOLD_BTN = -1;
+                        HOLD_CHANGED = true;
+                    }
                 }
             }
         }

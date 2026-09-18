@@ -28,6 +28,8 @@ const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_LSEEK: usize = 62;
 const SYS_FTRUNCATE: usize = 46;
+const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
 
@@ -93,6 +95,41 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         options(nostack)
     );
     ret
+}
+
+/// renameat 四参调用（命令管道认领取走）。
+#[inline(always)]
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
+        options(nostack)
+    );
+    ret
+}
+
+/// 同目录改名：目标已存在时内核按 POSIX 语义原子替换。成功 0。
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 96];
+    let mut q = [0u8; 96];
+    let on = old.len().min(95);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(95);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
 }
 
 // ==================== 基础 I/O ====================
@@ -220,46 +257,65 @@ fn handle_command(cmd: &[u8]) {
 
 /// 读取管道文件内容并逐行处理（普通文件模拟命名管道）。
 fn poll_pipe() {
-    // 256B 缓冲会截断长命令（管道文件为普通文件模拟，read 后 ftruncate 清空，
-    // 超长命令尾部直接丢失）。1024B 覆盖全部现有命令与扩展命令。
+    // 256B 缓冲会截断长命令（管道文件为普通文件模拟）。1024B 覆盖全部
+    // 现有命令与扩展命令；循环读到 EOF，长命令尾部不截断丢失。
     static mut BUF: [u8; 1024] = [0u8; 1024];
     static mut WARNED: bool = false;
+    // 认领名 "/var/run/networkd.pipe.r"
+    let mut taken = [0u8; 32];
+    let cb = PIPE_PATH.as_bytes();
+    taken[..cb.len()].copy_from_slice(cb);
+    taken[cb.len()] = b'.';
+    taken[cb.len() + 1] = b'r';
+    let tpath = core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("");
+    // 清掉上次崩溃残留的认领文件（存在则 rename 失败）
+    unsafe { syscall3(SYS_UNLINKAT, AT_FDCWD, taken.as_ptr() as usize, 0) };
+    // rename 认领取走：旧的「read → ftruncate 清空」两步之间写入方追加的
+    // 命令会被 ftruncate 一并抹掉（丢命令）；认领后新命令落在重生的管道
+    // 文件上，留待下一轮（真 FIFO 语义）。
+    if rename_path(PIPE_PATH, tpath) != 0 {
+        // 无管道文件：主循环稍后重建（k_main 启动路径 O_CREAT 创建）。
+        return;
+    }
     unsafe {
-        let fd = open(PIPE_PATH, O_RDWR);
+        let mut total = 0usize;
+        let fd = open(tpath, O_RDWR);
         if fd < 0 {
-            // 首次失败打印一次告警，避免每 200ms 刷屏。
             if !WARNED {
-                print("[networkd] 警告：无法打开管道 ");
-                print(PIPE_PATH);
+                print("[networkd] 警告：无法打开认领的管道 ");
+                print(tpath);
                 print("\n");
                 WARNED = true;
             }
-            return;
+            // ★ 不能提前 return：认领文件残留会被下轮残留清理删掉、
+            // rename 因 PIPE_PATH 不存在恒失败 → 管道永久失效。跳过读取、
+            // 继续走清认领 + 重建（wifid/audiod/alarmd 同款纪律）。
+        } else {
+            syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+            // 循环读到 EOF：单次 read 长度有限，长命令尾部不能截断丢失。
+            loop {
+                if total >= BUF.len() {
+                    print("[networkd] 警告：管道命令过长，尾部已丢弃\n");
+                    break;
+                }
+                let want = (BUF.len() - total).min(256);
+                let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr().add(total) as usize, want);
+                if n == 0 {
+                    break; // 读至文件末尾（EOF）
+                }
+                if n > want {
+                    break; // 读取出错（异常返回值），本轮丢弃
+                }
+                total += n as usize;
+            }
+            syscall1(SYS_CLOSE, fd as usize);
         }
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        // 循环读到 EOF：单次 read 长度有限，长命令尾部不能截断丢失。
-        let mut total = 0usize;
-        loop {
-            if total >= BUF.len() {
-                print("[networkd] 警告：管道命令过长，尾部已丢弃\n");
-                break;
-            }
-            let want = (BUF.len() - total).min(256);
-            let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr().add(total) as usize, want);
-            if n == 0 {
-                break; // 读至文件末尾（EOF）
-            }
-            if n > want {
-                break; // 读取出错（异常返回值），本轮丢弃
-            }
-            total += n as usize;
+        syscall3(SYS_UNLINKAT, AT_FDCWD, taken.as_ptr() as usize, 0);
+        // 重建空管道文件（无 O_TRUNC：认领后写入方已追加的新命令不截断）
+        let fd2 = open(PIPE_PATH, O_CREAT | O_RDWR);
+        if fd2 >= 0 {
+            syscall1(SYS_CLOSE, fd2 as usize);
         }
-        // 清空管道文件：避免同一命令每轮重复执行、文件无限增长、
-        // 以及超出缓冲后新命令永远读不到（真 FIFO 语义）。
-        // 注意：ftruncate 必须显式传 length=0（x1 寄存器残留值不可依赖，
-        // 否则内核按「length != 0」拒绝，管道文件从不被清空）。
-        syscall2(SYS_FTRUNCATE, fd as usize, 0);
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
         if total > 0 {
             let data = &BUF[..total];
             let mut start = 0usize;
@@ -272,7 +328,6 @@ fn poll_pipe() {
                 }
             }
         }
-        syscall1(SYS_CLOSE, fd as usize);
     }
 }
 
@@ -352,7 +407,7 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         write_fd(2, b"PANIC: networkd\n");
         if w.len > 0 {
-            write_fd(2, &w.buf[..w.len]);;
+            write_fd(2, &w.buf[..w.len]);
         }
         syscall1(SYS_EXIT, 1);
     }

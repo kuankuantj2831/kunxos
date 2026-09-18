@@ -43,7 +43,15 @@ pub const T_SYM: u16 = 6;
 // ==================== 布局常量 ====================
 
 /// 最大 inode 数。
-const MAX_INODES: usize = 256;
+///
+/// 512（2026-09-18 从 256 扩容）：rootfs 文件数涨到 196 后，sfsrace
+/// （4 进程 × 12 轮 = 48 文件）+ 守护进程信箱/状态文件数秒内耗尽剩余
+/// 60 个 inode，全系统 create 失败（表象：守护进程状态写不进、测试
+/// BASELINE FAIL: creat）。imap 块 4096B = 32768 位，512 位远未触顶；
+/// inode 表 32 块（128KB 磁盘，无 RAM 常驻成本）。
+/// ★ 旧 256-inode 镜像由 parse_sb 的 SB_NUM_INODES 护栏拒绝挂载
+/// （布局不相容），需 `rm disk.img && make disk` 重建。
+const MAX_INODES: usize = 512;
 /// inode 大小（字节）。
 const INODE_SIZE: usize = 256;
 /// 每个 inode 表块容纳的 inode 数。
@@ -374,78 +382,104 @@ fn txn_active(major: u32) -> bool {
 ///   - 事务状态被污染（TXN_MAJOR=u32::MAX 且日志区未初始化 jlog_blocks==0）
 ///     → jlog_place 对 0 取模 → 除零 panic（实测崩溃）。
 ///
-/// 锁语义：按 **持有 (CPU, TID)** 递归（同 CPU 同任务的嵌套调用 fs_symlink →
+/// 锁语义：按**持有者 TID** 递归（同任务的嵌套调用 fs_symlink →
 /// fs_create → fs_write 只增加深度、不互等），把每个顶层 FS 操作串行化为
-/// 原子段。编码（单原子字）：bit 32+ = 持有 CPU 号（全 0 = 空闲），
-/// bit 16..32 = 持有者 tid，低 16 位 = 重入深度。
+/// 原子段。编码（单原子字）：bit 32+ = 获取时所在 CPU 号（仅诊断/来源
+/// 记录，不参与持有判定），bit 16..32 = 持有者 tid，低 16 位 = 重入深度。
 ///
-/// 为什么不能只看 CPU 号：`pick_next` 无核间亲和，持锁任务可被定时器抢占并
-/// 迁移到其它核；此后同 CPU 的另一个任务会误判「本核已持有」而重入，与迁移
-/// 走的原持有者并发执行（SMP 下交错破坏 PENDING_*/SCRATCH_* 事务状态与
-/// inode/块分配）。加入 tid 后：同 CPU 他人持有且仍存活（已迁移）→ 真互斥
-/// 退避等待；持有者 tid 已死亡 → 死锁自愈，CAS 抢锁接管（继承旧 CPU-token
-/// 方案「持锁任务死亡后同 CPU 后续任务自然接管」的自愈性）。
-/// ★ tid 必须与 CPU/深度同字：此前 tid 存独立变量，「CAS 成功 → 存 tid」
-/// 两步之间同 CPU 新任务可能据陈旧 tid 误判持有者已死、CAS 接管成功 →
-/// 双任务并发进入临界区（SMP 竞态，恰逢抢占即触发）。
+/// ★ 持有身份必须是 tid 而非 (CPU, TID) 双令牌：`pick_next` 无核间亲和，
+/// 持锁任务可被抢占迁移到其它核——此后 (a) 迁移走的持有者再重入
+/// fs_lock 时按旧 CPU 位判「他人持有」死锁退避；(b) 其 fs_unlock 因
+/// `w>>32 != 当前核` 误走「非持有者」兜底而**无条件清零**，嵌套深度
+/// 丢失：外层临界区尚未退出锁已被释放，他任务重入 → 并发交错
+/// PENDING_*/SCRATCH_* 事务状态与 inode/块分配。两处都以 tid 判定后，
+/// 迁移只影响诊断位，不影响正确性。
+/// tid 必须与深度同字（此前 tid 存独立变量的两步窗口已由单字编码消除）。
+/// 持有者已死亡（tid 不再存活）→ 死锁自愈：任意核 CAS 抢锁接管，继承
+/// 「持锁任务死亡后后续任务自然接管」的自愈性。
 /// 等待者做**短睡眠轮询退避**（sleep_until 1ms，处于 Blocked 而非 Ready）：
 /// 不阻塞调度器、不忙等，且**不存在优先级饿死** —— 把锁让给持锁的低优先级
 /// 任务（实时音频任务等优先级高于普通任务时不会被 spin-yield 绕死），
 /// 持锁任务被抢占后仍会被再次调度并最终释放（无死锁）。
 static FS_LOCKED: AtomicU64 = AtomicU64::new(0);
 
-fn fs_lock() {
+/// FS 临界区锁（TID 单令牌、可重入）。pub 供 vfs::rename 把「目标打开
+/// 检查 → fs_rename」封进同一临界区（锁外检查存在 TOCTOU：检查通过到
+/// 取锁之间目标被打开，rename 仍会回收打开中的 inode → fd 与新文件别名）。
+pub fn fs_lock() {
     let cpu = crate::smp::cpu_id() as u64;
     let cur_tid = crate::sched_cfs::current_tid() as u64;
     loop {
         let w = FS_LOCKED.load(Ordering::Acquire);
-        if w == 0 {
-            // 单 CAS 同时写入 CPU 与 tid（无两步窗口）
+        let holder = (w >> 16) & 0xFFFF;
+        if w != 0 && holder == cur_tid {
+            // 本任务已持有（含迁移到其它核后重入：tid 才是持有身份）：
+            // 重入深度 +1（CAS 循环防与并发解锁交错）。
             if FS_LOCKED
-                .compare_exchange(0, (cpu << 32) | (cur_tid << 16) | 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(w, w + 1, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
                 return;
             }
-        } else if w >> 32 == cpu {
-            let holder = (w >> 16) & 0xFFFF;
-            if holder == cur_tid {
-                // 本 CPU 本任务已持有：重入深度 +1
-                FS_LOCKED.store(w + 1, Ordering::Relaxed);
+            continue;
+        }
+        if w == 0 || holder == 0 || !crate::sched_cfs::tid_alive(holder as u32) {
+            // 空闲，或持有者已死亡（不会再释放）：单 CAS 同时写入 CPU 与
+            // tid（无两步窗口）并复位深度。
+            if FS_LOCKED
+                .compare_exchange(
+                    w,
+                    (cpu << 32) | (cur_tid << 16) | 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 return;
             }
-            if holder == 0 || !crate::sched_cfs::tid_alive(holder as u32) {
-                // 持有者已死亡且锁在同 CPU 记录下：夺回（CAS 防止与迁移
-                // 走的原持有者的解锁竞态——若其恰好已释放则本轮重试）
-                if FS_LOCKED
-                    .compare_exchange(w, (cpu << 32) | (cur_tid << 16) | 1, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return;
-                }
-            }
-            // 同 CPU 他人持有且存活（已迁移到其它核）：真互斥，退避等待
         }
-        // 1ms 轮询退避：等待者进入可调度-阻塞态（Blocked），把 CPU 留给持锁
-        // 任务（含低优先级），杜绝 spin-yield 下「高优先级等待者饿死低优先级
-        // 持锁者」的活锁；唤醒后重试 CAS。
+        // 他人持有且存活（含迁移中的原持有者）：真互斥。1ms 轮询退避：
+        // 等待者进入可调度-阻塞态（Blocked），把 CPU 留给持锁任务（含低
+        // 优先级），杜绝 spin-yield 下「高优先级等待者饿死低优先级持锁者」
+        // 的活锁；唤醒后重试 CAS。
         crate::sched_cfs::sleep_until(crate::timer::now_us() + 1000);
     }
 }
 
-fn fs_unlock() {
-    let cpu = crate::smp::cpu_id() as u64;
-    let w = FS_LOCKED.load(Ordering::Acquire);
-    if w == 0 || w >> 32 != cpu {
-        // 防御：非持有者调用（全局状态曾被污染的兜底）。直接释放，避免锁被
-        // 永久持有导致整个系统 FS 死锁；调用方随后按失败路径恢复。
-        FS_LOCKED.store(0, Ordering::Release);
+pub fn fs_unlock() {
+    let cur_tid = crate::sched_cfs::current_tid() as u64;
+    loop {
+        let w = FS_LOCKED.load(Ordering::Acquire);
+        if w == 0 {
+            return;
+        }
+        let holder = (w >> 16) & 0xFFFF;
+        if holder == cur_tid {
+            // 持有者本尊（含迁移后：tid 身份与所在核无关）：深度 -1，归零
+            // 才真正释放（CAS 循环防与并发重入交错）。
+            let new = if w & 0xFFFF <= 1 { 0 } else { w - 1 };
+            if FS_LOCKED
+                .compare_exchange(w, new, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            continue;
+        }
+        if holder == 0 || !crate::sched_cfs::tid_alive(holder as u32) {
+            // 防御自愈：持有者已死未释放 → 清零防全局 FS 死锁。仅限死亡
+            // 情形——此前对存活持有者也无条件清零，任何非持有者误调都会
+            // 撕开互斥（并发入临界区）。
+            if FS_LOCKED
+                .compare_exchange(w, 0, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            continue;
+        }
+        // 持有者存活且非本任务：误调，不动锁。
         return;
-    }
-    if w & 0xFFFF <= 1 {
-        FS_LOCKED.store(0, Ordering::Release);
-    } else {
-        FS_LOCKED.store(w - 1, Ordering::Relaxed);
     }
 }
 
@@ -551,6 +585,10 @@ fn parse_sb(sb: &[u8; BLK_SIZE], c: &mut DevState) -> bool {
         || c.bmap_blocks as usize > MAX_BMAP_BLOCKS
         || c.data_start as usize >= c.total as usize
         || c.inode_start as usize >= c.data_start as usize
+        // ★ inode 容量护栏：镜像的 inode 表几何必须与本内核编译常量一致。
+        // 旧 256-inode 镜像的 jlog 紧跟 16 块 inode 表，本内核按 32 块推位
+        // 会把 ino 256..511 的读写打进旧日志区（静默损坏），必须拒绝挂载。
+        || c.num_inodes as usize != MAX_INODES
     {
         return false;
     }
@@ -877,6 +915,9 @@ fn checkpoint(major: u32) -> i32 {
     // 存在 copy-out 失败的已提交记录时禁止 head 前移：该记录必须保持可重放，
     // 否则其元数据更新会永久丢失（见 COPYOUT_FAILED 注释）。
     if unsafe { COPYOUT_FAILED[(major as usize) % 16] } {
+        crate::uart_send_str("[sfs] checkpoint 被 COPYOUT_FAILED 阻塞 major=");
+        crate::print_dec(major as u64);
+        crate::uart_send_str("\n");
         return -1;
     }
     let c = dev_mut(major);
@@ -1214,6 +1255,11 @@ fn commit_inner(major: u32) -> i32 {
         // 元数据 copy-out 失败：日志记录保持可重放（head 不前移，见
         // COPYOUT_FAILED），向调用方报错；RAM 状态保持本事务结果（与磁盘
         // 暂不一致，由重放/后续成功的检查点收敛）。
+        crate::uart_send_str("[sfs] copy-out 失败 major=");
+        crate::print_dec(major as u64);
+        crate::uart_send_str(" blk=");
+        crate::print_dec(unsafe { PENDING_TARGET[0] } as u64);
+        crate::uart_send_str("\n");
         let mi = (major as usize) % 16;
         unsafe { COPYOUT_FAILED[mi] = true };
         unsafe {
@@ -2148,6 +2194,19 @@ pub fn fs_write(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
     r
 }
 
+/// O_APPEND 原子追加：取尾与写入在同一临界区完成。
+///
+/// 若分两步（先 fs_size 后 fs_write，各自加锁），两个并发追加者会取到
+/// 同一尾部偏移、写至同一位置——后写覆盖先写（文件信箱丢消息）。文件
+/// 信箱（audiod.ctl / rild.cmd / wifid.pipe 等多写者管道）依赖本语义。
+pub fn fs_write_append(major: u32, ino: u32, buf: &[u8]) -> i32 {
+    fs_lock();
+    let off = fs_size_unlocked(major, ino) as usize;
+    let r = fs_write_unlocked(major, ino, off, buf);
+    fs_unlock();
+    r
+}
+
 fn fs_write_unlocked(major: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
     txn_begin(major);
     let mut inode = [0u8; INODE_SIZE];
@@ -2345,9 +2404,10 @@ fn fs_unlink_unlocked(major: u32, dir_ino: u32, name: &str) -> i32 {
 
 /// 重命名：把 `old_dir` 下的 `old_name` 移到 `new_dir` 下的 `new_name`。
 ///
-/// 仅支持普通文件与符号链接；目标已存在时拒绝。两个目录项变更在同一
-/// 日志事务中原子提交（掉电不会出现「旧项已删新项未加」的丢失状态）。
-/// 成功返回 0；失败 -1。
+/// 仅支持普通文件与符号链接；目标已存在且同为普通文件/符号链接时按 POSIX
+/// 语义原子替换（同一日志事务内摘除目标目录项并截断、回收其 inode——掉电
+/// 不会出现「旧项已删新项未加」或「目标半删」状态）。目标为目录、源不存在
+/// 或回收失败则整体回滚。成功返回 0；失败 -1。
 pub fn fs_rename(major: u32, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> i32 {
     fs_lock();
     let r = fs_rename_unlocked(major, old_dir, old_name, new_dir, new_name);
@@ -2381,9 +2441,30 @@ fn fs_rename_unlocked(major: u32, old_dir: u32, old_name: &str, new_dir: u32, ne
         txn_abort(major);
         return -1;
     }
-    if fs_lookup_unlocked(major, new_dir, new_name) >= 0 {
-        txn_abort(major);
-        return -1;
+    // POSIX 覆盖语义：目标已存在时在同一事务内摘除并回收（摘目录项 + 截断
+    // + inode_free，与 fs_unlink_unlocked 同序列）。目录项替换与源移动对
+    // 掉电是单个原子事务。「临时文件 + rename 原子提交」依赖此语义：崩溃
+    // 后要么看到完整旧文件、要么看到完整新文件，绝无中间态。
+    let tgt = fs_lookup_unlocked(major, new_dir, new_name);
+    if tgt >= 0 {
+        let tgt = tgt as u32;
+        let tty = fs_type_unlocked(major, tgt);
+        if tgt != ino as u32 && (tty != T_REG && tty != T_SYM) {
+            // 目标是目录/FIFO 等不可覆盖类型
+            txn_abort(major);
+            return -1;
+        }
+        if tgt != ino as u32 {
+            if dir_remove_entry(major, new_dir, new_name) < 0 {
+                txn_abort(major);
+                return -1;
+            }
+            if fs_truncate_unlocked(major, tgt) != 0 {
+                txn_abort(major);
+                return -1;
+            }
+            inode_free(major, tgt);
+        }
     }
     if dir_remove_entry(major, old_dir, old_name) < 0 {
         txn_abort(major);
@@ -2466,6 +2547,22 @@ pub fn fs_total_blocks(major: u32) -> u32 {
 /// 块大小（字节）：SFS 以 4KB 块为计数单位。
 pub fn fs_block_size(_major: u32) -> u32 {
     BLK_SIZE as u32
+}
+
+/// 空闲 inode 数（RAM 位图权威计数；inode 耗尽的排查出口——df 直接可见）。
+pub fn fs_free_inodes(major: u32) -> u32 {
+    fs_lock();
+    let r = dev_mut(major).free_inodes;
+    fs_unlock();
+    r
+}
+
+/// inode 总数（卷容量）。
+pub fn fs_total_inodes(major: u32) -> u32 {
+    fs_lock();
+    let r = dev_mut(major).num_inodes;
+    fs_unlock();
+    r
 }
 
 /// 读取 inode 的类型码。

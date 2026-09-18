@@ -43,7 +43,8 @@ SHARED_SRC := $(TOPDIR)/shared/ttf_text.rs $(TOPDIR)/shared/font_render.rs \
               $(TOPDIR)/shared/nav.rs $(TOPDIR)/shared/app_kit.rs $(TOPDIR)/shared/error_ui.rs \
               $(TOPDIR)/shared/cursor_overlay.rs $(TOPDIR)/shared/ds.rs \
               $(TOPDIR)/shared/lifecycle.rs $(TOPDIR)/shared/sensor_client.rs \
-              $(TOPDIR)/shared/cursor_sprite.rs $(TOPDIR)/shared/cursor.rgba
+              $(TOPDIR)/shared/cursor_sprite.rs $(TOPDIR)/shared/cursor.rgba \
+              $(TOPDIR)/shared/dialog.rs
 APPS      := $(TOPDIR)/apps
 LAUNCHER  := $(APPS)/launcher
 SETTINGS  := $(APPS)/settings
@@ -117,6 +118,7 @@ NOTES_ELF    := $(NOTES)/target/$(TARGET)/release/notes
 LCAPP_ELF    := $(LCAPP)/target/$(TARGET)/release/lcapp
 PKG_ELF      := $(KUNXPKG)/target/$(TARGET)/release/kunxpkg
 AUDIOTEST_ELF := $(APPS)/audiotest/target/$(TARGET)/release/audiotest
+TLSTEST_ELF  := $(APPS)/tlstest/target/$(TARGET)/release/tlstest
 AUDIOMIX_ELF  := $(APPS)/audiomix/target/$(TARGET)/release/audiomix
 AUDIOLAT_ELF  := $(APPS)/audiolat/target/$(TARGET)/release/audiolat
 RILD_ELF      := $(RILD)/target/$(TARGET)/release/rild
@@ -176,7 +178,7 @@ else
   CARGO_FEATURES := --features qemu
 endif
 
-.PHONY: all kernel pi4 init networkd test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
+.PHONY: all kernel pi4 init networkd test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
 
 all: kernel
 
@@ -261,6 +263,10 @@ $(foreach a,phone sms contacts browser clock calendar camera gallery music mail 
 
 $(AUDIOTEST_ELF): $(shell find $(APPS)/audiotest/src -name '*.rs') $(APPS)/audiotest/Cargo.toml $(APPS)/audiotest/build.rs $(APPS)/audiotest/linker.ld $(TOPDIR)/shared/audio.rs
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(APPS)/audiotest/Cargo.toml
+
+# 浏览器 TLS 栈来宾侧自测（复用 apps/browser/src/tls/）
+$(TLSTEST_ELF): $(shell find $(APPS)/tlstest/src -name '*.rs') $(shell find $(APPS)/browser/src/tls -name '*.rs') $(APPS)/tlstest/Cargo.toml $(APPS)/tlstest/build.rs $(APPS)/tlstest/linker.ld
+	$(CARGO) build --release --target $(TARGET) --manifest-path $(APPS)/tlstest/Cargo.toml
 
 $(AUDIOMIX_ELF): $(shell find $(APPS)/audiomix/src -name '*.rs') $(APPS)/audiomix/Cargo.toml $(APPS)/audiomix/build.rs $(APPS)/audiomix/linker.ld $(TOPDIR)/shared/audio.rs
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(APPS)/audiomix/Cargo.toml
@@ -365,7 +371,7 @@ $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done: $(CALC_ELF) $(TERMINAL_ELF) $(NOTES_
 $(ROOTFS)/var/lib/pkg/available: $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done
 	cp -f $(ROOTFS)/var/lib/pkg/repo/main/Packages $@
 
-$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
+$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
 	@mkdir -p $(ROOTFS)/bin $(ROOTFS)/dev $(ROOTFS)/etc/init.d $(ROOTFS)/proc \
 		$(ROOTFS)/tmp $(ROOTFS)/var/run $(ROOTFS)/var/log $(ROOTFS)/data $(ROOTFS)/data/oobe \
 		$(ROOTFS)/data/photos $(ROOTFS)/data/videos \
@@ -411,6 +417,7 @@ $(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(SENSORD_ELF) $(P
 	cp -f $(LCAPP_ELF) $(ROOTFS)/bin/lcapp
 	cp -f $(PKG_ELF) $(ROOTFS)/bin/pkg
 	cp -f $(AUDIOTEST_ELF) $(ROOTFS)/bin/audiotest
+	cp -f $(TLSTEST_ELF) $(ROOTFS)/bin/tlstest
 	cp -f $(AUDIOMIX_ELF) $(ROOTFS)/bin/audiomix
 	cp -f $(AUDIOLAT_ELF) $(ROOTFS)/bin/audiolat
 	cp -f $(RILD_ELF) $(ROOTFS)/bin/rild
@@ -556,6 +563,9 @@ TEST_SFSRACE_LOG := /tmp/kunxos-sfsrace.log
 test-sfsrace: $(SFSRACE_ELF)
 	@touch $(ROOTFS)/sfsrace-test
 	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
+	# mkfs 与上次 cargo 编译同秒时，mtime 粒度内 cargo 误判 Fresh → 测试标记
+	# 不重嵌进 kernel.img（间歇性 FAIL 根因）。强制 mtime 前进触发重编。
+	@touch $(RAMDISK)
 	@$(MAKE) kernel
 	@rm -f $(TEST_SFSRACE_LOG)
 	@echo "== running sfsrace in QEMU (headless) =="
@@ -566,6 +576,26 @@ test-sfsrace: $(SFSRACE_ELF)
 	@rm -f $(ROOTFS)/sfsrace-test
 	@grep -q "SFS-RACE PASS" $(TEST_SFSRACE_LOG) && echo "SFS RACE TEST: PASS" \
 		|| (echo "SFS RACE TEST: FAIL (see $(TEST_SFSRACE_LOG))"; exit 1)
+
+# ---- 并发信箱压测（rename 原子提交/认领） ----
+# 复用 sfsrace 二进制（内含信箱压测阶段）：阶段A 3 写者 O_APPEND 并发追加 +
+# 父进程 rename 认领消费（断言无丢失/无重复/无半行/轮询有界=无死锁）；
+# 阶段B 1 写者 tmp+fsync+rename 原子发布 + 1 读者并发整读（断言无撕裂、
+# 版本单调、终值可见）。断言串口日志同时含 "SFS-RACE PASS" 与 "MAILBOX PASS"。
+TEST_MAILBOX_LOG := /tmp/kunxos-mailbox.log
+
+test-mailbox: $(SFSRACE_ELF)
+	@touch $(ROOTFS)/sfsrace-test
+	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
+	@$(MAKE) kernel
+	@rm -f $(TEST_MAILBOX_LOG)
+	@echo "== running mailbox stress in QEMU (headless) =="
+	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+		-device virtio-rng-device | tee $(TEST_MAILBOX_LOG)
+	@rm -f $(ROOTFS)/sfsrace-test
+	@grep -q "SFS-RACE PASS" $(TEST_MAILBOX_LOG) && grep -q "MAILBOX PASS" $(TEST_MAILBOX_LOG) \
+		&& echo "MAILBOX TEST: PASS" \
+		|| (echo "MAILBOX TEST: FAIL (see $(TEST_MAILBOX_LOG))"; exit 1)
 
 # ---- 音频自动化测试（audiomix 混音/焦点 + audiolat 延迟） ----
 # 默认镜像不含 /etc/audio-test 标记（每次开机串行跑 audiomix+audiolat 5 会
@@ -626,12 +656,17 @@ run-disk: kernel $(DISK_IMG)
 		-device virtio-rng-device -audiodev none,id=aud0 -device AC97,audiodev=aud0 \
 		-nographic -no-reboot
 
-# SMP 多核：QEMU -kernel 直载模式无 PSCI（secondary 核需 EL3 固件唤醒，
-# 见 kunxcore/src/smp.rs 说明），此目标用于观察 cpus=N 检测与单核回退；
-# 多核调度代码（每核 CURRENT/idle/定时器/自旋锁）在具备 PSCI 的环境生效。
+# SMP 多核（-smp 2）：已真实打通——PSCI CPU_ON 经 DTB /psci 检测的 HVC
+# conduit 唤醒副核（QEMU virt 默认 secure=off 时 method="hvc"，QEMU 自身
+# 拦截 hvc 分派 PSCI，无需 EL3 固件；此前实测失败是误用 smc conduit）。
+# 副核每核 idle/tick + 全局就绪队列负载均衡，verbose 启动可见：
+#   [smp] PSCI version=0x10001 在线核数=2 / [smp] cpu1 已上线
+# ★ 实验性：sfsrace 全量并发压测在 -smp 2 下仍偶发任务表踩踏（已列
+# SMP 债务之外的深层竞态，见 BUG_REPORT SMP 专项），默认回归与发布
+# 仍以单核为准；此目标用于 SMP 开发与观察（-append verbose 看完整日志）。
 run-smp: kernel
 	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -smp 2 -m 512M -kernel $(KERNEL_IMG) \
-		-nographic -no-reboot
+		-append "verbose" -nographic -no-reboot
 
 # Pi 4 bootloader 骨架编译检查。
 boot-pi4:

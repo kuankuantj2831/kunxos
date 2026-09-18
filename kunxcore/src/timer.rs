@@ -42,13 +42,20 @@ unsafe fn read_cntvct() -> u64 {
 }
 
 /// 当前时刻（微秒，基于虚拟计数器），用于网络超时等需要真实时间的场景。
+///
+/// ★ 此前 `freq/1_000_000` 先截断再除计数器：CNTFRQ=62.5MHz 时 d=62，
+/// 每秒慢 ~0.8%（perf 帧统计 / 交互 deadline / 网络超时全部同比偏大）。
+/// 改 `(cnt/freq)*1e6 + (cnt%freq)*1e6/freq`，全程 u64 无溢出。
 pub fn now_us() -> u64 {
     let freq = unsafe { read_cntfrq() };
-    let d = freq / 1_000_000;
-    if d == 0 {
-        return 0; // 频率 < 1MHz 时无法细分微秒，避免除零
+    if freq == 0 {
+        return 0;
     }
-    (unsafe { read_cntvct() }) / d
+    let cnt = unsafe { read_cntvct() };
+    let secs = cnt / freq;
+    let frac = cnt % freq;
+    secs.saturating_mul(1_000_000)
+        .saturating_add(frac.saturating_mul(1_000_000) / freq)
 }
 
 /// 写 `CNTV_TVAL_EL0`（虚拟定时器递减初值）。

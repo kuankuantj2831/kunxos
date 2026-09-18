@@ -80,6 +80,10 @@ pub struct ElfImage {
     pub pt: alloc::boxed::Box<vm::ProcPageTable>,
     /// 初始程序断点：所有 PT_LOAD 段 (vaddr + memsz) 的最大值按页对齐。
     pub brk: usize,
+    /// 程序头表在用户空间的虚拟地址（供 auxv AT_PHDR；musl 静态启动必需）。
+    pub phdr_va: usize,
+    pub phnum: usize,
+    pub phentsize: usize,
 }
 
 // ==================== 用户进程注册表 ====================
@@ -241,6 +245,9 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
     }
     let mut brk = 0usize;
     let mut mapped = 0usize;
+    // 程序头表落在哪个 PT_LOAD 段内（auxv AT_PHDR 用；找不到则置 0，
+    // musl 单线程静态程序在 phnum=0 时仍能完成最小 TLS 初始化）
+    let mut phdr_va = 0usize;
 
     // 所有失败路径统一清理已分配的页与页表，防止恶意/损坏 ELF 反复
     // 加载耗尽物理内存（内核 DoS）。
@@ -292,6 +299,13 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
             None => fail!(),
         };
         brk = brk.max(seg_end);
+        // 程序头表位于本段文件映像内 → 记录其虚拟地址
+        if phdr_va == 0
+            && phoff >= p_offset
+            && phoff.checked_add(phnum * phentsize).map_or(false, |e| e <= p_offset + p_filesz)
+        {
+            phdr_va = p_vaddr + (phoff - p_offset);
+        }
 
         let flags = seg_flags(p_flags);
         let start = p_vaddr & !(vm::PAGE_SIZE - 1);
@@ -403,6 +417,9 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
         entry,
         pt,
         brk: brk_init,
+        phdr_va,
+        phnum,
+        phentsize,
     })
 }
 
@@ -458,12 +475,23 @@ fn stack_write_u64(pages: &[usize; STACK_PAGES], base: usize, va: usize, v: u64)
 ///
 /// 映射记录表满（`add_page` 失败）时回滚已分配栈页并返回 `None`，
 /// 由调用方清理地址空间（避免泄漏 + fork 不一致）。
+/// auxv 构造所需的启动信息（musl/glibc 静态程序必需）。
+pub struct AuxInit<'a> {
+    pub phdr_va: usize,
+    pub phnum: usize,
+    pub phentsize: usize,
+    pub entry: usize,
+    pub exec_path: &'a str,
+    pub uid: u64,
+}
+
 #[inline(never)]
 fn setup_stack(
     pt: &mut vm::ProcPageTable,
     argv: &[&str],
     envp: &[&str],
     stack_top: usize,
+    aux: Option<&AuxInit>,
 ) -> Option<(usize, usize)> {
     let stack_base = stack_top - vm::USER_STACK_SIZE;
     let mut pages: [usize; STACK_PAGES] = [0; STACK_PAGES];
@@ -511,8 +539,68 @@ fn setup_stack(
         env_addrs[i] = sp;
     }
 
-    // 2. 16 字节对齐
+    // 1.5 auxv 附属数据：AT_RANDOM 16 字节随机数 + AT_EXECFN 路径串
+    // （位于指针区上方；musl 经 AT_EXECFN/AT_RANDOM 指针读取）
+    let mut random_addr = 0usize;
+    let mut execfn_addr = 0usize;
+    if aux.is_some() {
+        let mut rb = [0u8; 16];
+        if crate::virtio_rng::get_random(&mut rb) <= 0 {
+            // 熵源不可用：时间回退（仅影响 stack canary 强度）
+            let t = crate::timer::now_us().to_le_bytes();
+            for i in 0..16 {
+                rb[i] = t[i % 8] ^ (i as u8).wrapping_mul(0x9E);
+            }
+        }
+        sp -= 16;
+        stack_write(&pages, stack_base, sp, &rb);
+        random_addr = sp;
+        let pth = aux.map(|a| a.exec_path).unwrap_or("");
+        sp -= pth.len() + 1;
+        stack_write(&pages, stack_base, sp, pth.as_bytes());
+        stack_write(&pages, stack_base, sp + pth.len(), &[0]);
+        execfn_addr = sp;
+    }
+
+    // 2. 16 字节对齐（argv/envp/auxv 指针区与 argc 共偶数个 8 字节槽则
+    // 天然对齐，奇数时补一空槽在指针区顶）
     sp &= !0xFusize;
+
+    // 2.5 对齐垫片（按下述压栈总数奇偶决定，先占位判断）
+    // 压栈时间顺序（自顶向下）：垫片 → auxv(AT_NULL 起倒序) → envp NULL →
+    // envp 指针 → argv NULL → argv 指针 → argc。
+    // 向上读出的最终布局：argc | argv | NULL | envp | NULL | auxv..AT_NULL。
+    let auxv = aux.map(|ai| {
+        build_auxv(
+            ai.phdr_va,
+            ai.phnum,
+            ai.phentsize,
+            ai.entry,
+            random_addr,
+            execfn_addr,
+            ai.uid,
+        )
+    });
+    let aux_cnt = auxv.as_ref().map_or(0, |v| v.len());
+    let qwords = 2 * aux_cnt + 1 + envc + 1 + argc + 1;
+    if qwords % 2 == 1 {
+        sp -= 8;
+        stack_write_u64(&pages, stack_base, sp, 0);
+    }
+
+    // auxv 对（含末尾 AT_NULL）：先压 AT_NULL（最高位），再倒序压其余对
+    if let Some(v) = &auxv {
+        sp -= 8;
+        stack_write_u64(&pages, stack_base, sp, 0);
+        sp -= 8;
+        stack_write_u64(&pages, stack_base, sp, AT_NULL);
+        for &(k, val) in v.iter().rev().skip(1) {
+            sp -= 8;
+            stack_write_u64(&pages, stack_base, sp, val);
+            sp -= 8;
+            stack_write_u64(&pages, stack_base, sp, k);
+        }
+    }
 
     // 3. envp 终止符（NULL）
     sp -= 8;
@@ -539,6 +627,53 @@ fn setup_stack(
     stack_write_u64(&pages, stack_base, sp, argc as u64);
 
     Some((sp, stack_base))
+}
+
+/// auxv 键（Linux ABI）。
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+const AT_EXECFN: u64 = 31;
+
+/// 为 musl/glibc 风格启动构造 auxv 数组（AT_RANDOM/AT_EXECFN 数据已由
+/// setup_stack 写到栈上，此处只填键值对）。
+fn build_auxv(
+    phdr_va: usize,
+    phnum: usize,
+    phentsize: usize,
+    entry: usize,
+    random_ptr: usize,
+    execfn_ptr: usize,
+    uid: u64,
+) -> alloc::vec::Vec<(u64, u64)> {
+    let mut v = alloc::vec::Vec::with_capacity(20);
+    v.push((AT_PHDR, phdr_va as u64));
+    v.push((AT_PHENT, phentsize as u64));
+    v.push((AT_PHNUM, phnum as u64));
+    v.push((AT_PAGESZ, vm::PAGE_SIZE as u64));
+    v.push((AT_ENTRY, entry as u64));
+    v.push((AT_UID, uid));
+    v.push((AT_EUID, uid));
+    v.push((AT_GID, uid));
+    v.push((AT_EGID, uid));
+    v.push((AT_HWCAP, 0));
+    v.push((AT_CLKTCK, 100));
+    v.push((AT_SECURE, 0));
+    v.push((AT_RANDOM, random_ptr as u64));
+    v.push((AT_EXECFN, execfn_ptr as u64));
+    v.push((AT_NULL, 0));
+    v
 }
 
 // ==================== 标准输入输出 ====================
@@ -612,7 +747,14 @@ fn user_trampoline(pid: usize) -> ! {
 
 /// 加载 ELF 并启动为用户进程，返回 pid；失败返回 `u32::MAX`。
 #[inline(never)]
+/// 兼容入口：无环境变量（等价 `spawn_env(name, data, argv, &[])`）。
 pub fn spawn(name: &'static str, data: &[u8], argv: &[&str]) -> u32 {
+    spawn_env(name, data, argv, &[])
+}
+
+/// 带环境变量创建进程（envp 元素为 "NAME=VALUE" 形式；压入初始用户栈，
+/// musl __init_libc 经 argv/envp 指针数组读取）。
+pub fn spawn_env(name: &'static str, data: &[u8], argv: &[&str], envp: &[&str]) -> u32 {
     let mut img = match load(data) {
         Ok(i) => i,
         Err(e) => {
@@ -623,7 +765,15 @@ pub fn spawn(name: &'static str, data: &[u8], argv: &[&str]) -> u32 {
         }
     };
     let stack_top = aslr_stack_top();
-    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, &[], stack_top) {
+    let aux = AuxInit {
+        phdr_va: img.phdr_va,
+        phnum: img.phnum,
+        phentsize: img.phentsize,
+        entry: img.entry,
+        exec_path: name,
+        uid: 0,
+    };
+    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, envp, stack_top, Some(&aux)) {
         Some((sp, base)) => (sp, base),
         None => {
             // 栈映射失败：回滚整个新地址空间（load 的页 + 页表）
@@ -740,7 +890,15 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
 
     // 3. 准备新用户栈（ASLR 随机化区顶；失败则回滚新地址空间，旧进程不变）
     let stack_top = aslr_stack_top();
-    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, envp, stack_top) {
+    let aux = AuxInit {
+        phdr_va: img.phdr_va,
+        phnum: img.phnum,
+        phentsize: img.phentsize,
+        entry: img.entry,
+        exec_path: path,
+        uid: 0,
+    };
+    let (initial_sp, stack_base) = match setup_stack(&mut img.pt, argv, envp, stack_top, Some(&aux)) {
         Some((sp, base)) => (sp, base),
         None => {
             crate::uart_send_str("[diag] execve 栈映射失败 (");
@@ -843,6 +1001,11 @@ fn basename(path: &str) -> &str {
 /// 从文件系统路径读取 ELF 并启动为用户进程，返回 pid；失败返回 -1。
 #[inline(never)]
 pub fn spawn_from_path(path: &'static str, argv: &[&str]) -> i32 {
+    spawn_from_path_env(path, argv, &[])
+}
+
+/// 同 [`spawn_from_path`]，但把 `envp`（"NAME=VALUE"）传入初始栈。
+pub fn spawn_from_path_env(path: &'static str, argv: &[&str], envp: &[&str]) -> i32 {
     let t0 = timer::now_us();
     // 读入缓冲按文件实际大小堆分配（此前固定 64KB：launcher 等大应用被静默
     // 截断后 load 必然失败，shell `run` 只能看到笼统的"加载失败"）。
@@ -885,7 +1048,12 @@ pub fn spawn_from_path(path: &'static str, argv: &[&str]) -> i32 {
         Some(i) if i + 1 < path.len() => &path[i + 1..],
         _ => path,
     };
-    let pid = spawn(name, unsafe { core::slice::from_raw_parts(buf as *const u8, total) }, argv);
+    let pid = spawn_env(
+        name,
+        unsafe { core::slice::from_raw_parts(buf as *const u8, total) },
+        argv,
+        envp,
+    );
     unsafe { crate::heap::kfree(buf) };
     if is_gui_app(name) {
         sched_cfs::set_current_nice(-3);

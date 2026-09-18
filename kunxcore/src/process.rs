@@ -16,6 +16,7 @@
 //! 返回 `fork()` 的调用点 —— 从而获得“父返回 pid、子返回 0”的标准语义。
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::allocator;
 use crate::sched_cfs::{self, PriorityClass, TaskContext};
@@ -33,6 +34,16 @@ pub const FD_MAX: usize = 16;
 /// 一启动就进测试模式并自动关机的直接原因。扩到 24：常驻 15 + sfsrace 6 子进程
 /// + 余量，fork 不再因进程表满而失败。
 pub const MAX_PROC: usize = 24;
+
+/// SMP：进程槽位认领位（1 = 分配中/回收中），与 `PROCESSES` 平行。
+///
+/// 此前槽位分配/回收的 Free 窗口无互斥：他核 `alloc_pid` 扫描见 Free 即
+/// 返回，与 `reap`「置 Free → 释放 fd/页表 → 清零 PCB」交错时双方同时
+/// 写同一槽位（新 PCB 半初始化即被清零、新页表被 reap 释放）。每槽一枚
+/// 认领位：`alloc_pid` 认领后持至 `state=Running` 写回（或失败清零后）
+/// 释放；`reap` 在 Zombie→Free 前认领、PCB 清零后释放。认领只独占单个
+/// 槽位，不阻塞其他槽位的并发分配（fork 的长地址空间复制不放大临界区）。
+static PROC_CLAIM: [AtomicU32; MAX_PROC] = [const { AtomicU32::new(0) }; MAX_PROC];
 /// 进程名上限。
 const MAX_NAME: usize = 16;
 /// 每个进程可登记的等待线程数（`wait(pid)` 多等待者：并发 wait 各自登记，
@@ -248,15 +259,38 @@ do_fork:
 
 // ==================== 内部辅助 ====================
 
+/// 认领一个 Free 槽位（原子，SMP）。
+///
+/// 认领成功后调用方**独占该槽位**，直到 `state=Running` 写回（成功）或
+/// 槽位清零（失败），期间必须调用 [`proc_claim_release`] 释放，漏调会把
+/// 该槽位永久占用（fork 慢性泄漏直至进程表满）。
 fn alloc_pid() -> u32 {
     unsafe {
         for i in 0..MAX_PROC {
+            if PROCESSES[i].state != ProcessState::Free {
+                continue;
+            }
+            if PROC_CLAIM[i].compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err()
+            {
+                continue; // 他核正在分配/回收此槽位
+            }
+            // 复查：认领成功即独占该槽位的 Free 生命周期（reap 亦须先取
+            // 认领才能置 Free），此处仅对认领前的陈旧 state 读双保险。
             if PROCESSES[i].state == ProcessState::Free {
                 return i as u32;
             }
+            PROC_CLAIM[i].store(0, Ordering::Release);
         }
     }
     u32::MAX
+}
+
+/// 释放槽位认领（分配成功 `state=Running` 已写回，或失败路径槽位已
+/// 清零/从未写入之后）。
+fn proc_claim_release(pid: u32) {
+    if (pid as usize) < MAX_PROC {
+        PROC_CLAIM[pid as usize].store(0, Ordering::Release);
+    }
 }
 
 fn set_name(pid: u32, name: &str) {
@@ -656,6 +690,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                     allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
                 }
             }
+            proc_claim_release(pid);
             unsafe { asm!("msr daifclr, #2") };
             return -1;
         }
@@ -675,6 +710,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
             }
         }
+        proc_claim_release(pid);
         unsafe { asm!("msr daifclr, #2") };
         return -1;
     }
@@ -763,10 +799,12 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
             }
         }
+        proc_claim_release(child_pid);
         unsafe { asm!("msr daifclr, #2") };
         return -1;
     }
 
+    proc_claim_release(child_pid);
     unsafe { asm!("msr daifclr, #2") };
     child_pid as i32
 }
@@ -849,7 +887,10 @@ pub fn spawn(
     // 返回即可，槽位可复用。
     let pt = match vm::ProcPageTable::try_new_boxed() {
         Some(pt) => pt,
-        None => return u32::MAX,
+        None => {
+            proc_claim_release(pid);
+            return u32::MAX;
+        }
     };
     let ttbr0 = pt.ttbr0;
     unsafe {
@@ -890,8 +931,10 @@ pub fn spawn(
             }
         }
         }
+        proc_claim_release(pid);
         return u32::MAX;
     }
+    proc_claim_release(pid);
     pid
 }
 
@@ -935,6 +978,7 @@ pub fn create_process(mut pt: alloc::boxed::Box<vm::ProcPageTable>, name: &str) 
         core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
     }
     set_name(pid, name);
+    proc_claim_release(pid);
     pid
 }
 
@@ -1174,6 +1218,13 @@ pub fn reap_forced(pid: u32) {
     if (pid as usize) >= MAX_PROC {
         return;
     }
+    // SMP：与 alloc_pid/reap 互斥（清零期间他核不得认领复用）。非阻塞：
+    // 认领失败即放弃（本函数仅「刚创建即失败」的单一调用路径）。
+    if PROC_CLAIM[pid as usize].compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     unsafe {
         let ttbr0 = PROCESSES[pid as usize].pt.ttbr0;
         for fd in 0..FD_MAX {
@@ -1205,13 +1256,41 @@ pub fn reap_forced(pid: u32) {
             }
         }
     }
+    proc_claim_release(pid);
 }
 
 /// 回收指定进程：释放用户数据页与私有页表，清空 fd 表，槽位标记 Free。
 ///
 /// 调用前提：目标进程已是 Zombie 且不再被调度（TTBR0 已指向其它进程）。
-fn reap(pid: u32) -> i32 {
+/// 返回 `Some(退出码)` = 本调用完成回收；`None` = 未回收（并发竞争失败
+/// 或 SMP 护栏命中，槽位留待 wait 重试）。
+///
+/// ★ 防重入：多线程父进程的两个线程可被同一次 exit 的 wake_pid 同时唤醒、
+/// 双方都扫到同一僵尸。先在关中断窗口内把状态从 Zombie 摘除，只有摘除
+/// 成功者继续释放 —— 此前无此防护，双重 reap = 双重 free_process_tables
+/// （把已复用的页二次归还分配器，后续 alloc 会把同一物理页发给两个进程）
+/// + fd 引用错减。
+fn reap(pid: u32) -> Option<i32> {
     unsafe {
+        // 原子认领：Zombie → Free（释放期间并发扫描看不到它）。
+        // ★ SMP：先取槽位认领位再置 Free——否则 alloc_pid 可在他核看到
+        // Free 即认领并写入新 PCB，与本函数后续的 fd/页表释放及 PCB 清零
+        // 交错（新页表被释放、新 PCB 被清零）。认领持有至 PCB 清零完成。
+        if PROC_CLAIM[pid as usize]
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None; // 他核正在分配/回收此槽位：wait 循环稍后重试
+        }
+        let saved = crate::sched_cfs::read_daif();
+        core::arch::asm!("msr daifset, #2");
+        if PROCESSES[pid as usize].state != ProcessState::Zombie {
+            crate::sched_cfs::write_daif(saved);
+            proc_claim_release(pid);
+            return None;
+        }
+        PROCESSES[pid as usize].state = ProcessState::Free;
+        crate::sched_cfs::write_daif(saved);
         let code = PROCESSES[pid as usize].exit_code;
         let ttbr0 = PROCESSES[pid as usize].pt.ttbr0;
         crate::kinfo! {
@@ -1221,17 +1300,20 @@ fn reap(pid: u32) -> i32 {
             crate::print_dec(PROCESSES[pid as usize].pid as u64);
             crate::uart_send_str(" ttbr0=");
             crate::print_hex(ttbr0 as u64);
-            crate::uart_send_str(" st=");
-            crate::print_dec(PROCESSES[pid as usize].state as u64);
             crate::uart_send_str("\n");
         }
         // 释放该进程全部 fd 资源（文件引用计数 -1、管道/队列/共享内存/套接字对
         // 槽位释放），防止对象池耗尽 panic 与文件表项泄漏。
         // ★ SMP 护栏必须先行：目标仍有存活任务（他核 kill_req 待兑现）时其
-        // 地址空间正在被使用，先释放页表/fd = use-after-free。此时放弃释放
-        // （槽位留待后续 wait 重试），只返回退出码。
+        // 地址空间正在被使用，先释放页表/fd = use-after-free。恢复 Zombie
+        // 并放弃（wait 循环重试），只返回退出码。
         if crate::sched_cfs::has_live_tasks(pid) {
-            return PROCESSES[pid as usize].exit_code;
+            let saved2 = crate::sched_cfs::read_daif();
+            core::arch::asm!("msr daifset, #2");
+            PROCESSES[pid as usize].state = ProcessState::Zombie;
+            crate::sched_cfs::write_daif(saved2);
+            proc_claim_release(pid);
+            return None;
         }
         for fd in 0..FD_MAX {
             let e = PROCESSES[pid as usize].fds[fd];
@@ -1251,7 +1333,13 @@ FdKind::File => crate::vfs::close_ref(e.index),
         // 复位该 pid 槽位的用户堆断点/mmap 游标：槽位会被复用（如 OOBE 退出后
         // launcher 复用同一 pid），遗留的未对齐断点会让新进程堆分配写越界。
         crate::bionic_shim::reset_brk_state(pid as usize);
-                {
+        // 清 ELF 运行时信息与信号 handler 表（与 reap_forced 对齐）：pid
+        // 复用给非 ELF 进程时陈旧的 ASLR 栈基址/brk 会被 current_stack_base()
+        // /current_brk() 当作新进程的值使用；SIG handler 残留则会把本应默认
+        // 终止的信号跳转到新地址空间里的垃圾地址。
+        crate::elf::release(pid);
+        SIG_TABLES[pid as usize] = EMPTY_SIG;
+        {
             // 先归还 pt 的堆记录表（清零只写 null 不 drop，会泄漏 1.5MB）
             PROCESSES[pid as usize].pt.user_pages.release();
             let n = core::mem::size_of::<Process>() / 8;
@@ -1260,7 +1348,8 @@ FdKind::File => crate::vfs::close_ref(e.index),
                 core::ptr::write_volatile(p.add(j), 0u64);
             }
         }
-        code
+        proc_claim_release(pid);
+        Some(code)
     }
 }
 
@@ -1338,6 +1427,9 @@ pub fn exit(code: i32) -> ! {
 /// 收尾（pthread_exit / 线程函数返回）走此处 —— 若误走 [`exit`]，任一线程
 /// 结束都会 kill_pid 整个线程组，pthread_join 永远等不到、主线程被杀。
 pub fn exit_thread(code: i32) -> ! {
+    // CLONE_CHILD_CLEARTID：清 tid + futex 唤醒 join 方（须在地址空间仍
+    // 映射时执行；最后一线程走 exit() 整体退出，无 join 方需要唤醒）
+    crate::bionic_shim::exit_thread_notify();
     if !sched_cfs::exit_thread_current() {
         exit(code);
     }
@@ -1439,8 +1531,12 @@ pub fn wait(pid: i32) -> (i32, i32) {
                 }
             }
             if let Some(z) = zombie {
-                let code = reap(z);
-                return (z as i32, code);
+                if let Some(code) = reap(z) {
+                    return (z as i32, code);
+                }
+                // 被并发线程抢先收走（或 SMP 护栏命中）：让出后重扫
+                sched_cfs::yield_now();
+                continue;
             }
             // 判断是否还存在子进程（否则 ECHILD）
             let mut any_child = false;
@@ -1476,8 +1572,13 @@ pub fn wait(pid: i32) -> (i32, i32) {
             match zombie2 {
                 Some(z) => {
                     unsafe { sched_cfs::write_daif(saved) };
-                    let code = reap(z);
-                    return (z as i32, code);
+                    if let Some(code) = reap(z) {
+                        return (z as i32, code);
+                    }
+                    // 与首路径一致让出重扫（reap 开中断窗口内的退出唤醒
+                    // 只唤醒 Blocked 任务，盲目 block 会丢唤醒）。
+                    sched_cfs::yield_now();
+                    continue;
                 }
                 None => {
                     sched_cfs::block_current();
@@ -1526,8 +1627,14 @@ match p.state {
             };
             if action.is_some() {
                 unsafe { sched_cfs::write_daif(saved) };
-                let code = reap(pid as u32);
-                return (pid, code);
+                if let Some(code) = reap(pid as u32) {
+                    return (pid, code);
+                }
+                // 被并发抢先收走（state 已 Free → 下一轮 ECHILD）或护栏
+                // 命中（恢复 Zombie → 重试）：让出后重扫（不在此阻塞 ——
+                // 本路径 Zombies 场景下未登记 waiter）。
+                sched_cfs::yield_now();
+                continue;
             }
             sched_cfs::block_current();
             unsafe { sched_cfs::write_daif(saved) };
@@ -1609,11 +1716,17 @@ pub fn sig_table_copy(parent: u32, child: u32) {
 }
 
 /// 清除进程的待处理信号位。
+///
+/// ★ 位图读-改-写屏蔽 IRQ：handle_pending 的 clear 与他进程 kill 的 send
+/// 并发交错会丢新置的位（含 SIGKILL 静默丢弃）。
 pub fn signal_clear(pid: u32, sig: u32) {
     if (pid as usize) < MAX_PROC && (sig as usize) < 64 {
+        let saved = unsafe { sched_cfs::read_daif() };
+        unsafe { core::arch::asm!("msr daifset, #2") };
         unsafe {
             PROCESSES[pid as usize].signals &= !(1u64 << sig);
         }
+        unsafe { sched_cfs::write_daif(saved) };
     }
 }
 
@@ -1621,9 +1734,12 @@ pub fn signal_send(pid: u32, sig: u32) {
     if sig >= 64 || (pid as usize) >= MAX_PROC {
         return;
     }
+    let saved = unsafe { sched_cfs::read_daif() };
+    unsafe { core::arch::asm!("msr daifset, #2") };
     unsafe {
         PROCESSES[pid as usize].signals |= 1u64 << sig;
     }
+    unsafe { sched_cfs::write_daif(saved) };
 }
 
 /// 读取进程待处理信号位图。

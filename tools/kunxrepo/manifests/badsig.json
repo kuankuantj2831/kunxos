@@ -1,0 +1,14 @@
+{
+  "name": "badsig",
+  "version": "1.0.0",
+  "api_level": 1,
+  "description": "签名损坏示例：有效证书链 + 被篡改的包签名（负例，必须拒绝安装）",
+  "author": "KunxOS Team",
+  "main": "bin/badsig",
+  "permissions": [],
+  "dependencies": {},
+  "provides": [],
+  "conflicts": [],
+  "_elf_text": "KUNXTEST-BADSIG",
+  "_badsig": true
+}

@@ -13,6 +13,7 @@ PIPE = os.path.join(WORKDIR, "kx")
 
 FRAME_DOWN = 0x01
 FRAME_UP = 0x00
+FRAME_MOVE = 0x02
 
 def frame(kind, x, y):
     return bytes([0xAA, kind, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF])
@@ -55,6 +56,22 @@ try:
 except OSError:
     infd = -1
 
+def tap_swipe_up():
+    # 底部上滑回桌面：从 (270,935) 按下 → 上移到 (270,300) → 抬起。
+    global infd
+    if infd < 0:
+        return
+    try:
+        os.write(infd, frame(FRAME_DOWN, 270, 935))
+        time.sleep(0.30)
+        for y in range(935, 300, -80):
+            os.write(infd, frame(FRAME_MOVE, 270, y))
+            time.sleep(0.04)
+        os.write(infd, frame(FRAME_UP, 0, 0))
+        time.sleep(0.2)
+    except OSError:
+        pass
+
 def tap(x, y, hold=0.02):
     if infd < 0:
         return
@@ -65,10 +82,12 @@ def tap(x, y, hold=0.02):
     except OSError:
         pass
 
-def wait_for(marker, timeout):
+def wait_for(marker, timeout, from_off=None):
+    # from_off：只搜索该偏移之后的新增内容（防陈旧标记误匹配）
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if marker.encode() in bytes(log):
+        hay = bytes(log[from_off:]) if from_off is not None else bytes(log)
+        if marker.encode() in hay:
             return True
         if p.poll() is not None:
             return False
@@ -113,20 +132,39 @@ try:
     # 图标 56x56 → 中心 (150,182)。旧坐标 (130,100) 落在状态栏点不到图标）。
     tap(150, 182)
     print("[test] tapped first icon (150,182)")
-    # 采集启动转场统计 + 应用拉起/失败 + 返回转场统计
+    # 采集启动转场统计 + 应用拉起/失败 + 返回转场统计。
+    # ★ 2026-09-18：生命周期设计为「应用前台期间 launcher 不读输入（应用
+    # 独占 fb0 与输入设备）」——此前的「第二次点击看 launcher [input]」
+    # 断言只在应用启动失败（gate 写失败退化）时才会通过。改为真实流程：
+    # 等应用就绪 → 点应用内返回键 (24,24) 退出 → 验证 launcher 恢复输入。
     wait_for("[launcher] 启动 ", 20)
-    wait_for("已退出", 30)
     print("[test] transitions captured")
-    # 决定性验证：空闲后再点一次空白处。若 launcher/内核冻结，第二次点击
-    # 不会有任何输入处理输出（内核打印「[input] 按下（x,y)」）。
-    time.sleep(3)
-    tap(400, 500)
-    print("[test] second tap sent (400,500)")
-    time.sleep(3)
-    if "[input] 按下（400,500)".encode() in open(LOGFILE, "rb").read():
-        print("[test] SECOND TAP PROCESSED -> launcher alive")
+    anchor = len(log)
+    app_ready = wait_for("] 就绪", 25, from_off=anchor)
+    if not app_ready:
+        print("[test] app did NOT become ready -> launch broken")
     else:
-        print("[test] second tap NOT processed -> launcher frozen (storm/hang)")
+        print("[test] app ready; tapping in-app back (24,24) to exit")
+        time.sleep(1)
+        tap(24, 24)
+        anchor2 = len(log)
+        exited = wait_for("正在退出", 30, from_off=anchor2)
+        if not exited:
+            # clock 的返回键在标题栏；不响应则用底部上滑手势回桌面。
+            print("[test] back tap no exit; trying bottom-swipe home")
+            tap_swipe_up()
+            exited = wait_for("正在退出", 20, from_off=anchor2)
+        print("[test] app exited" if exited else "[test] app STILL foreground")
+    # 决定性验证：回桌面后点空白处，launcher 应打印 [input]（冻结则无输出）。
+    time.sleep(4)
+    anchor3 = len(log)
+    tap(400, 500)
+    print("[test] post-exit tap sent (400,500)")
+    time.sleep(3)
+    if "[input] 按下（400,500)".encode() in bytes(log[anchor3:]):
+        print("[test] POST-EXIT TAP PROCESSED -> launcher alive")
+    else:
+        print("[test] post-exit tap NOT processed -> launcher frozen (hang)")
     time.sleep(1)
 finally:
     stop = True

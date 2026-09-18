@@ -52,15 +52,20 @@ pub const USER_DEVICE_WINDOW_END: VirtAddr = 0x0C00_0000;
 /// 落在 L1[0]（0x0000_0000-0x3FFF_FFFF）区域，从而与共享的内核 RAM 恒等
 /// 映射（L1[1]）彻底分离，保证多进程各自持有独立的用户页表而不互相污染。
 pub const USER_STACK_TOP: VirtAddr = 0x3F00_0000;
-/// 用户栈大小：1MB（向下增长）。预留 16MB 区间上限，实际按需映射。
-pub const USER_STACK_SIZE: usize = 0x0010_0000;
+/// 用户栈大小：2MB（向下增长，execve 时饿式映射全部页）。
+///
+/// 历史意图是 8MB（NetSurf 深递归）+ 按需落地，但 setup_stack 是饿式
+/// 映射：8MB × MAX_PROC=24 并发上限 = 192MB 物理页，512MB 机型不可承受。
+/// 实测 2MB 下 nsmonkey 冒烟通过；8MB 需先做栈区按需落地（guard 页 +
+/// 缺页处理）再放开。ASLR 随机化窗口已预留 16MB 区间，未来扩容只改此值。
+pub const USER_STACK_SIZE: usize = 0x0020_0000;
 /// 用户栈底。
 pub const USER_STACK_BASE: VirtAddr = USER_STACK_TOP - USER_STACK_SIZE;
 
 /// ASLR 用户栈随机化窗口（页数）：栈区顶在 `[USER_STACK_TOP - 16MB,
 /// USER_STACK_TOP)` 内随机（16MB = 4096 页熵）。栈区下方保留 15MB 隔离带
 /// （匿名/文件 mmap 游标上限 `bionic_shim::MMAP_CAP = 0x3D00_0000`，
-/// 最低栈底 0x3DF0_0000 之下还有守护空间），栈溢出不会静默写进 mmap 区。
+/// 最低栈底 0x3D90_0000 之下还有守护空间），栈溢出不会静默写进 mmap 区。
 pub const STACK_ASLR_PAGES: usize = 0x1000;
 
 /// 内核空间（高地址）起始：恒等映射内核位于低 39 位地址空间，

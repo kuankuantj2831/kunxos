@@ -43,8 +43,8 @@ const T_LISTEN: u8 = 8;
 /// 服务器侧已收到 SYN、发出 SYN-ACK，等待客户端 ACK。
 const T_SYN_RCVD: u8 = 9;
 
-const TCP_WINDOW: u16 = 4096;
-const TCP_RXBUF: usize = 4096;
+const TCP_WINDOW: u16 = 16384;
+const TCP_RXBUF: usize = 16384;
 const TCP_RTXBUF: usize = 2048;
 
 /// 重传间隔与各阶段超时（微秒，基于虚拟计数器）。
@@ -714,9 +714,9 @@ unsafe fn udp_recv(idx: usize, buf: &mut [u8]) -> i32 {
 /// 返回 `false` = 段未上线路（超长或 IP 层发送失败）——调用方**不得**
 /// 推进 snd_nxt（此前静默丢段但 snd_nxt 照常推进 → 连接永久失步）。
 unsafe fn tcp_xmit(idx: usize, seq: u32, flags: u8, data: &[u8]) -> bool {
-    let (local_ip, remote_ip, local_port, remote_port, rcv_nxt) = {
+    let (local_ip, remote_ip, local_port, remote_port, rcv_nxt, rx_count) = {
         let s = &TCPS[idx];
-        (s.local_ip, s.remote_ip, s.local_port, s.remote_port, s.rcv_nxt)
+        (s.local_ip, s.remote_ip, s.local_port, s.remote_port, s.rcv_nxt, s.rx_count)
     };
     let total = 20 + data.len();
     if total > TCPBUF.len() {
@@ -728,7 +728,10 @@ unsafe fn tcp_xmit(idx: usize, seq: u32, flags: u8, data: &[u8]) -> bool {
     TCPBUF[8..12].copy_from_slice(&rcv_nxt.to_be_bytes());
     TCPBUF[12] = 0x50;
     TCPBUF[13] = flags;
-    TCPBUF[14..16].copy_from_slice(&TCP_WINDOW.to_be_bytes());
+    // 通告真实可用接收空间（缓冲 4096 − 未取走字节数）：固定窗口会让对端
+    // 在缓冲满后继续超发，数据被丢只能等 RTO 重传，接收吞吐骤降。
+    let adv_wnd = (TCP_RXBUF - rx_count).min(TCP_WINDOW as usize) as u16;
+    TCPBUF[14..16].copy_from_slice(&adv_wnd.to_be_bytes());
     TCPBUF[16..18].copy_from_slice(&0u16.to_be_bytes());
     TCPBUF[18..20].copy_from_slice(&0u16.to_be_bytes());
     TCPBUF[20..total].copy_from_slice(data);
@@ -1136,6 +1139,12 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                             TCPS[idx].state = T_TIME_WAIT;
                         }
                         need_ack = true;
+                    } else if seq_lt(fin_seq, TCPS[idx].rcv_nxt) {
+                        // 对端 FIN 重传（我方首个 ACK 已丢）：重新 ACK 让对端
+                        // 结束重传循环 —— 与 TIME_WAIT 分支同语义。此前不回
+                        // ACK，对端只能 RTO 重传到放弃，拆除卡在 CLOSE_WAIT
+                        // 直到本端应用 close()。
+                        need_ack = true;
                     }
                 }
             }
@@ -1233,8 +1242,13 @@ fn tcp_send(idx: usize, data: &[u8]) -> i32 {
         return -1;
     }
     // 段必须能完整穿越下层缓冲，否则会被静默丢帧但 snd_nxt 照常推进 →
-    // 连接永久失步。链路极限 = FRAME(2048) − 14(以太网头) − 20(IP头)
-    // − 20(TCP头) = 1994 字节；必须在这里拒绝。
+    // 连接永久失步。且必须满足标准以太网 MTU：1500 − 20(IP) − 20(TCP) =
+    // 1460 字节载荷——按内部缓冲极限（~1994）放行的段组出 2048 字节帧，
+    // QEMU slirp 侥幸可过，真实网卡/交换机一律丢弃 → 大段黑洞、连接卡死。
+    const TCP_MSS: usize = 1460;
+    if data.len() > TCP_MSS {
+        return -1;
+    }
     if unsafe { 54 + data.len() > TCPBUF.len() } {
         return -1;
     }
@@ -1303,6 +1317,9 @@ fn tcp_recv(idx: usize, buf: &mut [u8]) -> i32 {
         net_stack::net_lock();
         let n = unsafe { tcp_rx_drain(idx, buf) };
         if n > 0 {
+            // 窗口更新：取走数据后立即 ACK，通告重新打开的接收窗口——
+            // 否则对端在填满旧窗口后只能靠零窗口探测/RTO 逐段恢复。
+            unsafe { send_ack(idx) };
             net_stack::net_unlock();
             return n as i32;
         }

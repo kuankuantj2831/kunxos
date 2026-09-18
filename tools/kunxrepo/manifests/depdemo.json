@@ -1,0 +1,13 @@
+{
+  "name": "depdemo",
+  "version": "1.0.0",
+  "api_level": 1,
+  "description": "依赖链示例：目标应用（菱形依赖 libgfx + libbase）",
+  "author": "KunxOS Team",
+  "main": "bin/depdemo",
+  "permissions": [],
+  "dependencies": {"libgfx": ">=1.0.0", "libbase": ">=1.2.0"},
+  "provides": [],
+  "conflicts": [],
+  "_elf": "kunxpkg/target/aarch64-unknown-none/release/kunxpkg"
+}

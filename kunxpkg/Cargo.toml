@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# TLS 1.2 客户端（https 软件源）依赖 kunxsec 的 SHA-256；
+# kunxsec 为 no_std 零外部依赖，不破坏 kunxpkg 的自包含构建。
+kunxsec = { path = "../kunxsec" }
 
 [profile.release]
 opt-level = "z"

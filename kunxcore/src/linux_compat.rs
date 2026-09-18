@@ -483,6 +483,11 @@ fn trace_syscall(nr: usize, f: &TrapFrame) {
         SYS_TRACE[SYS_TRACE_POS] = (nr, f.elr, f.sp_el0);
         SYS_TRACE_POS = (SYS_TRACE_POS + 1) % SYS_TRACE_N;
     }
+    // 临时诊断：白名单外的 syscall 打印（定位 musl 程序启动卡点）
+    const COMMON: [usize; 22] = [
+        63, 64, 66, 56, 57, 214, 222, 215, 101, 169, 98, 278, 29, 62, 80, 61, 172, 96, 93, 94,
+        78, 113,
+    ];
 }
 
 /// 读取最近一次系统调用的诊断信息。
@@ -583,7 +588,14 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_RT_SIGACTION => crate::signal::rt_sigaction_syscall(f),
         SYS_RT_SIGRETURN => crate::signal::rt_sigreturn_syscall(f),
         // 无掩码/等待机制：明确报 ENOSYS，避免调用方误以为已生效。
-        SYS_RT_SIGPROCMASK | SYS_RT_SIGPENDING | SYS_RT_SIGSUSPEND => ENOSYS,
+        // musl 启动路径 __block_all_sigs 会调用（忽略返回值），成功桩即可
+        SYS_RT_SIGPROCMASK => 0,
+        // pselect6/ppoll：monkey 等 poll()/select() 事件循环依赖（musl 的
+        // poll() 走 ppoll）。pselect6 按 fd_set 语义（x0=nfds、x1=readfds）；
+        // ppoll 是 pollfd 数组 ABI（x0=数组指针、x1=条数），各自独立实现。
+        SYS_PSELECT6 => sys_poll_family(f, 4),
+        SYS_PPOLL => sys_ppoll(f),
+        SYS_RT_SIGPENDING | SYS_RT_SIGSUSPEND => ENOSYS,
         SYS_SIGALTSTACK => 0, // 信号处理不依赖 altstack，接受调用
         SYS_WAIT4 => sys_wait4(f),
         SYS_BRK => sys_brk(f),
@@ -642,19 +654,33 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             let cap = f.x[1] as u16;
             if cap > 100 {
                 EINVAL
+            } else if !pm_target_allowed(pid) {
+                // 冻结/限速能把任意进程调度权重打到 0（cpu_cap==0 的任务
+                // pick_next 直接跳过 = 软冻结），权限必须与 sys_kill 对齐。
+                EPERM
             } else {
                 crate::sched_cfs::set_task_cpu_cap(pid, cap) as i64
             }
         }
         SYS_KUNX_PM_FREEZE => {
             let pid = f.x[0] as u32;
-            let freeze = f.x[1] != 0;
-            crate::sched_cfs::set_task_cpu_cap(pid, if freeze { 0 } else { 100 }) as i64
+            if !pm_target_allowed(pid) {
+                EPERM
+            } else {
+                let freeze = f.x[1] != 0;
+                crate::sched_cfs::set_task_cpu_cap(pid, if freeze { 0 } else { 100 }) as i64
+            }
         }
         SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[0] as u64),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
-        _ => ENOSYS,
+        // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
+        _ => {
+            crate::uart_send_str("[syscall-unimpl] nr=");
+            crate::print_dec(nr as u64);
+            crate::uart_send_str("\n");
+            ENOSYS
+        }
     }
 }
 
@@ -723,7 +749,14 @@ fn sys_openat(f: &mut TrapFrame) -> i64 {
     let acc = flags & 0x3;
     let creat = flags & O_CREAT;
     let trunc = flags & O_TRUNC;
-    let fd = vfs::open(s, acc | creat | trunc | (flags & vfs::O_NONBLOCK));
+    // O_APPEND 必须透传给 VFS（vfs::write 依赖 OpenFile.flags 判定追加，
+    // 多写者信箱各自「open 时 seek 尾」会取到同一尾偏移互相覆盖）。
+    // O_APPEND 必须透传给 VFS（vfs::write 依赖 OpenFile.flags 判定追加，
+    // 多写者信箱各自「open 时 seek 尾」会取到同一尾偏移互相覆盖）。
+    let fd = vfs::open(
+        s,
+        acc | creat | trunc | (flags & vfs::O_NONBLOCK) | (flags & vfs::O_APPEND),
+    );
     if fd < 0 {
         return fd as i64;
     }
@@ -822,20 +855,51 @@ fn sys_write(f: &mut TrapFrame) -> i64 {
     if count == 0 {
         return 0;
     }
-    let n = count.min(4096);
-    let mut tmp = [0u8; 4096];
-    let copied = unsafe { copy_from_user(buf_ptr, &mut tmp[..n]) };
-    if copied == 0 {
-        return EFAULT;
-    }
     let entry = match process::get_fd(fd) {
         Some(e) => e,
         None => return EBADF,
     };
     match entry.kind {
-        FdKind::File => vfs::write(fd, &tmp[..copied]) as i64,
-        FdKind::Pipe => ipc::pipe_write(fd, &tmp[..copied]) as i64,
-        FdKind::Pair => ipc::pair_write(fd, &tmp[..copied]) as i64,
+        FdKind::File => {
+            // ★ 按块循环写（与 sys_read_at 对称）：此前 `count.min(4096)` 把
+            // 大于 4KB 的写入静默截断为短写（朴素应用不重试即丢数据）。
+            // 中途错误返回已完成部分（Linux 语义）。
+            let mut done: i64 = 0;
+            let mut off = 0usize;
+            while off < count {
+                let n = (count - off).min(4096);
+                let mut tmp = [0u8; 4096];
+                let copied = unsafe { copy_from_user(buf_ptr + off as u64, &mut tmp[..n]) };
+                if copied == 0 {
+                    return if done > 0 { done } else { EFAULT };
+                }
+                let w = vfs::write(fd, &tmp[..copied]);
+                if w < 0 {
+                    return if done > 0 { done } else { w as i64 };
+                }
+                done += w as i64;
+                off += w as usize;
+                if (w as usize) < copied {
+                    break; // 底层短写且无错误：到此为止
+                }
+            }
+            done
+        }
+        FdKind::Pipe | FdKind::Pair => {
+            // 管道保持单趟 ≤4KB：管道写循环在读者不消费时会无限阻塞，
+            // 且 POSIX 允许管道短写。
+            let n = count.min(4096);
+            let mut tmp = [0u8; 4096];
+            let copied = unsafe { copy_from_user(buf_ptr, &mut tmp[..n]) };
+            if copied == 0 {
+                return EFAULT;
+            }
+            if entry.kind == FdKind::Pipe {
+                ipc::pipe_write(fd, &tmp[..copied]) as i64
+            } else {
+                ipc::pair_write(fd, &tmp[..copied]) as i64
+            }
+        }
         _ => EBADF,
     }
 }
@@ -864,6 +928,9 @@ fn sys_writev(f: &mut TrapFrame) -> i64 {
         // 预校验范围钳到实际拷贝量（下方拷贝每 iovec 只用 len.min(4096)）：
         // 对用户给的完整 len 逐页 ensure 会强制落地/清零至多 ~256MB 预留页
         // ——单条 syscall 打穿物理内存 + 数十亿次映射记录扫描。
+        if len == 0 {
+            continue; // 零长度 iov 项合法（base 可为 NULL）：按 POSIX 忽略
+        }
         if !user_ok(base, len.min(4096)) {
             all_ok = false;
             break;
@@ -883,6 +950,9 @@ fn sys_writev(f: &mut TrapFrame) -> i64 {
         let len = unsafe { *(iov as *const u64).add(i * 2 + 1) } as usize;
         unsafe { crate::mmu::uaccess_end() };
         let n = len.min(4096);
+        if n == 0 {
+            continue; // 零长度 iov 项：跳过而非 break（否则 musl 无缓冲流死循环）
+        }
         let mut tmp = [0u8; 4096];
         let c = unsafe { copy_from_user(base, &mut tmp[..n]) };
         if c == 0 {
@@ -1061,20 +1131,34 @@ fn sys_write_at(fd: i32, buf_ptr: u64, count: usize) -> i64 {
     if count == 0 {
         return 0;
     }
-    let n = count.min(4096);
-    let mut tmp = [0u8; 4096];
-    let copied = unsafe { copy_from_user(buf_ptr, &mut tmp[..n]) };
-    if copied == 0 {
-        return EFAULT;
+    // ★ 按块循环写（与 sys_read_at 对称）：此前大于 4KB 的 pwrite 静默截断。
+    let mut done: i64 = 0;
+    let mut off = 0usize;
+    while off < count {
+        let n = (count - off).min(4096);
+        let mut tmp = [0u8; 4096];
+        let copied = unsafe { copy_from_user(buf_ptr + off as u64, &mut tmp[..n]) };
+        if copied == 0 {
+            return if done > 0 { done } else { EFAULT };
+        }
+        let entry = match process::get_fd(fd) {
+            Some(e) => e,
+            None => return if done > 0 { done } else { EBADF },
+        };
+        let w = match entry.kind {
+            FdKind::File => vfs::write(fd, &tmp[..copied]),
+            _ => return if done > 0 { done } else { EBADF },
+        };
+        if w < 0 {
+            return if done > 0 { done } else { w as i64 };
+        }
+        done += w as i64;
+        off += w as usize;
+        if (w as usize) < copied {
+            break;
+        }
     }
-    let entry = match process::get_fd(fd) {
-        Some(e) => e,
-        None => return EBADF,
-    };
-    match entry.kind {
-        FdKind::File => vfs::write(fd, &tmp[..copied]) as i64,
-        _ => EBADF,
-    }
+    done
 }
 
 fn sys_lseek(f: &mut TrapFrame) -> i64 {
@@ -1090,6 +1174,11 @@ fn sys_pipe2(f: &mut TrapFrame) -> i64 {
         return EFAULT;
     }
     let (r, w) = ipc::pipe_create();
+    if r < 0 || w < 0 {
+        // 池满/fd 表满：此前不检查、把两个 -1 写给用户还返回成功，应用拿
+        // fd=-1 后续 read/close 全乱。与 sys_socketpair 同款处理。
+        return EMFILE;
+    }
     // PAN 放行：写入用户 fds[2]（此前只校验后裸写，PAN 开启时挂死内核）
     unsafe {
         crate::mmu::uaccess_begin();
@@ -1130,8 +1219,9 @@ fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
             ipc::shm_add_ref(e.index);
             let f = process::alloc_fd(FdKind::Shm, e.index, e.flags);
             if f < 0 {
-                // 撤销刚加的引用（当前进程未映射，仅减 refs）
-                ipc::shm_close_index(process::current_pid(), e.index);
+                // 撤销刚加的一次 fd 引用（绝不能走 shm_close_index——它会清光
+                // 本进程的映射记录但不 unmap，活着回滚 = 记录没了 PTE 还在）。
+                ipc::shm_drop_one_ref(e.index);
                 return EMFILE;
             }
             f
@@ -1168,7 +1258,7 @@ fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
             process::close_fd(nfd);
             match e.kind {
                 FdKind::File => vfs::close_ref(e.index),
-                FdKind::Shm => ipc::shm_close_index(process::current_pid(), e.index),
+                FdKind::Shm => ipc::shm_drop_one_ref(e.index),
                 FdKind::Pipe => ipc::pipe_drop_ref(e.index, e.flags & ipc::FD_WRITE != 0),
                 FdKind::MsgQueue => ipc::msgq_drop_ref(e.index),
                 FdKind::Pair => ipc::pair_drop_ref(e.index, e.flags as u32),
@@ -1240,7 +1330,11 @@ fn sys_dup3(f: &mut TrapFrame) -> i64 {
         return EBADF;
     }
     if oldfd == newfd {
-        // Linux dup3：oldfd == newfd 且未置 O_CLOEXEC 时成功（本内核无 CLOEXEC 语义）
+        // Linux dup3：oldfd == newfd 且未置 O_CLOEXEC 时成功（本内核无
+        // CLOEXEC 语义）—— 前提是 oldfd 有效，无效描述符返回 EBADF。
+        if process::get_fd(oldfd).is_none() {
+            return EBADF;
+        }
         return newfd as i64;
     }
     dup_fd_common(oldfd, newfd)
@@ -1381,6 +1475,15 @@ fn sys_ioctl(f: &mut TrapFrame) -> i64 {
 }
 
 /// `getdents64`：把目录 fd 枚举为 `linux_dirent64` 序列（目录流位置由 fd 内部维护）。
+/// PM 冻结/限速的目标权限：与 sys_kill 同级 —— 仅 root、目标自身或目标的
+/// 父进程。此前无任何检查：uid 10000+ 的任意应用可把 launcher/系统服务
+/// 限到 1%（或传 cap=0 软冻结桌面）。
+fn pm_target_allowed(pid: u32) -> bool {
+    process::current_uid() == 0
+        || pid == process::current_pid()
+        || process::parent_of(pid) == process::current_pid() as i32
+}
+
 fn sys_getdents64(f: &mut TrapFrame) -> i64 {
     let fd = f.x[0] as i32;
     let dirp = f.x[1];
@@ -1399,6 +1502,7 @@ fn sys_getdents64(f: &mut TrapFrame) -> i64 {
     }
     let mut name = [0u8; 32];
     let mut written = 0usize;
+    let mut overflow = false;
     loop {
         let (ino, typ) = vfs::readdir_next(fd, &mut name);
         if ino < 0 {
@@ -1408,6 +1512,11 @@ fn sys_getdents64(f: &mut TrapFrame) -> i64 {
         // d_reclen = align(19 + namelen + 1, 8)
         let reclen = (19 + elen + 1 + 7) & !7usize;
         if written + reclen > count {
+            // 放不下：把刚被 readdir_next 消费的条目回退，下次调用重新
+            // 返回（此前直接 break —— 缓冲在两条记录中间装满时该条目被
+            // 静默跳过，目录枚举从此丢项）。
+            vfs::readdir_back(fd);
+            overflow = true;
             break;
         }
         unsafe {
@@ -1422,6 +1531,11 @@ fn sys_getdents64(f: &mut TrapFrame) -> i64 {
             crate::mmu::uaccess_end();
         }
         written += reclen;
+    }
+    if written == 0 && overflow {
+        // 缓冲连一条记录都装不下：POSIX 语义返回 EINVAL 而非 0（返回 0
+        // 会被调用方当成「目录结束」提前终止枚举）。
+        return EINVAL;
     }
     written as i64
 }
@@ -1519,6 +1633,10 @@ fn sys_mknodat(f: &mut TrapFrame) -> i64 {
 }
 
 /// `renameat(dirfd, oldpath, newdirfd, newpath)`：单根文件系统，忽略 dirfd（含 AT_FDCWD）。
+///
+/// POSIX 覆盖语义：目标已存在且为普通文件/符号链接时原子替换（SFS 单日志
+/// 事务）。AArch64 asm-generic 无独立 `rename` 号（134 是 rt_sigaction，已被
+/// 占用）；`rename` 语义经由本调用（38）与 AT_FDCWD 组合提供。
 fn sys_renameat(f: &mut TrapFrame) -> i64 {
     let mut old = [0u8; 128];
     let mut new = [0u8; 128];
@@ -1533,16 +1651,17 @@ fn sys_renameat(f: &mut TrapFrame) -> i64 {
     let pn = core::str::from_utf8(&new[..nn]).unwrap_or("");
     let Some(o) = resolve_user_path(po, &mut abspath_o) else { return ENAMETOOLONG; };
     let Some(n) = resolve_user_path(pn, &mut abspath_n) else { return ENAMETOOLONG; };
-    // 源必须存在：resolve_parent 阶段不报错，此处区分 ENOENT 与 EEXIST
+    // 源必须存在：resolve_parent 阶段不报错，此处区分 ENOENT 与其他错误
     let mut dev = 0u32;
     let mut ino = 0u32;
     if vfs::resolve(o, &mut dev, &mut ino) != 0 {
         return ENOENT;
     }
-    if vfs::rename(o, n) != 0 {
-        EEXIST
-    } else {
-        0
+    match vfs::rename(o, n) {
+        0 => 0,
+        -18 => -18, // EXDEV：跨文件系统
+        -16 => EBUSY, // 目标 inode 仍被打开
+        _ => EEXIST,
     }
 }
 
@@ -2619,6 +2738,162 @@ fn sys_clock_getres(f: &mut TrapFrame) -> i64 {
             write_u64_to_user(tp + 8, 1_000_000);
         }
     }
+    0
+}
+
+/// pselect6：真实就绪检测。常规文件恒就绪；字符设备（/dev/tty）按
+/// UART 待读字节判断。无就绪 fd 时按超时小睡（50ms 切片，提前返回 0
+/// 合法——调用方会重巡 schedule 回调）。
+fn sys_poll_family(f: &mut TrapFrame, tmo_reg: usize) -> i64 {
+    let nfds = f.x[0] as usize;
+    let readfds = f.x[1] as usize;
+    let timeout = f.x[tmo_reg] as usize;
+    let mut count = 0i64;
+    if readfds != 0 && nfds > 0 {
+        let nbytes = ((nfds + 7) / 8).min(128);
+        if user_ok(readfds as u64, nbytes) {
+            unsafe {
+                let mut tmp = [0u8; 128];
+                copy_from_user(readfds as u64, &mut tmp[..nbytes]);
+                for fd in 0..nfds.min(1024) {
+                    if tmp[fd / 8] & (1 << (fd % 8)) != 0 {
+                        // 就绪判定：字符设备（tty）看 UART 待读；其余（常规文件等）恒就绪
+                        let ready = match process::get_fd(fd as i32) {
+                            Some(_) => match vfs::fstat(fd as i32) {
+                                Some((t, _)) if t == crate::fs_simple::T_CHR => {
+                                    crate::uart_rx_pending()
+                                }
+                                Some(_) => true,
+                                None => false,
+                            },
+                            None => false,
+                        };
+                        if ready {
+                            count += 1;
+                        } else {
+                            // 清掉该 fd 的就绪位（用户侧 FD_ISSET 判定）
+                            let byte_idx = readfds as usize + fd / 8;
+                            let mut b = [0u8; 1];
+                            unsafe {
+                                copy_from_user(byte_idx as u64, &mut b);
+                                let nv = b[0] & !(1 << (fd % 8));
+                                crate::mmu::uaccess_begin();
+                                core::ptr::write_volatile(byte_idx as *mut u8, nv);
+                                crate::mmu::uaccess_end();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if count > 0 {
+        return count;
+    }
+    // 无就绪 fd：小睡一段（≤50ms）后返回 0（提前超时合法，调用方重巡事件）
+    let mut sleep_us = 50_000u64;
+    if timeout != 0 && user_ok(timeout as u64, 16) {
+        unsafe {
+            let mut tb = [0u8; 16];
+            copy_from_user(timeout as u64, &mut tb);
+            let sec = u64::from_le_bytes(tb[0..8].try_into().unwrap_or([0; 8]));
+            let nsec = u64::from_le_bytes(tb[8..16].try_into().unwrap_or([0; 8]));
+            let total = sec.saturating_mul(1_000_000).saturating_add(nsec / 1000);
+            if total == 0 {
+                return 0; // 纯非阻塞探测
+            }
+            sleep_us = sleep_us.min(total);
+        }
+    } else if timeout == 0 {
+        // timeout=NULL（阻塞语义）：退化为 50ms 轮询
+    }
+    crate::sched_cfs::sleep_until(crate::timer::now_us() + sleep_us);
+    0
+}
+
+/// ppoll（aarch64 nr 73）：musl 的 poll() 走此调用。
+///
+/// ABI 与 pselect6 完全不同：x0 = `struct pollfd[]` **数组指针**、
+/// x1 = 条数、x2 = `*timespec` 超时、x3 = sigmask（忽略）。
+/// pollfd = { fd: i32, events: i16, revents: i16 }（8 字节）；
+/// 就绪写 `revents`（copy_to_user 走可写校验 + COW break，不裸写）。
+/// 就绪判定与 pselect6 同源：tty 看 UART 待读、常规文件恒就绪、
+/// 管道/socket 暂不就绪（无就绪排队），fd<0 按 POSIX 忽略，
+/// 未登记 fd 报 POLLNVAL。
+const POLLIN: i16 = 0x001;
+const POLLNVAL: i16 = 0x020;
+/// pollfd 数组上限（256 项 = 2KB 内核栈读缓冲，musl NSOCK/标准 poll 远低于此）。
+const PPOLL_MAX: usize = 256;
+
+fn sys_ppoll(f: &mut TrapFrame) -> i64 {
+    let fds_ptr = f.x[0] as u64;
+    let nfds = f.x[1] as usize;
+    let timeout = f.x[2] as usize;
+    if fds_ptr == 0 || nfds == 0 {
+        return 0;
+    }
+    let n = nfds.min(PPOLL_MAX);
+    if !user_ok(fds_ptr, n * 8) {
+        return EFAULT;
+    }
+    let mut buf = [0u8; PPOLL_MAX * 8];
+    unsafe {
+        copy_from_user(fds_ptr, &mut buf[..n * 8]);
+    }
+    let mut ready_count = 0i64;
+    let mut changed = false;
+    for i in 0..n {
+        let fd = i32::from_le_bytes(buf[i * 8..i * 8 + 4].try_into().unwrap_or([0; 4]));
+        let events = i16::from_le_bytes(buf[i * 8 + 4..i * 8 + 6].try_into().unwrap_or([0; 2]));
+        if fd < 0 {
+            continue; // POSIX：fd < 0 的项忽略，revents 置 0
+        }
+        let mut revents = 0i16;
+        if process::get_fd(fd).is_some() {
+            let readable = match vfs::fstat(fd) {
+                Some((t, _)) if t == crate::fs_simple::T_CHR => crate::uart_rx_pending(),
+                Some(_) => true,
+                None => false,
+            };
+            if readable && (events & POLLIN) != 0 {
+                revents |= POLLIN;
+            }
+        } else {
+            revents |= POLLNVAL;
+        }
+        let old = i16::from_le_bytes(buf[i * 8 + 6..i * 8 + 8].try_into().unwrap_or([0; 2]));
+        if revents != old {
+            buf[i * 8 + 6..i * 8 + 8].copy_from_slice(&revents.to_le_bytes());
+            changed = true;
+        }
+        if revents != 0 {
+            ready_count += 1;
+        }
+    }
+    if changed {
+        unsafe {
+            copy_to_user(fds_ptr, &buf[..n * 8]);
+        }
+    }
+    if ready_count > 0 {
+        return ready_count;
+    }
+    // 无就绪 fd：小睡一段（≤50ms）后返回 0（提前超时合法，调用方重巡）。
+    let mut sleep_us = 50_000u64;
+    if timeout != 0 && user_ok(timeout as u64, 16) {
+        unsafe {
+            let mut tb = [0u8; 16];
+            copy_from_user(timeout as u64, &mut tb);
+            let sec = u64::from_le_bytes(tb[0..8].try_into().unwrap_or([0; 8]));
+            let nsec = u64::from_le_bytes(tb[8..16].try_into().unwrap_or([0; 8]));
+            let total = sec.saturating_mul(1_000_000).saturating_add(nsec / 1000);
+            if total == 0 {
+                return 0; // 纯非阻塞探测
+            }
+            sleep_us = sleep_us.min(total);
+        }
+    }
+    crate::sched_cfs::sleep_until(crate::timer::now_us() + sleep_us);
     0
 }
 

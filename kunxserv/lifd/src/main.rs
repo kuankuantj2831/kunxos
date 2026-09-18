@@ -31,6 +31,7 @@ const SYS_CLOSE: usize = 57;
 const SYS_GETDENTS64: usize = 61;
 const SYS_LSEEK: usize = 62;
 const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 const SYS_MKDIRAT: usize = 34;
 const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
@@ -154,6 +155,21 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         inlateout("x0") a1 => ret,
         in("x1") a2,
         in("x2") a3,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
         options(nostack)
     );
     ret
@@ -297,6 +313,56 @@ fn unlink(path: &str) {
     unsafe {
         syscall3(SYS_UNLINKAT, AT_FDCWD, p.as_ptr() as usize, 0);
     }
+}
+
+/// rename（同目录，jlog 事务原子；目标已存在时内核拒绝）。
+fn rename_file(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 96];
+    let mut q = [0u8; 96];
+    let on = old.len().min(95);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    o[on] = 0;
+    let nn = new.len().min(95);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    q[nn] = 0;
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
+}
+
+/// 发布式写入（「最新事件胜」语义信箱）：写 `<path>.new` → unlink 目标 →
+/// rename 到 `<path>`。读方（rename 取走）要么看到旧内容、要么看到完整
+/// 新内容，不再有「O_TRUNC 重写与读后清空交错 → 事件丢失」的竞态。
+/// 目标被读方抢先取走时 unlink 失败无妨（rename 直接落到空名上）。
+/// 目标被第三方打开（如 shell `cat` 观测）导致 unlink 被拒、rename 落不下：
+/// 短暂重试后仍失败则退回就地覆写（旧 O_TRUNC 语义，功能优先），并清理
+/// 临时名 —— 防止 `.new` 残留逐个泄漏 inode。
+fn publish_file(path: &str, data: &[u8]) -> bool {
+    let mut tmp = [0u8; 96];
+    let n = path.len().min(90);
+    tmp[..n].copy_from_slice(&path.as_bytes()[..n]);
+    tmp[n..n + 4].copy_from_slice(b".new");
+    let tmp_str = core::str::from_utf8(&tmp[..n + 4]).unwrap_or("");
+    if !write_file(tmp_str, data) {
+        return false;
+    }
+    for _ in 0..3 {
+        unlink(path);
+        if rename_file(tmp_str, path) == 0 {
+            return true;
+        }
+        sleep_ms(4);
+    }
+    // 退回就地覆写；清掉临时名（防泄漏）。
+    let ok = write_file(path, data);
+    unlink(tmp_str);
+    ok
 }
 
 fn mkdir(path: &str) {
@@ -477,16 +543,16 @@ fn push_dec_to(out: &mut [u8], n: &mut usize, mut v: u64) {
 
 // ==================== 事件投递 ====================
 
-/// 向应用写事件（覆盖式：最新事件优先，生命周期事件幂等）。
+/// 向应用写事件（覆盖式：最新事件优先，生命周期事件幂等；经 rename 发布）。
 fn send_evt(pid: u32, evt: &[u8]) {
     let mut p = [0u8; 96];
     let n = build_evt_path(pid, &mut p);
-    write_file(core::str::from_utf8(&p[..n]).unwrap_or(""), evt);
+    publish_file(core::str::from_utf8(&p[..n]).unwrap_or(""), evt);
 }
 
 /// 向 launcher 写事件。
 fn send_launcher(evt: &[u8]) {
-    write_file(LAUNCHER_EVT, evt);
+    publish_file(LAUNCHER_EVT, evt);
 }
 
 /// 更新最近任务文件（launcher 读取）。
@@ -711,7 +777,13 @@ fn handle_cmd(pid: u32, s: &[u8]) {
             if n >= 3 {
                 let (ty, _) = parse_dec(f[1]);
                 let (dur, _) = parse_dec(f[2]);
-                grant_bg_task(pid, ty as u8, dur as u32);
+                // 先按原始 u64 校验再收窄：直接 `as u8` 会把 BTASK 256 截断成
+                // 音频类型(0)绕过白名单，超长 dur 也会回绕（2^32+x）。
+                if ty > BT_DOWNLOAD as u64 {
+                    log("后台任务被拒: 未知类型");
+                } else {
+                    grant_bg_task(pid, ty as u8, dur.min(u32::MAX as u64) as u32);
+                }
             }
         }
         b"BTASK_END" => {
@@ -993,8 +1065,18 @@ fn run_lmk() {
 // ==================== 轮询 ====================
 
 /// 扫描 /data/life 目录处理 reg_*/cmd_* 文件。
+///
+/// 两段式：先 getdents 收集全部匹配文件名并关闭目录，再逐个处理 ——
+/// 处理（handle_cmd → send_evt）会在**同一目录**里 rename 发布事件文件
+/// （`evt_*.new` → `evt_*`），目录项增删会使正在迭代的 getdents 游标错位，
+/// 跳过后续 cmd/reg 文件（FG/BTASK 静默不执行）。收集后处理则目录扫描
+/// 与目录变更互不交错。
 fn poll_mailbox() {
     let mut raw = [0u8; 4096];
+    // 名字收集区（每项 48B，最多 32 个 —— 超出的留到下一轮 50ms 扫描）。
+    let mut names = [[0u8; 48]; 32];
+    let mut lens = [0usize; 32];
+    let mut count = 0usize;
     let fd = sys_open(LC_DIR, O_RDONLY);
     if fd < 0 {
         return;
@@ -1015,15 +1097,26 @@ fn poll_mailbox() {
             }
             let name = &raw[off + 19..off + reclen];
             let elen = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-            if elen >= 4 && name.starts_with(b"cmd_") {
-                handle_cmd_file(&name[..elen]);
-            } else if elen >= 4 && name.starts_with(b"reg_") {
-                handle_reg_file(&name[..elen]);
+            let is_cmd = elen >= 4 && name.starts_with(b"cmd_");
+            let is_reg = elen >= 4 && name.starts_with(b"reg_");
+            if (is_cmd || is_reg) && count < names.len() {
+                let k = elen.min(names[count].len());
+                names[count][..k].copy_from_slice(&name[..k]);
+                lens[count] = k;
+                count += 1;
             }
             off += reclen;
         }
     }
     unsafe { syscall1(SYS_CLOSE, fd as usize) };
+    for i in 0..count {
+        let fname = &names[i][..lens[i]];
+        if fname.starts_with(b"cmd_") {
+            handle_cmd_file(fname);
+        } else {
+            handle_reg_file(fname);
+        }
+    }
 }
 
 /// 处理单个 cmd_<pid> 文件：读取 → 执行 → 删除。

@@ -513,6 +513,11 @@ pub(crate) fn uart_try_read_char_masked() -> Option<u8> {
     }
 }
 
+/// UART 接收缓冲是否有待读字节（供 pselect6 就绪检测，非破坏性）。
+pub(crate) fn uart_rx_pending() -> bool {
+    unsafe { UART_RX_COUNT > 0 }
+}
+
 /// 非阻塞读取 UART 接收缓冲中的一个字节（供 /dev/tty 与 shell 使用）。
 ///
 /// 返回 `None` 表示当前无待读字节。
@@ -2448,10 +2453,15 @@ extern "C" fn el0_page_fault_handler(_frame: *mut u8) -> bool {
     const DFSC_TRANSLATION: u32 = 0b000001;
     const DFSC_PERMISSION_L01: u32 = 0b001001;
     const DFSC_PERMISSION_L23: u32 = 0b010001;
-    match dfsc & 0b111001 {
-        DFSC_TRANSLATION => crate::process::page_fault_resolve(va),
-        DFSC_PERMISSION_L01 | DFSC_PERMISSION_L23 => crate::process::cow_break(va),
-        _ => false,
+    // 各级 translation/permission/AF 编码经掩码归一：全部先试 LAZY 预留页
+    // 落地（mmap 匿名区被继承的内核恒等映射 2MB 块遮盖时报 L2 权限错误而非
+    // translation），再试 COW，均失败才 SIGSEGV。wild 指针因无记录自然落到
+    // SIGSEGV 分支，语义不变。
+    let _ = dfsc;
+    if crate::process::page_fault_resolve(va) {
+        true
+    } else {
+        crate::process::cow_break(va)
     }
 }
 // ==================== 启动汇编 ====================
@@ -2522,11 +2532,15 @@ secondary_entry:
     // x0 = cpu id（从 MPIDR 读取，不依赖 PSCI context_id）
     mrs x19, mpidr_el1
     and x19, x19, #0xFF
-    // 设置 per-cpu 栈：SECONDARY_STACKS + cpu*STACK_SIZE + STACK_SIZE
+    // 设置 per-cpu 栈：SECONDARY_STACKS + cpu*STACK_SIZE + STACK_SIZE。
+    // SP 防御性 16 字节向下对齐（AAPCS64）：SECONDARY_STACKS 声明已带
+    // #[repr(align(16))]，此处兜底任何链接布局（对齐丢失 ≤15 字节）。
     ldr x0, =SECONDARY_STACKS
     mov x1, #16384
     madd x0, x19, x1, x0
-    add sp, x0, x1
+    add x0, x0, x1
+    bic x0, x0, #0xF
+    mov sp, x0
     // 若 PSCI 以 EL2 唤醒（secure=on），降到 EL1
     bl drop_to_el1
     // 使能 FP/SIMD（与 _start 一致）

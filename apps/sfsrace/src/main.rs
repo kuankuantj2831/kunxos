@@ -32,6 +32,8 @@ const SYS_TRUNCATE: usize = 45;
 const SYS_UNLINKAT: usize = 35;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_WAIT4: usize = 260;
+const SYS_RENAMEAT: usize = 38;
+const SYS_FSYNC: usize = 82;
 
 const SIGCHLD: usize = 17;
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -39,6 +41,7 @@ const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x200;
+const O_APPEND: usize = 0x400;
 
 // ==================== 测试参数 ====================
 
@@ -310,6 +313,15 @@ fn unlink(path: usize) -> i64 {
     unsafe { syscall2(SYS_UNLINKAT, AT_FDCWD, path) as i64 }
 }
 
+/// renameat（信箱认领 / 原子发布）。目标已存在时内核 POSIX 覆盖。
+fn rename(old: usize, new: usize) -> i64 {
+    unsafe { syscall4(SYS_RENAMEAT, AT_FDCWD, old, AT_FDCWD, new) as i64 }
+}
+
+fn fsync(fd: i64) -> i64 {
+    unsafe { syscall1(SYS_FSYNC, fd as usize) as i64 }
+}
+
 fn fork() -> i64 {
     unsafe { syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as i64 }
 }
@@ -442,6 +454,453 @@ fn child_main(i: usize) -> ! {
     exit(0);
 }
 
+// ==================== 并发信箱压测（rename 原子提交/认领） ====================
+//
+// 模拟真实文件信箱的两类协议（本轮 lifd/audiod/rild/alarmd/wifid 迁移后的
+// 形态），断言：无丢失、无重复、无半行（撕裂）、无死锁（有界轮询）。
+//
+// 阶段 A（多写者管道 + 认领读者，模型 audiod.ctl / rild.cmd / wifid.pipe）：
+//   3 个写者子进程并发 O_APPEND 追加 "W<i> <seq>\n"（写时取尾由内核保证
+//   互不覆盖），父进程 rename 认领取走并按 (i, seq) 计数。结束断言：
+//   每写者每序号恰好出现一次（丢失/重复即失败），全部消息完整成行。
+//
+// 阶段 B（单写者发布 + 并发读者，模型 rild.state / alarms.txt / .st）：
+//   1 个写者子进程 tmp+fsync+rename 原子发布版本 "V<n>\n"，1 个读者子进程
+//   反复整读并校验：任一读到的内容必须是完整合法行（无撕裂），版本号
+//   单调不减且最终能观察到终值（活锁/死锁即失败）。
+
+const MBX_WRITERS: usize = 3;
+const MBX_ITERS: usize = 48;
+const MBX_POLLS_MAX: usize = 30_000; // 死锁护栏：认领轮询上限（≥ 全部消息耗尽所需轮数一个量级）
+
+const MBX_PIPE: &[u8] = b"/var/run/mbx.pipe";
+const MBX_PIPE_R: &[u8] = b"/var/run/mbx.pipe.r";
+const MBX_PUB: &[u8] = b"/var/run/mbx.pub";
+const MBX_PUB_TMP: &[u8] = b"/var/run/mbx.pub.tmp";
+
+/// 认领统计：`SEEN[i][seq]` = 写者 i 的序号 seq 已被消费恰好一次。
+static mut SEEN: [[bool; MBX_ITERS]; MBX_WRITERS] = [[false; MBX_ITERS]; MBX_WRITERS];
+static mut MBX_BUF: [u8; 2048] = [0u8; 2048];
+
+/// 把静态路径写进给定缓冲（NUL 结尾），返回指针。
+fn cstr(dst: &mut [u8; 64], s: &[u8]) -> usize {
+    let n = s.len().min(63);
+    dst[..n].copy_from_slice(&s[..n]);
+    dst[n] = 0;
+    dst.as_ptr() as usize
+}
+
+/// 阶段 A 写者：追加 `MBX_ITERS` 条消息 + 1 条 DONE 哨兵。
+fn mbx_writer(i: usize) -> ! {
+    let mut p = [0u8; 64];
+    let pipe = cstr(&mut p, MBX_PIPE);
+    for seq in 0..MBX_ITERS {
+        let mut line = [0u8; 24];
+        let mut n = 0usize;
+        line[n] = b'W';
+        n += 1;
+        line[n] = b'0' + i as u8;
+        n += 1;
+        line[n] = b' ';
+        n += 1;
+        let mut v = seq + 1;
+        let mut digits = [0u8; 8];
+        let mut k = digits.len();
+        while v > 0 {
+            k -= 1;
+            digits[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        for &d in digits[k..].iter() {
+            line[n] = d;
+            n += 1;
+        }
+        line[n] = b'\n';
+        n += 1;
+        // 与真实写方一致：每条消息独立 open(O_APPEND) → write → close。
+        // 单次 write ≤ 4096，内核写时取尾 + FS 全局锁保证追加互不覆盖。
+        let fd = open(pipe, O_WRONLY | O_CREAT | O_APPEND);
+        if fd < 0 {
+            fail("mbx writer open", i, seq);
+        }
+        let w = write_fd(fd, &line[..n]);
+        close(fd);
+        if w != n as i64 {
+            fail("mbx writer write", i, seq);
+        }
+        nanosleep_us(300 + (i * 137 + seq * 31) % 900); // 错峰放大并发窗口
+    }
+    // DONE 哨兵：读者收齐 3 个哨兵且再取空一轮即知全部消息已到
+    let fd = open(pipe, O_WRONLY | O_CREAT | O_APPEND);
+    if fd < 0 {
+        fail("mbx writer done open", i, MBX_ITERS);
+    }
+    let mut line = [0u8; 8];
+    line[0] = b'W';
+    line[1] = b'0' + i as u8;
+    line[2] = b' ';
+    line[3] = b'D';
+    line[4] = b'\n';
+    let w = write_fd(fd, &line[..5]);
+    close(fd);
+    if w != 5 {
+        fail("mbx writer done write", i, MBX_ITERS);
+    }
+    exit(0);
+}
+
+/// 解析一批认领内容（完整行 "W<i> <seq>\n" / "W<i> D\n"）。
+/// 返回 0 成功；1 失败（已打印原因）。尾字节非 \n = 撕裂半行。
+fn mbx_parse_batch(buf: &mut [u8], n: usize, dones: &mut usize) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+    if buf[n - 1] != b'\n' {
+        print("[sfsrace] MAILBOX FAIL: 半行（写入撕裂）len=");
+        print_dec(n);
+        print("\n");
+        return 1;
+    }
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i;
+        while j < n && buf[j] != b'\n' {
+            j += 1;
+        }
+        let line = &buf[i..j];
+        i = j + 1;
+        if line.len() < 3 || line[0] != b'W' {
+            print("[sfsrace] MAILBOX FAIL: 非法行\n");
+            return 1;
+        }
+        let wi = (line[1] - b'0') as usize;
+        if wi >= MBX_WRITERS || line[2] != b' ' {
+            print("[sfsrace] MAILBOX FAIL: 非法写者号\n");
+            return 1;
+        }
+        if line.len() == 4 && line[3] == b'D' {
+            *dones += 1;
+            continue;
+        }
+        // 序号十进制
+        let mut seq = 0usize;
+        for &d in line[3..].iter() {
+            if !(d.is_ascii_digit()) {
+                print("[sfsrace] MAILBOX FAIL: 非法序号\n");
+                return 1;
+            }
+            seq = seq * 10 + (d - b'0') as usize;
+        }
+        if seq == 0 || seq > MBX_ITERS {
+            print("[sfsrace] MAILBOX FAIL: 序号越界 seq=");
+            print_dec(seq);
+            print("\n");
+            return 1;
+        }
+        let seen = unsafe { &mut *core::ptr::addr_of_mut!(SEEN) };
+        if seen[wi][seq - 1] {
+            print("[sfsrace] MAILBOX FAIL: 重复消息 W");
+            print_dec(wi);
+            print(" seq=");
+            print_dec(seq);
+            print("\n");
+            return 1;
+        }
+        seen[wi][seq - 1] = true;
+    }
+    0
+}
+
+/// 阶段 A 读者（父进程执行）：认领 → 读 → 删 → 重建 → 解析计数。
+/// 返回 0 成功；1 失败（已打印原因）。
+fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(MBX_BUF) };
+    let mut p = [0u8; 64];
+    let pipe = cstr(&mut p, MBX_PIPE);
+    let mut r = [0u8; 64];
+    let taken = cstr(&mut r, MBX_PIPE_R);
+    // 残留标记：仅在上一轮 unlink(taken) 失败（写者持 fd）时才需要排干
+    // ——否则每轮多一次 ENOENT open（刷 vfs 失败日志）。
+    static mut TAKEN_LEFT: bool = false;
+    loop {
+        *polls += 1;
+        if *polls > MBX_POLLS_MAX {
+            print("[sfsrace] MAILBOX FAIL: 认领轮询超限（疑似死锁/活锁）\n");
+            return 1;
+        }
+        // 残留认领文件：上一轮 rename 后写者迟到 append 落在其上（写者持
+        // fd 期间 unlink 失败）——先排干再删。盲删会把迟到消息销毁，
+        // 把认领协议自身的窗口误报成「丢失消息」内核 bug（假阳性 FAIL）。
+        if unsafe { TAKEN_LEFT } {
+            let lfd = open(taken, O_RDONLY);
+            if lfd >= 0 {
+                let ln = read_all(lfd, buf) as usize;
+                close(lfd);
+                if mbx_parse_batch(buf, ln, dones) != 0 {
+                    return 1;
+                }
+            }
+            unsafe { TAKEN_LEFT = unlink(taken) != 0 };
+        }
+        if rename(pipe, taken) != 0 {
+            // 无消息：sleep 后再试（写者还在跑）
+            nanosleep_us(1000);
+            if *dones >= MBX_WRITERS {
+                return 0; // 全部哨兵已收齐：调用方再做一次取空确认
+            }
+            continue;
+        }
+        let fd = open(taken, O_RDONLY);
+        if fd < 0 {
+            print("[sfsrace] MAILBOX FAIL: 打开认领文件失败\n");
+            return 1;
+        }
+        let n = read_all(fd, buf) as usize;
+        close(fd);
+        unsafe { TAKEN_LEFT = unlink(taken) != 0 };
+        // 重建空管道（无 O_TRUNC：认领后写入方新追加不截断）
+        let fd2 = open(pipe, O_WRONLY | O_CREAT);
+        if fd2 >= 0 {
+            close(fd2);
+        }
+        if n == 0 {
+            continue;
+        }
+        if mbx_parse_batch(buf, n, dones) != 0 {
+            return 1;
+        }
+    }
+}
+
+/// 阶段 A 主控：fork 写者 + 父进程认领消费 + 终局断言。
+fn mailbox_phase_a() -> i32 {
+    let mut p = [0u8; 64];
+    let pipe = cstr(&mut p, MBX_PIPE);
+    let mut r = [0u8; 64];
+    let taken = cstr(&mut r, MBX_PIPE_R);
+    unlink(taken);
+    unlink(pipe);
+    // 建空管道：写者第一次 open 就绪
+    let fd = open(pipe, O_WRONLY | O_CREAT);
+    if fd >= 0 {
+        close(fd);
+    }
+
+    let mut pids = [0i32; MBX_WRITERS];
+    for i in 0..MBX_WRITERS {
+        let pid = fork();
+        if pid < 0 {
+            print("[sfsrace] MAILBOX FAIL: fork 写者失败\n");
+            return 1;
+        }
+        if pid == 0 {
+            mbx_writer(i);
+        }
+        pids[i] = pid as i32;
+    }
+
+    let mut dones = 0usize;
+    let mut polls = 0usize;
+    // 认领循环直到三个 DONE 哨兵收齐（哨兵是各写者最后一条消息，其被
+    // 消费即证明该写者此前全部消息均已计入；此后管道再无新写入）
+    if mbx_reader(&mut dones, &mut polls) != 0 {
+        return 1;
+    }
+    // 收割写者
+    for i in 0..MBX_WRITERS {
+        let mut status = 0i32;
+        let rr = wait4(pids[i] as i64, &mut status);
+        if r_is_bad(rr, status) {
+            print("[sfsrace] MAILBOX FAIL: 写者异常退出\n");
+            return 1;
+        }
+    }
+    // 无丢失断言：每写者全部序号恰好消费一次
+    let seen = unsafe { &*core::ptr::addr_of!(SEEN) };
+    for wi in 0..MBX_WRITERS {
+        for seq in 0..MBX_ITERS {
+            if !seen[wi][seq] {
+                print("[sfsrace] MAILBOX FAIL: 丢失消息 W");
+                print_dec(wi);
+                print(" seq=");
+                print_dec(seq + 1);
+                print("\n");
+                return 1;
+            }
+        }
+    }
+    print("[sfsrace] 信箱A 多写者追加+认领 消费 ");
+    print_dec(MBX_WRITERS * MBX_ITERS);
+    print(" 条无丢失/无重复 OK\n");
+    0
+}
+
+fn r_is_bad(r: i64, status: i32) -> bool {
+    r <= 0 || (((status as u32) >> 8) & 0xFF) != 0
+}
+
+/// 阶段 B 写者：`MBX_ITERS` 个版本 "V<n>\n"，tmp+fsync+rename 原子发布。
+fn mbx_publisher() -> ! {
+    let mut p = [0u8; 64];
+    let mut t = [0u8; 64];
+    let pubp = cstr(&mut p, MBX_PUB);
+    let tmp = cstr(&mut t, MBX_PUB_TMP);
+    for v in 1..=MBX_ITERS {
+        let mut line = [0u8; 16];
+        let mut n = 0usize;
+        line[n] = b'V';
+        n += 1;
+        let mut x = v;
+        let mut digits = [0u8; 8];
+        let mut k = digits.len();
+        while x > 0 {
+            k -= 1;
+            digits[k] = b'0' + (x % 10) as u8;
+            x /= 10;
+        }
+        for &d in digits[k..].iter() {
+            line[n] = d;
+            n += 1;
+        }
+        line[n] = b'\n';
+        n += 1;
+        // 与 rild.state / alarmd.state 一致：写临时 → fsync → rename 覆盖。
+        // 读者持打开时 rename EBUSY → 重试（读窗口微秒级，有界重试必过）。
+        let mut ok = false;
+        for _try in 0..64 {
+            let fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC);
+            if fd < 0 {
+                fail("mbx pub open", 0, v);
+            }
+            let w = write_fd(fd, &line[..n]);
+            fsync(fd);
+            close(fd);
+            if w != n as i64 {
+                fail("mbx pub write", 0, v);
+            }
+            if rename(tmp, pubp) == 0 {
+                ok = true;
+                break;
+            }
+            nanosleep_us(200); // EBUSY：读者恰好持打开，稍候重试
+        }
+        if !ok {
+            fail("mbx pub rename 重试超限", 0, v);
+        }
+        nanosleep_us(500 + (v * 97) % 800);
+    }
+    exit(0);
+}
+
+/// 阶段 B 读者：反复整读，断言每次内容都是完整合法 "V<n>\n" 且版本单调
+/// 不减；观察到终值 MBX_ITERS 即成功退出（终值可能被跳过？不可能——读者
+/// 轮询快于发布间隔，但即便跳过中间版本也合法，只要求终值可见）。
+fn mbx_observer() -> ! {
+    let mut p = [0u8; 64];
+    let pubp = cstr(&mut p, MBX_PUB);
+    let mut buf = [0u8; 32];
+    let mut last = 0usize;
+    for _poll in 0..MBX_POLLS_MAX {
+        let fd = open(pubp, O_RDONLY);
+        if fd >= 0 {
+            let n = read_fd(fd, &mut buf) as usize;
+            close(fd);
+            if n > 0 {
+                // 完整行校验：'V' + 数字... + '\n'（无撕裂半行）
+                if buf[n - 1] != b'\n' || buf[0] != b'V' || n < 3 {
+                    print("[sfsrace] MAILBOX FAIL: 发布内容撕裂 len=");
+                    print_dec(n);
+                    print("\n");
+                    exit(1);
+                }
+                let mut v = 0usize;
+                for &d in buf[1..n - 1].iter() {
+                    if !d.is_ascii_digit() {
+                        print("[sfsrace] MAILBOX FAIL: 发布内容非法\n");
+                        exit(1);
+                    }
+                    v = v * 10 + (d - b'0') as usize;
+                }
+                if v == 0 || v > MBX_ITERS {
+                    print("[sfsrace] MAILBOX FAIL: 发布版本越界 v=");
+                    print_dec(v);
+                    print("\n");
+                    exit(1);
+                }
+                if v < last {
+                    print("[sfsrace] MAILBOX FAIL: 发布版本回退 ");
+                    print_dec(v);
+                    print(" < ");
+                    print_dec(last);
+                    print("\n");
+                    exit(1);
+                }
+                last = v;
+                if v == MBX_ITERS {
+                    exit(0); // 终值可见：活性与一致性均达成
+                }
+            }
+        }
+        nanosleep_us(300);
+    }
+    print("[sfsrace] MAILBOX FAIL: 观察者轮询超限（终值不可达，疑似活锁）\n");
+    exit(1);
+}
+
+/// 阶段 B 主控：fork 发布者 + 观察者，收割并断言双零退出。
+fn mailbox_phase_b() -> i32 {
+    let mut p = [0u8; 64];
+    let mut t = [0u8; 64];
+    let pubp = cstr(&mut p, MBX_PUB);
+    let tmp = cstr(&mut t, MBX_PUB_TMP);
+    unlink(pubp);
+    unlink(tmp);
+    let wpid = fork();
+    if wpid < 0 {
+        print("[sfsrace] MAILBOX FAIL: fork 发布者失败\n");
+        return 1;
+    }
+    if wpid == 0 {
+        mbx_publisher();
+    }
+    let opid = fork();
+    if opid < 0 {
+        print("[sfsrace] MAILBOX FAIL: fork 观察者失败\n");
+        return 1;
+    }
+    if opid == 0 {
+        mbx_observer();
+    }
+    let mut bad = 0usize;
+    for i in 0..2 {
+        let mut status = 0i32;
+        let pid = if i == 0 { wpid } else { opid };
+        let r = wait4(pid, &mut status);
+        if r_is_bad(r, status) {
+            bad += 1;
+        }
+    }
+    unlink(pubp);
+    if bad != 0 {
+        print("[sfsrace] MAILBOX FAIL: 阶段B 子进程异常\n");
+        return 1;
+    }
+    print("[sfsrace] 信箱B 发布+并发整读 无撕裂/版本单调 OK\n");
+    0
+}
+
+/// 信箱压测入口：阶段 A + B 全绿返回 0。
+fn mailbox_phase() -> i32 {
+    if mailbox_phase_a() != 0 {
+        return 1;
+    }
+    if mailbox_phase_b() != 0 {
+        return 1;
+    }
+    print("[sfsrace] MAILBOX PASS\n");
+    0
+}
+
 // ==================== 主流程 ====================
 
 #[no_mangle]
@@ -500,6 +959,12 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     if nbad == 0 {
         print("[sfsrace] SFS-RACE PASS\n");
+        // 并发信箱压测（rename 原子提交/认领）：追加 PASS 前缀 MAILBOX；
+        // 任一断言（无丢失/无重复/无撕裂/无死锁）失败都以非零退出收场。
+        if mailbox_phase() != 0 {
+            print("[sfsrace] SFS-RACE FAIL (mailbox)\n");
+            return 1;
+        }
         0
     } else {
         print("[sfsrace] SFS-RACE FAIL\n");

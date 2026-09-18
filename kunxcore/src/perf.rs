@@ -129,6 +129,11 @@ static mut FS_SPIKES: u64 = 0;
 static mut FS_RENDER_SUM: u64 = 0;
 static mut FS_RENDER_MAX: u64 = 0;
 static mut FS_RENDER_N: u64 = 0;
+// fb_present 关中断临界区（元数据 + 提交阶段，不含像素搬运）耗时：
+// 该值逼近直绘渲染总耗时说明 IRQ 窗口退化回「全程屏蔽」（输入/调度被
+// 呈现路径独占）；显著小于总耗时即像素阶段已让出 CPU 给 IRQ。
+static mut FS_CRIT_SUM: u64 = 0;
+static mut FS_CRIT_MAX: u64 = 0;
 static mut T2F_COUNT: u64 = 0;
 static mut T2F_MIN: u64 = u64::MAX;
 static mut T2F_MAX: u64 = 0;
@@ -138,12 +143,19 @@ static mut T2F_N: usize = 0;
 static mut FS_PENDING: bool = false;
 
 /// 应用直绘路径合成+呈现耗时上报（compositor::fb_present 成功呈现时调用）。
-pub fn note_app_render(render_us: u64) {
+///
+/// `render_us` 为呈现总耗时；`crit_us` 为其中 IRQ 被屏蔽的临界区耗时
+/// （fb_present 元数据 + 提交阶段，不含 canvas→back 像素搬运）。
+pub fn note_app_render(render_us: u64, crit_us: u64) {
     unsafe {
         FS_RENDER_SUM += render_us;
         FS_RENDER_N += 1;
         if render_us > FS_RENDER_MAX {
             FS_RENDER_MAX = render_us;
+        }
+        FS_CRIT_SUM += crit_us;
+        if crit_us > FS_CRIT_MAX {
+            FS_CRIT_MAX = crit_us;
         }
     }
 }
@@ -155,74 +167,40 @@ pub fn poll_report() {
             return;
         }
         FS_PENDING = false;
+        // 快照 + 复位在关中断窗口内完成：note_frame 在 IRQ/呈现上下文推进
+        // 同一组计数，可被抢占的「读-排序-清零」会把新样本抹掉或跨窗口
+        // 混算。UART 打印（毫秒级忙等）留在可中断上下文 —— 帧统计冲刷
+        // 此前刚因 IRQ 内忙等打满帧预算而从 CNTP 挪出来，不能倒退。
+        let saved = crate::sched_cfs::read_daif();
+        core::arch::asm!("msr daifset, #2");
         let n = FS_N;
         if n == 0 {
             // 报告标记跨窗口竞态（同 anim::report_frame_stats 的 n==0 防御）
+            crate::sched_cfs::write_daif(saved);
             return;
         }
         let mut buf = [0u64; FS_WINDOW];
         buf[..n].copy_from_slice(&FS_SAMPLES[..n]);
-        for i in 1..n {
-            let key = buf[i];
-            let mut j = i;
-            while j > 0 && buf[j - 1] > key {
-                buf[j] = buf[j - 1];
-                j -= 1;
-            }
-            buf[j] = key;
-        }
-        let p95 = buf[(n * 95 / 100).min(n - 1)];
-        let avg = FS_SUM / FS_COUNT.max(1);
-        crate::uart_send_str("[perf] 帧(n=");
-        crate::print_dec(FS_COUNT);
-        crate::uart_send_str(" 间隔(min=");
-        crate::print_dec(FS_MIN);
-        crate::uart_send_str(",avg=");
-        crate::print_dec(avg);
-        crate::uart_send_str(",p95=");
-        crate::print_dec(p95);
-        crate::uart_send_str(",max=");
-        crate::print_dec(FS_MAX);
-        crate::uart_send_str(")us 掉帧(>12ms)=");
-        crate::print_dec(FS_DROPS);
-        crate::uart_send_str(" 尖峰(>20ms)=");
-        crate::print_dec(FS_SPIKES);
-        if FS_RENDER_N > 0 {
-            crate::uart_send_str(" 直绘渲染(avg=");
-            crate::print_dec(FS_RENDER_SUM / FS_RENDER_N);
-            crate::uart_send_str(",max=");
-            crate::print_dec(FS_RENDER_MAX);
-            crate::uart_send_str(")us");
-        }
-        crate::uart_send_str("\n");
-
-        // t2f：触控→上屏延迟分布（输入跟随帧）
+        let count = FS_COUNT;
+        let min = FS_MIN;
+        let max = FS_MAX;
+        let sum = FS_SUM;
+        let drops = FS_DROPS;
+        let spikes = FS_SPIKES;
+        let rn = FS_RENDER_N;
+        let rsum = FS_RENDER_SUM;
+        let rmax = FS_RENDER_MAX;
+        let csum = FS_CRIT_SUM;
+        let cmax = FS_CRIT_MAX;
         let tn = T2F_N;
+        let mut tb = [0u64; 32];
         if tn > 0 {
-            let mut tb = [0u64; 32];
             tb[..tn].copy_from_slice(&T2F_SAMPLES[..tn]);
-            for i in 1..tn {
-                let key = tb[i];
-                let mut j = i;
-                while j > 0 && tb[j - 1] > key {
-                    tb[j] = tb[j - 1];
-                    j -= 1;
-                }
-                tb[j] = key;
-            }
-            let tp95 = tb[(tn * 95 / 100).min(tn - 1)];
-            crate::uart_send_str("[perf] t2f(n=");
-            crate::print_dec(T2F_COUNT);
-            crate::uart_send_str(" min=");
-            crate::print_dec(T2F_MIN);
-            crate::uart_send_str(" avg=");
-            crate::print_dec(T2F_SUM / T2F_COUNT.max(1));
-            crate::uart_send_str(" p95=");
-            crate::print_dec(tp95);
-            crate::uart_send_str(" max=");
-            crate::print_dec(T2F_MAX);
-            crate::uart_send_str("us\n");
         }
+        let tcount = T2F_COUNT;
+        let tmin = T2F_MIN;
+        let tmax = T2F_MAX;
+        let tsum = T2F_SUM;
         // 复位报告窗口（保留 FS_LAST_PRESENT_US 保证跨窗口间隔连续）
         FS_COUNT = 0;
         FS_MIN = u64::MAX;
@@ -235,12 +213,81 @@ pub fn poll_report() {
         FS_RENDER_SUM = 0;
         FS_RENDER_MAX = 0;
         FS_RENDER_N = 0;
+        FS_CRIT_SUM = 0;
+        FS_CRIT_MAX = 0;
         T2F_COUNT = 0;
         T2F_MIN = u64::MAX;
         T2F_MAX = 0;
         T2F_SUM = 0;
         T2F_SAMPLES = [0; 32];
         T2F_N = 0;
+        crate::sched_cfs::write_daif(saved);
+
+        // ---- 排序 + 打印（可中断上下文） ----
+        for i in 1..n {
+            let key = buf[i];
+            let mut j = i;
+            while j > 0 && buf[j - 1] > key {
+                buf[j] = buf[j - 1];
+                j -= 1;
+            }
+            buf[j] = key;
+        }
+        let p95 = buf[(n * 95 / 100).min(n - 1)];
+        let avg = sum / count.max(1);
+        crate::uart_send_str("[perf] 帧(n=");
+        crate::print_dec(count);
+        crate::uart_send_str(" 间隔(min=");
+        crate::print_dec(min);
+        crate::uart_send_str(",avg=");
+        crate::print_dec(avg);
+        crate::uart_send_str(",p95=");
+        crate::print_dec(p95);
+        crate::uart_send_str(",max=");
+        crate::print_dec(max);
+        crate::uart_send_str(")us 掉帧(>12ms)=");
+        crate::print_dec(drops);
+        crate::uart_send_str(" 尖峰(>20ms)=");
+        crate::print_dec(spikes);
+        if rn > 0 {
+            crate::uart_send_str(" 直绘渲染(avg=");
+            crate::print_dec(rsum / rn);
+            crate::uart_send_str(",max=");
+            crate::print_dec(rmax);
+            crate::uart_send_str(")us");
+            // 关中断临界区占比：验收 fb_present IRQ 窗口收窄的观测点
+            crate::uart_send_str(" 关中断(avg=");
+            crate::print_dec(csum / rn);
+            crate::uart_send_str(",max=");
+            crate::print_dec(cmax);
+            crate::uart_send_str(")us");
+        }
+        crate::uart_send_str("\n");
+
+        // t2f：触控→上屏延迟分布（输入跟随帧）
+        if tn > 0 {
+            for i in 1..tn {
+                let key = tb[i];
+                let mut j = i;
+                while j > 0 && tb[j - 1] > key {
+                    tb[j] = tb[j - 1];
+                    j -= 1;
+                }
+                tb[j] = key;
+            }
+            let tp95 = tb[(tn * 95 / 100).min(tn - 1)];
+            crate::uart_send_str("[perf] t2f(n=");
+            crate::print_dec(tcount);
+            crate::uart_send_str(" min=");
+            crate::print_dec(tmin);
+            crate::uart_send_str(" avg=");
+            crate::print_dec(tsum / tcount.max(1));
+            crate::uart_send_str(" p95=");
+            crate::print_dec(tp95);
+            crate::uart_send_str(" max=");
+            crate::print_dec(tmax);
+            crate::uart_send_str("us\n");
+        }
     }
 }
 

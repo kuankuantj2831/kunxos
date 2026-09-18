@@ -5,10 +5,13 @@
 //! ```text
 //! /data/life/
 //! ├── reg_<name>      launcher 启动应用时登记（内容 "pid FG"），lifd 读取后删除
-//! ├── cmd_<pid>       应用/launcher → lifd 的命令（BG / RECENTS / BTASK ...）
+//! ├── cmd_<pid>_<seq> 应用/launcher → lifd 的命令（BG / RECENTS / BTASK ...）；
+//! │                   每消息一文件，写 <name>.tmp 后 rename 发布（读方要么
+//! │                   看不到、要么看到完整消息，消除 read→clear 竞态）
 //! ├── evt_<pid>       lifd → 应用的事件（PAUSE / SUSPEND / RESUME / TERMINATE /
-//! │                   NOTIFY / BG_TASK_EXPIRED ...）；"最新覆盖"语义，应用读后清空
-//! └── launcher_evt    lifd → launcher 的事件（BG / FG / KILLED / EXITED）
+//! │                   NOTIFY / BG_TASK_EXPIRED ...）；"最新覆盖"语义：lifd 写
+//! │                   .new 后 rename 发布，应用 rename 取走后读
+//! └── launcher_evt    lifd → launcher 的事件（BG / FG / KILLED / EXITED），同上
 //! ```
 //!
 //! 内核侧配合：SIGSTOP 停止进程（后台）、SIGCONT 恢复（回到前台）——均在内核
@@ -134,10 +137,9 @@ pub fn lc_init() -> bool {
             LC_NAME[..s.len()].copy_from_slice(s);
             LC_NAME_LEN = s.len();
         }
-        // 事件文件存在性探测：目录不存在视为 lifd 未启动
-        let mut path = [0u8; 64];
-        let n = mk_evt_path(&mut path);
-        let fd = super::open(core::str::from_utf8(&path[..n]).unwrap_or(""), super::O_RDONLY);
+        // lifd 就绪探测：事件文件改为「rename 取走」语义后不常驻（取走后
+        // 不存在），探测目录本身才正确。
+        let fd = super::open(LC_DIR, super::O_RDONLY);
         if fd < 0 {
             // 不销毁 INITED：后续 lc_poll 仍会尝试（lifd 可能稍后启动）
             return false;
@@ -171,7 +173,7 @@ fn mk_evt_path(out: &mut [u8; 64]) -> usize {
     }
 }
 
-fn mk_cmd_path(out: &mut [u8; 64]) -> usize {
+fn mk_cmd_path(out: &mut [u8; 80]) -> usize {
     unsafe {
         let p = LC_CMD_PREFIX.as_bytes();
         out[..p.len()].copy_from_slice(p);
@@ -195,51 +197,111 @@ fn mk_cmd_path(out: &mut [u8; 64]) -> usize {
     }
 }
 
-/// 写一条命令到命令信箱（覆盖式）。
+/// 自包含 rename（SYS_RENAMEAT=38，dirfd 忽略、直接收绝对路径；目标已
+/// 存在时内核拒绝）。不复用 super::syscall4 —— 并非所有引入方都导出它。
+#[inline(always)]
+unsafe fn lc_rename(old: &[u8], new: &[u8]) -> isize {
+    let ret: usize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") 38usize,
+        inlateout("x0") 0xFFFF_FFFF_FFFF_FF9Cusize => ret, // AT_FDCWD
+        in("x1") old.as_ptr(),
+        in("x2") 0xFFFF_FFFF_FFFF_FF9Cusize,
+        in("x3") new.as_ptr(),
+        options(nostack)
+    );
+    ret as isize
+}
+
+/// 命令序号（每消息一文件的名字唯一性）。
+static mut LC_CMD_SEQ: u64 = 0;
+
+/// 写一条命令到命令信箱（每消息一文件 + 临时名 rename 发布）。
+///
+/// 此前「O_TRUNC 覆盖单文件」与 lifd 读方的「读后 unlink」之间存在竞态：
+/// 读方读到一半写方重写、或读方 unlink 掉刚写入的新命令 —— 命令静默丢失。
+/// spool 语义下目标名 `<base>_<seq>` 永不存在，rename 恒成功，读方要么
+/// 看不到文件、要么看到完整已提交消息。lifd 侧目录扫描 + parse_dec 到
+/// 非数字停止，`cmd_<pid>_<seq>` 命名对读方零改动。
 fn lc_write_cmd(cmd: &[u8]) -> bool {
     unsafe {
-        let mut path = [0u8; 64];
-        let n = mk_cmd_path(&mut path);
+        let mut base = [0u8; 80];
+        let n = mk_cmd_path(&mut base);
+        LC_CMD_SEQ = LC_CMD_SEQ.wrapping_add(1);
+        let mut seq = [0u8; 16];
+        let mut i = seq.len();
+        let mut v = LC_CMD_SEQ;
+        if v == 0 {
+            i -= 1;
+            seq[i] = b'0';
+        } else {
+            while v > 0 {
+                i -= 1;
+                seq[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        // 发布名 / 临时名（含 NUL 结尾）。
+        let mut pub_path = [0u8; 96];
+        let mut tmp_path = [0u8; 96];
+        let mut m = n;
+        pub_path[..n].copy_from_slice(&base[..n]);
+        pub_path[m] = b'_';
+        m += 1;
+        pub_path[m..m + (seq.len() - i)].copy_from_slice(&seq[i..]);
+        m += seq.len() - i;
+        tmp_path[..m].copy_from_slice(&pub_path[..m]);
+        tmp_path[m..m + 4].copy_from_slice(b".tmp");
+        // 写临时名 → rename 发布。
         let fd = super::open(
-            core::str::from_utf8(&path[..n]).unwrap_or(""),
+            core::str::from_utf8(&tmp_path[..m + 4]).unwrap_or(""),
             super::O_WRONLY | 0x40 | 0x200, // O_CREAT | O_TRUNC
         );
         if fd < 0 {
             return false;
         }
-        let r = super::syscall3(super::SYS_WRITE, fd as usize, cmd.as_ptr() as usize, cmd.len());
+        let r =
+            super::syscall3(super::SYS_WRITE, fd as usize, cmd.as_ptr() as usize, cmd.len());
         super::syscall1(super::SYS_CLOSE, fd as usize);
-        (r as isize) == cmd.len() as isize
+        if (r as isize) != cmd.len() as isize {
+            // 写失败：清理临时名（rename 不会发布残缺消息）。
+            super::syscall3(super::SYS_UNLINKAT, super::AT_FDCWD, tmp_path.as_ptr() as usize, 0);
+            return false;
+        }
+        lc_rename(&tmp_path[..m + 4], &pub_path[..m]) == 0
     }
 }
 
 /// 读取事件文件并清空；无事件返回空。返回事件内容（不含尾部 NUL）。
+///
+/// 「rename 取走」：先把事件文件原子改名到 `<path>.r` 再打开读取、读完
+/// unlink —— 取走与读取之间 lifd 新发布的事件落在重生的 `<path>` 上，
+/// 不会被本次读取吞掉（此前「读 → unlink」会把 publish 与 unlink 之间的
+/// 新事件一并删掉）。
 fn lc_read_evt(buf: &mut [u8]) -> usize {
     unsafe {
         let mut path = [0u8; 64];
         let n = mk_evt_path(&mut path);
-        let fd = super::open(core::str::from_utf8(&path[..n]).unwrap_or(""), super::O_RDONLY);
+        let mut taken = [0u8; 64];
+        taken[..n].copy_from_slice(&path[..n]);
+        taken[n..n + 2].copy_from_slice(b".r");
+        if lc_rename(&path[..n], &taken[..n + 2]) != 0 {
+            // 无待读事件（ENOENT）。
+            return 0;
+        }
+        let fd = super::open(core::str::from_utf8(&taken[..n + 2]).unwrap_or(""), super::O_RDONLY);
         if fd < 0 {
             return 0;
         }
         let r = super::syscall3(super::SYS_READ, fd as usize, buf.as_mut_ptr() as usize, buf.len())
             as isize;
         super::syscall1(super::SYS_CLOSE, fd as usize);
+        super::syscall3(super::SYS_UNLINKAT, super::AT_FDCWD, taken.as_ptr() as usize, 0);
         if r <= 0 {
             return 0;
         }
-        let len = (r as usize).min(buf.len());
-        // 读后清空（unlink + 重建为空文件：保证下一次 lc_poll 读不到旧事件）
-        super::syscall3(super::SYS_UNLINKAT, super::AT_FDCWD, path.as_ptr() as usize, 0);
-        // 重建空文件（lifd 用 O_CREAT 追加语义写事件；先建好避免 lifd 写入失败）
-        let fd2 = super::open(
-            core::str::from_utf8(&path[..n]).unwrap_or(""),
-            super::O_WRONLY | 0x40 | 0x200,
-        );
-        if fd2 >= 0 {
-            super::syscall1(super::SYS_CLOSE, fd2 as usize);
-        }
-        len
+        (r as usize).min(buf.len())
     }
 }
 
@@ -527,8 +589,16 @@ pub fn lc_notify_local(title: &[u8], body: &[u8]) -> bool {
         n = push_dec(&mut path, n, LC_PID as u64);
         out_push(&mut path, &mut n, b'_');
         n = push_dec(&mut path, n, (super::now_us() & 0xFFFF) as u64);
+        // ★ 原子发布（.tmp + rename）：pushd 的 getdents 若扫到 create 与
+        // write 之间的半成品文件，会读到 0 字节并立即 unlink —— 通知永久
+        // 丢失（无重试）。目标名含时间戳永不存在，rename 恒成功。
+        let mut tmp = [0u8; 64];
+        tmp[..n].copy_from_slice(&path[..n]);
+        if n + 4 < tmp.len() {
+            tmp[n..n + 4].copy_from_slice(b".tmp");
+        }
         let fd = super::open(
-            core::str::from_utf8(&path[..n]).unwrap_or(""),
+            core::str::from_utf8(&tmp[..n + 4]).unwrap_or(""),
             super::O_WRONLY | 0x40 | 0x200,
         );
         if fd < 0 {
@@ -548,7 +618,15 @@ pub fn lc_notify_local(title: &[u8], body: &[u8]) -> bool {
         pl += b;
         let r = super::syscall3(super::SYS_WRITE, fd as usize, payload.as_ptr() as usize, pl);
         super::syscall1(super::SYS_CLOSE, fd as usize);
-        (r as isize) == pl as isize
+        if (r as isize) != pl as isize {
+            // 半写：清临时名，不发布
+            let mut t2 = [0u8; 64];
+            t2[..n + 4].copy_from_slice(&tmp[..n + 4]);
+            t2[n + 4] = 0;
+            super::syscall3(super::SYS_UNLINKAT, super::AT_FDCWD, t2.as_ptr() as usize, 0);
+            return false;
+        }
+        lc_rename(&tmp[..n + 4], &path[..n]) == 0
     }
 }
 

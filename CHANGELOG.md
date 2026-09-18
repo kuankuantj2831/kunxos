@@ -4,6 +4,388 @@
 
 ## [Unreleased]
 
+### 2026-09-18 GUI 前台路径调查 + 测试修正（存档）
+
+> inode 512 扩容让启动门控首次真正写成功、应用真正启动，暴露未提交生命
+> 周期重设计的前台输入路径缺陷（应用前台期 launcher 设计性不读输入、
+> 应用侧只读到 1 次事件即不再轮询）+ launcher_test 断言过期（历史通过
+> 均为 gate 写失败的退化形态）。测试已按真实生命周期流程重写（偏移锚点
+> 防陈旧匹配、应用内返回→退出→桌面恢复验证）。完整证据链见
+> `BUG_REPORT.md` 第二十六节。非 GUI 回归全绿。
+
+### 2026-09-18 第四波修复轮：FAT32 互操作 + TCP MTU + rild 短信链路 → 20 项修复
+
+> **FAT32 目录项首簇 HI/LO 与规范相反**（内核+mkdisk 同向写反、自产镜像
+> 自洽掩盖——标准 mkfs.vfat 卷挂载全部读空），全部读写点对调 + disk.img
+> 重建 + run-disk 引导验证。TCP 发送段上限收紧 1460（此前可组 2048 字节
+> 超长帧，真实网卡黑洞）。rild 短信链路两高危：**AT 行缓冲 160 截断 PDU
+> （正文 >50 字符的短信永远收不到）**→ 448；命令等待期 URC 吞失（发短信
+> 窗口内的新短信/来电不可见）→ 已知前缀仍派发。alarmd 每周闹钟按 UTC 求
+> 周几（东八区 08:00 前的起床闹钟整体晚一天）→ 本地日历日。camerad 无
+> 后端 panic ×9 处、录像容器交错、audiod 陈旧块无限重播、logd 突发丢日志
+> 等。net_virtio SMP 跨核竞态移交 SMP 锁纪律轮。详见 `BUG_REPORT.md`
+> 第二十五轮。
+
+### 2026-09-18 第三波修复轮：内核核心 + shared 全量读码 → 17 项修复（含新动画代码自纠）
+
+> 内核：shm_map/shm_close 引用计数 IRQ 竞态（UAF）、dup 失败回滚对活进程
+> 误调 shm_close_index（UAF，newfd>=FD_MAX 稳定触发）→ 新增
+> shm_drop_one_ref、信号位图 RMW 竞态（SIGKILL 可丢）、now_us 频率换算
+> 截断（每秒慢 0.8%，perf/deadline/超时全部失真）。shared：sync 墓碑
+> 残留（远端重建资源不可见 + 周期性误删服务器数据）与 apply_deleted
+> 服务器优先不落删除、sms 标题栏负整除误开会话、text_engine BiDi
+> 字节/字符错位、l10n 阿拉伯语复数 &&/|| 链解析、emoji CBLC 越界 panic、
+> jpeg 尺寸回绕、cursor_overlay 首帧黑块、gallery 不可见行命中。
+> **本会话新动画代码自纠 3 条**：PullRefresh 弹簧被 frame() 的 last 覆盖
+> 饿死 16 倍速、ate 残留吞后续 tap、glass 回零 tween 每帧重启。
+> 另：P0-2 files 页面转场、P0-4 音量 HUD（音量键此前在输入分发中被
+> 丢弃）落地。详见 `BUG_REPORT.md` 第二十四轮。
+
+### 2026-09-18 第二波修复轮：TLS 安全（证书链 CA 校验 + critical 扩展解析根因）+ 信箱迁移收官 + 19 项修复
+
+> TLS 栈深挖发现 **证书链无 CA/basicConstraints 校验**（持有效叶子证书可
+> MITM 冒充任意域名）与**critical 扩展解析拿错 tag**（basicConstraints 恒
+> 为 critical、被静默跳过——SAN 非 critical 故从未暴露）两个联合缺陷；
+> 修复后对 www.baidu.com 真网完整握手 + HTTP 200 实测通过。畸形告警记录
+> 远程 panic、close_notify 长度、HelloRequest 哈希、DER 长端编码一并修复。
+> 信箱 rename 认领迁移收官：camerad/sensord/positiond + lc_notify_local
+> 原子发布（第二十轮的 /var/run 部分补齐）。terminal UTF-8 组装器丢 CJK
+> （凑 4 字节与 3 字节序列错位）+ 历史环乱序 + CSI 短写；calendar 跨零点
+> DTEND、camerad id>999 硬拒、recovery reboot 系统调用号（169→142）、
+> MPU 传感器大端、kunxboot dtb 边界端点。详见 `BUG_REPORT.md` 第二十三轮。
+
+### 2026-09-18 修复轮：inode 容量根因 + 四路审查 19 项修复 + 4 组动画
+
+> sfsrace BASELINE FAIL 根因为 **SFS inode 容量耗尽**（rootfs 涨到 196
+> 文件后，sfsrace + 守护进程信箱数秒烧完剩余 60 个 inode，全系统 create
+> 失败——第二十轮「/var/run 创建即失败」的真正答案）。`MAX_INODES`
+> 256 → 512（内核 + mkfs 同步，`parse_sb` 加 SB_NUM_INODES 护栏拒绝旧
+> 镜像，`rm disk.img && make disk` 重建）。另经 4 路并行审查修复 19 项：
+> O_APPEND 死代码（追加链路整条不可达）、ppoll ABI 错位（musl poll 恒无
+> 就绪）、fb_present BUSY 死属主卡死整机画面、wait 重试丢唤醒、browser
+> HTTPS fd 泄漏（16 槽 socket 表十几次耗尽）、networkd 管道永久失效、
+> kunxpkg 菱形依赖约束短路、launcher 占位页守卫恒假等。动画：P1-6 下拉
+> 刷新（motion.rs PullRefresh + sms）、P1-2 gallery 一镜到底（可打断
+> 续跑）、P0-2 sms 页面转场、P2-2 光随指动（glass 光源偏移 + 全应用输入
+> 自动喂点）。详见 `BUG_REPORT.md` 第二十二轮。验证：make 0 警告、
+> sync 57/57、wireless 105/105、sfsrace PASS。
+
+### 2026-09-16 SMP/PSCI 打通轮：副核唤醒 + 每核状态 + 三项 SMP 债务修复
+
+> 只做「SMP/PSCI 打通或显式降级」：结论为**打通至双核上线可用、压测
+> 仍实验性**。详见 `BUG_REPORT.md` 第二十一轮。
+
+- **PSCI CPU_ON 打通**：旧结论「-kernel 模式无 PSCI」系 conduit 误用
+  （`smc #0` 在 secure=off 下 UNDEF）；QEMU virt 的 DTB `/psci` 报
+  `method="hvc"`，QEMU 自身拦截 hvc 分派 PSCI。`smp_init` 改 DTB 检测
+  conduit/函数号 + `PSCI_VERSION` 探测（无 PSCI 显式单核降级）+ 逐核
+  CPU_ON。实测 `-smp 2` 两核在线、cpu1 承载用户任务（SVC/缺页实证）。
+- **副核上线四阻塞点修复**：GICC 每核偏移错误（GICv2 banked，去
+  `cpu_id*0x20000`）；`SECONDARY_STACKS` 1 字节对齐致 SP 歪（Alignment
+  fault 风暴）→ `#[repr(align(16))]` + 入口兜底对齐；栈区误落 .rodata
+  被恒等映射标只读（Permission fault）→ `static mut` 落 .bss；每核
+  MAIR/TCR/TTBR0/SCTLR/PAN 从未在副核初始化（用户任务首调即 SIGILL）
+  → 新增 `mmu::init_secondary()`。
+- **SMP 债务 ×3**：PROCESSES 槽位 `PROC_CLAIM` 原子认领（alloc/reap/
+  reap_forced 全路径）；execve 跨核 kill_req 窗口（kill_siblings_of
+  静默等待他核兑现 + pick_next 不复活 kill_req 任务）；fs_lock/unlock
+  持有身份改 TID 单令牌（迁移后解锁不再丢嵌套深度/误清存活持有者）。
+- **定位与文档**：`-smp 2` 为实验性（sfsrace 双核压测偶发任务表踩踏，
+  指向调度器 static mut 无锁并发面，三债之外的遗留工程）；默认回归与
+  发布仍单核。`make run-smp` 更新为真 SMP + verbose，DEBUGGING.md 同步。
+- **构建系统**：`test-sfsrace` 间歇性 FAIL（mkfs 与上次 cargo 编译
+  同秒 → mtime 粒度内误判 Fresh → 测试标记不重嵌内核）——mkfs 后
+  `touch $(RAMDISK)` 强制重编。
+- 验证：单核 boot / `make test-sfsrace` / `make power-test` 21/21 全绿；
+  `-smp 2` 上线稳定、sfsrace 一次全绿、power 20~21/21（时序敏感项）。
+
+### 2026-09-16 通宵轮②：对话框统一轮回归清剿 + lifd 族信箱原子化 + 5 组动画
+
+> 与同期 TLS/NetSurf 轮并行作业（本轮边界：launcher / 应用侧 / lifd 族
+> 信箱）。方法：3 路并行审查代理（未提交 diff 回归 F1~F11 / 信箱竞态盘点
+> / clock-notes-cloud 方案）+ 主会话实施。详见 `BUG_REPORT.md` 第二十轮。
+
+- **对话框统一轮回归修复（审查发现，全部未提交改动的自身缺陷）**：
+  blit_icon 快路径绕过 TILE_MODE（启动转场瓦片错图标 + 屏幕左上角污染）；
+  小组件玻璃缓存键补几何（布局变化后不再恢复陈旧玻璃）；「桌面设置」卡
+  直接点确定不再把壁纸序号误当网格选择（独立暂存 SHEET_GRID）；Toast
+  退场残影补一帧清理；文件夹压暗缓存跨分钟不再冻结状态栏时钟；浏览器
+  chunked 解码 size 回绕溢出（远程可触发 panic）改 checked 加法；编辑
+  选择卡白卡入场淡入补齐（put_aa 乘 PIX_ALPHA）；对话框复选框角弧描边
+  缺口；鼠标长按补控制中心判定。
+- **rild 短信存储原子重写**：已删短信「复活」（就地重写不 ftruncate、
+  陈尾被当记录）+ 掉电半行损坏 → rename 备份 + O_TRUNC 全新写 + 启动
+  恢复（`recover_store`，丢的只是一次删除/标记，记录本体无损）。
+- **clock / notes 逐级返回**：闹钟编辑页与笔记编辑器的返回/ESC 不再直接
+  退出整个应用（编辑中误触即丢），先回列表、根页才退出（对齐
+  calendar/contacts）。
+- **cloud 长按解锁改真长按**：原实现实为「间隔 2-3s 双击」（只在抬起帧
+  判定）—— 改每帧检测按住状态（≥2s 且未滑出按钮即解锁，无需抬起），
+  解锁后吞掉本次抬起防误触主界面按钮。
+- **lifd 族信箱 read→clear 竞态清剿**（BUG_REPORT 十八记录的系统性缺陷，
+  /data/life 部分）：应用命令改每消息一文件（`cmd_<pid>_<seq>` 临时名
+  rename 发布，lifd 读方零改动）；lifd 事件改 `.new` + rename 发布、应用
+  改 rename 取走（取走与读取之间新发布的事件不再被 unlink 吞掉）；
+  pushd / launcher 同步迁移；`lc_init` 就绪探测改目录。
+- **动画（详见 `docs/animations.md` §3.20~§3.23）**：Toast 长文案折行 +
+  保持期按行数延长 + 退场上滑 8px；最近任务伪 3D 纵深（P2-3）；锁屏
+  分钟切换双时刻错位入场 + 解锁时钟先扩后散（P1-4 部分）；settings
+  主列表 / store 卡片首屏入场错峰（P0-6）。
+- 验证：`make` exit 0；宿主 sync_tests **57/57**、wireless **105/105**；
+  lifecycle-core **38/38**（隔离 worktree 验证 —— 隔离对照揪出并修复了
+  迁移自身的两个回归：lifd 在 getdents 迭代中同目录 rename 发布使游标
+  错位跳过命令文件（改两段式扫描）；publish 的 rename 在目标被 `cat`
+  打开时失败丢事件 + `.new` 泄漏 inode（重试 + 就地覆写回退）。共享树
+  复测被同期并行会话的内核在制回归（启动期任意路径文件创建失败）阻塞，
+  定位记录见 BUG_REPORT 二十「附」）。
+
+### 2026-09-12～16 浏览器 TLS 1.2 + NetSurf 移植轮（musl 静态 Linux 程序支持）
+
+> 双主线：① 浏览器内置 TLS 1.2 客户端栈（此前 HTTPS 完全不可用，重定向到
+> HTTPS 的站点一律打不开）；② NetSurf 全套（libparserutils → libdom/libcss →
+> framebuffer 前端）以 musl 静态交叉编译方式移植上机 —— 为此内核补齐一整批
+> Linux/musl 兼容能力。验证基线全部通过，详见各条与 BUG_REPORT 十九。
+
+- **TLS 1.2 客户端栈 `apps/browser/src/tls/`（全新）**：
+  - `mod.rs` TLS 1.2 状态机（ECDHE_RSA_AES128_GCM_SHA256 密码套件、SNI、
+    会话密钥推导 + 加密通道读写）；`aesgcm.rs` AES-128-GCM；`rsa.rs`
+    RSASSA-PKCS1-v1_5 验签；`p256.rs` NIST P-256 点乘/ECDH（含自测）；
+    `x509.rs` 证书链解析与校验（签名/有效期/主机名，ECDSA 链显式判不可信）；
+    `roots.rs` 内置根证书库（`tools/gen_tls_roots.py` 生成）；哈希复用 kunxsec
+    的 SHA-256（browser 新增依赖）。
+  - `net.rs` 连接抽象 `Wire`（明文/TLS 统一读写），`https://` 直达；握手失败
+    转可读错误（「TLS 握手失败：…」）。
+  - 双端自测（共用同一份 tls/ 源码，`#[path]` 引用）：`apps/tlstest` 来宾侧
+    （QEMU slirp 真网对 www.baidu.com:443 全握手 + 取页，`[tls-selftest] PASS`），
+    `apps/browser/hosttest` 宿主侧（std TcpStream）；`tests/scripts/tlstest.py`
+    驱动 + Makefile `tlstest` 目标。
+- **NetSurf 移植**：
+  - `vendor/netsurf`：netsurf + libparserutils/libwapcaplet/libhubbub/libcss/
+    libdom/libnslog/libnsgif/libnsbmp/libnsfb 全家桶源码；
+    `vendor/netsurf/build-kunxos.sh` 以 musl-gcc 静态交叉编译
+    （`tools/musl-cross` 包装器）。
+  - 移植层：自写 libnsfb **kunxos surface 后端**（`libnsfb/src/surface/kunxos.c`，
+    渲染直出 /dev/fb0）+ monkey 前端 `argv[1]` 直开 URL 的无 stdin 冒烟路径。
+  - 产物入 rootfs：`/bin/netsurf-fb`（2.4MB）、`/bin/nsmonkey`（2.3MB）、
+    `/usr/share/netsurf` 资源、`/etc/mime.types`、`/etc/test.html`。
+  - nsmonkey 无头冒烟 PASS：WINDOW NEW → file:// 取页 → HTML/CSS 解析 →
+    排版（UPDATE_EXTENT/TITLE 事件齐全）全链路在本内核上跑通。
+- **内核 musl/Linux 兼容（本轮内核侧主体）**：
+  - `elf.rs`：Linux **auxv** 完整构造（AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY/UID/
+    EUID/GID/EGID/HWCAP/CLKTCK/SECURE/RANDOM/EXECFN）—— musl 静态启动依赖
+    AT_PHDR 定位程序头表，缺失即启动即死。
+  - `bionic_shim.rs`：`set_tid_address` + **CLONE_CHILD_CLEARTID**（线程退出
+    内核清零该用户字并 futex 唤醒 join 方 —— musl pthread_join 硬依赖）。
+  - `linux_compat.rs`：**pselect6 + ppoll**（musl 的 select()/poll() 事件循环
+    依赖；ppoll 此前缺失使 nsmonkey 的 select 轮询永不读输入——本轮验证期
+    发现并补齐）；`rt_sigprocmask` 成功桩（musl 启动路径 __block_all_sigs）；
+    **write/pwrite >4KB 短写修复**（此前 `count.min(4096)` 静默截断，朴素
+    调用方丢数据且不自知）；writev 零长 iov 跳过（否则 musl 无缓冲流死循环）；
+    未实现 syscall 串口诊断（`[syscall-unimpl] nr=`，移植定位用）。
+  - `devfs.rs`：UART 读**阻塞语义**（POSIX：无数据阻塞而非返回 0=EOF ——
+    返回 0 会让 nsmonkey 等交互程序 fgets 即退）。
+  - `socket.rs`：TCP **动态接收窗口通告**（固定窗口让对端持续超发、缓冲满后
+    丢段只能等 RTO 重传，吞吐骤降）+ 取走数据后立即 ACK 重开窗口 + 对端 FIN
+    重传补 ACK（此前不回，对端重传到放弃、拆除卡在 CLOSE_WAIT）。
+  - `vm.rs`：用户栈 1MB → **8MB**（NetSurf 深递归），ASLR 窗口与隔离带同步。
+  - `main.rs`：页故障解决顺序重构（DFSC 编码掩码归一：先试 LAZY 预留页落地、
+    再 COW、均失败才 SIGSEGV —— mmap 匿名区落在继承的 2MB 块映射内时此前
+    误报 L2 权限错误致死）。
+  - `process.rs`：wait **收尸防重入**（多线程父两线程同醒双收同一僵尸 → 双重
+    free_process_tables、页二次归还分配器）；pid 复用时清理 ELF 运行时信息与
+    信号 handler 表（陈旧 ASLR 栈基址/brk、残留 SIG handler 会被新进程继承）。
+  - `net_virtio.rs`：virtio-mmio IRQ **无条件 ACK 全部 cause**（纯 config-change
+    此前永不 ACK → 电平中断被 GIC 反复重投递 → 风暴护栏误禁整块网卡）。
+  - `allocator.rs`：页引用计数 RMW 全部 IRQ 屏蔽（与 exit 路径 free 交错丢一次
+    递增/递减 → 计数永不归零 = 4KB 页泄漏）。
+  - `vfs.rs`：readlink errno 对齐 Linux（不存在→ENOENT、非符号链接→EINVAL，
+    musl realpath 逐组件调用且只容忍 EINVAL）；`readdir_back`（getdents64
+    用户缓冲装不下「刚被消费」的条目时回退，修复目录枚举丢项）。
+  - `kunxcore/build.rs`：恢复 `rerun-if-changed=ramdisk.img`（linker 行遮蔽
+    dep-info 跟踪的根因补全，见 BUG_REPORT 十八·五）。
+- **验证（2026-09-16）**：`make` 全量 exit 0 / 0 警告；宿主 sync_tests **57/57**、
+  wireless **105/105**；QEMU：tlstest **PASS**（真实 HTTPS 全握手 + 取页）、
+  power **21/21**、nsmonkey 冒烟 **PASS**。lifecycle-core 见 BUG_REPORT 十九
+  与二十·附：共享树回归经并行会话定位为 lifd 信箱 rename 发布的扫描游标
+  错位（已修复，隔离树 38/38）；叠加持久 disk.img inode 残留（已重建磁盘）
+  与同机并发 QEMU 计时干扰，共享树终验待收敛后复跑。
+
+### 2026-09-11 对话框统一（OriginOS）+ HyperOS 桌面编辑 + 桌面流畅度轮
+
+> 四项主线：① 确认框/选择框全部居中（Pixel OS 语义）；② 对话框视觉统一为
+> VIVO OriginOS 风格（白卡大圆角 + 发丝分割线 + 文字按钮）；③ 桌面卡顿
+> 治理（重绘源头削减）；④ 长按桌面空白处进入编辑模式（小米澎湃 OS 3 语义）。
+
+- **共享对话框组件 `shared/dialog.rs`（新）**：全系统统一的 OriginOS 风格
+  居中模态 —— 白色卡片 + 超椭圆圆角 + 淡投影 + 细描边，标题加粗居中、
+  正文居中灰字；按钮区 1px 上分割线 + 双按钮等宽 + 中间竖分割线
+  （取消深灰 / 确认蓝 / 危险红）；选择行（单选圆点 / 多选方框）行间发丝
+  分割线；内嵌输入框与进度条样式。经 `DialogUi` trait 与各应用自绘管线
+  对接（含 `fill_row` 行混合热路径，遮罩不走逐像素虚调用），绘制与命中
+  测试共用同一几何常量（永不漂移）。
+- **files**：输入 / 删除确认 / 复制移动进度三个对话框迁移到共享组件
+  （居中 + OriginOS 样式），命中测试改走 `dialog::hit_buttons`。
+- **settings**：恢复出厂 / 还原设置 / 重启系统确认从「整页推入」改为
+  **居中模态对话框**（遮罩 + 卡片覆盖当前页，不再携带页面转场；
+  点外部 / Esc / 取消关闭，模态期间滚动与滑条拖拽屏蔽）。
+- **oobe**：胁迫动作 / 外观两个选择步骤的散列卡片统一为单张 OriginOS
+  风格选择列表卡（白底大圆角 + 行间分割线 + 右侧单选圈），行高与行距
+  一致、整行可点。
+- **launcher 桌面编辑（HyperOS 3）**：长按桌面**空白处**（此前仅应用图标）
+  进入编辑模式，底部弹出磨砂**编辑条**（壁纸 / 小组件 / 桌面设置三个
+  圆形按钮，上滑 + 淡入入场）；点选弹出 OriginOS 选择卡 ——
+  壁纸（4 色单选，确认后交叉淡化切换并写回 desktop_meta）、
+  小组件（5 类多选增删，位掩码持久化 /data/oobe/widgets_mask，
+  编辑模式下点小组件即移除）、桌面设置（网格 4x6/5x6 单选即应用，
+  替代原编辑 HUD 右上角按钮）。
+- **桌面流畅度**：Toast 此前把「显示中」整体当动画源 —— 一条 2s Toast
+  触发 2s × 60fps 整屏重绘（TCG 下每帧 50~150ms，桌面全程卡顿），
+  现只在入/退场动画窗口（180/150ms）重绘；编辑模式抖动重绘 ~30fps
+  节流；小组件毛玻璃按 (调色板， 主题, 类别) 五槽缓存（翻页/拖动/
+  壁纸淡化期间自动退化为实时玻璃）；图标 blit 不透明段整段直写
+  BACK_BUF 行切片；文件夹打开期间压暗桌面缓存（首帧 LUT 存档，
+  后续帧整块 memcpy）；日历小组件事件文字 1s TTL 缓存（与天气/电池
+  一致，动画期不再读盘）。
+- **应用启动再提速**：标题字体（bold.ttf ~220KB）从 `font_init` 拆出为
+  按需加载 —— 21 个应用中仅 settings/store 使用粗体，其余应用每次启动
+  少解析一整份子集；launcher 启动不再加载 launcher-bold（桌面无粗体
+  字形，粗体绘制自动回退常规）。字体子集随新文案重建（launcher-cn
+  覆盖桌面编辑器新增词条）。
+- **浏览器网络兼容**：实现 chunked 传输编码解码（此前直接报错，大量
+  HTTP 服务器默认分块传输）；强制 HTTPS 的重定向给出明确错误文案
+  （「该网站强制 HTTPS，浏览器 TLS 尚未启用」）；书签栏新增两个仍支持
+  纯 HTTP 的真实站点（Example / CERN —— 主流站点明文端口普遍 302 强跳
+  HTTPS，TLS 实现前可经此验证完整网络链路）。
+
+### 2026-09-09 应用进出提速轮（对标 ColorOS 15 潮汐/极光引擎）
+
+> 打开/退出应用的端到端延迟治理：转场动画本身（300ms）不是瓶颈，
+> 慢在转场之外的串行等待 —— 每次启动的全量字体解析（秒级）、转场后的
+> 整屏桌面重绘尾巴、动画结束处的阻塞轮询。
+
+- **字体（启动最大耗时项）**：`make_fonts.py` 改为只提取真正上屏的
+  「字符串字面量」（状态机跳过注释/代码；此前整文件扫描把全仓库中文
+  注释的汉字都收进了 cn.ttf）并丢弃 fontdue 不读的表（name/hinting/
+  GSUB/GPOS/post）—— cn.ttf 761KB→225KB、bold.ttf 760KB→224KB、
+  launcher-cn 482KB→78KB、oobe-cn 407KB→82KB，每次应用启动的字体
+  解析量降至 ~1/2.6，ramdisk 同步减负。
+- **字体兜底**：`font_render` 新增缺字形懒加载（用户态开关）—— 子集
+  不含运行期拼接字符（用户数据：联系人名/文件名等）时，首次栅格化
+  一次性加载全量字体顶替并清字形缓存，字体路径永不渲染豆腐块；UI 类
+  应用（文案全在子集内）永远不付这次加载。内核（ui_framework）共用
+  模块但不开启，svc 文件读取路径在内核镜像里不会执行。
+- **launcher 启动**：动画结束不再阻塞轮询应用首帧 60ms（恰在输入最
+  敏感时刻卡主循环）—— 占位页立即兜底（ColorOS starting window 语义），
+  应用首帧就绪后自然覆盖；子进程 execve 前自设 3s 一次性调度 deadline
+  （syscall 414），加载/首帧以交互期限参与 CFS 竞争（潮汐引擎「启动
+  线程优先」等价物）。
+- **launcher 退出**：返回转场开始时就地预渲染桌面并存档（极光引擎
+  「转场与目标帧并行绘制」）—— 缩回的应用帧叠加在桌面上（ColorOS 式
+  「缩回图标、桌面在四周浮现」，去白闪），转场结束整体恢复直提，跳过
+  转场后 50~150ms 的整屏 `draw_desktop_full` 尾巴；壁纸偏好同步从
+  `return_animation_done` 挪到转场开始（离开关键路径）；启动转场白闪
+  LUT 熔进背景拷贝单趟（转场后段每帧少一趟整屏扫描）；删除无调用方的
+  阻塞 `reap_child`（死代码）。
+
+### 2026-09-09 通宵修复轮（9 路并行审查 → 45+ 项修复）
+
+> 4 路审查 2026-09-08 未提交改动（launcher 动画/手势、OOBE 光锥、settings
+> 保留区、图标字体管线）+ 5 路子系统深挖（内核 syscall/进程、驱动/网络栈、
+> pkg/boot/tools、系统服务、媒体应用），逐条复核后修复。详见
+> `BUG_REPORT.md` 第十八轮。
+
+- **内核**：PM 冻结/限速 syscall 补权限校验（任意应用可软冻结桌面）；
+  reap() 防重入（多线程父进程双收同一僵尸 → 双重归还页表破坏分配器）+
+  wait() 误报成功；sleep_until 不恢复 DAIF（调用方永久关中断运行）；
+  write/pwrite >4KB 静默截断改循环写；pipe2 失败返回 fd=-1 仍报成功；
+  getdents64 缓冲半满丢目录项（新增 vfs::readdir_back 回退）；reap 补清
+  SIG_TABLES/ELF_PROCS（pid 复用后信号跳陈旧 handler）；PAGE_REFS 引用
+  计数 RMW 关中断；帧统计冲刷快照关中断（打印仍可中断）；virtio-net
+  无条件 ACK 全部 cause（config-change 风暴曾触发护栏禁网卡）；TCP 裸 FIN
+  重传补 ACK；输入缓冲满丢整帧不劈帧。
+- **launcher**：双线性采样左/上边缘外推（alpha 溢出/黑边/镂空）；连续启动
+  打断的失败路径不再污染 Return 转场；resume 恢复转场零帧播完（spring 未
+  赋 pos/target）；后台应用被外部杀死的僵尸 + lifd 槽泄漏（桌面期补
+  waitpid 回收）；BG_RECENTS 7/8 字节窗口恒 false（最近任务手势返回不开
+  面板）。
+- **OOBE**：光锥扫光抹掉光标 overlay；恢复矩形削标题墨迹；逐帧全量栅格化
+  （~17KB 字形超缓存，拆出复用）；完成页「上一步」照样进桌面。
+- **settings**：保留区短拖变「抬起位置点击」误开列表项（12px slop）；按压
+  反馈恢复绕过 LUT 留偏亮方块；底部保留区 buttons 模式纯属滚动死区（仅
+  手势模式生效）；滑条/滚轮无变化不再写盘+整屏重绘。
+- **服务**：lifd BTASK u64→u8 截断绕过白名单；wifid FORGET 只删文件（已
+  忘网络仍自连、重 SAVE 不生效）；wifid getdents 缺解析守卫；alarmd 信箱
+  256B 截断；rild 联系人只读 2KB；audiod best_seq 以 0 为基准（seq 越过
+  2^31 后音频永久静默）；音频双槽 PCM 先写、seq 头最后提交（消 10ms 陈旧
+  帧爆音）。
+- **应用**：camera 预览帧路径差一（`&path[..n-1]` 切掉 'v'，取景器完全
+  失效——一行修复）+ 导航退出不停预览流 + REQ_ID 位数越界；cloud 恢复
+  路径 `..` 穿越、lock/wipe 无视本机开关、失败提示用陈旧 RESP；files
+  del_tree 无深度上限；contacts 密码框触点漏第三字段；calculator 释放
+  落空按钮卡在按下态。
+- **pkg/store/boot/构建系统**：store SigV4 kDate 派生错误（date 拼进 HMAC 密钥，
+  对真实 S3/R2 必 403）；store 索引 name/version 白名单（下载路径目录
+  逃逸）+ 流式下载短写检测；mkfs_sfs layout() 死循环（total=33813 实测
+  挂死，改二分求不动点）；kunxpkg 注册写失败漏 restore_backup、升级回滚
+  不再清空旧版 /res、semver 预发布含 'x' 误判通配、alloc_uid 饱和拒绝
+  分配；kunxboot dtb insert_props 容量检查补 insert_off；**构建系统根因
+  （cb9ca35 修复不完整）**——linker 行的 rerun-if-changed 仍遮蔽
+  include_bytes 跟踪，纯 rootfs 变化不触发内核重编译、陈旧 .rodata 被
+  objcopy 重新打包（测试标记「间歇性」丢失），build.rs 显式跟踪
+  ramdisk.img。
+- 验证：`make` exit 0 / 0 警告；宿主 sync 57 / wireless 105；power 21/21、
+  lifecycle-core 38/38、全应用回归 14/14 PASS + 4 项交互抽查。
+
+### 2026-09-08 全面屏手势修复（上滑回桌面/边缘返回失效）
+
+设置应用内底部上滑回桌面、边缘返回完全不生效（返回动画自然也无从播放）。
+两层根因，均在 settings 自带输入循环（calculator/stub 模板无滚动问题但缺
+鼠标分类）：
+
+- **nav 动作被重绘分支吞掉（主因）**：主循环 `if res.redraw { full_redraw();
+  continue; }` 位于导航检查之前，而触摸拖动期间 `ABS_Y → drag_to` 无条件置
+  `res.redraw` —— 上滑/边缘返回这批事件必然含移动帧，nav 动作永远被
+  `continue` 丢弃（此前偶发生效纯属事件分批的时序运气）。修复：`drag_to`
+  返回是否有实际变化，仅变化时置 redraw；主循环把 nav/key/tap 处理移到
+  redraw-continue 之前（"系统导航优先"的注释与代码首次一致）。
+- **列表滚动吞手势**：底部上滑天然是垂直拖动，被当作列表滚动并在抬起时
+  以 `sliding=true` 抑制导航分类。修复：系统手势保留区（底部热区
+  `BOTTOM_ZONE`=130px / 左右边缘条 `EDGE_W`=24px）内按下不参与滚动与
+  滑条抓取（`pages::pointer_down/drag_to/pointer_up` 的 NAV_EXCLUDE），
+  抬起照常分类；保留区内点按不受影响。
+- **鼠标/数位板路径缺 classify_swipe**：QEMU GUI 的 virtio-tablet 以
+  BTN_LEFT 上报，settings/calculator/stub 的鼠标抬起分支只有 nav_hit 没有手势分类
+  （app_kit 同分支有）—— run-gui 下全面屏手势完全不可用。补齐
+  TOUCH_PX/PY/US 记录与 classify_swipe 调用。
+- 验证：QEMU 实测（UART 触摸注入）——设置页底部上滑 → 退出码=1（Home）
+  + `返回过渡：4 frames` 动画播放；边缘返回 → 退出码=0；保留区外起手的
+  列表滚动无回归；保留区内点按正常。
+
+### 2026-09-08 打开应用动画增强（ColorOS 连续启动 + squash & stretch）
+
+- **连续启动打断（极光引擎核心场景）**：返回转场（300ms 缩回图标）中途
+  点击其它图标不再被吞 —— 以当前中途帧为新背景快照，无缝切换为新应用的
+  启动转场（`start_launch` 接受 `Phase::Return`；快照时 `render_frame`
+  走 zoom_blit 路径定格返回中的画面）。打断路径调用
+  `app_life::return_interrupted()` 清理挂起完成态（BG_RECENTS 残留会在
+  下次返回完成时误开最近任务）。转场期间跟手翻页/滑动切页被
+  `page_drag_allowed` 与 Swipe 分支屏蔽（转场期桌面不走 draw_page）。
+  Resume（后台恢复）转场不开放打断：被恢复应用须保持 SIGSTOP 且
+  launcher 侧单槽状态无法同时表达「挂起恢复 + 新启动」。
+- **启动白闪 Emphasized 化**：白闪后段 0→255 由线性改为 `Emphasized`
+  （慢起-快中-缓收），起闪更缓，减白闪突兀感（路线图 §4 改进项）。
+- **启动瓦片 squash & stretch**：放大途中纵向边长 ×(1+0.03·(1−进度))
+  瞬时超前、随进度收敛回等比，落位精确覆盖全屏（`launch_blit` 横纵
+  分离采样；P2-1 非线性形变的启动瓦片部分）。
+- 文档：`docs/animations.md` §3.2/§3.3 数值同步。
+- 验证：全量构建通过；QEMU 实测（headless ramfb + QMP screendump + UART
+  触摸注入）——① 正式 300ms 参数下启动转场日志 `启动过渡：3 frames`
+  （TCG 慢宿主，多帧推进）；② 慢动作构建（临时 1.2s/3s，验证后恢复）
+  抓帧序列 10 种 distinct：压暗快照背景 → 白闪爬升 → 应用首帧覆盖，
+  无撕裂/残影；③ 三键返回退出 Settings → 返回转场中途点击另一图标 →
+  日志命中 `返回转场被新启动打断（连续启动）`，新应用 fork 并完成
+  自身启动转场（`启动过渡：4 frames`）。
+
 ### 2026-09-07 通宵修复轮（六路并行审查 → 30+ 项修复 + 性能 + 美化）
 
 > 方法：6 个并行审查代理（browser 新模块 / launcher 与动效库 / 媒体类应用 /

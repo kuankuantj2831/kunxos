@@ -162,8 +162,86 @@ pub mod ui {
     pub const MOON: u32 = 0xE330; // moon
     pub const HOME: u32 = 0xE2C2; // house
     pub const MAP_PIN: u32 = 0xE316; // map-pin
+    pub const GLOBE: u32 = 0xE288; // globe
+    pub const LIGHTNING: u32 = 0xE2DE; // lightning
     pub const COPY: u32 = 0xE1CA; // copy
     pub const SHARE: u32 = 0xE408; // share-network
+}
+
+// ==================== 设置应用图标（Phosphor-Bold） ====================
+
+/// 设置应用行图标码点（粗线风格，24px 圆角底上按 16px 栅格化；与
+/// apps/settings/src/ui.rs 的 ICONS 表按索引对应）。返回箭头（caret-left）、
+/// 列表箭头（caret-right）、搜索清除（x）也在此集中定义。
+pub mod settings {
+    /// WLAN（wifi-high）。
+    pub const WIFI: u32 = 0xE4EA;
+    /// 蜂窝网络（cell-signal-full）。
+    pub const MOBILE: u32 = 0xE142;
+    /// VPN（shield-check）。
+    pub const VPN: u32 = 0xE40C;
+    /// 蓝牙（bluetooth）。
+    pub const BT: u32 = 0xE0DA;
+    /// 显示/亮度（sun）。
+    pub const SUN: u32 = 0xE472;
+    /// 深色模式（moon）。
+    pub const MOON: u32 = 0xE330;
+    /// 字体大小（text-aa）。
+    pub const FONT: u32 = 0xE6EE;
+    /// 声音（speaker-high）。
+    pub const SPEAK: u32 = 0xE44A;
+    /// 通知（bell）。
+    pub const BELL: u32 = 0xE0CE;
+    /// 电池（battery-full）。
+    pub const BATT: u32 = 0xE0C0;
+    /// 存储（hard-drive）。
+    pub const DISK: u32 = 0xE29E;
+    /// 隐私/指纹（fingerprint）。
+    pub const FINGER: u32 = 0xE23E;
+    /// 锁屏（lock）。
+    pub const LOCK: u32 = 0xE2FA;
+    /// 系统更新（download-simple）。
+    pub const UPDATE: u32 = 0xE20C;
+    /// 电话（phone）。
+    pub const PHONE: u32 = 0xE3B8;
+    /// 系统导航（arrows-left-right）。
+    pub const NAV: u32 = 0xE0A0;
+    /// 应用管理（squares-four）。
+    pub const APPS: u32 = 0xE464;
+    /// 恢复出厂（arrow-counter-clockwise）。
+    pub const RESET: u32 = 0xE038;
+    /// 账户（user）。
+    pub const USER: u32 = 0xE4C2;
+    /// 云服务（cloud）。
+    pub const CLOUD: u32 = 0xE1AA;
+    /// 同步（arrows-clockwise）。
+    pub const SYNC: u32 = 0xE094;
+    /// 时区（clock）。
+    pub const CLOCK: u32 = 0xE19A;
+    /// 语言（translate）。
+    pub const LANG: u32 = 0xE4A2;
+    /// 键盘（keyboard）。
+    pub const KBD: u32 = 0xE2D8;
+    /// 图案解锁（dots-nine）。
+    pub const PAT: u32 = 0xE1FC;
+    /// 关于（info）。
+    pub const INFO: u32 = 0xE2CE;
+    /// 无障碍（person-arms-spread）。
+    pub const ACC: u32 = 0xECFE;
+    /// 显存/眼睛（eye）。
+    pub const EYE: u32 = 0xE220;
+    /// 开发者（gear）。
+    pub const GEAR: u32 = 0xE270;
+    /// 保存（floppy-disk）。
+    pub const SAVE: u32 = 0xE248;
+    /// 输入法（cursor-text）。
+    pub const INPUT: u32 = 0xE7D8;
+    /// 返回箭头（caret-left，标题栏）。
+    pub const CARET_LEFT: u32 = 0xE138;
+    /// 列表右箭头（caret-right）。
+    pub const CARET_RIGHT: u32 = 0xE13A;
+    /// 清除（x，搜索框）。
+    pub const X: u32 = 0xE4F6;
 }
 
 // ==================== Emoji → Phosphor 映射 ====================

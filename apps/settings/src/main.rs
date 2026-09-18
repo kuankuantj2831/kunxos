@@ -730,10 +730,14 @@ pub(crate) unsafe fn press_feedback_up() {
     if x1 < x0 || y1 < y0 {
         return;
     }
+    // 恢复必须走与 flip 相同的 LUT（亮度/反色/对比度）—— 默认亮度 85 下
+    // LUT 非恒等，裸拷 BACK_BUF 会在抬起处留下一块偏亮方块并踩掉光标
+    // sprite，直到下一次整屏重绘。
+    let (lut, _) = flip_lut();
     for py in y0..=y1 {
         for px in x0..=x1 {
             let idx = py as usize * DISPLAY_W + px as usize;
-            *FB_PTR.add(idx) = BACK_BUF[idx];
+            *FB_PTR.add(idx) = lut_px(BACK_BUF[idx], lut);
         }
     }
     fb_present_rects(&[(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32)]);
@@ -832,6 +836,47 @@ pub(crate) fn draw_bits(x: i32, y: i32, bits: &[u8; 8], scale: i32, color: u32) 
             }
         }
     }
+}
+
+/// Phosphor-Bold 图标字形（粗线风格，笔画加粗 ~1px）按墨迹包围盒居中绘制到
+/// (cx, cy)。灰度 alpha 与背景混合。图标字体未就绪返回 false，
+/// 调用方退回 8x8 点阵兜底（draw_bits）。
+pub(crate) fn draw_icon_glyph_centered(
+    cx: i32,
+    cy: i32,
+    cp: u32,
+    px: f32,
+    color: u32,
+) -> bool {
+    if !ttf_text::font_render::icon_ready(false) {
+        return false;
+    }
+    let Some(g) = ttf_text::font_render::rasterize_icon_thick(false, cp, px) else {
+        return false;
+    };
+    if g.width == 0 || g.height == 0 {
+        return false;
+    }
+    let x0 = cx - g.width as i32 / 2;
+    let y0 = cy - g.height as i32 / 2;
+    for row in 0..g.height {
+        for col in 0..g.width {
+            let a = g.data[row * g.width + col];
+            if a == 0 {
+                continue;
+            }
+            let gx = x0 + col as i32;
+            let gy = y0 + row as i32;
+            if gx < 0 || gy < 0 || gx >= DISPLAY_W as i32 || gy >= DISPLAY_H as i32 {
+                continue;
+            }
+            unsafe {
+                let bg = BACK_BUF[gy as usize * DISPLAY_W + gx as usize];
+                put_pixel(gx, gy, ttf_text::font_render::blend(bg, color, a));
+            }
+        }
+    }
+    true
 }
 
 // ==================== TTF 平滑字体（cn.ttf，任意字号） ====================
@@ -1160,16 +1205,18 @@ fn poll_input() -> PollRes {
                             // drag_to 期望「按下点为基准的绝对 y」：累计相对增量。
                             // 此前直接传单次 REL_Y 增量 → SCROLL 恒为
                             // SCROLL_AT_DOWN - (delta - PRESS_Y) ≈ 常量，按住
-                            // 拖动立即钳到一端。
+                            // 拖动立即钳到一端。仅变化时置 redraw（理由同 ABS_Y）。
                             MOUSE_DRAG_ACC = MOUSE_DRAG_ACC.saturating_add(value);
-                            unsafe { pages::drag_to(pages::press_y() + MOUSE_DRAG_ACC); }
-                            res.redraw = true;
+                            if unsafe { pages::drag_to(pages::press_y() + MOUSE_DRAG_ACC) } {
+                                res.redraw = true;
+                            }
                         }
                         CUR_Y = (CUR_Y + value).clamp(0, DISPLAY_H as i32 - 1);
                         res.moved = true;
                     } else if code == REL_WHEEL {
-                        unsafe { pages::wheel_by(value); }
-                        res.redraw = true;
+                        if unsafe { pages::wheel_by(value) } {
+                            res.redraw = true;
+                        }
                     }
                 }
                 EV_ABS => {
@@ -1181,8 +1228,11 @@ fn poll_input() -> PollRes {
                             // drag_to 期望绝对 y：此前传 TOUCH_PY - value，
                             // 展开后 SCROLL = SCROLL_AT_DOWN + value —— 滚动量
                             // 等于手指绝对坐标，按在屏幕下半区一碰就钳到底。
-                            unsafe { pages::drag_to(value); }
-                            res.redraw = true;
+                            // 仅在实际滚动/滑条变化时置 redraw：无变化的重绘帧
+                            // 会让主循环在导航检查前 continue，吞掉手势 nav。
+                            if unsafe { pages::drag_to(value) } {
+                                res.redraw = true;
+                            }
                         }
                         CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
                         res.moved = true;
@@ -1213,7 +1263,12 @@ fn poll_input() -> PollRes {
                                     );
                                     if g != sys_nav::NavAction::None {
                                         res.nav = g;
-                                    } else {
+                                    } else if (CUR_X - TOUCH_PX).abs() <= 12
+                                        && (CUR_Y - TOUCH_PY).abs() <= 12
+                                    {
+                                        // 保留区内短拖（11~47px，不满足手势阈值）
+                                        // 不得变成「抬起位置点击」—— 此前会误开
+                                        // 列表项/开关。位移在 slop 内才视为点按。
                                         res.tap = Some((CUR_X, CUR_Y));
                                     }
                                 }
@@ -1223,6 +1278,12 @@ fn poll_input() -> PollRes {
                         if value == 1 {
                             MOUSE_DOWN = true;
                             MOUSE_DRAG_ACC = 0;
+                            // 与 BTN_TOUCH 共用同一套手势状态：QEMU GUI 的
+                            // virtio-tablet 以 BTN_LEFT 上报，缺失这些字段
+                            // 会让全面屏手势（底部上滑/边缘返回）在鼠标下失效。
+                            TOUCH_PX = CUR_X;
+                            TOUCH_PY = CUR_Y;
+                            TOUCH_US = now_us();
                             unsafe { pages::pointer_down(CUR_X, CUR_Y); }
                             unsafe { press_feedback_down(CUR_X, CUR_Y); }
                         } else if value == 0 && MOUSE_DOWN {
@@ -1230,11 +1291,25 @@ fn poll_input() -> PollRes {
                             unsafe { press_feedback_up(); }
                             let sliding = unsafe { pages::pointer_up(0, 0, CUR_X, CUR_Y) };
                             if !sliding {
-                                let a = sys_nav::nav_hit(CUR_X, CUR_Y, sys_nav::nav_mode());
+                                let mode = sys_nav::nav_mode();
+                                let a = sys_nav::nav_hit(CUR_X, CUR_Y, mode);
                                 if a != sys_nav::NavAction::None {
                                     res.nav = a;
                                 } else {
-                                    res.tap = Some((CUR_X, CUR_Y));
+                                    let dur = now_us().saturating_sub(TOUCH_US) / 1000;
+                                    let g = sys_nav::classify_swipe(
+                                        TOUCH_PX, TOUCH_PY, CUR_X, CUR_Y, dur, mode,
+                                    );
+                                    if g != sys_nav::NavAction::None {
+                                        res.nav = g;
+                                    } else if (CUR_X - TOUCH_PX).abs() <= 12
+                                        && (CUR_Y - TOUCH_PY).abs() <= 12
+                                    {
+                                        // 保留区内短拖（11~47px，不满足手势阈值）
+                                        // 不得变成「抬起位置点击」—— 此前会误开
+                                        // 列表项/开关。位移在 slop 内才视为点按。
+                                        res.tap = Some((CUR_X, CUR_Y));
+                                    }
                                 }
                             }
                         }
@@ -1373,30 +1448,20 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     unsafe { cfg::settings_init(); }
 
     ttf_text::font_init();
+    // 标题字体：font_init 已改为按需加载（各应用启动少解析一份 ~220KB 子集），
+    // 设置页标题/对话框标题走粗体，这里显式加载。
+    ttf_text::font_init_bold();
     full_redraw();
     print("[settings] 就绪
 ");
+    // 首屏主列表入场错峰（P0-6）：仅在启动时播放一次，滚动/翻页不重播。
+    unsafe { pages::play_root_enter(10); }
 
     loop {
         let res = poll_input();
-        if res.moved {
-            // 指针移动：overlay 快速路径只更新光标小区域，并把新旧位置区
-            // 以小脏矩形提交呈现（不再整屏提交 —— 整屏拷贝是移动卡顿根源）。
-            let rects = cursor_overlay::overlay_move_rects(
-                unsafe { FB_PTR },
-                unsafe { FB_STRIDE_PX },
-                unsafe { FB_W } as i32,
-                unsafe { FB_H } as i32,
-                unsafe { CUR_X },
-                unsafe { CUR_Y },
-            );
-            fb_present_rects(&rects);
-        }
-        if res.redraw {
-            full_redraw();
-            continue;
-        }
-        // 系统导航动作优先。
+        // 系统导航动作最优先：必须先于 redraw 的 continue 分支 —— 否则同一
+        // 批事件里只要有一个移动帧置了 redraw，上滑回桌面/边缘返回的 nav
+        // 就会被整屏重绘分支直接丢弃（全面屏手势失效的根因）。
         if res.nav != sys_nav::NavAction::None {
             let code = sys_nav::nav_exit_code(res.nav);
             print("[settings] 导航操作 → 退出
@@ -1438,6 +1503,23 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
                 TapEffect::None => {}
             }
+        }
+        if res.redraw {
+            full_redraw();
+            continue;
+        }
+        if res.moved {
+            // 指针移动：overlay 快速路径只更新光标小区域，并把新旧位置区
+            // 以小脏矩形提交呈现（不再整屏提交 —— 整屏拷贝是移动卡顿根源）。
+            let rects = cursor_overlay::overlay_move_rects(
+                unsafe { FB_PTR },
+                unsafe { FB_STRIDE_PX },
+                unsafe { FB_W } as i32,
+                unsafe { FB_H } as i32,
+                unsafe { CUR_X },
+                unsafe { CUR_Y },
+            );
+            fb_present_rects(&rects);
         }
         if poll_key() {
             print("[settings] ESC → 退出

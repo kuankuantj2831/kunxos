@@ -40,6 +40,11 @@ pub fn jpeg_encode_rgb888(
     if width == 0 || height == 0 {
         return Err(JpegError::BadDimensions);
     }
+    // SOF0 尺寸字段是 u16：>65535 时 as u16 回绕（65536→0），产出尺寸
+    // 错误的 JPEG 且返回 Ok —— 入口显式拒绝。
+    if width > 65535 || height > 65535 {
+        return Err(JpegError::BadDimensions);
+    }
     if rgb.len() != width * height * 3 {
         return Err(JpegError::BadDimensions);
     }

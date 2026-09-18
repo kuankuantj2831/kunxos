@@ -1049,7 +1049,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                         do_vcf_import();
                     } else if btn_hit(x, y, 190, 452, 150, 44) {
                         do_vcf_export();
-                    } else if y >= 110 && y < 260 {
+                    } else if y >= 110 && y < 380 {
+                        // 三字段 y=110/200/290 各高 90 —— 上界 260 让密码框
+                        // (290..380) 点不中只能靠 Enter 切焦点（calendar 同类
+                        // bug 的漏改残留）；按钮行从 y=380 开始。
                         unsafe { F_FOCUS = ((y - 110) / 90) as u8; }
                     }
                 }

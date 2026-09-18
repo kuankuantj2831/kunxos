@@ -621,11 +621,38 @@ pub fn poll_deferred_stats() {
 /// 打印当前统计窗口并重置（保留 `last_frame_us` 保证跨窗口间隔连续）。
 fn report_frame_stats() {
     unsafe {
+        // 快照 + 复位在关中断窗口内完成：note_frame 在 IRQ 上下文推进
+        // FRAME_STATS，可被抢占的读-清零会把新样本抹掉或跨窗口混算。
+        // UART 打印（毫秒级忙等）留在可中断上下文。
+        let saved = crate::sched_cfs::read_daif();
+        core::arch::asm!("msr daifset, #2");
         let s = &mut FRAME_STATS;
         let n = s.count.min(STAT_WINDOW);
         let mut buf = [0u64; STAT_WINDOW];
         buf[..n].copy_from_slice(&s.samples[..n]);
-        // 插入排序（n ≤ 64，IRQ 上下文开销可忽略）
+        if n == 0 {
+            // STATS_PENDING 跨上下文竞态：IRQ 侧在 report 的 UART 输出期间
+            // 再次置位、线程侧消费空窗口 —— n==0 时直接返回，防 n-1 下溢。
+            crate::sched_cfs::write_daif(saved);
+            return;
+        }
+        let count = s.count;
+        let min = s.min;
+        let max = s.max;
+        let spike_count = s.spike_count;
+        let avg = if count > 0 { s.sum / count as u64 } else { 0 };
+        let ravg = if count > 0 { s.render_sum / count as u64 } else { 0 };
+        let rmax = s.render_max;
+        s.count = 0;
+        s.min = u64::MAX;
+        s.max = 0;
+        s.sum = 0;
+        s.samples = [0; STAT_WINDOW];
+        s.spike_count = 0;
+        s.render_sum = 0;
+        s.render_max = 0;
+        crate::sched_cfs::write_daif(saved);
+        // 插入排序（n ≤ 64，开销可忽略）
         for i in 1..n {
             let key = buf[i];
             let mut j = i;
@@ -635,39 +662,24 @@ fn report_frame_stats() {
             }
             buf[j] = key;
         }
-        if n == 0 {
-            // STATS_PENDING 跨上下文竞态：IRQ 侧在 report 的 UART 输出期间
-            // 再次置位、线程侧消费空窗口 —— n==0 时直接返回，防 n-1 下溢。
-            return;
-        }
         let p95 = buf[(n * 95 / 100).min(n - 1)];
-        let avg = if s.count > 0 { s.sum / s.count as u64 } else { 0 };
-        let ravg = if s.count > 0 { s.render_sum / s.count as u64 } else { 0 };
         uart(" [anim] 帧统计 n=");
-        crate::print_dec(s.count as u64);
-uart(" 间隔(min=");
-        crate::print_dec(s.min);
+        crate::print_dec(count as u64);
+        uart(" 间隔(min=");
+        crate::print_dec(min);
         uart(",avg=");
         crate::print_dec(avg);
         uart(",p95=");
         crate::print_dec(p95);
         uart(",max=");
-        crate::print_dec(s.max);
+        crate::print_dec(max);
         uart(")us 尖峰(>20ms)=");
-        crate::print_dec(s.spike_count);
+        crate::print_dec(spike_count);
         uart(" 渲染(avg=");
         crate::print_dec(ravg);
         uart(",max=");
-        crate::print_dec(s.render_max);
+        crate::print_dec(rmax);
         uart(")us\n");
-        s.count = 0;
-        s.min = u64::MAX;
-        s.max = 0;
-        s.sum = 0;
-        s.samples = [0; STAT_WINDOW];
-        s.spike_count = 0;
-        s.render_sum = 0;
-        s.render_max = 0;
     }
 }
 

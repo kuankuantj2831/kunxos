@@ -253,8 +253,15 @@ pub fn parse_constraints(s: &[u8]) -> Option<([Constraint; 4], usize)> {
             (Op::Exact, p)
         };
         let ver = parse(trim(rest))?;
-        // 通配检测：末尾为 "x" 的版本
-        let is_wild = trim(rest).iter().any(|&c| c == b'x' || c == b'X' || c == b'*');
+        // 通配检测：仅末段（最后一个 '.' 之后，无 '.' 则整段）恰为
+        // "x"/"X"/"*" 才算通配 —— 此前对整段做 any 检测，预发布版
+        // "1.2.3-next"（pre 段含 x）会被误判成通配符，退化为 1.x 全匹配。
+        let t = trim(rest);
+        let last_seg = match t.iter().rposition(|&c| c == b'.') {
+            Some(i) => &t[i + 1..],
+            None => t,
+        };
+        let is_wild = last_seg == b"x" || last_seg == b"X" || last_seg == b"*";
         out[n] = Constraint { op: if is_wild { Op::Wildcard } else { op }, ver };
         n += 1;
     }

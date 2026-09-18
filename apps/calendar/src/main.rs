@@ -462,7 +462,12 @@ fn save_new_event() {
             ev.all_day = true;
             ev.dtend = DateTime::from_epoch(sync::util::epoch_from_civil(y, mo, d, 0, 0, 0) + 86400);
         } else {
-            ev.dtend = DateTime::new(y, mo, d, (h + 1) % 24, mi, 0, 0, true);
+            // ★ 结束时刻 = 开始 + 1h 的 epoch 反推：h=23 时 (h+1)%24 = 0 会
+            // 产生同日 00:00 < 开始的非法 DTEND（RFC 5545 要求 DTEND >
+            // DTSTART，CalDAV 服务器会拒收）。
+            ev.dtend = DateTime::from_epoch(
+                ev.dtstart.to_epoch() + 3600,
+            );
         }
         // 写入本地存储（含生成 iCalendar Blob，置脏待同步）
         let mut env = SyncEnv {

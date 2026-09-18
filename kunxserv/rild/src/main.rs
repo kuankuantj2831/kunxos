@@ -89,18 +89,51 @@ impl TrimAsciiExt for [u8] {
 }
 
 /// 读取并清空命令管道（普通文件模拟 FIFO）。
+///
+/// rename 认领取走：先把命令文件原子改名为 `.r` 再读再删。旧的
+/// 「read → ftruncate 清空」两步间应用追加的新命令会被 ftruncate 一并
+/// 抹掉（丢命令）；认领后新追加落在重生的命令文件上，留待下轮处理。
 fn poll_commands() {
     static mut BUF: [u8; 1024] = [0u8; 1024];
     unsafe {
-        let fd = open(CMD_PATH, O_RDWR);
-        if fd < 0 {
-            return;
+        // 认领名 "/var/run/rild.cmd.r"（含 NUL 结尾）
+        let mut taken = [0u8; 32];
+        let cb = CMD_PATH.as_bytes();
+        taken[..cb.len()].copy_from_slice(cb);
+        taken[cb.len()] = b'.';
+        taken[cb.len() + 1] = b'r';
+        // 清理上次崩溃残留的认领文件（存在则 rename 会失败）
+        sys::unlink(core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or(""));
+        if sys::rename(CMD_PATH, core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("")) != 0 {
+            return; // 无命令文件
         }
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
-        let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len());
-        // 清空管道文件（ftruncate 显式传 0）
-        syscall2(SYS_FTRUNCATE, fd as usize, 0);
-        syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+        let fd = open(core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or(""), O_RDWR);
+        let mut n: isize = 0;
+        if fd >= 0 {
+            syscall3(SYS_LSEEK, fd as usize, 0, SEEK_SET);
+            // 循环读到 EOF：单次 read 上限 1024，排队多条 SEND 时尾部命令
+            // 会随认领文件一起被删（静默丢失）。
+            loop {
+                let r = syscall3(
+                    SYS_READ,
+                    fd as usize,
+                    BUF.as_mut_ptr().add(n as usize) as usize,
+                    BUF.len() - n as usize,
+                ) as isize;
+                if r <= 0 || n as usize + r as usize > BUF.len() {
+                    break;
+                }
+                n += r;
+            }
+            syscall1(SYS_CLOSE, fd as usize);
+        }
+        sys::unlink(core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or(""));
+        // 重建空命令文件：写方（应用）以 O_CREAT|O_APPEND 追加，但主循环
+        // 诊断与其它读者按「文件常驻」假设打开，保持与 ftruncate 时代一致。
+        let fd2 = open(CMD_PATH, O_CREAT | O_RDWR);
+        if fd2 >= 0 {
+            syscall1(SYS_CLOSE, fd2 as usize);
+        }
         if n > 0 && (n as usize) <= BUF.len() {
             let data = &BUF[..n as usize];
             let mut start = 0usize;
@@ -113,7 +146,6 @@ fn poll_commands() {
                 }
             }
         }
-        syscall1(SYS_CLOSE, fd as usize);
     }
 }
 

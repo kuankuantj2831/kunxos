@@ -33,6 +33,8 @@ const SYS_WRITE: usize = 64;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_FTRUNCATE: usize = 46;
+const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 const SYS_LSEEK: usize = 62;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_EXIT: usize = 93;
@@ -152,6 +154,40 @@ unsafe fn open(path: &str, flags: usize) -> isize {
     PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
     PATH_BUF[n] = 0;
     syscall3(SYS_OPENAT, AT_FDCWD, PATH_BUF.as_ptr() as usize, flags) as isize
+}
+
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
+        options(nostack)
+    );
+    ret
+}
+
+unsafe fn unlink(path: &str) -> i32 {
+    let n = path.len().min(PATH_BUF.len() - 1);
+    PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
+    PATH_BUF[n] = 0;
+    syscall2(SYS_UNLINKAT, AT_FDCWD, PATH_BUF.as_ptr() as usize) as i32
+}
+
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 64];
+    let mut q = [0u8; 64];
+    let on = old.len().min(63);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(63);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(SYS_RENAMEAT, AT_FDCWD, o.as_ptr() as usize, AT_FDCWD, q.as_ptr() as usize)
+            as isize
+    }
 }
 
 // ==================== 数字格式化 ====================
@@ -484,27 +520,36 @@ fn handle_command(cmd: &[u8], fix: Option<&GpsFix>, sim: &mut bool, quit: &mut b
 
 fn poll_pipe(fix: Option<&GpsFix>, sim: &mut bool, quit: &mut bool) {
     static mut BUF: [u8; 256] = [0u8; 256];
-    static mut WARNED: bool = false;
     unsafe {
-        let fd = open(PIPE_PATH, O_RDWR);
-        if fd < 0 {
-            if !WARNED {
-                print("[positiond] WARNING: 无法打开管道 ");
-                print(PIPE_PATH);
-                print("\n");
-                WARNED = true;
-            }
-            return;
+        // rename 认领（rild/camerad/sensord 同款）：「read → ftruncate」两步
+        // 之间写入的命令会被抹掉。认领后新命令落在重生的管道文件上。
+        let mut taken = [0u8; 32];
+        let cb = PIPE_PATH.as_bytes();
+        taken[..cb.len()].copy_from_slice(cb);
+        taken[cb.len()] = b'.';
+        taken[cb.len() + 1] = b'r';
+        let tpath = core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("");
+        unlink(tpath); // 清崩溃残留
+        if rename_path(PIPE_PATH, tpath) != 0 {
+            return; // 无命令
         }
-        syscall3(SYS_LSEEK, fd as usize, 0, 0);
-        let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len());
-        syscall2(SYS_FTRUNCATE, fd as usize, 0);
-        syscall3(SYS_LSEEK, fd as usize, 0, 0);
-        if n > 0 && n <= BUF.len() {
-            let data = &BUF[..n];
+        let mut n: isize = 0;
+        let fd = open(tpath, O_RDWR);
+        if fd >= 0 {
+            syscall3(SYS_LSEEK, fd as usize, 0, 0);
+            n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len()) as isize;
+            syscall1(SYS_CLOSE, fd as usize);
+        }
+        unlink(tpath);
+        let fd2 = open(PIPE_PATH, O_CREAT | O_RDWR);
+        if fd2 >= 0 {
+            syscall1(SYS_CLOSE, fd2 as usize);
+        }
+        if n > 0 && (n as usize) <= BUF.len() {
+            let data = &BUF[..n as usize];
             let mut start = 0usize;
-            for i in 0..=n {
-                if i == n || data[i] == b'\n' {
+            for i in 0..data.len() {
+                if i == data.len() || data[i] == b'\n' {
                     if i > start {
                         handle_command(&data[start..i], fix, sim, quit);
                     }
@@ -512,7 +557,6 @@ fn poll_pipe(fix: Option<&GpsFix>, sim: &mut bool, quit: &mut bool) {
                 }
             }
         }
-        syscall1(SYS_CLOSE, fd as usize);
     }
 }
 

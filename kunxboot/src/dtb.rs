@@ -323,8 +323,15 @@ unsafe fn insert_props(hdr: &mut Hdr, ctx: &Ctx, props: &[(&[u8], &[u8])]) -> bo
     }
     let content_end = hdr.content_end;
     let scratch_end = SCRATCH.as_ptr() as usize + SCRATCH_SIZE;
-    // 边界检查：结构块搬移 + 追加字符串都必须在 scratch 内
-    if content_end + struct_added + str_added > scratch_end {
+    // 边界检查：结构块搬移 + 追加字符串都必须在 scratch 内。插入点
+    // insert_off 本身可能越过 content_end 最多 3 字节（chosen 名字 NUL
+    // 恰落在结构块末尾且缺 END_NODE 的畸形 DTB）—— 必须计入约束，
+    // 否则属性写入尾可越出 scratch 最多 3 字节（踩进 .bss 相邻变量）。
+    // ★ 上界按最高写入点计算：结构块搬移的终点是 content_end + struct_added
+    //（不是 insert_off —— chosen 通常在结构块前部，二者差整个 DTB 主体），
+    // 字符串追加起于 content_end + struct_added。
+    let high = if content_end > insert_off { content_end } else { insert_off };
+    if high + struct_added + str_added > scratch_end {
         return false;
     }
 

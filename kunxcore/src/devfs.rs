@@ -197,17 +197,25 @@ fn mem_write(minor: u32, buf: &[u8]) -> i32 {
 /// 镜像到 out_q 的屏幕输出字节。
 fn tty_read(minor: u32, _flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
     if minor == TTY_MINOR {
-        let mut n = 0usize;
-        while n < buf.len() {
-            match crate::uart_try_read_char() {
-                Some(c) => {
-                    buf[n] = c;
-                    n += 1;
+        // 阻塞语义：POSIX read 在无数据时应阻塞而非返回 0（返回 0 会被
+        // musl/glibc 当作 EOF，fgets 立即结束——nsmonkey 等交互程序死因）。
+        // 至少等到一个字符，再一次性取走当时可用的全部字符。
+        loop {
+            let mut n = 0usize;
+            while n < buf.len() {
+                match crate::uart_try_read_char() {
+                    Some(c) => {
+                        buf[n] = c;
+                        n += 1;
+                    }
+                    None => break,
                 }
-                None => break,
             }
+            if n > 0 {
+                return n as i32;
+            }
+            crate::sched_cfs::yield_now();
         }
-        return n as i32;
     }
     crate::tty::screen_get(minor, buf) as i32
 }

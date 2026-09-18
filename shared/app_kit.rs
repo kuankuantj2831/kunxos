@@ -179,6 +179,8 @@ pub const SYS_CONNECT: usize = 203;
 pub const SYS_SENDTO: usize = 206;
 pub const SYS_RECVFROM: usize = 207;
 pub const SYS_UNLINKAT: usize = 35;
+pub const SYS_RENAMEAT: usize = 38;
+pub const SYS_FSYNC: usize = 82;
 pub const SYS_SHUTDOWN: usize = 210;
 pub const SYS_DNS_RESOLVE: usize = 403;
 /// 自定义：内核内存压力等级（0/1/2），见 `mem_pressure` 模块。
@@ -473,6 +475,18 @@ pub static mut TOUCH_PX: i32 = 0;
 pub static mut TOUCH_PY: i32 = 0;
 pub static mut TOUCH_US: u64 = 0;
 
+/// 光随指动缓动是否有新帧（读后自清；应用据此置 dirty 重绘玻璃高光）。
+static mut LIGHT_ANIM: bool = false;
+
+/// 光随指动是否在缓动中（读后自清；应用据此置 dirty）。
+pub fn light_animating() -> bool {
+    unsafe {
+        let a = LIGHT_ANIM;
+        LIGHT_ANIM = false;
+        a
+    }
+}
+
 // ==================== 系统调用封装 ====================
 
 #[inline(always)]
@@ -498,6 +512,22 @@ pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         inlateout("x0") a1 => ret,
         in("x1") a2,
         in("x2") a3,
+        options(nostack)
+    );
+    ret
+}
+
+/// renameat / fsync 等四参系统调用（文件信箱原子提交用）。
+#[inline(always)]
+pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
         options(nostack)
     );
     ret
@@ -1431,6 +1461,7 @@ pub fn key_to_char(code: u16, shift: bool) -> Option<u8> {
         52 => b'.',
         51 => b',',
         53 => b'/',
+        39 => b';',
         77 => b'@',
         _ => return None,
     };
@@ -1453,6 +1484,7 @@ pub fn key_to_char(code: u16, shift: bool) -> Option<u8> {
             b'0' => b')',
             b'-' => b'_',
             b'=' => b'+',
+            b';' => b':',
             b'.' => b'>',
             b',' => b'<',
             b'/' => b'?',
@@ -1472,6 +1504,10 @@ pub fn poll_input() -> PollResult {
     unsafe {
         // 生命周期事件优先于输入分发（TERMINATE 会退出；RESUME 置重绘标记）。
         lifecycle::lc_poll();
+        // 光随指动缓动推进（触摸中 120ms FastOutSlowIn 跟随；离开后回零）。
+        if glass::light_frame(now_us()) {
+            LIGHT_ANIM = true;
+        }
         if INPUT_FD < 0 {
             INPUT_FD = open(INPUT_PATH, O_RDONLY | O_NONBLOCK);
         }
@@ -1518,6 +1554,16 @@ pub fn poll_input() -> PollResult {
                     } else if code == ABS_Y {
                         CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
                         res.moved = true;
+                    }
+                    // 光随指动：触摸/触控笔拖动期间喂光源目标（P2-2）。
+                    if TOUCH_DOWN && (code == ABS_X || code == ABS_Y) {
+                        glass::light_track(
+                            CUR_X,
+                            CUR_Y,
+                            DISPLAY_W as i32,
+                            DISPLAY_H as i32,
+                            now_us(),
+                        );
                     }
                 }
                 EV_KEY => {

@@ -408,12 +408,77 @@ pub fn clone_thread(
     child_tidptr: usize,
 ) -> i32 {
     let tid = unsafe { do_clone(trap_frame, child_stack, tls, parent_tidptr, child_tidptr) };
+    if tid > 0 {
+        // 记录子线程的 CLONE_CHILD_CLEARTID 地址（musl 新线程传
+        // &__thread_list_lock——线程退出时内核清零并 futex 唤醒，
+        // 以释放线程列表锁；pthread_join/__tl_lock 都依赖此语义）
+        let t = tid as usize;
+        unsafe {
+            if t < CLEAR_TID.len() {
+                CLEAR_TID[t] = child_tidptr;
+            }
+        }
+    }
     core::hint::black_box(tid)
 }
 
-/// `set_tid_address`：返回当前线程 tid（clear_child_tid 指针暂仅记录）。
-pub fn set_tid_address(_clear_child_tid: usize) -> i32 {
-    sched_cfs::current_tid() as i32
+/// 各 tid 的 clear_child_tid 槽位（CLONE_CHILD_CLEARTID 语义：线程退出时
+/// 内核向该用户地址写 0 并 futex 唤醒等待者——musl 的 pthread_join 依赖）。
+static mut CLEAR_TID: [usize; 1024] = [0; 1024];
+
+/// `set_tid_address`：记录 clear_child_tid 并返回当前线程 tid。
+pub fn set_tid_address(clear_child_tid: usize) -> i32 {
+    let tid = sched_cfs::current_tid() as usize;
+    unsafe {
+        if tid < CLEAR_TID.len() {
+            CLEAR_TID[tid] = clear_child_tid;
+        }
+    }
+    tid as i32
+}
+
+/// 任务死亡/槽位回收时清除其 CLEAR_TID 登记。
+///
+/// 经 kill_req / 进程整体 exit 死亡的线程不经过 `exit_thread_notify`，
+/// 槽位残留旧用户地址；tid 即任务槽位下标、会被立刻复用 —— 新任务正常
+/// 退出时读到陈旧地址，只要该 VA 恰在新任务地址空间可写（同二进制线程
+/// VA 布局相同，概率不低），就把无辜用户字清零并 `futex_wake` 错误地址。
+pub fn clear_tid_slot(tid: u32) {
+    let t = tid as usize;
+    unsafe {
+        if t < CLEAR_TID.len() {
+            CLEAR_TID[t] = 0;
+        }
+    }
+}
+
+/// 线程退出通知：CLONE_CHILD_CLEARTID——清零 tid 槽位并 futex 唤醒
+/// 等待者（join 方）。须在 dying 线程的地址空间仍活跃时调用。
+pub fn exit_thread_notify() {
+    let tid = sched_cfs::current_tid() as usize;
+    let addr = unsafe {
+        if tid < CLEAR_TID.len() {
+            let a = CLEAR_TID[tid];
+            CLEAR_TID[tid] = 0;
+            a
+        } else {
+            0
+        }
+    };
+    if addr == 0 {
+        return;
+    }
+    let ok = addr % 4 == 0
+        && addr.checked_add(4).map_or(false, |e| e <= USER_TOP)
+        && process::ensure_user_range_writable(addr, 4);
+    if ok {
+        unsafe {
+            crate::mmu::uaccess_begin();
+            core::ptr::write_volatile(addr as *mut u32, 0);
+            crate::mmu::uaccess_end();
+            futex_wake(addr, 1);
+        }
+    }
 }
 
 // ==================== malloc：brk / mmap 匿名映射 ====================
@@ -576,6 +641,13 @@ pub fn mmap_anon(len: usize) -> i64 {
             return -1;
         }
         MMAP_NEXT[pid] += size;
+        if va + size > 0x3F00_0000 {
+            crate::uart_send_str("[mmap-anon-高地址] va=");
+            crate::print_hex(va as u64);
+            crate::uart_send_str(" size=");
+            crate::print_dec(size as u64);
+            crate::uart_send_str("\n");
+        }
         let mut reserved = 0usize;
         for i in 0..pages {
             if !process::reserve_user_page(va + i * vm::PAGE_SIZE) {

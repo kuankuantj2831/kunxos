@@ -123,8 +123,6 @@ static mut CC_PROG: f32 = 0.0;
 static mut CC_SPRING: CcSpring = CcSpring::fixed();
 static mut CC_SPRING_T: u64 = 0;
 /// 收起起始进度：从打开进行中的当前进度收起（否则面板先闪跳到全开）。
-static mut CC_CLOSE_FROM: f32 = 1.0;
-static mut CC_CLOSE_T0: u64 = 0;
 static mut CC_GLASS_READY: bool = false;
 static mut CC_GLASS: [u32; DISPLAY_W * (CC_PANEL_H as usize)] =
     [0; DISPLAY_W * (CC_PANEL_H as usize)];
@@ -136,6 +134,18 @@ static mut CC_SW: [bool; 4] = [false; 4];
 static mut CC_FLASHLIGHT: bool = false;
 static mut CC_BRIGHTNESS: u32 = 85;
 static mut CC_VOLUME: u32 = 60;
+
+/// 音量键调节（P0-4 音量 HUD 接线）：调节并落盘，返回新值。
+pub unsafe fn volume_bump(delta: i32) -> u32 {
+    CC_VOLUME = (CC_VOLUME as i32 + delta).clamp(0, 100) as u32;
+    save_number("/data/oobe/volume", CC_VOLUME);
+    CC_VOLUME
+}
+
+/// 当前音量（0..100，控制中心滑条同源）。
+pub fn volume_value() -> u32 {
+    unsafe { CC_VOLUME }
+}
 static mut CC_PLAYING: bool = false;
 static mut CC_TRACK: usize = 0;
 static CC_TRACKS: [&[u8]; 3] = [b"Sunset Drive", b"Neon Nights", b"Midnight Pulse"];
@@ -296,8 +306,16 @@ pub fn shade_drag_release() {
                 CC_SPRING_T = now_us();
             } else {
                 CC_PHASE = CcPhase::Closing;
-                CC_CLOSE_FROM = CC_PROG;
-                CC_CLOSE_T0 = now_us();
+                CC_SPRING = CcSpring {
+                    stiffness: 420.0,
+                    damping: 2.0 * fsqrt(420.0) * 0.9,
+                    mass: 1.0,
+                    target: 0.0,
+                    pos: CC_PROG,
+                    // 继承手指速度（收起方向的负速度同样接续）
+                    vel: (SHADE_VEL / CC_PANEL_H as f32).clamp(-4.0, 4.0),
+                };
+                CC_SPRING_T = now_us();
             }
         } else {
             NOTIF_OPEN = open;
@@ -360,8 +378,16 @@ fn cc_close() {
             return;
         }
         CC_PHASE = CcPhase::Closing;
-        CC_CLOSE_FROM = CC_PROG;
-        CC_CLOSE_T0 = now_us();
+        // 非手势路径（点外部/按钮关闭）：从当前进度零初速弹簧回零
+        CC_SPRING = CcSpring {
+            stiffness: 420.0,
+            damping: 2.0 * fsqrt(420.0) * 0.9,
+            mass: 1.0,
+            target: 0.0,
+            pos: CC_PROG,
+            vel: 0.0,
+        };
+        CC_SPRING_T = now_us();
         CC_DRAG_SLIDER = -1;
         CC_PRESS_KIND = 0;
         CC_PRESS_SPRINGING = false;
@@ -998,14 +1024,18 @@ pub fn cc_advance(now: u64) -> bool {
                 anim = true;
             }
             CcPhase::Closing => {
-                let t = now.saturating_sub(CC_CLOSE_T0) as f32 / 200_000.0;
-                if t >= 1.0 {
+                // 弹簧回零（P2-4 速度接续）：松手瞬间的下滑速度被继承，
+                // 与打开方向的续接对称（此前 200ms 无速度 tween——位置连续
+                // 但速度跳变，快速下甩时有顿挫感）。
+                let dt = now.saturating_sub(CC_SPRING_T) as f32 / 1000.0;
+                CC_SPRING_T = now;
+                CC_SPRING.step_ms(dt);
+                CC_PROG = CC_SPRING.pos.clamp(0.0, 1.2);
+                if (CC_PROG - 0.0).abs() < 0.02 && CC_SPRING.vel.abs() < 0.05 {
                     CC_PROG = 0.0;
                     CC_PHASE = CcPhase::Closed;
                     NEEDS_REDRAW = true;
                 } else {
-                    // 从收起那一刻的进度起播：打开中途关闭不闪跳到全开。
-                    CC_PROG = CC_CLOSE_FROM * (1.0 - Easing::EaseOut.sample(t));
                     anim = true;
                 }
             }

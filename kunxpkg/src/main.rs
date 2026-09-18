@@ -2,16 +2,18 @@
 //
 // 支持的包格式：
 //   1. `.kunx`（原生）：KUNXPKG1 归档 = manifest.json + 载荷 + META-INF 证书链
-//      + Ed25519 签名。安装流程：下载 → 验签（证书链 + 包签名）→ API 级别检查
-//      → 依赖解析/冲突检测 → 权限声明与用户授权 → 沙箱创建（per-app UID +
-//      /data/app/<name>/ 数据目录）→ 备份 → 解压 → 注册 →（失败回滚）。
+//      + Ed25519 签名。安装流程：依赖闭包解析（递归 + 环检测）→ 逐包
+//      （依赖在前）下载 → 验签（证书链 + 包签名）→ API 级别检查 → 依赖/冲突
+//      复核 → 权限声明与用户授权 → 沙箱创建（per-app UID +
+//      /data/app/<name>/ 数据目录）→ 备份 → 解压 → 注册（原子写 + fsync）
+//      →（失败回滚）。任一依赖失败即中止，目标不落盘，杜绝「装出即坏」。
 //   2. `.pkg`（旧版 NOVAPKG1）：仅 FNV-1a 完整性校验（可被伪造），安装时
 //      明确告警，仅作兼容。
 //
 // 命令：
-//   pkg update                    更新软件源索引（验签 + 增量 + 缓存）
-//   pkg install <name> [--yes]    从索引下载并安装
-//   pkg install-file <file.kunx>  安装本地 .kunx 文件
+//   pkg update                    更新软件源索引（验签 + 增量 + 缓存 + 原子写）
+//   pkg install <name> [--yes]    递归解析依赖闭包并按序安装（依赖在前）
+//   pkg install-file <file.kunx>  安装本地 .kunx（其依赖自动从软件源补齐）
 //   pkg remove <name> [--keep-data]
 //   pkg rollback <name>           从备份恢复上一个版本
 //   pkg list | search <kw> | info <name>
@@ -28,6 +30,14 @@
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
+// TLS 1.2 客户端：与 apps/browser / apps/tlstest 共用同一份源码，
+// https:// 软件源传输层加密用（证书链验证见 tls/x509.rs）。
+extern crate alloc;
+extern crate kunxsec as kxsec;
+
+#[path = "../../apps/browser/src/tls/mod.rs"]
+mod tls;
+
 mod sha512;
 pub mod ed25519;
 mod hex;
@@ -43,6 +53,32 @@ mod fsio;
 mod repo;
 mod delta;
 mod review;
+
+// ==================== TLS 堆分配器 ====================
+//
+// kunxpkg 其余部分静态分配零堆；tls 模块内部用 Vec（握手缓冲 / 证书链，
+// 峰值 ~100KB 量级）。SYS_BRK 单调递增分配、不回收 —— pkg 是短命进程，
+// 退出即整体归还，无需更复杂的分配器。
+
+const SYS_BRK: usize = 214;
+
+struct BrkAlloc;
+
+unsafe impl core::alloc::GlobalAlloc for BrkAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let size = layout.size().max(1) + layout.align();
+        let raw = syscall1(SYS_BRK, 0);
+        let new = syscall1(SYS_BRK, raw + size);
+        if new < raw + size {
+            return core::ptr::null_mut();
+        }
+        ((raw + layout.align() - 1) & !(layout.align() - 1)) as *mut u8
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: BrkAlloc = BrkAlloc;
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -83,7 +119,7 @@ static mut META_BUF: [u8; 512] = [0; 512];
 /// sources.list 内容。
 static mut SRC_BUF: [u8; 1024] = [0; 1024];
 /// 已安装记录缓冲。
-static mut REC_BUF: [u8; 1024] = [0; 1024];
+static mut REC_BUF: [u8; 2048] = [0; 2048];
 /// 临时缓冲（权限提示等）。
 static mut TMP_BUF: [u8; 4096] = [0; 4096];
 
@@ -339,7 +375,10 @@ fn count_packages(buf: &[u8]) -> usize {
 // ==================== 已安装数据库 ====================
 
 fn installed_path(out: &mut [u8], name: &str) -> usize {
-    fsio::path_join(out, INSTALLED_DIR, name.as_bytes())
+    // ★ 必须带 '/' 分隔符：path_join 只做拼接，此前拼出
+    // "/var/lib/pkg/installed<name>"（写到目录旁的同名文件而非目录内），
+    // is_installed/list/remove 全部失灵。
+    fsio::path_join3(out, INSTALLED_DIR, b"/", name.as_bytes())
 }
 
 fn is_installed(name: &str) -> bool {
@@ -446,6 +485,18 @@ unsafe fn load_available() -> usize {
     fsio::read_path(AVAILABLE, &mut AVAIL_BUF)
 }
 
+/// SFS 检查点自愈：内核 FS 事务在 SMP 竞态下可能泄漏（TXN_DEPTH 卡在 >0，
+/// PENDING 暂存满），此后一切元数据**创建**（新文件/新目录/rename）失败、
+/// 仅覆写既有文件可用——表现为本应成功的安装莫名回滚。对镜像内必然存在
+/// 的 available 文件做一次 fsync 即触发内核 fs_checkpoint（其会强制
+/// commit_inner 收尾泄漏事务），创建随即恢复。更新/安装前与写失败重试时
+/// 调用；这是 fsync 的常规用法，不依赖也不掩盖内核侧竞态修复。
+fn fs_recover() {
+    unsafe {
+        fsio::fsync_path(AVAILABLE);
+    }
+}
+
 // ==================== 软件源 / 下载 ====================
 
 /// 下载索引中 `filename` 指向的包到 PKG_BUF，返回长度；失败 0。
@@ -473,6 +524,7 @@ unsafe fn download_pkg(filename: &[u8]) -> usize {
 // ==================== 命令：update ====================
 
 unsafe fn cmd_update() {
+    fs_recover();
     let sn = fsio::read_path(SOURCES, &mut SRC_BUF);
     if sn == 0 {
         print("[pkg] 无法读取 sources.list\n");
@@ -590,9 +642,9 @@ unsafe fn cmd_update() {
         print_dec(count_packages(&IDX_BUF[..len]));
         print("\n");
 
-        // 写缓存
-        fsio::write_path(&cp[..cn], &IDX_BUF[..len]);
-        fsio::write_path(&mp[..mn], &META_BUF[..mlen_new]);
+        // 写缓存（原子替换：崩溃不留半写索引，坏缓存会让下次增量校验失败）
+        fsio::write_path_atomic(&cp[..cn], &IDX_BUF[..len]);
+        fsio::write_path_atomic(&mp[..mn], &META_BUF[..mlen_new]);
 
         // 合并进 available
         if total > 0 && total < AVAIL_BUF.len() - 1 {
@@ -609,13 +661,14 @@ unsafe fn cmd_update() {
         print("[pkg] 未获取到任何软件包\n");
         return;
     }
-    fsio::write_path(AVAILABLE, &AVAIL_BUF[..total]);
+    // 合并索引：原子替换写 + fsync
+    fsio::write_path_atomic(AVAILABLE, &AVAIL_BUF[..total]);
     print("[pkg] 已更新 ");
     print_dec(count);
     print(" 个软件包\n");
 }
 
-// ==================== 命令：install ====================
+// ==================== 命令：install（递归依赖闭包） ====================
 
 unsafe fn cmd_install(name: &str, yes: bool) {
     let alen = load_available();
@@ -623,18 +676,145 @@ unsafe fn cmd_install(name: &str, yes: bool) {
         print("[pkg] 没有软件包索引，请先运行 'pkg update'\n");
         return;
     }
-    let Some((rs, re)) = find_record(&AVAIL_BUF[..alen], name) else {
+    if find_record(&AVAIL_BUF[..alen], name).is_none() {
         print("[pkg] 未找到软件包: ");
         print(name);
         print("\n");
         return;
+    }
+
+    // ★ 依赖闭包解析（递归 + 环检测）必须在下载/安装**之前**整体完成：
+    // 此前「索引存在即放行」只查一层，多级依赖装出即坏。
+    let mut plan = deps::Plan::new();
+    let mut res = deps::Resolver::new();
+    if let Err(_) = res.resolve(
+        name.as_bytes(),
+        &mut plan,
+        installed_satisfies,
+        available_has,
+        index_deps_raw,
+        index_version,
+    ) {
+        print_resolve_failure(&res);
+        return;
+    }
+    // 目标已安装时闭包为空 —— 显式补入（升级/重装语义与单包安装一致）
+    if !plan.contains(name.as_bytes()) && !plan.push_name(name.as_bytes()) {
+        print("[pkg] 依赖检查失败: 依赖闭包过大（>24 个软件包）\n");
+        return;
+    }
+
+    print_plan(&plan);
+    for i in 0..plan.count {
+        let pname = core::str::from_utf8(plan.name(i)).unwrap_or("");
+        // 目标必须装；依赖已满足则跳过（闭包解析后状态一般不变，防御性复查）
+        if pname != name && installed_satisfies(plan.name(i), b"") {
+            print("[pkg] ");
+            print(pname);
+            print(" 已安装，跳过\n");
+            continue;
+        }
+        if !install_from_index(pname, yes) {
+            print("[pkg] 安装 ");
+            print(pname);
+            print(" 失败：已中止（目标未安装，避免依赖缺失的坏状态）\n");
+            return;
+        }
+    }
+}
+
+/// 打印安装计划（依赖在前）。
+fn print_plan(plan: &deps::Plan) {
+    print("[pkg] 安装计划: ");
+    print_dec(plan.count);
+    print(" 个软件包（依赖在前）:");
+    for i in 0..plan.count {
+        print(" ");
+        print_bytes(plan.name(i));
+        if i + 1 < plan.count {
+            print(",");
+        }
+    }
+    print("\n");
+}
+
+/// 闭包解析失败信息（含环路径）。
+fn print_resolve_failure(res: &deps::Resolver) {
+    match res.fail {
+        deps::ResolveFail::Cycle => {
+            print("[pkg] 依赖检查失败: 检测到依赖环:");
+            for i in 0..res.depth() {
+                print(" ");
+                print_bytes(res.stack_name(i));
+                print(" ->");
+            }
+            print(" ");
+            print_bytes(&res.fail_name[..res.fail_name_len]);
+            print("\n");
+        }
+        deps::ResolveFail::Missing => {
+            print("[pkg] 依赖检查失败: ");
+            print_bytes(&res.fail_name[..res.fail_name_len]);
+            print(" 无法满足依赖（未安装且软件源中不存在或版本不匹配）\n");
+        }
+        deps::ResolveFail::DepthExceeded => {
+            print("[pkg] 依赖检查失败: 依赖链过深（>");
+            print_dec(deps::DEPTH_MAX);
+            print(" 层）\n");
+        }
+        deps::ResolveFail::ClosureFull => {
+            print("[pkg] 依赖检查失败: 依赖闭包过大（>");
+            print_dec(deps::CLOSURE_MAX);
+            print(" 个软件包）\n");
+        }
+    }
+}
+
+/// 索引 Depends 原始串（deps 引擎回调）；包不在索引返回 usize::MAX。
+fn index_deps_raw(name: &[u8], out: &mut [u8]) -> usize {
+    unsafe {
+        let alen = load_available();
+        let s = core::str::from_utf8(name).unwrap_or("");
+        match find_record(&AVAIL_BUF[..alen], s) {
+            Some((rs, re)) => field_copy(&AVAIL_BUF[..alen], rs, re, "Depends", out),
+            None => usize::MAX,
+        }
+    }
+}
+
+/// 索引 Version（deps 引擎回调）；不在索引返回 0。
+fn index_version(name: &[u8], out: &mut [u8]) -> usize {
+    unsafe {
+        let alen = load_available();
+        let s = core::str::from_utf8(name).unwrap_or("");
+        match find_record(&AVAIL_BUF[..alen], s) {
+            Some((rs, re)) => field_copy(&AVAIL_BUF[..alen], rs, re, "Version", out),
+            None => 0,
+        }
+    }
+}
+
+/// 从索引下载并安装单个包（不做递归；递归由 cmd_install 的计划循环驱动）。
+/// 返回是否成功。
+unsafe fn install_from_index(name: &str, yes: bool) -> bool {
+    let alen = load_available();
+    if alen == 0 {
+        print("[pkg] 没有软件包索引，请先运行 'pkg update'\n");
+        return false;
+    }
+    let Some((rs, re)) = find_record(&AVAIL_BUF[..alen], name) else {
+        print("[pkg] 未找到软件包: ");
+        print(name);
+        print("\n");
+        return false;
     };
 
+    fs_recover();
     let mut filename = [0u8; 64];
     let flen = field_copy(&AVAIL_BUF[..alen], rs, re, "Filename", &mut filename);
     if flen == 0 {
         print("[pkg] 软件包缺少文件名\n");
-        return;
+        return false;
     }
     let mut version = [0u8; 32];
     let vlen = field_copy(&AVAIL_BUF[..alen], rs, re, "Version", &mut version);
@@ -645,7 +825,7 @@ unsafe fn cmd_install(name: &str, yes: bool) {
     let pn = download_pkg(&filename[..flen]);
     if pn == 0 {
         print("[pkg] 下载失败\n");
-        return;
+        return false;
     }
 
     // 缓存
@@ -664,16 +844,17 @@ unsafe fn cmd_install(name: &str, yes: bool) {
     fsio::write_path(&cache[..cfull], &PKG_BUF[..pn]);
 
     if PKG_BUF[..pn].starts_with(&format::MAGIC) {
-        install_kunx(&PKG_BUF[..pn], name, yes);
+        install_kunx(&PKG_BUF[..pn], name, yes)
     } else if PKG_BUF[..pn].starts_with(b"NOVAPKG1") {
         print("[pkg] 旧版 .pkg 格式：仅 FNV-1a 完整性校验，未经密码学验证\n");
-        install_legacy(&PKG_BUF[..pn], name, &version[..vlen]);
+        install_legacy(&PKG_BUF[..pn], name, &version[..vlen])
     } else {
         print("[pkg] 未知的软件包格式\n");
+        false
     }
 }
 
-/// 安装本地 .kunx 文件。
+/// 安装本地 .kunx 文件（其依赖自动从软件源递归补齐，依赖在前）。
 unsafe fn cmd_install_file(path: &str, yes: bool) {
     let pn = fsio::read_path(path.as_bytes(), &mut PKG_BUF);
     if pn == 0 {
@@ -682,20 +863,96 @@ unsafe fn cmd_install_file(path: &str, yes: bool) {
         print("\n");
         return;
     }
-    if PKG_BUF[..pn].starts_with(&format::MAGIC) {
-        install_kunx(&PKG_BUF[..pn], "", yes);
-    } else {
+    if !PKG_BUF[..pn].starts_with(&format::MAGIC) {
         print("[pkg] 不是 .kunx 软件包\n");
+        return;
     }
+
+    // 先拷出 manifest 依赖（PKG_BUF 随后会被依赖包下载覆盖）
+    let mut dep_names = [[0u8; deps::NAME_MAX]; 12];
+    let mut dep_cons = [[0u8; 32]; 12];
+    let mut dep_nlens = [0usize; 12];
+    let mut dep_clens = [0usize; 12];
+    let mut dep_n = 0usize;
+    if let Some(pkg) = format::parse(&PKG_BUF[..pn]) {
+        if let Some(mf) = format::parse_manifest(pkg.manifest(&PKG_BUF[..pn])) {
+            for i in 0..mf.dep_count {
+                let (n, c) = (mf.deps[i].0 .0, mf.deps[i].1);
+                if dep_n < dep_names.len()
+                    && !n.is_empty()
+                    && n.len() <= deps::NAME_MAX
+                    && c.len() <= 32
+                {
+                    dep_names[dep_n][..n.len()].copy_from_slice(n);
+                    dep_nlens[dep_n] = n.len();
+                    dep_cons[dep_n][..c.len()].copy_from_slice(c);
+                    dep_clens[dep_n] = c.len();
+                    dep_n += 1;
+                }
+            }
+        }
+    }
+
+    if dep_n > 0 {
+        let mut edges: [(&[u8], &[u8]); 12] = [(&[], &[]); 12];
+        for i in 0..dep_n {
+            edges[i] = (
+                &dep_names[i][..dep_nlens[i]],
+                &dep_cons[i][..dep_clens[i]],
+            );
+        }
+        let mut plan = deps::Plan::new();
+        let mut res = deps::Resolver::new();
+        if let Err(_) = res.resolve_deps(
+            &edges[..dep_n],
+            &mut plan,
+            installed_satisfies,
+            available_has,
+            index_deps_raw,
+            index_version,
+        ) {
+            print_resolve_failure(&res);
+            return;
+        }
+        if plan.count > 0 {
+            print_plan(&plan);
+            for i in 0..plan.count {
+                let pname = core::str::from_utf8(plan.name(i)).unwrap_or("");
+                if installed_satisfies(plan.name(i), b"") {
+                    print("[pkg] ");
+                    print(pname);
+                    print(" 已安装，跳过\n");
+                    continue;
+                }
+                if !install_from_index(pname, yes) {
+                    print("[pkg] 安装 ");
+                    print(pname);
+                    print(" 失败：已中止（本地包未安装，避免依赖缺失的坏状态）\n");
+                    return;
+                }
+            }
+        }
+    }
+
+    // 重读本地包（PKG_BUF 已被依赖下载覆盖）
+    let pn2 = fsio::read_path(path.as_bytes(), &mut PKG_BUF);
+    if pn2 == 0 {
+        print("[pkg] 无法读取 ");
+        print(path);
+        print("\n");
+        return;
+    }
+    install_kunx(&PKG_BUF[..pn2], "", yes);
 }
 
-/// 核心安装流程（.kunx）：验签 → API → 依赖 → 授权 → 沙箱 → 备份 → 解压 → 注册。
-unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
+/// 核心安装流程（.kunx）：验签 → API → 依赖复核 → 授权 → 沙箱 → 备份 →
+/// 解压 → 注册（原子写 + fsync）。返回是否成功（递归安装循环据此中止）。
+unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) -> bool {
     let rv = match review::review(data, 0) {
         Some(r) => r,
         None => {
             print("[pkg] 无效的软件包\n");
-            return;
+            return false;
         }
     };
     let mname = rv.manifest.name;
@@ -705,29 +962,29 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
         print(" != ");
         print(index_name);
         print("\n");
-        return;
+        return false;
     }
     let name_str = core::str::from_utf8(mname).unwrap_or("");
     if name_str.is_empty() {
         print("[pkg] 软件包名称为空\n");
-        return;
+        return false;
     }
     // 包名白名单（防路径穿越）
     if !format::valid_path(mname) || mname.contains(&b'/') {
         print("[pkg] 软件包名称无效\n");
-        return;
+        return false;
     }
 
     print("[pkg] 正在验证证书链... ");
     if !rv.chain_valid {
         print("FAILED\n");
-        return;
+        return false;
     }
     print("OK\n");
     print("[pkg] 正在验证软件包签名... ");
     if !rv.sig_valid {
         print("FAILED\n");
-        return;
+        return false;
     }
     print("OK\n");
 
@@ -737,7 +994,7 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
         print("，系统为 ");
         print_dec_u32(trust::API_LEVEL);
         print("\n");
-        return;
+        return false;
     }
 
     // 依赖 + 冲突
@@ -770,7 +1027,7 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
                 }
             }
             print("\n");
-            return;
+            return false;
         }
     }
 
@@ -793,7 +1050,7 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
         print(" 项危险权限需要用户授权\n");
         if !yes && !approved_before(name_str, &rv.manifest.version) && !prompt_yes() {
             print("[pkg] 安装已被用户取消\n");
-            return;
+            return false;
         }
         if yes {
             print("[pkg] 权限已授权 (--yes)\n");
@@ -802,6 +1059,10 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
 
     // 沙箱：分配 per-app UID + 数据目录
     let uid = alloc_uid();
+    if uid == 0 {
+        print("[pkg] UID 分配失败：已安装包数过多，无法安全分配\n");
+        return false;
+    }
     print("[pkg] 沙箱 uid=");
     print_dec_u32(uid);
     print("\n");
@@ -821,7 +1082,8 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
         backup_pkg(name_str);
     }
 
-    // 解压载荷
+    // 解压载荷（前先做 FS 检查点自愈：新包的 /bin/<name> 等均为新建文件）
+    fs_recover();
     let mut files = [0u8; 1024];
     let mut fn_len = 0usize;
     let mut ok = true;
@@ -869,25 +1131,22 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
             print("[pkg] 警告：旧版本恢复失败，可用 pkg rollback 手动恢复\n");
         }
         print("[pkg] 安装失败，已回滚\n");
-        return;
+        return false;
     }
 
-    // manifest → /pkg/<name>.mf
-    fsio::mkdir_path(b"/pkg");
-    let mut mf = [0u8; 160];
-    let mn = fsio::path_join3(&mut mf, b"/pkg/", name_str.as_bytes(), b".mf");
-    if fsio::write_path(&mf[..mn], rv.pkg.manifest(data)) != 0 {
-        rollback_files(name_str, &files[..fn_len]);
-        if !restore_backup(name_str) {
-            print("[pkg] 警告：旧版本恢复失败，可用 pkg rollback 手动恢复\n");
-        }
-        print("[pkg] 无法写入 manifest，已回滚\n");
-        return;
+    // ★ manifest 不再落独立文件：SFS 根文件系统运行期 mkdir 失效（vfs 于
+    // 任何 SFS 目录建新目录均失败，内核侧问题），/pkg、/var/lib/pkg/manifest
+    // 都建不出来。改为内嵌安装记录 manifest= 字段（换行压成空格，行式
+    // 解析兼容），无单独 .mf 文件。
+    let msrc = rv.pkg.manifest(data);
+    let mut mflat = [0u8; 640];
+    let ml = msrc.len().min(mflat.len());
+    for i in 0..ml {
+        mflat[i] = if msrc[i] == b'\n' || msrc[i] == b'\r' { b' ' } else { msrc[i] };
     }
-    fn_len = append_path(&mut files, fn_len, b"/pkg/<name>.mf");
 
     // 注册
-    let mut rec = [0u8; 1024];
+    let mut rec = [0u8; 1536];
     let mut off = 0usize;
     append_bounded(&mut rec, &mut off, b"name=");
     append_bounded(&mut rec, &mut off, name_str.as_bytes());
@@ -917,15 +1176,25 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
     append_bounded(&mut rec, &mut off, cert_subject(data));
     append_bounded(&mut rec, &mut off, b"\nfiles=");
     append_bounded(&mut rec, &mut off, &files[..fn_len]);
+    append_bounded(&mut rec, &mut off, b"\nmanifest=");
+    append_bounded(&mut rec, &mut off, &mflat[..ml]);
     append_bounded(&mut rec, &mut off, b"\n");
 
     fsio::mkdir_path(INSTALLED_DIR);
     let mut ip = [0u8; 160];
     let in0 = installed_path(&mut ip, name_str);
-    if fsio::write_path(&ip[..in0], &rec[..off]) != 0 {
+    // 安装记录：原子替换写 + fsync —— 崩溃后只会读到旧全量记录或缺失，
+    // 绝不会读到半写记录（此前 O_TRUNC 直写可能留下截断损坏的记录）。
+    if fsio::write_path_atomic_with(&ip[..in0], &rec[..off], Some(fs_recover)) != 0 {
         rollback_files(name_str, &files[..fn_len]);
+        // 与解压失败/manifest 写失败两条路径对齐：恢复备份的旧版
+        // /bin/<name> 与 .mf —— 否则旧记录声称 vX 已安装，而二进制已被
+        // rollback 删除且无人从备份恢复。
+        if !restore_backup(name_str) {
+            print("[pkg] 备份恢复失败：旧版文件缺失\n");
+        }
         print("[pkg] 无法注册，已回滚\n");
-        return;
+        return false;
     }
 
     // 权限授权记录
@@ -939,25 +1208,26 @@ unsafe fn install_kunx(data: &[u8], index_name: &str, yes: bool) {
     print(" (uid=");
     print_dec_u32(uid);
     print(")\n");
+    true
 }
 
 /// 旧版 .pkg（NOVAPKG1）安装：FNV-1a 完整性校验 + 直接写入（无沙箱）。
-unsafe fn install_legacy(data: &[u8], name: &str, version: &[u8]) {
+unsafe fn install_legacy(data: &[u8], name: &str, version: &[u8]) -> bool {
     let pkg = match legacy_parse(data) {
         Ok(p) => p,
         Err(_) => {
             print("[pkg] 无效的软件包\n");
-            return;
+            return false;
         }
     };
     if !legacy_verify(data, &pkg) {
         print("[pkg] 完整性校验 FAILED\n");
-        return;
+        return false;
     }
     print("[pkg] 完整性 OK (旧版 FNV-1a，非密码学签名)\n");
     if legacy_install(&pkg, data) != 0 {
         print("[pkg] 安装失败\n");
-        return;
+        return false;
     }
     let mut files = [0u8; 512];
     let fl = legacy_build_files(&pkg, data, &mut files);
@@ -965,6 +1235,7 @@ unsafe fn install_legacy(data: &[u8], name: &str, version: &[u8]) {
     print("[pkg] 已安装 (旧版) ");
     print(name);
     print("\n");
+    true
 }
 
 // ==================== 沙箱 / UID ====================
@@ -996,6 +1267,11 @@ unsafe fn alloc_uid() -> u32 {
         }
         i = j + 1;
     }
+    // 收集表满：>64 个已安装包时剩余 UID 未被收集，继续分配可能撞号
+    // （两个应用共享 UID 即破坏沙箱隔离）—— 返回 0 让调用方拒绝安装。
+    if used_n == used.len() {
+        return 0;
+    }
     // 从 counter 继续（counter 文件存的是已分配数量）
     let mut counter = 0u32;
     let mut cb = [0u8; 16];
@@ -1013,7 +1289,7 @@ unsafe fn alloc_uid() -> u32 {
     let next = uid - APP_UID_BASE + 1;
     let mut nb = [0u8; 16];
     let nn = fmt_u32(next, &mut nb);
-    fsio::write_path(UID_COUNTER, &nb[..nn]);
+    fsio::write_path_atomic_with(UID_COUNTER, &nb[..nn], Some(fs_recover));
     uid
 }
 
@@ -1081,7 +1357,7 @@ fn prompt_yes() -> bool {
     b[0] == b'y' || b[0] == b'Y'
 }
 
-/// 写权限授权记录 /var/lib/pkg/permissions/<name>。
+/// 写权限授权记录 /var/lib/pkg/permissions/<name>（原子替换写）。
 unsafe fn write_perms_record(name: &str, perms: &[&[u8]], n: usize) {
     fsio::mkdir_path(PERMS_DIR);
     let mut p = [0u8; 160];
@@ -1095,7 +1371,7 @@ unsafe fn write_perms_record(name: &str, perms: &[&[u8]], n: usize) {
         append_bounded(&mut rec, &mut off, perms[i]);
         append_bounded(&mut rec, &mut off, b": granted\n");
     }
-    fsio::write_path(&p[..plen], &rec[..off]);
+    fsio::write_path_atomic_with(&p[..plen], &rec[..off], Some(fs_recover));
 }
 
 /// 列出某包已授权权限。
@@ -1198,7 +1474,7 @@ unsafe fn cmd_perms(name: &str, action: &str, perm: &str) {
 
 // ==================== 备份 / 回滚 ====================
 
-/// 备份现有 /bin/<name> 与 /pkg/<name>.mf 到 backup/<name>/。
+/// 备份现有 /bin/<name> 到 backup/<name>/bin。
 unsafe fn backup_pkg(name: &str) {
     let mut bdir = [0u8; 160];
     let bn = fsio::path_join3(&mut bdir, BACKUP_DIR, b"/", name.as_bytes());
@@ -1209,12 +1485,6 @@ unsafe fn backup_pkg(name: &str) {
     let mut dst = [0u8; 200];
     let sn = fsio::path_join(&mut src, b"/bin/", name.as_bytes());
     let dn = fsio::path_join3(&mut dst, &bdir[..bn], b"/", b"bin");
-    let n = fsio::read_path(&src[..sn], &mut TMP_BUF);
-    if n > 0 {
-        fsio::write_path(&dst[..dn], &TMP_BUF[..n]);
-    }
-    let sn = fsio::path_join3(&mut src, b"/pkg/", name.as_bytes(), b".mf");
-    let dn = fsio::path_join3(&mut dst, &bdir[..bn], b"/", b"manifest.mf");
     let n = fsio::read_path(&src[..sn], &mut TMP_BUF);
     if n > 0 {
         fsio::write_path(&dst[..dn], &TMP_BUF[..n]);
@@ -1235,14 +1505,10 @@ unsafe fn restore_backup(name: &str) -> bool {
             return false;
         }
     }
+    // 旧版备份中的 manifest.mf（新版本已把 manifest 内嵌进安装记录，
+    // 不再有独立 .mf 文件）—— 残留文件仅作清理。
     let sn = fsio::path_join3(&mut src, &bdir[..bn], b"/", b"manifest.mf");
-    let n = fsio::read_path(&src[..sn], &mut TMP_BUF);
-    if n > 0 {
-        let dn = fsio::path_join3(&mut dst, b"/pkg/", name.as_bytes(), b".mf");
-        if fsio::write_path(&dst[..dn], &TMP_BUF[..n]) != 0 {
-            return false;
-        }
-    }
+    fsio::unlink_path(&src[..sn]);
     clear_backup(name);
     true
 }
@@ -1276,16 +1542,18 @@ unsafe fn rollback_files(name: &str, files: &[u8]) {
         }
         i = j + 1;
     }
-    // 资源目录
-    let mut rdir = [0u8; 160];
-    let rn = fsio::path_join(&mut rdir, b"/res/", name.as_bytes());
-    remove_dir_contents(&rdir[..rn]);
+    // 注意：这里**不再**清空 /res/<name>/ 整目录 —— files 列表逐项 unlink
+    // 已覆盖新包解压出的全部资源；整目录清空会把升级前旧版本的、未被新包
+    // 覆盖的资源一并删掉，而备份不含 res → 回滚后旧版资源永久丢失。
+    // 卸载路径需要彻底清空资源目录，自行调用 remove_dir_contents。
 }
 
 /// 把 files 记录中的路径映射回真实路径。
 fn map_record_path(name: &str, rec: &[u8], out: &mut [u8]) -> usize {
+    // 兼容旧记录中的 "/pkg/<name>.mf" 标记：新版本 manifest 内嵌安装
+    // 记录、不再落独立文件，此标记映射为空（无文件可删）。
     if rec == b"/pkg/<name>.mf" {
-        return fsio::path_join3(out, b"/pkg/", name.as_bytes(), b".mf");
+        return 0;
     }
     if rec.starts_with(b"bin/") {
         return fsio::path_join(out, b"/bin/", &rec[4..]);
@@ -1349,6 +1617,11 @@ unsafe fn cmd_remove(name: &str, keep_data: bool) {
     let fn_len = files.len().min(fl.len());
     fl[..fn_len].copy_from_slice(&files[..fn_len]);
     rollback_files(name, &fl[..fn_len]);
+    // 卸载：彻底清空资源目录（rollback_files 不再整目录清空 —— 那是给
+    // 升级回滚用的，会把旧版未覆盖资源一并删掉）。
+    let mut rdir = [0u8; 160];
+    let rn = fsio::path_join(&mut rdir, b"/res/", name.as_bytes());
+    remove_dir_contents(&rdir[..rn]);
 
     // 沙箱数据：默认清除；--keep-data 保留
     let mut appdir = [0u8; 160];
@@ -1698,7 +1971,7 @@ unsafe fn cmd_review(arg0: &str, approve: bool) {
         append_bounded(&mut rec, &mut off, b"\nsigner=");
         append_bounded(&mut rec, &mut off, &fp16(&rv.leaf_key));
         append_bounded(&mut rec, &mut off, b"\napproved=1\n");
-        fsio::write_path(&p[..n], &rec[..off]);
+        fsio::write_path_atomic_with(&p[..n], &rec[..off], Some(fs_recover));
         print("[pkg] 已批准 ");
         print_bytes(rv.manifest.name);
         print(" v");
@@ -1808,7 +2081,7 @@ fn append_bounded(dst: &mut [u8], off: &mut usize, data: &[u8]) {
     *off += n;
 }
 
-/// 写入已安装记录（旧版 .pkg 路径用）。
+/// 写入已安装记录（旧版 .pkg 路径用；原子替换写）。
 fn write_installed_record(name: &str, version: &[u8], files: &[u8]) {
     fsio::mkdir_path(INSTALLED_DIR);
     let mut p = [0u8; 160];
@@ -1822,7 +2095,7 @@ fn write_installed_record(name: &str, version: &[u8], files: &[u8]) {
     append_bounded(&mut rec, &mut off, b"\nuid=0\nperms=\nfiles=");
     append_bounded(&mut rec, &mut off, files);
     append_bounded(&mut rec, &mut off, b"\n");
-    fsio::write_path(&p[..n], &rec[..off]);
+    fsio::write_path_atomic_with(&p[..n], &rec[..off], Some(fs_recover));
 }
 
 fn fmt_u32_buf(v: u32) -> [u8; 12] {
@@ -1983,15 +2256,10 @@ fn legacy_install(pkg: &LegacyPkg, data: &[u8]) -> isize {
         return -1;
     }
     fsio::mkdir_path(b"/bin");
-    fsio::mkdir_path(b"/pkg");
     fsio::mkdir_path(b"/res");
-    let mut path = [0u8; 128];
+    let mut path = [0u8; 192];
     let n = fsio::path_join(&mut path, b"/bin/", name.as_bytes());
     if fsio::write_path(&path[..n], &data[pkg.elf_off..pkg.elf_off + pkg.elf_len]) != 0 {
-        return -1;
-    }
-    let n = fsio::path_join3(&mut path, b"/pkg/", name.as_bytes(), b".mf");
-    if fsio::write_path(&path[..n], &data[pkg.man_off..pkg.man_off + pkg.man_len]) != 0 {
         return -1;
     }
     let mut off = pkg.res_off;

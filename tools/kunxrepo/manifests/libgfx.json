@@ -1,0 +1,13 @@
+{
+  "name": "libgfx",
+  "version": "1.1.0",
+  "api_level": 1,
+  "description": "依赖链示例：图形库（依赖 libbase，二级依赖）",
+  "author": "KunxOS Team",
+  "main": "bin/libgfx",
+  "permissions": [],
+  "dependencies": {"libc": ">=1.0.0", "libbase": ">=1.0.0"},
+  "provides": [],
+  "conflicts": [],
+  "_elf": "kunxpkg/target/aarch64-unknown-none/release/kunxpkg"
+}

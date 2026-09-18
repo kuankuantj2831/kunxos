@@ -113,6 +113,10 @@ fn wallpaper_fade_in() {
 }
 
 fn draw_wifi(x: i32, y: i32, color: u32) {
+    // Phosphor wifi-high 矢量字形（抗锯齿；替换逐像素圆弧）。
+    if crate::draw_icon_thick(x + 7, y + 7, ttf_cp::WIFI, 14.0, color) {
+        return;
+    }
     let cx = x + 7;
     let cy = y + 11;
     crate::put_pixel(cx, cy, color);
@@ -132,9 +136,19 @@ fn draw_wifi(x: i32, y: i32, color: u32) {
 }
 
 fn draw_battery(x: i32, y: i32, color: u32) {
+    // Phosphor battery-full 矢量字形（抗锯齿；替换硬边矩形拼合）。
+    if crate::draw_icon_thick(x + 9, y + 5, ttf_cp::BATT, 14.0, color) {
+        return;
+    }
     crate::draw_rect(x, y, 18, 10, color);
     crate::fill_rect(x + 18, y + 3, 2, 4, color);
     crate::fill_rect(x + 2, y + 2, 12, 6, color);
+}
+
+/// shared/icons.rs 码点别名（收窄本文件引用长度）。
+mod ttf_cp {
+    pub(crate) use crate::ttf_text::font_render::icons::settings::WIFI as WIFI;
+    pub(crate) use crate::ttf_text::font_render::icons::ui::BATTERY as BATT;
 }
 
 fn draw_status_bar() {

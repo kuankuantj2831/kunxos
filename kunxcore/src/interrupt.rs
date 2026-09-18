@@ -14,6 +14,92 @@ const MAX_IRQ: usize = 1020;
 /// 中断处理函数表：irq -> 处理函数。
 static mut HANDLERS: [Option<IrqHandler>; MAX_IRQ] = [None; MAX_IRQ];
 
+// ==================== 中断观测点（irqstat：风暴源定位） ====================
+//
+// 中断风暴（尤其 iar=0/SGI 锁存与 dist 寄存器视图自相矛盾的 act0 待复现
+// 案例，见 BUG_REPORT「中断风暴 iar=0」）此前只有风暴时刻的一次性转储，
+// 缺少「episode 前后分布」与「常态每源分发频率」两类数据。观测点：
+//   1. 每 IRQ 分发计数（IRQ_COUNTS）：irqstat 输出，定位高频源/风暴贡献者；
+//   2. 风暴 episode 环形日志（STORM_LOG）：转储阈值时刻的 GIC 状态快照
+//      （含 act0），事后可回溯，不必盯着串口抓现场。
+
+/// 每 IRQ 分发计数（含定时器；1020+ 伪中断不计）。
+static mut IRQ_COUNTS: [u64; MAX_IRQ] = [0; MAX_IRQ];
+
+/// 一次风暴 episode 在转储阈值时刻的 GIC 状态快照。
+#[derive(Clone, Copy)]
+pub struct StormEp {
+    /// 风暴中断号（IAR 低 10 位）。
+    pub irq: u32,
+    /// 连续重入次数（阈值 2000/20000/200000 各记一条）。
+    pub n: u64,
+    /// 快照时刻（µs，timer::now_us）。
+    pub t_us: u64,
+    /// GICD_ISPENDR0/1（挂起）。
+    pub pend0: u32,
+    pub pend1: u32,
+    /// GICD_ICACTIVER0（SGI/PPI 活动）/1（SPI 活动）。
+    pub act0: u32,
+    pub act1: u32,
+    /// GICC_RPR（运行优先级）。
+    pub rpr: u32,
+    /// 快照时刻当前 pid。
+    pub pid: u32,
+}
+
+const EMPTY_EP: StormEp = StormEp {
+    irq: u32::MAX,
+    n: 0,
+    t_us: 0,
+    pend0: 0,
+    pend1: 0,
+    act0: 0,
+    act1: 0,
+    rpr: 0,
+    pid: u32::MAX,
+};
+
+/// 风暴 episode 环形日志（最近 8 条；新→旧遍历）。
+static mut STORM_LOG: [StormEp; 8] = [EMPTY_EP; 8];
+/// 累计写入条数（环形游标 = STORM_LOG_N % 8）。
+static mut STORM_LOG_N: usize = 0;
+
+/// 记录一条风暴 episode（转储阈值时刻调用，IRQ 已关闭）。
+unsafe fn storm_ep_record(irq: u32, n: u64, pend0: u32, pend1: u32, act0: u32, act1: u32, rpr: u32) {
+    let ep = StormEp {
+        irq,
+        n,
+        t_us: crate::timer::now_us(),
+        pend0,
+        pend1,
+        act0,
+        act1,
+        rpr,
+        pid: crate::process::current_pid(),
+    };
+    STORM_LOG[STORM_LOG_N % 8] = ep;
+    STORM_LOG_N = STORM_LOG_N.wrapping_add(1);
+}
+
+/// 遍历非零 per-IRQ 分发计数（IRQ 号升序；shell `irqstat` 观测点）。
+pub fn for_each_irq_count(f: &mut dyn FnMut(u32, u64)) {
+    for i in 0..MAX_IRQ {
+        let c = unsafe { IRQ_COUNTS[i] };
+        if c != 0 {
+            f(i as u32, c);
+        }
+    }
+}
+
+/// 遍历风暴 episode 历史（新→旧，最多 8 条；shell `irqstat` 观测点）。
+pub fn for_each_storm_ep(f: &mut dyn FnMut(&StormEp)) {
+    let n = unsafe { STORM_LOG_N };
+    for k in 0..n.min(8) {
+        let e = unsafe { &STORM_LOG[(n - 1 - k) % 8] };
+        f(e);
+    }
+}
+
 /// 注册中断处理函数。
 pub fn register_handler(irq: u32, handler: IrqHandler) {
     if (irq as usize) < MAX_IRQ {
@@ -85,6 +171,8 @@ pub extern "C" fn irq_handler() {
             crate::uart_send_str(" pid=");
             crate::print_dec(crate::process::current_pid() as u64);
             crate::uart_send_str("\n");
+            // episode 落入环形日志（irqstat 事后回溯，不必盯串口抓现场）
+            storm_ep_record(irq, STORM_N, pend0, pend1, act0, act1, rpr);
             // 转储全程 IRQ 关闭且逐字节忙等 TX（~13ms）：间隙主动排空
             // UART RX，避免 16 字节硬件 FIFO 溢出丢输入。
             crate::uart_rx_drain();
@@ -118,6 +206,10 @@ pub extern "C" fn irq_handler() {
     if irq >= 1020 {
         return;
     }
+
+    // 每 IRQ 分发计数（irqstat 观测点；一次数组写，与风暴探测器同级的
+    // 常态开销）
+    unsafe { IRQ_COUNTS[irq as usize] += 1 };
 
     // 定时器（CNTV 调度 tick / CNTP 动画帧）：先确认（重装清除中断源）再 EOI，
     // 避免电平触发重触发风暴；之后再分发（调度器 tick 可能切换上下文，

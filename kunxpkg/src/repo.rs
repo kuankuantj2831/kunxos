@@ -4,8 +4,8 @@
 //! 安全模型：
 //! - **索引签名**（`Packages.sig` = 仓库密钥对 `Packages` 的 Ed25519 签名）是
 //!   真实性与完整性的根本保障，传输层加密（HTTPS/TLS）是纵深防御；
-//! - KunxOS 内核当前无 TLS 栈，因此 `https://` 源会被**明确拒绝**（不静默降级），
-//!   待内核 TLS 落地后同一代码路径即支持；`http://` 与 `file://` 可用；
+//! - `https://` 源经 TLS 1.2（`crate::tls`，与浏览器同一栈）获取：证书链
+//!   验证 + 主机名校验 + 有效期校验；`http://` 与 `file://` 行为不变；
 //! - 增量补丁 `delta-<base>-<target>` 同样由仓库密钥签名后才可应用。
 //!
 //! 缓存策略（/var/lib/pkg/cache/index/<n>/）：
@@ -13,8 +13,12 @@
 //! - 更新时先取 meta 比较 Revision：未变 → 直接用缓存；变了 → 尝试
 //!   `delta-<old>-<new>`（有签名则应用），失败再取全量。
 
+use crate::tls;
 use crate::ed25519;
 use crate::trust;
+
+/// TLS 握手失败（https 源专用错误码；-1..-10 与明文路径复用）。
+pub const E_TLS: isize = -11;
 
 /// 源数量上限。
 pub const MAX_SOURCES: usize = 4;
@@ -152,12 +156,15 @@ fn next_line(b: &[u8], from: usize) -> usize {
 }
 
 fn trim(b: &[u8]) -> &[u8] {
+    // 剥行首/行尾空白。必须包含 '\n'：next_line 返回的区间含行尾换行，
+    // 不剥的话 file:// 源路径尾部带 \n（"main\n/Packages" 解析失败，
+    // pkg update 恒 -9），meta 的 Revision 数字解析也会失败。
     let mut s = 0usize;
     let mut e = b.len();
-    while s < e && (b[s] == b' ' || b[s] == b'\t' || b[s] == b'\r') {
+    while s < e && matches!(b[s], b' ' | b'\t' | b'\r' | b'\n') {
         s += 1;
     }
-    while e > s && (b[e - 1] == b' ' || b[e - 1] == b'\t' || b[e - 1] == b'\r') {
+    while e > s && matches!(b[e - 1], b' ' | b'\t' | b'\r' | b'\n') {
         e -= 1;
     }
     &b[s..e]
@@ -190,15 +197,103 @@ pub fn meta_revision(meta: &[u8]) -> u64 {
     0
 }
 
-// ==================== HTTP 传输 ====================
+// ==================== HTTP/HTTPS 传输 ====================
+
+// ---- TLS 依赖的最小 syscall 面（与本文件其余部分同款内联 asm） ----
+
+const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_GETRANDOM: usize = 278;
+
+#[inline(always)]
+unsafe fn tls_syscall2(n: usize, a1: usize, a2: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn tls_syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        options(nostack)
+    );
+    ret
+}
+
+/// RTC 墙钟（秒，epoch）；不可用返回 0（证书有效期校验将失败拒连）。
+fn now_sec() -> i64 {
+    let mut tv = [0u8; 16];
+    let r = unsafe { tls_syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0) };
+    if (r as isize) < 0 {
+        return 0;
+    }
+    let sec = u64::from_le_bytes(tv[0..8].try_into().unwrap_or([0; 8]));
+    sec as i64
+}
+
+/// 内核 getrandom（virtio-rng 熵源）；不可用退化为时间+地址混合。
+struct GetRandom;
+
+impl tls::Rng for GetRandom {
+    fn fill(&mut self, buf: &mut [u8]) {
+        let n = unsafe { tls_syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), 0) };
+        if (n as isize) < 0 {
+            let mut seed = (now_sec() as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (buf.as_ptr() as u64).rotate_left(32);
+            for b in buf.iter_mut() {
+                seed = seed
+                    .wrapping_mul(6364_1362_2384_6793_005)
+                    .wrapping_add(1442_6950_4088_8963_407);
+                *b = (seed >> 33) as u8;
+            }
+        }
+    }
+}
+
+/// TLS 传输层：复用 crate::net 的 socket syscall。
+struct NetTr {
+    fd: isize,
+}
+
+impl tls::Transport for NetTr {
+    fn send_all(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        unsafe {
+            let mut sent = 0usize;
+            while sent < data.len() {
+                let n = crate::net::sock_send(self.fd, &data[sent..]);
+                if n <= 0 {
+                    return Err("TLS 传输发送失败");
+                }
+                sent += n as usize;
+            }
+        }
+        Ok(())
+    }
+    fn recv_some(&mut self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let n = unsafe { crate::net::sock_recv(self.fd, buf) };
+        if n < 0 {
+            return Err("TLS 传输接收失败");
+        }
+        Ok(n as usize)
+    }
+}
 
 /// 对 `file` 发 HTTP GET，响应体写入 `resp`，返回响应体长度；失败返回负值。
 /// 响应须为 HTTP/1.x 200；仅解析 Content-Length 或读到连接关闭。
+/// https 源：先做 TLS 1.2 握手（证书链验证），随后读写走密文通道。
 pub fn http_get(src: &Source, file: &[u8], resp: &mut [u8]) -> isize {
-    if src.kind == SourceKind::Https {
-        // 内核无 TLS：明确拒绝，不静默降级（索引签名仍保证真实性）
-        return -5;
-    }
     let host = &src.host[..src.host_len];
     let (ip, port, ok) = crate::net::resolve(host, src.port);
     if !ok || ip == 0 {
@@ -238,30 +333,68 @@ pub fn http_get(src: &Source, file: &[u8], resp: &mut [u8]) -> isize {
             crate::net::sock_close(fd);
             return -3;
         }
-        let mut sent = 0usize;
-        while sent < n {
-            let s = crate::net::sock_send(fd, &req[sent..n]);
-            if s <= 0 {
+        let mut total = 0usize;
+        if src.kind == SourceKind::Https {
+            // TLS 1.2：握手（证书链验证 + SNI）→ 密文发送/接收 → close_notify
+            let host_str = core::str::from_utf8(host).unwrap_or("");
+            let mut conn =
+                match tls::TlsConn::connect(NetTr { fd }, host_str, &mut GetRandom, now_sec()) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        crate::net::sock_close(fd);
+                        return E_TLS;
+                    }
+                };
+            if conn.send(&req[..n]).is_err() {
+                conn.close();
                 crate::net::sock_close(fd);
                 return -4;
             }
-            sent += s as usize;
-        }
-        let mut total = 0usize;
-        loop {
-            let space = resp.len() - total;
-            if space == 0 {
-                break;
+            loop {
+                let space = resp.len() - total;
+                if space == 0 {
+                    break;
+                }
+                match conn.recv(&mut resp[total..]) {
+                    Ok(0) => break,
+                    Ok(k) => total += k,
+                    // HTTP/1.0 + Connection:close 读到 EOF：对端不发 close_notify
+                    // 直接关 TCP（记录层视为错误）——按响应结束处理，正文完整性
+                    // 由索引 Ed25519 验签兜底。
+                    Err("TLS 连接被对端关闭") => break,
+                    Err(_) => {
+                        conn.close();
+                        crate::net::sock_close(fd);
+                        return -6;
+                    }
+                }
             }
-            let r = crate::net::sock_recv(fd, &mut resp[total..]);
-            if r < 0 {
-                crate::net::sock_close(fd);
-                return -6;
+            conn.close();
+        } else {
+            let mut sent = 0usize;
+            while sent < n {
+                let s = crate::net::sock_send(fd, &req[sent..n]);
+                if s <= 0 {
+                    crate::net::sock_close(fd);
+                    return -4;
+                }
+                sent += s as usize;
             }
-            if r == 0 {
-                break;
+            loop {
+                let space = resp.len() - total;
+                if space == 0 {
+                    break;
+                }
+                let r = crate::net::sock_recv(fd, &mut resp[total..]);
+                if r < 0 {
+                    crate::net::sock_close(fd);
+                    return -6;
+                }
+                if r == 0 {
+                    break;
+                }
+                total += r as usize;
             }
-            total += r as usize;
         }
         crate::net::sock_close(fd);
         // 解析状态行与头部
@@ -279,8 +412,13 @@ pub fn http_get(src: &Source, file: &[u8], resp: &mut [u8]) -> isize {
         if !(status.len() >= 12 && &status[9..12] == b"200") {
             return -8;
         }
-        let body = &resp[head_end + 4..total];
-        body.len() as isize
+        // ★ 把响应体前移到 resp[0]：调用方（fetch_full / fetch_file /
+        // try_apply_delta）一律按「返回长度 N ⇒ 纯 body 在 resp[..N]」取数。
+        // 此前返回长度却不搬移，HTTP 源时 resp[0] 起是响应头 —— 索引验签
+        // 算在「头+体」上恒失败（file:// 不经 http_get，未暴露）。
+        let blen = total - (head_end + 4);
+        resp.copy_within(head_end + 4..total, 0);
+        blen as isize
     }
 }
 
@@ -416,7 +554,7 @@ pub fn fetch_file(src: &Source, file: &[u8], buf: &mut [u8]) -> isize {
                 n as isize
             }
         }
-        SourceKind::Http => {
+        SourceKind::Http | SourceKind::Https => {
             let mut resp = [0u8; HTTP_MAX];
             let r = http_get(src, file, &mut resp);
             if r < 0 {
@@ -429,7 +567,6 @@ pub fn fetch_file(src: &Source, file: &[u8], buf: &mut [u8]) -> isize {
             buf[..m].copy_from_slice(&resp[..m]);
             m as isize
         }
-        SourceKind::Https => -5,
     }
 }
 

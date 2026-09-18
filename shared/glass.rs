@@ -17,6 +17,97 @@ pub const GLASS_DOWN_H: usize = 240;
 /// 4x 降采样缓冲（进程内共享；应用均为单线程，无并发问题）。
 static mut GLASS_DOWN: [u32; GLASS_DOWN_W * GLASS_DOWN_H] = [0; GLASS_DOWN_W * GLASS_DOWN_H];
 
+// ==================== 光随指动（P2-2，HarmonyOS 空间光效） ====================
+
+/// 光源偏移跟随的目标最大幅度（px）。
+const LIGHT_MAX_OFF: i32 = 24;
+
+static mut LIGHT_X: f32 = 0.0; // 当前偏移（渲染用）
+static mut LIGHT_Y: f32 = 0.0;
+static mut LIGHT_TX: f32 = 0.0; // 目标偏移
+static mut LIGHT_TY: f32 = 0.0;
+static mut LIGHT_T0: u64 = 0; // 本段跟随起点时刻
+static mut LIGHT_FX: f32 = 0.0; // 本段跟随起始偏移
+static mut LIGHT_FY: f32 = 0.0;
+static mut LIGHT_TOUCH_US: u64 = 0; // 最近一次触摸时刻（0 = 无触摸）
+static mut LIGHT_DECAY: bool = false; // 回零段锚定标志（只起一次 tween）
+
+/// 喂触摸点（屏幕坐标）与屏幕尺寸：按「相对屏幕中心位移 × 0.15」更新光源
+/// 目标。无输入设备的应用不喂即保持默认 (0,0)。
+pub fn light_track(px: i32, py: i32, w: i32, h: i32, now_us: u64) {
+    unsafe {
+        LIGHT_TOUCH_US = now_us;
+        let tx = ((px - w / 2) as f32 * 0.15).clamp(-LIGHT_MAX_OFF as f32, LIGHT_MAX_OFF as f32);
+        let ty = ((py - h / 2) as f32 * 0.15).clamp(-LIGHT_MAX_OFF as f32, LIGHT_MAX_OFF as f32);
+        if (tx - LIGHT_TX).abs() + (ty - LIGHT_TY).abs() > 0.5 {
+            // 新目标：从当前缓动位置起算 120ms FastOutSlowIn 跟随。
+            LIGHT_FX = LIGHT_X;
+            LIGHT_FY = LIGHT_Y;
+            LIGHT_TX = tx;
+            LIGHT_TY = ty;
+            LIGHT_T0 = now_us;
+        }
+    }
+}
+
+/// 推进光源跟随（120ms FastOutSlowIn；触摸离开 300ms 后目标回零）。
+/// 返回偏移是否有变化（应用据此触发重绘）。
+pub fn light_frame(now_us: u64) -> bool {
+    unsafe {
+        // 离手回零：锚定一次 tween（此前触发条件置 0 后恒真，每帧重设
+        // FX/T0 → 实际是逐帧指数收敛，而非一次 120ms 缓动）。
+        if LIGHT_TOUCH_US != 0
+            && now_us.saturating_sub(LIGHT_TOUCH_US) > 300_000
+            && (LIGHT_X.abs() + LIGHT_Y.abs() > 0.05 || LIGHT_TX != 0.0 || LIGHT_TY != 0.0)
+        {
+            LIGHT_TOUCH_US = 0;
+            LIGHT_FX = LIGHT_X;
+            LIGHT_FY = LIGHT_Y;
+            LIGHT_TX = 0.0;
+            LIGHT_TY = 0.0;
+            LIGHT_T0 = now_us;
+            LIGHT_DECAY = true;
+        }
+        if LIGHT_TOUCH_US != 0 {
+            // 触摸中：新目标由 light_track 锚定，衰减标志复位
+            LIGHT_DECAY = false;
+        }
+        if LIGHT_T0 == 0 {
+            return false;
+        }
+        let el = now_us.saturating_sub(LIGHT_T0);
+        if el >= 120_000 {
+            let done = (LIGHT_X - LIGHT_TX).abs() + (LIGHT_Y - LIGHT_TY).abs() < 0.05;
+            LIGHT_X = LIGHT_TX;
+            LIGHT_Y = LIGHT_TY;
+            if done && LIGHT_DECAY && LIGHT_TX == 0.0 && LIGHT_TY == 0.0 {
+                // 回零段完成：清锚定，停止重绘
+                LIGHT_DECAY = false;
+                LIGHT_T0 = 0;
+                return false;
+            }
+            return true;
+        }
+        // FastOutSlowIn 近似（0.4,0,0.2,1）的 8 段等距折线查表，避免每帧解贝塞尔。
+        const Y: [f32; 9] = [0.0, 0.33, 0.60, 0.78, 0.89, 0.95, 0.98, 0.995, 1.0];
+        let t = el as f32 / 120_000.0;
+        let i = ((t * 8.0) as usize).min(7);
+        let lt = (t * 8.0) - i as f32;
+        let e = Y[i] + (Y[i + 1] - Y[i]) * lt;
+        let nx = LIGHT_FX + (LIGHT_TX - LIGHT_FX) * e;
+        let ny = LIGHT_FY + (LIGHT_TY - LIGHT_FY) * e;
+        let moved = (nx - LIGHT_X).abs() + (ny - LIGHT_Y).abs() >= 0.05;
+        LIGHT_X = nx;
+        LIGHT_Y = ny;
+        moved
+    }
+}
+
+/// 当前光源偏移（整数 px，渲染路径用）。
+pub fn light_offset() -> (i32, i32) {
+    unsafe { (LIGHT_X as i32, LIGHT_Y as i32) }
+}
+
 /// 玻璃绘制目标：调用方提供背景读取与像素写入。
 pub trait GlassTarget {
     /// 读取屏幕坐标 (x, y) 处的背景像素（模糊输入源）。
@@ -244,6 +335,8 @@ pub fn glass_rect_style<T: GlassTarget>(
             }
         }
         // 3. 双线性放大 + 着色 + 顶部高光 + 斜向光泽 + 抗锯齿圆角 + 描边。
+        // 光随指动：高光带随光源垂直偏移、斜向光泽随其对角偏移（P2-2）。
+        let (lx, ly) = light_offset();
         let spec_h = (h / 3).max(1);
         let sheen_len = ((w + h) / 3).max(1);
         let white = 0x00_FF_FF_FF;
@@ -251,7 +344,9 @@ pub fn glass_rect_style<T: GlassTarget>(
             let fy = (dy as f32 / DOWN as f32) - 0.5;
             let j0 = (fy as i32).max(0).min(dhu as i32 - 1);
             let j1 = (j0 + 1).min(dhu as i32 - 1);
-            let ty = fy - j0 as f32;
+            // 顶/左边缘 fy<0 时向零截断得负 ty → bilerp 线性外插，暗背景
+            // 下负值饱和为 0（亮背景顶行/左列暗边）。钳 [0,1]。
+            let ty = (fy - j0 as f32).clamp(0.0, 1.0);
             for dx in 0..wu {
                 // 覆盖度：仅四个 r×r 圆角盒需要超采样，内部恒为不透明。
                 let in_box = (dx < r as usize || dx >= w as usize - r as usize)
@@ -267,20 +362,21 @@ pub fn glass_rect_style<T: GlassTarget>(
                 let fx = (dx as f32 / DOWN as f32) - 0.5;
                 let i0 = (fx as i32).max(0).min(dwu as i32 - 1);
                 let i1 = (i0 + 1).min(dwu as i32 - 1);
-                let tx = fx - i0 as f32;
+                let tx = (fx - i0 as f32).clamp(0.0, 1.0);
                 let a = *buf.add(j0 as usize * dwu + i0 as usize);
                 let b = *buf.add(j0 as usize * dwu + i1 as usize);
                 let c = *buf.add(j1 as usize * dwu + i0 as usize);
                 let d = *buf.add(j1 as usize * dwu + i1 as usize);
                 let mut out = blend(bilerp(a, b, c, d, tx, ty), st.tint, st.alpha);
-                // 顶部镜面高光（液态玻璃的“受光面”）。
-                if dy < spec_h as usize {
-                    let k = ((spec_h - dy as i32) * st.spec as i32 / spec_h) as u32;
+                // 顶部镜面高光（液态玻璃的“受光面”，随光源上下移动）。
+                let sdy = dy as i32 - ly;
+                if sdy >= 0 && sdy < spec_h {
+                    let k = ((spec_h - sdy) * st.spec as i32 / spec_h) as u32;
                     out = blend(out, white, k);
                 }
-                // 左上→右下斜向光泽带。
-                let sheen_d = dx as i32 + dy as i32;
-                if sheen_d < sheen_len {
+                // 左上→右下斜向光泽带（随光源沿对角线移动）。
+                let sheen_d = dx as i32 + dy as i32 - (lx + ly);
+                if sheen_d >= 0 && sheen_d < sheen_len {
                     let k = ((sheen_len - sheen_d) * st.sheen as i32 / sheen_len) as u32;
                     out = blend(out, white, k);
                 }
@@ -597,6 +693,7 @@ pub fn glass_rect_solid<T: GlassTarget>(
     let white = 0x00_FF_FF_FF;
     let r = r.max(0).min(w / 2).min(h / 2);
     let ri = (r - 1).max(0);
+    let (lx, ly) = light_offset();
     for dy in 0..h {
         for dx in 0..w {
             let in_box = (dx < r || dx >= w - r) && (dy < r || dy >= h - r);
@@ -610,12 +707,13 @@ pub fn glass_rect_solid<T: GlassTarget>(
             }
             let bg = t.backdrop(x + dx, y + dy);
             let mut out = blend(bg, st.tint, st.alpha);
-            if dy < spec_h {
-                let k = ((spec_h - dy) * st.spec as i32 / spec_h) as u32;
+            let sdy = dy - ly;
+            if sdy >= 0 && sdy < spec_h {
+                let k = ((spec_h - sdy) * st.spec as i32 / spec_h) as u32;
                 out = blend(out, white, k);
             }
-            let sheen_d = dx + dy;
-            if sheen_d < sheen_len {
+            let sheen_d = dx + dy - (lx + ly);
+            if sheen_d >= 0 && sheen_d < sheen_len {
                 let k = ((sheen_len - sheen_d) * st.sheen as i32 / sheen_len) as u32;
                 out = blend(out, white, k);
             }

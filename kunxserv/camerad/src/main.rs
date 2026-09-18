@@ -45,6 +45,7 @@ const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_CLOCK_GETTIME: usize = 113;
 const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 const O_RDONLY: usize = 0;
@@ -198,6 +199,39 @@ unsafe fn unlink(path: &str) -> i32 {
     syscall2(SYS_UNLINKAT, AT_FDCWD, PATH_BUF.as_ptr() as usize) as i32
 }
 
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
+        options(nostack)
+    );
+    ret
+}
+
+/// renameat（信箱认领用）。
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 64];
+    let mut q = [0u8; 64];
+    let on = old.len().min(63);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(63);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
+}
+
 unsafe fn write_file(path: &str, data: &[u8]) -> bool {
     let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
     if fd < 0 {
@@ -291,8 +325,11 @@ static mut FRAME_BUF: [u8; 640 * 480 * 3] = [0u8; 640 * 480 * 3];
 /// JPEG 输出缓冲。
 static mut JPEG_OUT: [u8; JPEG_BUF] = [0u8; JPEG_BUF];
 
-fn camera_backend_ref() -> &'static mut dyn CameraDevice {
-    kunxhal::camera::camera_backend().expect("no camera backend")
+/// 拿相机后端；无后端（非 qemu/pi4 构建）时返回 None——调用方回
+/// "ERR no backend" 而不是 panic 杀掉整个守护进程（k_main 对无后端是
+/// 优雅降级设计，此前第一条相机命令就把 camerad 干掉）。
+fn camera_backend_opt() -> Option<&'static mut dyn CameraDevice> {
+    kunxhal::camera::camera_backend()
 }
 
 /// 写入一帧到环形文件：22B 头 + 数据。
@@ -345,12 +382,15 @@ unsafe fn write_rec_frame(result: &kunxhal::camera::CaptureResult, payload: &[u8
     name[10..14].copy_from_slice(b".kxv");
     let plen = build_path(&mut path, VIDEO_DIR, core::str::from_utf8(&name[..14]).unwrap_or(""));
     path[plen] = 0;
-    let fd = syscall3(
-        SYS_OPENAT,
-        AT_FDCWD,
-        path.as_ptr() as usize,
-        O_WRONLY | O_CREAT,
-    ) as isize;
+    // ★ 首帧重建容器（O_TRUNC）：REC_N 是内存静态量（重启归 1），漏
+    // REC_STOP/中途崩溃后同名 rec_XXXXXX.kxv 残留 —— 无 TRUNC 时 16B 头
+    // 覆写旧文件头、新帧追加旧数据尾，容器交错损坏。
+    let flags = if unsafe { REC_HDR_WRITTEN } {
+        O_WRONLY | O_CREAT
+    } else {
+        O_WRONLY | O_CREAT | O_TRUNC
+    };
+    let fd = syscall3(SYS_OPENAT, AT_FDCWD, path.as_ptr() as usize, flags) as isize;
     if fd < 0 {
         return;
     }
@@ -387,7 +427,7 @@ fn fmt_tag(id: u32) -> &'static str {
     buf[i] = b'#';
     i += 1;
     let mut v = id;
-    let mut digits = [0u8; 4];
+    let mut digits = [0u8; 10]; // u32 最多 10 位（应用 REQ_ID 递增不回绕）
     let mut d = 0;
     loop {
         digits[d] = b'0' + (v % 10) as u8;
@@ -456,11 +496,14 @@ fn parse_cmd(line: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     let mut id = 0u32;
     let mut i = 1;
     while i < line.len() && line[i].is_ascii_digit() {
-        id = id * 10 + (line[i] - b'0') as u32;
-        i += 1;
-        if id > 999 {
-            return None;
+        // 应用侧 REQ_ID 每命令 +1 不回绕（支持 10 位）：此处只防溢出，
+        // 不能再硬拒 >999 —— 长会话第 1000 条命令起会被整体丢弃，
+        // 相机应用每个操作都超时直到重启。
+        match id.checked_mul(10).and_then(|v| v.checked_add((line[i] - b'0') as u32)) {
+            Some(v) => id = v,
+            None => return None,
         }
+        i += 1;
     }
     if i >= line.len() || line[i] != b' ' {
         return None;
@@ -534,7 +577,8 @@ unsafe fn handle_cmd(line: &[u8]) {
     match cmd {
         b"LIST" => {
             let mut info = cam_info();
-            let n = camera_backend_ref().enumerate(&mut info);
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            let n = cam.enumerate(&mut info);
             if n > 0 {
                 let mut body = [0u8; 64];
                 let l = fmt_dec(&mut body, n as u64);
@@ -544,11 +588,12 @@ unsafe fn handle_cmd(line: &[u8]) {
             }
         }
         b"OPEN" => {
-            let r = camera_backend_ref().open(0);
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            let r = cam.open(0);
             respond(tag, if r.is_ok() { "OK" } else { "ERR busy" });
         }
         b"CLOSE" => {
-            camera_backend_ref().close().ok();
+            if let Some(cam) = camera_backend_opt() { cam.close().ok(); }
             respond(tag, "OK");
         }
         b"CONFIG" => {
@@ -560,7 +605,8 @@ unsafe fn handle_cmd(line: &[u8]) {
             ) {
                 (Some(w), Some(h), Some(fps), Some(fmt)) => {
                     let cfg = CameraConfig::new(w as usize, h as usize, fps as usize, fmt);
-                    let r = camera_backend_ref().configure(&cfg);
+                    let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+                    let r = cam.configure(&cfg);
                     respond(tag, if r.is_ok() { "OK" } else { "ERR config" });
                 }
                 _ => respond(tag, "ERR bad args"),
@@ -571,7 +617,8 @@ unsafe fn handle_cmd(line: &[u8]) {
                 respond(tag, "ERR already");
                 return;
             }
-            let r = camera_backend_ref().start_stream();
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            let r = cam.start_stream();
             if r.is_ok() {
                 STREAMING = true;
                 respond(tag, "OK");
@@ -580,7 +627,7 @@ unsafe fn handle_cmd(line: &[u8]) {
             }
         }
         b"PREVIEW_STOP" => {
-            camera_backend_ref().stop_stream().ok();
+            if let Some(cam) = camera_backend_opt() { cam.stop_stream().ok(); }
             STREAMING = false;
             respond(tag, "OK");
         }
@@ -588,7 +635,8 @@ unsafe fn handle_cmd(line: &[u8]) {
             // 临时切到 RGB888 拍照分辨率 → 采集 → JPEG → 落盘 → 恢复预览配置
             let saved = CAM_CONFIG;
             let photo_cfg = CameraConfig::new(PHOTO_W, PHOTO_H, 1, PixelFormat::Rgb888);
-            if camera_backend_ref().configure(&photo_cfg).is_err() {
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            if cam.configure(&photo_cfg).is_err() {
                 respond(tag, "ERR config");
                 return;
             }
@@ -598,10 +646,11 @@ unsafe fn handle_cmd(line: &[u8]) {
                 single: true,
                 buffer_mask: 0,
             };
-            match camera_backend_ref().capture_single(&req) {
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            match cam.capture_single(&req) {
                 Ok(result) => {
                     let buf = &mut *core::ptr::addr_of_mut!(FRAME_BUF);
-                    match camera_backend_ref().read_frame(&result, buf) {
+                    match cam.read_frame(&result, buf) {
                         Ok(size) => {
                             let out = &mut *core::ptr::addr_of_mut!(JPEG_OUT);
                             match jpeg_encode_rgb888(out, PHOTO_W, PHOTO_H, &buf[..size], 85) {
@@ -662,7 +711,9 @@ unsafe fn handle_cmd(line: &[u8]) {
                 }
                 Err(_) => respond(tag, "ERR capture"),
             }
-            camera_backend_ref().configure(&saved).ok();
+            if let Some(cam) = camera_backend_opt() {
+                cam.configure(&saved).ok();
+            }
         }
         b"REC_START" => {
             if RECORDING {
@@ -671,7 +722,7 @@ unsafe fn handle_cmd(line: &[u8]) {
             }
             REC_HDR_WRITTEN = false;
             if !STREAMING {
-                if camera_backend_ref().start_stream().is_ok() {
+                if camera_backend_opt().map_or(false, |cam| cam.start_stream().is_ok()) {
                     STREAMING = true;
                 }
             }
@@ -684,7 +735,8 @@ unsafe fn handle_cmd(line: &[u8]) {
             respond(tag, "OK");
         }
         b"3A_GET" => {
-            let p = camera_backend_ref().get_3a();
+            let Some(cam) = camera_backend_opt() else { return respond(tag, "ERR no backend"); };
+            let p = cam.get_3a();
             let mut body = [0u8; 96];
             let mut n = 0;
             for &b in b"OK ae " {
@@ -721,21 +773,43 @@ unsafe fn handle_cmd(line: &[u8]) {
 }
 
 /// 轮询命令文件并处理所有行。
+///
+/// rename 认领方案（rild/wifid/audiod 同款）：旧的「read → ftruncate 清空」
+/// 两步之间，相机应用（cam_send）追加写入的新命令会被 ftruncate 一并抹掉
+/// → 应用侧 cam_cmd 满超时（拍照/预览偶发卡死）。认领后新命令落在重生的
+/// 命令文件上，留待下一轮。
 unsafe fn poll_commands() {
     static mut BUF: [u8; 1024] = [0u8; 1024];
-    let fd = open(CTL_PATH, O_RDWR);
-    if fd < 0 {
-        return;
+    // 认领名 "/var/run/camerad.ctl.r"
+    let mut taken = [0u8; 32];
+    let cb = CTL_PATH.as_bytes();
+    taken[..cb.len()].copy_from_slice(cb);
+    taken[cb.len()] = b'.';
+    taken[cb.len() + 1] = b'r';
+    let tpath = core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("");
+    // 清上次崩溃残留（存在则 rename 失败）
+    unlink(tpath);
+    if rename_path(CTL_PATH, tpath) != 0 {
+        return; // 无命令文件
     }
-    syscall3(SYS_LSEEK, fd as usize, 0, 0);
-    let n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len());
-    syscall2(SYS_FTRUNCATE, fd as usize, 0);
-    syscall3(SYS_LSEEK, fd as usize, 0, 0);
-    if n > 0 && n <= BUF.len() {
-        let data = &BUF[..n];
+    let mut n: isize = 0;
+    let fd = open(tpath, O_RDWR);
+    if fd >= 0 {
+        syscall3(SYS_LSEEK, fd as usize, 0, 0);
+        n = syscall3(SYS_READ, fd as usize, BUF.as_mut_ptr() as usize, BUF.len()) as isize;
+        syscall1(SYS_CLOSE, fd as usize);
+    }
+    unlink(tpath);
+    // 重建空命令文件（写方按「文件常驻」假设 O_CREAT 追加）。
+    let fd2 = open(CTL_PATH, O_CREAT | O_RDWR);
+    if fd2 >= 0 {
+        syscall1(SYS_CLOSE, fd2 as usize);
+    }
+    if n > 0 && (n as usize) <= BUF.len() {
+        let data = &BUF[..n as usize];
         let mut start = 0usize;
-        for i in 0..=n {
-            if i == n || data[i] == b'\n' {
+        for i in 0..data.len() {
+            if i == data.len() || data[i] == b'\n' {
                 if i > start {
                     handle_cmd(&data[start..i]);
                 }
@@ -743,7 +817,6 @@ unsafe fn poll_commands() {
             }
         }
     }
-    syscall1(SYS_CLOSE, fd as usize);
 }
 
 /// 预览/录像帧投递：若流运行且有新帧，渲染并写入环形文件。
@@ -751,7 +824,10 @@ unsafe fn pump_frames() {
     if !STREAMING {
         return;
     }
-    let cam = camera_backend_ref();
+    let Some(cam) = camera_backend_opt() else {
+        STREAMING = false;
+        return;
+    };
     while let Some(result) = cam.poll_frame() {
         let buf = &mut *core::ptr::addr_of_mut!(FRAME_BUF);
         match cam.read_frame(&result, buf) {
@@ -810,11 +886,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         let _ = now_us;
 
         // 打开并配置默认预览
-        if camera_backend_ref().open(0).is_ok() {
+        if camera_backend_opt().map_or(false, |cam| cam.open(0).is_ok()) {
             print("[camerad] 相机 0 已打开\n");
         }
         let cfg = CameraConfig::new(DEF_W, DEF_H, DEF_FPS, PixelFormat::Yuv420);
-        if camera_backend_ref().configure(&cfg).is_ok() {
+        if camera_backend_opt().map_or(false, |cam| cam.configure(&cfg).is_ok()) {
             CAM_CONFIG = cfg;
             print("[camerad] 已配置 ");
             print_dec(DEF_W as u64);

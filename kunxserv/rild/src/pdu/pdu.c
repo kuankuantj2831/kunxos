@@ -555,7 +555,7 @@ int pdu_deliver_decode(const unsigned char *pdu, int pdu_len,
             if (dcs) *dcs = d;
             p += 2;
             if (scts && scts_cap >= 20) {
-            static const unsigned char hexd[] = "0123456789";
+            static const unsigned char hexd[] = "0123456789ABCDEF";
             unsigned char tz = t[p + 6];
             int neg = (tz & 0x80) != 0;
             unsigned char tzv = tz & 0x7F;

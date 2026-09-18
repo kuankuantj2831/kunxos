@@ -172,3 +172,22 @@ pub fn init() {
         enable_pan_if_available();
     }
 }
+
+/// secondary 核的每核地址翻译状态初始化（SMP，`smp_secondary_main` 调用）。
+///
+/// MAIR/TCR/TTBR0/SCTLR/PAN 均为**每核**寄存器：CPU0 在 [`init`] 配置，
+/// 而 secondary 经 PSCI CPU_ON 以复位态唤醒——不配置则本核首次切入用户
+/// 任务（换 TTBR0 到用户页表）时以复位值 TCR/MAIR 翻译 → Instruction
+/// Abort（实测 init 在 cpu1 首次调度即 SIGILL @0x400000）。恒等映射页表
+/// 由 CPU0 构建完毕（SCHED_READY 释放副核前）本核直接复用，无需重建。
+pub unsafe fn init_secondary() {
+    write_mair();
+    write_tcr();
+    write_ttbr0_el1(vm::kernel_root_addr() as u64);
+    asm!("dsb ishst");
+    enable_mmu();
+    asm!("tlbi vmalle1");
+    asm!("dsb ish");
+    asm!("isb");
+    enable_pan_if_available();
+}

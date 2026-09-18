@@ -63,6 +63,11 @@ fn restore_under(fb: *mut u32, stride_px: usize, fw: i32, fh: i32) {
     unsafe {
         let x = CUR_UNDER_X;
         let y = CUR_UNDER_Y;
+        // 首次 overlay_redraw 之前收到 move 时备份还是全 0：恢复会把 25×25
+        // 黑块写到 (0,0) 附近（负坐标被裁剪）——跳过（下一整帧重绘自愈）。
+        if x < 0 || y < 0 {
+            return;
+        }
         for dy in 0..UH as i32 {
             for dx in 0..UW as i32 {
                 fb_set_px(

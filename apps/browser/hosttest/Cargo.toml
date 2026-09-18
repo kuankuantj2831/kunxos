@@ -1,0 +1,13 @@
+[package]
+name = "tls-hosttest"
+version = "0.1.0"
+edition = "2021"
+
+# 浏览器 TLS 模块的宿主机端到端测试：与来宾侧共用 apps/browser/src/tls/
+# 同一份源码（#[path] 引入），传输层换成 std TcpStream，对真实站点
+# 做完整握手 + 证书链验证 + 取页。
+[dependencies]
+kunxsec = { path = "../../../kunxsec" }
+
+[profile.release]
+opt-level = 2

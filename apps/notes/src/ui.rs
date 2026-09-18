@@ -198,6 +198,7 @@ pub fn tap_list(x: i32, y: i32) {
             EDIT_LEN = 0;
             PAGE = 1;
         }
+        print("[notes] 打开编辑器（新建）\n");
         return;
     }
     // 搜索框
@@ -223,6 +224,7 @@ pub fn tap_list(x: i32, y: i32) {
                 load_into_editor(i);
                 PAGE = 1;
             }
+            print("[notes] 打开编辑器\n");
             return;
         }
         yy += CELL_H;
@@ -249,6 +251,7 @@ fn load_into_editor(i: usize) {
 /// 编辑器页点击。
 pub fn tap_editor(x: i32, y: i32) {
     if ds_back_hit(x, y) {
+        print("[notes] 返回 → 列表\n");
         unsafe { PAGE = 0; }
         return;
     }

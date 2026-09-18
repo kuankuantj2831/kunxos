@@ -28,12 +28,15 @@ static mut GICD_BASE: usize = GICD_DEFAULT;
 /// CPU0 的 GIC CPU Interface 基地址（初始化后固定）。
 static mut GICC_BASE: usize = GICC_DEFAULT;
 
-/// 当前 CPU 的 GICC 基址（QEMU virt GICv2：每核偏移 0x20000）。
+/// 当前 CPU 的 GICC 基址。
 ///
-/// GIC CPU Interface 是每核一套（GICC_IAR/EOIR/CTLR/PMR 均 per-CPU），
-/// SMP 下各核必须访问自己的接口，否则应答/EOI 写错核导致中断错乱。
+/// GICv2 CPU interface 是每核 **banked**：各核访问同一 MMIO 地址，硬件
+/// 自动切到本核视图（GICC_IAR/EOIR/CTLR/PMR 的 per-CPU 语义由此提供，
+/// 不靠地址偏移）。此前 `+ cpu_id() * 0x20000` 的每核偏移把 cpu1+ 的
+/// 访问引到 0x08030000（GICV 区，NS EL1 不可访问）→ 同步异常（DFSC
+/// 0x10），副核在 `gic_init_secondary` 即 PANIC——SMP 打通的实际阻塞点。
 fn gicc_base() -> usize {
-    unsafe { GICC_BASE + crate::smp::cpu_id() as usize * 0x20000 }
+    unsafe { GICC_BASE }
 }
 
 /// 初始化 GICv2（CPU0 主核）。

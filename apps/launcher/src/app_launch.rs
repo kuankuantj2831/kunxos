@@ -31,7 +31,7 @@ impl Spring {
             vel: 0.0,
         }
     }
-    fn ios(damping_ratio: f32, initial_velocity: f32) -> Spring {
+    pub fn ios(damping_ratio: f32, initial_velocity: f32) -> Spring {
         let stiffness = 280.0;
         let mass = 1.0;
         let crit = 2.0 * fsqrt(stiffness * mass);
@@ -200,6 +200,9 @@ pub struct Motion {
     pub launch_t: u64,
     /// 覆盖全屏的缩放目标（定点 1.0=256）。
     pub launch_target: u32,
+    /// 启动瓦片纵向超前（‰，1000 = 等比；放大途中 ×1.03 → 落位 1.0，
+    /// squash & stretch，见 docs/animations.md §3.2）。
+    pub cur_stretch: u32,
 }
 
 pub static mut MOTION: Motion = Motion {
@@ -232,6 +235,7 @@ pub static mut MOTION: Motion = Motion {
     launch_spring: Spring::fixed(),
     launch_t: 0,
     launch_target: SCALE_1,
+    cur_stretch: 1000,
 };
 
 /// 按压反馈：80ms 内缩到 0.95。
@@ -251,12 +255,23 @@ const RETURN_END_SCALE: u32 = {
         v
     }
 };
-/// 动画结束后等待应用首帧的窗口与轮询间隔。
-const APP_READY_WAIT_US: u64 = 60_000;
-const APP_READY_POLL_MS: usize = 5;
-
 /// 桌面快照（转场期间作为缩放源，避免转场中重绘桌面产生闪烁）。
 static mut FRAME_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+
+/// 桌面预渲染存档（返回转场专用）：start_return 时把整幅桌面（BACK_BUF）
+/// 存档于此，转场各帧以它为底图合成缩回中的应用帧，转场结束整体恢复 ——
+/// 消除转场后的整屏 draw_desktop_full 尾巴（TCG 下 50~150ms）。
+static mut DESK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+/// Return 转场是否处于「桌面预渲染」模式（render_frame Return 分支据此选路）。
+static mut DESK_PRERENDERED: bool = false;
+/// 上一合成帧的应用帧矩形（恢复基准）：缩回矩形逐帧变小，若只写矩形内部
+/// 会在四周留下上一帧的应用像素拖尾 —— 每帧先用 DESK_BUF 恢复该区域再合成。
+static mut DESK_RET_PREV: [i32; 4] = [0; 4];
+
+/// Return 转场当前是否以预渲染桌面为底图（main.rs render_frame 查询）。
+pub fn desk_prerendered() -> bool {
+    unsafe { DESK_PRERENDERED }
+}
 
 /// 供 app_life 写入 Resume 动画的缩放源（应用末帧快照）。
 pub fn frame_buf_mut() -> *mut u32 {
@@ -370,6 +385,75 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
     }
 }
 
+/// 返回转场（桌面预渲染模式）：把 FRAME_BUF 中的应用末帧按 `scale`（定点
+/// 1.0=256）以 (cx, cy) 为锚点缩小后叠加到 BACK_BUF 的桌面上。缩小的矩形
+/// 之外不再填 COLOR_BG（预渲染桌面就是背景），也无需白闪 —— ColorOS 式
+/// 「应用缩回图标、桌面在四周浮现」。采样映射与 zoom_blit 一致（定点逆
+/// 变换 + ZOOM_BLOCK 块采样），矩形边界取源映射落入画面的精确范围。
+///
+/// 每帧先用 DESK_BUF 恢复上一帧矩形（EaseOut 单调缩小，取两帧矩形包围盒
+/// 防御非单调），再合成当前矩形 —— 否则缩小的矩形四周会留下应用像素拖尾。
+pub fn return_blit_over_desktop(scale: u32, cx: i32, cy: i32) {
+    unsafe {
+        let s = scale.max(1) as i64;
+        let inv = (256i64 << 16) / s;
+        let w = DISPLAY_W as i32;
+        let h = DISPLAY_H as i32;
+        let bw = DISPLAY_W as usize;
+        // 与 zoom_blit 的 sx/sy 判定互逆：源 [0..w) 映射回目标轴的落点范围。
+        let x0 = (cx - ((cx as i64 * s) >> 8) as i32).max(0);
+        let x1 = (cx + ((((w - 1 - cx) as i64) * s) >> 8) as i32).min(w - 1);
+        let y0 = (cy - ((cy as i64 * s) >> 8) as i32).max(0);
+        let y1 = (cy + ((((h - 1 - cy) as i64) * s) >> 8) as i32).min(h - 1);
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let bs = ZOOM_BLOCK as i32;
+        // 1. 恢复上一帧矩形 ∪ 当前矩形（防御性包围盒）区域的桌面底图。
+        let px0 = DESK_RET_PREV[0].min(x0).max(0);
+        let py0 = DESK_RET_PREV[1].min(y0).max(0);
+        let px1 = DESK_RET_PREV[2].max(x1).min(w - 1);
+        let py1 = DESK_RET_PREV[3].max(y1).min(h - 1);
+        if px0 <= px1 && py0 <= py1 {
+            for y in py0..=py1 {
+                let row = y as usize * bw;
+                BACK_BUF[row + px0 as usize..row + px1 as usize + 1]
+                    .copy_from_slice(&DESK_BUF[row + px0 as usize..row + px1 as usize + 1]);
+            }
+        }
+        // 2. 合成当前矩形内的应用帧（块采样 + 块填充）。
+        let mut py = y0;
+        while py <= y1 {
+            let sy = cy + (((py - cy) as i64 * inv) >> 16) as i32;
+            let sy_ok = sy >= 0 && sy < h;
+            let mut px = x0;
+            while px <= x1 {
+                let sx = cx + (((px - cx) as i64 * inv) >> 16) as i32;
+                let c = if sy_ok && sx >= 0 && sx < w {
+                    FRAME_BUF[sy as usize * bw + sx as usize]
+                } else {
+                    COLOR_BG
+                };
+                let bx_end = (px as usize + bs as usize).min((x1 + 1) as usize);
+                let by_end = (py as usize + bs as usize).min((y1 + 1) as usize);
+                let mut yy = py as usize;
+                while yy < by_end {
+                    let iy = yy * bw;
+                    let mut xx = px as usize;
+                    while xx < bx_end {
+                        BACK_BUF[iy + xx] = c;
+                        xx += 1;
+                    }
+                    yy += 1;
+                }
+                px += bs;
+            }
+            py += bs;
+        }
+        DESK_RET_PREV = [x0, y0, x1, y1];
+    }
+}
+
 /// 启动动画：应用图标方块从图标位置/尺寸逐渐放大到覆盖整个屏幕，
 /// 白色淡入衔接应用首帧。
 ///
@@ -390,35 +474,85 @@ unsafe fn zoom_put(idx: usize, c: u32) {
 
 /// 桌面快照 FRAME_BUF 压暗作为背景，图标瓦片 ICON_TILE 以 `scale`（定点）
 /// 缩放绘制，`fade` 为白色覆盖（0..255，结尾全白衔接应用）。
-pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
+///
+/// `stretch` 为纵向边长超前（‰，1000 = 等比）：放大途中 y 向轻微拉伸
+/// （squash & stretch），横纵独立采样，落位恢复等比精确覆盖全屏。
+/// 白闪 LUT 作用于单个像素的 RGB（保留 alpha 字节，供瓦片半透明边缘在
+/// 混合前先行变白 —— 与「先合成后整屏过 LUT」的差异仅在图标边缘数像素）。
+#[inline(always)]
+fn white_pixel(lut: &[u32; 256], c: u32) -> u32 {
+    let v = c & 0x00_FF_FF_FF;
+    (c & 0xFF00_0000)
+        | (lut[((v >> 16) & 0xFF) as usize] << 16)
+        | (lut[((v >> 8) & 0xFF) as usize] << 8)
+        | lut[(v & 0xFF) as usize]
+}
+
+pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
     unsafe {
         let w = DISPLAY_W as i32;
         let h = DISPLAY_H as i32;
         let total = DISPLAY_W * DISPLAY_H;
-        // 1. 已压暗的桌面快照作为背景（转场开始时 darken_frame_buf 压暗一次，
-        //    此处纯 memcpy，不再逐帧全屏 LUT 扫描）。
-        BACK_BUF[..total].copy_from_slice(&FRAME_BUF);
+        // 白闪 LUT 整场只建一次；激活时熔进背景拷贝与瓦片采样（单趟完成
+        // 「拷贝 + 变白」，替代原先拷贝后对整屏的第二趟扫描 —— 转场后段
+        // 每帧少穿行 ~2MB，TCG 慢宿主下每帧省数十毫秒）。
+        let wlut = if fade > 0 {
+            Some(build_white_lut(fade.min(255)))
+        } else {
+            None
+        };
+        // 1. 已压暗的桌面快照作为背景（转场开始时 darken_frame_buf 压暗一次）；
+        //    白闪激活时同趟完成变白。
+        match &wlut {
+            Some(lut) => {
+                for i in 0..total {
+                    let v = FRAME_BUF[i];
+                    BACK_BUF[i] = (lut[((v >> 16) & 0xFF) as usize] << 16)
+                        | (lut[((v >> 8) & 0xFF) as usize] << 8)
+                        | lut[(v & 0xFF) as usize];
+                }
+            }
+            None => {
+                BACK_BUF[..total].copy_from_slice(&FRAME_BUF);
+            }
+        }
         // 2. 图标方块放大：ICON_TILE（ICON_SIZE x ICON_SIZE 圆角图标）按当前边长缩放，
-        //    以图标中心 (cx, cy) 为锚点，最近邻采样 + ZOOM_BLOCK 块填充。
+        //    以图标中心 (cx, cy) 为锚点。2px 块 + 块中心预乘双线性采样：放大途中
+        //    图标边缘平滑（最近邻 + 4px 块会呈现明显马赛克），迭代数仍远低于逐像素。
         let s = (ICON_SIZE as u32 * scale / SCALE_1).max(1) as i32;
+        // 纵向边长按 stretch（‰）超前，横纵分离。
+        let sy = ((s as i64 * stretch.max(1000).min(2000) as i64) / 1000).max(1) as i32;
         let half = s / 2;
+        let half_y = sy / 2;
         let x0 = (cx - half).max(0);
-        let y0 = (cy - half).max(0);
+        let y0 = (cy - half_y).max(0);
         let x1 = (cx + half).min(w - 1);
-        let y1 = (cy + half).min(h - 1);
-        let bs = ZOOM_BLOCK as usize;
+        let y1 = (cy + half_y).min(h - 1);
+        let bs = 2usize;
         let isz = ICON_SIZE as u32;
+        let sf = isz as f32 / s.max(1) as f32;
+        let sfy = isz as f32 / sy.max(1) as f32;
         let mut py = y0;
         while py <= y1 {
             let mut px = x0;
             while px <= x1 {
                 let dx = px - (cx - half); // 0..s
-                let dy = py - (cy - half); // 0..s
-                let sx = ((dx as u32 * (isz - 1)) / s.max(1) as u32).min(isz - 1) as usize;
-                let sy = ((dy as u32 * (isz - 1)) / s.max(1) as u32).min(isz - 1) as usize;
-                let c = ICON_TILE[sy * ICON_SIZE as usize + sx];
-                // ZOOM_BLOCK×ZOOM_BLOCK 整块填充（步进=块尺寸，与 zoom_blit
-                // 同规则；此前只写 2×2 像素却步进 4 → 放大图标呈条纹镂空）。
+                let dy = py - (cy - half_y); // 0..sy
+                // 块中心 (+0.5) 映射回源贴图连续坐标（横纵独立缩放）。
+                let fx = (dx as f32 + 0.5) * sf - 0.5;
+                let fy = (dy as f32 + 0.5) * sfy - 0.5;
+                let c0 = sample_icon_bilinear_stride(
+                    &ICON_TILE,
+                    ICON_SIZE as usize,
+                    ICON_SIZE as usize,
+                    fx,
+                    fy,
+                );
+                let c = match &wlut {
+                    Some(lut) => white_pixel(lut, c0),
+                    None => c0,
+                };
+                // bs×bs 整块填充（步进=块尺寸）。
                 let bx_end = (px as usize + bs).min(w as usize);
                 let by_end = (py as usize + bs).min(h as usize);
                 let mut yy = py as usize;
@@ -435,20 +569,7 @@ pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
             }
             py += bs as i32;
         }
-        // 3. 白色覆盖（结尾全白，衔接应用首帧）：LUT 查表 + 2 像素一组。
-        if fade > 0 {
-            let lut = build_white_lut(fade.min(255));
-            for i in (0..total).step_by(2) {
-                let c0 = BACK_BUF[i];
-                let c1 = BACK_BUF[i + 1];
-                BACK_BUF[i] = (lut[((c0 >> 16) & 0xFF) as usize] << 16)
-                    | (lut[((c0 >> 8) & 0xFF) as usize] << 8)
-                    | lut[(c0 & 0xFF) as usize];
-                BACK_BUF[i + 1] = (lut[((c1 >> 16) & 0xFF) as usize] << 16)
-                    | (lut[((c1 >> 8) & 0xFF) as usize] << 8)
-                    | lut[(c1 & 0xFF) as usize];
-            }
-        }
+        // 3. 白色覆盖已熔进第 1/2 步（见 wlut）—— 无独立整屏扫描。
     }
 }
 
@@ -463,6 +584,11 @@ static mut CANCEL_PID: isize = -1;
 static mut CANCEL_IDX: usize = 0;
 /// WNOHANG（wait4 options）。
 const WNOHANG: usize = 0x1;
+/// SYS_KUNX_SCHED_SET_DEADLINE：当前任务一次性调度 deadline（相对 µs，0 清除）。
+const SYS_KUNX_SCHED_SET_DEADLINE: usize = 414;
+/// 启动窗口时长：子进程加载（ELF/字体/数据）+ 首帧渲染期间以交互期限
+/// 参与 CFS 竞争，到期自动失效（潮汐引擎「启动线程优先」的等价物）。
+const LAUNCH_BOOST_US: usize = 3_000_000;
 
 /// 清除启动中记录的子 pid。应用在启动动画窗口内被 KILLED/EXITED（app_life
 /// 事件路径回收僵尸）时调用——若不清除，动画完成时 `launch_complete` 会拿
@@ -600,6 +726,9 @@ fn launch_child(app_idx: usize) -> isize {
                 print(") 失败，拒绝以 root 运行\n");
                 exit(126);
             }
+            // 启动加速：3s 一次性调度 deadline（相对 µs），覆盖字体加载与
+            // 首帧渲染的启动窗口；首帧通常远早于 3s，deadline 到期自动清除。
+            syscall1(SYS_KUNX_SCHED_SET_DEADLINE, LAUNCH_BOOST_US);
             let mut argv = [0usize; 2];
             let mut p = [0u8; PATH_CAP];
             let len = app.path.len().min(PATH_CAP - 1);
@@ -615,47 +744,6 @@ fn launch_child(app_idx: usize) -> isize {
             exit(127);
         }
         pid
-    }
-}
-
-/// 动画完成后回收应用子进程：等待退出 → 处理退出码 → 返回桌面转场。
-fn reap_child(app_idx: usize, pid: isize) {
-    if pid <= 0 {
-        return;
-    }
-    let app = &APPS[app_idx];
-    unsafe {
-        let mut status = 0i32;
-        let r = waitpid(pid, &mut status);
-        print("[launcher] 应用 '");
-        print(app.name);
-        print("' 已退出");
-        let mut code = 0u32;
-        if r == pid {
-            code = ((status >> 8) & 0xFF) as u32;
-            print("，退出码=");
-            print_dec(code);
-        }
-        print("，返回桌面\n");
-        // 应用退出码约定：0 普通返回；1 回桌面首页；2 打开最近任务；
-        // 127 = execve 失败（launch_child 子进程约定），提示启动失败。
-        if code == 127 {
-            show_toast(txt("App failed to start", "应用启动失败"));
-        }
-        match code {
-            1 => {
-                CURRENT_PAGE = 0;
-                SHADE_OPEN = false;
-                RECENTS_OPEN = false;
-            }
-            2 => {
-                recents_open();
-                SHADE_OPEN = false;
-            }
-            _ => {}
-        }
-        // 应用覆盖了桌面（应用自己画 fb），退出后以缩放转场回到桌面。
-        start_return(app_idx);
     }
 }
 
@@ -696,9 +784,16 @@ pub fn cancel_press() {
 /// 放行应用绘制首帧；应用未就绪则显示占位页。
 pub fn start_launch(app_idx: usize) {
     unsafe {
+        // 连续启动打断（ColorOS 极光引擎）：返回转场中途点击新图标，不等
+        // 300ms 播完 —— 以当前中途帧为背景快照，无缝切换为新应用的启动
+        // 转场（快照时 MOTION.phase 仍是 Return，render_frame 走 zoom_blit
+        // 路径定格返回中的画面）。Resume 不开放打断：被恢复应用须保持
+        // SIGSTOP 且 launcher 侧单槽状态无法同时表达"挂起恢复 + 新启动"。
+        let interrupt_return = MOTION.phase == Phase::Return;
         if MOTION.phase != Phase::Idle
             && MOTION.phase != Phase::PressIn
             && MOTION.phase != Phase::PressOut
+            && !interrupt_return
         {
             return;
         }
@@ -710,24 +805,11 @@ pub fn start_launch(app_idx: usize) {
                 return;
             }
         }
-        // 快照当前桌面（此刻仍为普通桌面渲染路径）
-        render_frame();
-        core::ptr::copy_nonoverlapping(
-            BACK_BUF.as_ptr(),
-            FRAME_BUF.as_mut_ptr(),
-            DISPLAY_W * DISPLAY_H,
-        );
-        // 快照压暗一次化：launch_blit 每帧的「压暗桌面快照」背景在这里一次
-        // 完成（见 darken_frame_buf 注释），转场各帧只做 memcpy。
-        darken_frame_buf();
-        // 预渲染应用图标瓦片（32x32 圆角图标），供启动动画放大使用。
-        let app = &APPS[app_idx];
-        TILE_MODE = true;
-        draw_app_icon(app, 0, 0, ICON_SIZE);
-        TILE_MODE = false;
         // 门控置 0（等待）：应用在 font_init 后轮询此文件，动画完成前不绘制。
         // unlink 重建 + 重读校验都成功才 fork：门控不可用时应用可能读到残留
         // 内容（如上次取消残留的 "2"）直接 exit(1)，表象"点击图标秒退无提示"。
+        // 门控/fork 失败路径必须在动 Return 挂起状态与 FRAME_BUF 之前返回 ——
+        // 打断路径下返回转场要以原快照原样继续播完（完成后照常开最近任务）。
         if !gate_prepare_wait() {
             print("[launcher] 启动门控写入失败，放弃启动\n");
             gate_release(); // 尽力恢复放行态（无人等待）
@@ -746,6 +828,33 @@ pub fn start_launch(app_idx: usize) {
             cancel_press();
             return;
         }
+        if interrupt_return {
+            // Return 的完成回调不会再触发，清掉其挂起状态（BG_RECENTS
+            // 残留会在下次返回完成时误开最近任务）；已计入的返回帧不属于
+            // 即将开始的启动转场，一并清零。
+            super::app_life::return_interrupted();
+            TRANS_FRAMES = 0;
+            print("[motion] 返回转场被新启动打断（连续启动）\n");
+        }
+        // 快照当前桌面（此刻仍为普通桌面渲染路径；打断路径 MOTION.phase 仍
+        // 是 Return，render_frame 走桌面预渲染合成路径定格返回中的画面）
+        render_frame();
+        core::ptr::copy_nonoverlapping(
+            BACK_BUF.as_ptr(),
+            FRAME_BUF.as_mut_ptr(),
+            DISPLAY_W * DISPLAY_H,
+        );
+        // 快照已定格，Return 阶段结束：退出桌面预渲染模式（新启动转场
+        // 使用自己的快照路径，不受 Return 标志影响）。
+        DESK_PRERENDERED = false;
+        // 快照压暗一次化：launch_blit 每帧的「压暗桌面快照」背景在这里一次
+        // 完成（见 darken_frame_buf 注释），转场各帧只做 memcpy。
+        darken_frame_buf();
+        // 预渲染应用图标瓦片（32x32 圆角图标），供启动动画放大使用。
+        let app = &APPS[app_idx];
+        TILE_MODE = true;
+        draw_app_icon(app, 0, 0, ICON_SIZE);
+        TILE_MODE = false;
         LAUNCH_PID = pid;
         LAUNCH_IDX = app_idx;
         // 生命周期：登记应用（lifd 建立注册表）并置启动中状态。
@@ -766,7 +875,12 @@ pub fn start_launch(app_idx: usize) {
         MOTION.cy = cy;
         MOTION.launch_target = target;
         // spring(300ms, bounce≈0.07)：从按压尺寸起跳放大到覆盖全屏（ColorOS）。
+        // 打断路径没有本轮按压反馈（start_press 在 Return 期间被吞），
+        // press_scale 是上一次按压的陈值，从原尺寸起跳。
         MOTION.launch_spring = Spring::launch();
+        if interrupt_return {
+            MOTION.press_scale = SCALE_1;
+        }
         MOTION.launch_spring.pos = MOTION.press_scale as f32;
         MOTION.launch_spring.target = target as f32;
         MOTION.launch_t = now_us();
@@ -784,6 +898,9 @@ pub fn start_launch(app_idx: usize) {
 }
 
 /// 开始返回转场：快照当前显存（应用最后一帧）→ 从全屏缩回图标原位。
+/// 转场开始时就地预渲染桌面（ColorOS 极光引擎「转场与目标帧并行绘制」）：
+/// 转场期间桌面是静态的，先把它画进 BACK_BUF 并存档 DESK_BUF，各帧只做
+/// 「桌面 + 缩回应用帧」合成；结束时整体恢复，不再付整屏重绘尾巴。
 pub fn start_return(app_idx: usize) {
     unsafe {
         if !FB.is_null() {
@@ -797,6 +914,16 @@ pub fn start_return(app_idx: usize) {
                 );
             }
         }
+        // 壁纸偏好同步挪到转场开始（原在 return_animation_done —— 转场后的
+        // 关键路径上）；若调色板变化触发了淡入，直接结算到终态：预渲染是
+        // 静态底图，淡入无从插帧。
+        wallpaper_sync_from_prefs();
+        WP_FADE_ACTIVE = false;
+        draw_desktop_full();
+        DESK_BUF.copy_from_slice(&BACK_BUF);
+        DESK_PRERENDERED = true;
+        // 恢复基准 = 全屏：首帧先把整幅桌面恢复进 BACK_BUF 再合成应用帧。
+        DESK_RET_PREV = [0, 0, DISPLAY_W as i32 - 1, DISPLAY_H as i32 - 1];
         let (hx, hy) = icon_center(app_idx);
         MOTION.phase = Phase::Return;
         MOTION.t0 = now_us();
@@ -963,14 +1090,17 @@ pub fn motion_advance(now: u64) -> bool {
                     m.cur_fade = 255;
                     let app = m.app;
                     // 放行应用绘制首帧（应用在 start_launch 已 fork+execve，
-                    // 动画期间完成加载）；未就绪则显示占位页直到首帧覆盖。
-                    let sample = fb_sample();
+                    // 动画期间完成字体加载）。放行后不再阻塞轮询应用首帧
+                    // （原 app_ready_within 最多卡主循环 60ms，恰在输入最敏感
+                    // 时刻）：占位页立即兜底（ColorOS starting window 语义），
+                    // 应用首帧就绪后自然覆盖占位页。
+                    // ★ 首帧基线必须在放行**之前**采样（自比较恒假守卫使
+                    // 占位页无条件覆盖应用首帧）。
+                    let baseline = fb_sample();
                     gate_release();
                     let pid = LAUNCH_PID;
                     LAUNCH_PID = -1;
-                    if !app_ready_within(&sample) {
-                        draw_placeholder(app);
-                    }
+                    draw_placeholder(app, &baseline);
                     // 进入前台管理态（非阻塞；应用退出/后台化由 app_life 处理）
                     super::app_life::launch_complete(app, pid);
                     // 返回 false：本帧不应再触发主循环重绘 —— phase 已置 Idle，
@@ -982,11 +1112,15 @@ pub fn motion_advance(now: u64) -> bool {
                     return false;
                 }
                 m.cur_scale = m.launch_spring.pos as u32;
-                // 白闪在动画后段才开始（衔接应用首帧，避免过早遮住图标）
+                // 白闪在动画后段才开始（衔接应用首帧，避免过早遮住图标）；
+                // Emphasized（慢起-快中-缓收）替代线性：起闪更缓，减白闪突兀感。
                 let span = (m.launch_target - SCALE_1).max(1) as f32;
                 let prog = ((m.launch_spring.pos - SCALE_1 as f32) / span).clamp(0.0, 1.0);
                 let fade_p = ((prog - 0.55) / 0.45).clamp(0.0, 1.0);
-                m.cur_fade = (255.0 * fade_p) as u32;
+                m.cur_fade = (255.0 * Easing::Emphasized.sample(fade_p)) as u32;
+                // squash & stretch：放大途中纵向边长 1.03 倍瞬时超前，随进度
+                // 收敛回等比（落位 prog=1 时精确覆盖全屏）。
+                m.cur_stretch = (1000.0 + 30.0 * (1.0 - prog)) as u32;
                 true
             }
             Phase::Resume => {
@@ -1017,9 +1151,20 @@ pub fn motion_advance(now: u64) -> bool {
                     m.phase = Phase::Idle;
                     m.cur_scale = RETURN_END_SCALE;
                     m.cur_fade = 255;
+                    // 桌面预渲染模式：BACK_BUF 整体恢复为纯桌面并直接提交，
+                    // 不置 NEEDS_REDRAW —— 跳过转场后的整屏 draw_desktop_full
+                    // （TCG 下 50~150ms），退出尾巴归零（ColorOS 无缝回桌面）。
+                    if DESK_PRERENDERED {
+                        let total = DISPLAY_W * DISPLAY_H;
+                        BACK_BUF[..total].copy_from_slice(&DESK_BUF);
+                        flip();
+                        draw_cursor_overlay();
+                        DESK_PRERENDERED = false;
+                    } else {
+                        NEEDS_REDRAW = true;
+                    }
                     // 生命周期：返回动画完成（BG 原因为 RECENTS 时打开最近任务）
                     super::app_life::return_animation_done();
-                    NEEDS_REDRAW = true;
                     return false;
                 }
                 // ease-out：从全屏（1:1 应用末帧）缩回图标原位，白闪淡入收尾
@@ -1137,25 +1282,13 @@ fn fb_matches(sample: &[u32; 12]) -> bool {
     }
 }
 
-/// 放行应用后轮询其首帧：窗口内绘制了首帧则返回 true。
-fn app_ready_within(sample: &[u32; 12]) -> bool {
-    let mut waited = 0u64;
-    while waited < APP_READY_WAIT_US {
-        sleep_ms(APP_READY_POLL_MS);
-        waited += APP_READY_POLL_MS as u64 * 1000;
-        if !fb_matches(sample) {
-            return true;
-        }
-    }
-    false
-}
-
 /// 占位页面（应用主题色背景 + 居中图标）：应用 350ms 内未就绪时显示，
-/// 应用首帧绘制到显存后自然覆盖。
-fn draw_placeholder(app_idx: usize) {
+/// 应用首帧绘制到显存后自然覆盖。`baseline` 是放行应用**之前**采的显存
+/// 基线（此刻显存必然还是启动动画末帧 = 基线本身；与基线一致 = 应用
+/// 尚未画首帧，允许覆盖）。
+fn draw_placeholder(app_idx: usize, baseline: &[u32; 12]) {
     unsafe {
-        let sample = fb_sample();
-        if !fb_matches(&sample) {
+        if !fb_matches(baseline) {
             return; // 应用已绘制首帧，不再覆盖
         }
         let app = &APPS[app_idx];

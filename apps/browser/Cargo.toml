@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 fontdue = "0.9.4"
+kunxsec = { path = "../../kunxsec" }
 
 [profile.release]
 opt-level = "z"

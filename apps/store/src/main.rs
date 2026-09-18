@@ -3,9 +3,12 @@
 // 连接 Cloudflare R2 对象存储（S3 兼容 API，AWS SigV4 手写签名）作为软件源：
 //   1. R2 连接：GET Object（Packages.json 索引 / .kunx 包 / 索引签名），
 //      SigV4 (HMAC-SHA256) 签名请求，复用天气应用的 HTTP+TCP 内核网络栈。
-//   2. 索引同步：下载 Packages.json（含可选索引签名验证），本地缓存
-//      /data/store/cache/index.bin（KXST1 头 + 时间戳），TTL 12h，过期重拉，
-//      离线回退过期缓存。
+//   2. 索引同步：下载 Packages.json 并强制索引签名验证（Packages.json.sig，
+//      Ed25519 REPO_ANCHOR）：验签通过才可安装并写本地缓存
+//      /data/store/cache/index.bin（KXST2 头 + 时间戳，只存验签索引）；
+//      签名缺失/不可用 → 索引仅可浏览，安装一律拒绝（fail-closed）；
+//      签名不匹配 → 索引整体拒绝。缓存 TTL 12h，过期重拉，离线回退
+//      过期缓存（缓存索引必已验签）。
 //   3. 商店 UI：分类浏览（chips）、搜索框（物理键盘）、应用详情页、安装按钮、
 //      更新检查（索引版本 vs 已安装版本）。
 //   4. 下载管理：队列式下载（逐一处理）、进度显示、网络失败重试（1s/2s/4s 退避，
@@ -41,6 +44,8 @@ use core::panic::PanicInfo;
 
 #[path = "../../../kunxpkg/src/sha512.rs"]
 mod sha512;
+#[path = "../../../shared/motion.rs"]
+mod motion;
 #[path = "../../../kunxpkg/src/ed25519.rs"]
 mod ed25519;
 #[path = "../../../kunxpkg/src/json.rs"]
@@ -727,13 +732,21 @@ const IDX_FROM_R2: u8 = 1;
 const IDX_FROM_LOCAL: u8 = 2;
 static mut IDX_SRC: u8 = 0;
 static mut IDX_TS: u64 = 0; // 缓存时间戳
+/// 当前索引是否经 Ed25519 签名验证。只有本次在线拉取验签通过、或加载了
+/// 「验签后才写入」的 KXST2 缓存才为 true；未签名索引仅可浏览，安装一律
+/// 拒绝（install_app 入口强制检查）。
+static mut IDX_SIG_OK: bool = false;
 
-/// 保存索引缓存：`KXST1 <unix>` + JSON body。
+/// 保存索引缓存：`KXST2 <unix>` + JSON body。
+///
+/// 头版本从 KXST1 升到 KXST2：旧缓存可能来自「未签名照收」时代的索引，
+/// 一律作废（读取端只认 KXST2），首次重新在线拉取。只有验签通过的索引
+/// 才会写入缓存（调用点保证），由此维持「缓存内索引必已验签」的不变量。
 fn index_cache_save(ts: u64, body: &[u8]) {
     unsafe {
         let mut hdr = [0u8; 32];
         let mut n = 0usize;
-        hdr[n..n + 6].copy_from_slice(b"KXST1 ");
+        hdr[n..n + 6].copy_from_slice(b"KXST2 ");
         n += 6;
         let mut num = [0u8; 20];
         let nl = fmt_dec(ts, &mut num);
@@ -773,6 +786,7 @@ fn index_cache_save(ts: u64, body: &[u8]) {
 }
 
 /// 读取缓存，body 前移回 IDX_BUF。返回 (ok, ts, body_len)。
+/// 只认 KXST2（验签后才写入的缓存）；KXST1 旧缓存视为不存在。
 fn index_cache_load() -> (bool, u64, usize) {
     unsafe {
         let n = read_file(IDX_CACHE, &mut IDX_BUF);
@@ -780,7 +794,7 @@ fn index_cache_load() -> (bool, u64, usize) {
             return (false, 0, 0);
         }
         let b = &IDX_BUF[..n as usize];
-        if !starts_with(b, b"KXST1 ") {
+        if !starts_with(b, b"KXST2 ") {
             return (false, 0, 0);
         }
         let mut ts: u64 = 0;
@@ -825,8 +839,13 @@ fn r2_retryable(code: isize) -> bool {
     )
 }
 
-/// 拉取 Packages.json（可选索引签名验证），成功返回 body 长度（写入 IDX_BUF）。
-/// 失败返回负错误码。
+/// 拉取 Packages.json 并做索引签名验证（fail-closed），成功返回 body 长度
+/// （写入 IDX_BUF）。失败返回负错误码。
+///
+/// 签名策略：`Packages.json.sig` 存在且 Ed25519 验签通过 → 索引可信
+/// （`IDX_SIG_OK = true`，可安装）。签名缺失（404）、拉取失败或长度异常
+/// → 索引仅可浏览，`IDX_SIG_OK` 保持 false，安装一律拒绝。签名不匹配
+/// → 整个索引拒绝（返回 -50），不进缓存。
 unsafe fn index_fetch_r2() -> isize {
     let cfg = build_r2_cfg();
     let mut status = 0i32;
@@ -835,7 +854,7 @@ unsafe fn index_fetch_r2() -> isize {
     loop {
         let r = r2::s3_get(&cfg, b"Packages.json", &mut IDX_BUF, &mut status);
         if r > 0 {
-            // 拉索引签名（可选）
+            // 拉索引签名（必需：缺失/不可用即禁止安装，不能仅告警照收）
             let sig_r = r2::s3_get(&cfg, b"Packages.json.sig", &mut SIG_BUF, &mut status);
             if sig_r == 64 {
                 let sig: [u8; 64] = SIG_BUF[..64].try_into().unwrap();
@@ -844,11 +863,13 @@ unsafe fn index_fetch_r2() -> isize {
                     return -50;
                 }
                 print("[store] 索引签名校验通过\n");
+                IDX_SIG_OK = true;
             } else if sig_r == r2::R2_ERR_NOTFOUND {
-                print("[store] 索引未签名（无 Packages.json.sig），仅供显示\n");
-            } else if sig_r < -29 {
-                // 网络错误拉签名失败：接受但记录
-                print("[store] 索引签名拉取失败，按未签名继续\n");
+                print("[store] 索引未签名（无 Packages.json.sig），仅可浏览，禁止安装\n");
+            } else {
+                // 网络错误拉签名失败 / 签名长度异常（≠64）：同样按未签名
+                // 处理（禁止安装），不能默默照收。
+                print("[store] 索引签名不可用，仅可浏览，禁止安装\n");
             }
             return r;
         }
@@ -868,10 +889,15 @@ unsafe fn index_fetch_r2() -> isize {
 
 /// 加载索引：新鲜缓存 → 用之；否则拉 R2；失败回退过期缓存/本地目录。
 /// 返回 0 新数据，1 过期缓存，2 本地目录，3 无数据。
+///
+/// IDX_SIG_OK 不变量：缓存（KXST2）只存验签通过的索引，因此两条缓存路径
+/// 均置 true；网络路径由 index_fetch_r2 按验签结果置位；本地目录不涉及
+/// Packages.json.sig（安装走 pkg 自身的包级验签）。
 fn index_load() -> u8 {
     unsafe {
         ensure_dirs();
         index::reset();
+        IDX_SIG_OK = false;
         let now = now_us() / 1_000_000;
         // 1. 新鲜缓存
         let (ok, ts, bl) = index_cache_load();
@@ -879,6 +905,7 @@ fn index_load() -> u8 {
             if index::parse(&IDX_BUF[..bl]) {
                 IDX_SRC = IDX_FROM_R2;
                 IDX_TS = ts;
+                IDX_SIG_OK = true;
                 print("[store] 索引缓存命中 ts=");
                 print_dec(ts as u32);
                 print("\n");
@@ -894,7 +921,10 @@ fn index_load() -> u8 {
                 if index::parse(&IDX_BUF[..m]) {
                     IDX_SRC = IDX_FROM_R2;
                     IDX_TS = now;
-                    index_cache_save(now, &IDX_BUF[..m]);
+                    // 只缓存验签通过的索引；未签名索引仅本会话内浏览。
+                    if IDX_SIG_OK {
+                        index_cache_save(now, &IDX_BUF[..m]);
+                    }
                     print("[store] 索引已获取，包数=");
                     print_dec(index::count() as u32);
                     print("\n");
@@ -915,6 +945,7 @@ print("）\n");
             if index::parse(&IDX_BUF[..bl]) {
                 IDX_SRC = IDX_FROM_R2;
                 IDX_TS = ts;
+                IDX_SIG_OK = true;
                 print("[store] 索引过期，回退使用\n");
                 return 1;
             }
@@ -1093,6 +1124,14 @@ fn install_app(idx: usize) -> bool {
             show_error("请先在设置页配置 R2 软件源".as_bytes());
             return false;
         }
+        // 索引未验签（Packages.json.sig 缺失/不可用）→ 明确阻止安装：
+        // 索引可浏览，但绝不从不可信索引起草下载与安装（fail-closed）。
+        if !IDX_SIG_OK {
+            status("索引未签名".as_bytes());
+            show_error("软件源索引未签名（缺 Packages.json.sig），已阻止安装".as_bytes());
+            print("[store] 拒绝安装：索引未签名\n");
+            return false;
+        }
         // 构造对象键：优先索引的 filename，否则 packages/<name>-<version>.kunx
         let mut key = [0u8; 128];
         let mut kn = 0usize;
@@ -1234,6 +1273,82 @@ const VIEW_DETAIL: u8 = 1;
 const VIEW_SETTINGS: u8 = 2;
 
 static mut VIEW: u8 = VIEW_LIST;
+
+// ==================== 页面切换转场（P0-2，settings/sms/files 同款整页滑动） ====================
+static mut SNAP_BUF: [u32; 540 * 960] = [0u32; 540 * 960];
+static mut TRANS_T0: u64 = 0;
+static mut TRANS_PUSH: bool = false;
+const TRANS_DUR: u64 = 240_000;
+
+fn shade_px(c: u32, a: u32) -> u32 {
+    let r = ((c >> 16) & 0xFF) * a / 255;
+    let g = ((c >> 8) & 0xFF) * a / 255;
+    let b = (c & 0xFF) * a / 255;
+    (r << 16) | (g << 8) | b
+}
+
+fn snapshot_page() {
+    unsafe {
+        core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), SNAP_BUF.as_mut_ptr(), 540 * 960);
+    }
+}
+
+fn begin_transition(push: bool) {
+    unsafe {
+        TRANS_PUSH = push;
+        TRANS_T0 = now_us();
+    }
+}
+
+fn transition_active() -> bool {
+    unsafe { TRANS_T0 != 0 && now_us() < TRANS_T0 + TRANS_DUR }
+}
+
+fn compose_transition(e: f32) {
+    if e >= 1.0 {
+        return;
+    }
+    unsafe {
+        let w = 540usize;
+        let off = ((1.0 - e) * w as f32) as usize;
+        if off == 0 {
+            return;
+        }
+        for y in 0..960usize {
+            let row = y * w;
+            if TRANS_PUSH {
+                for x in (off..w).rev() {
+                    BACK_BUF[row + x] = BACK_BUF[row + x - off];
+                }
+                for x in 0..off {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x];
+                }
+                for s in 0..10 {
+                    if s < off {
+                        let x = off - 1 - s;
+                        BACK_BUF[row + x] = shade_px(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            } else {
+                for x in 0..w - off {
+                    BACK_BUF[row + x] = BACK_BUF[row + x + off];
+                }
+                for x in (w - off)..w {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x - (w - off)];
+                }
+                let c = w - off;
+                for s in 0..10 {
+                    if s < off && c > s {
+                        let x = c - 1 - s;
+                        BACK_BUF[row + x] = shade_px(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            }
+        }
+    }
+}
+/// 首屏卡片入场错峰起点（0 = 不在入场期；P0-6，仅启动播放一次）。
+static mut ENTER_T0: u64 = 0;
 static mut VIEW_APP: usize = 0; // 详情页选中的 index 下标
 static mut CATS: [[u8; 16]; 8] = [[0; 16]; 8];
 static mut CAT_LENS: [usize; 8] = [0; 8];
@@ -1622,6 +1737,13 @@ fn draw_title_bar() {
         _ => ("应用商店".as_bytes(), store_text_width_bold("应用商店".as_bytes())),
     };
     store_text_bold((540 - tw) / 2, 24, title, 0x00_1A_1C_22);
+    // 设置入口（列表页右上）：设置页此前不可达（VIEW 从未被赋值
+    // VIEW_SETTINGS），而错误提示让用户「到设置页配置」。
+    if unsafe { VIEW } == VIEW_LIST {
+        store_glass(492, 4, 44, 36, 10);
+        let sw = store_text_width("设置".as_bytes());
+        store_text(492 + (44 - sw) / 2, 15, "设置".as_bytes(), 0x00_1A_1C_22);
+    }
 }
 
 fn back_hit(x: i32, y: i32) -> bool {
@@ -1722,9 +1844,21 @@ fn render_list() {
         let top = 156i32;
         let mut visible = 0;
         for i in SCROLL..LIST_COUNT {
-            let ry = top + row_h * (i - SCROLL) as i32;
+            let mut ry = top + row_h * (i - SCROLL) as i32;
             if ry + row_h > 890 {
                 break;
+            }
+            // 首屏卡片入场错峰（P0-6）：未到出场时间的卡不绘制，出场后自
+            // 下方 20px 上滑入位（200ms EaseOut，卡间错峰 25ms；仅启动
+            // 首次进入且未滚动时播放，滚动/搜索过滤不重播）。
+            if ENTER_T0 != 0 && SCROLL == 0 {
+                let p = motion::progress(ENTER_T0 + (i - SCROLL) as u64 * 25_000, 200_000, now_us());
+                if p <= 0.0 {
+                    continue;
+                }
+                if p < 1.0 {
+                    ry += (20.0 * (1.0 - motion::Easing::EaseOut.eval(p))) as i32;
+                }
             }
             let p = index::pkg(LIST[i]);
             let st = pkg_install_state(p);
@@ -2078,6 +2212,8 @@ fn handle_keyboard() {
     unsafe {
         if KB_ESC {
             if VIEW == VIEW_SETTINGS || VIEW == VIEW_DETAIL {
+                snapshot_page();
+                begin_transition(false);
                 VIEW = VIEW_LIST;
                 QUERY_FOCUS = false;
                 SET_FOCUS = -1;
@@ -2188,6 +2324,13 @@ fn handle_tap(x: i32, y: i32) {
                     }
                     return;
                 }
+                // 设置入口（标题栏右上）
+                if x >= 492 && x < 536 && y >= 4 && y < 40 {
+                    snapshot_page();
+                    begin_transition(true);
+                    VIEW = VIEW_SETTINGS;
+                    return;
+                }
                 // 列表行
                 let top = 156i32;
                 let row_h = 84i32;
@@ -2207,6 +2350,8 @@ fn handle_tap(x: i32, y: i32) {
                             cursor_overlay_redraw();
                         }
                     } else if x >= 16 && x < 524 && y >= ry && y < ry + 76 {
+                        snapshot_page();
+                        begin_transition(true);
                         VIEW_APP = LIST[r];
                         VIEW = VIEW_DETAIL;
                     }
@@ -2214,6 +2359,8 @@ fn handle_tap(x: i32, y: i32) {
             }
             VIEW_DETAIL => {
                 if back_hit(x, y) {
+                    snapshot_page();
+                    begin_transition(false);
                     VIEW = VIEW_LIST;
                     rebuild_list();
                     return;
@@ -2233,6 +2380,8 @@ fn handle_tap(x: i32, y: i32) {
             }
             VIEW_SETTINGS => {
                 if back_hit(x, y) {
+                    snapshot_page();
+                    begin_transition(false);
                     VIEW = VIEW_LIST;
                     rebuild_list();
                     return;
@@ -2312,6 +2461,28 @@ fn store_redraw() {
         VIEW_SETTINGS => render_settings(),
         _ => render_list(),
     }
+    // 页面转场合成（目标页已画进 BACK_BUF，叠加滑动 + 快照补底）。
+    unsafe {
+        if TRANS_T0 != 0 {
+            let now = now_us();
+            let el = now.saturating_sub(TRANS_T0);
+            let p = if el >= TRANS_DUR { 1.0 } else { el as f32 / TRANS_DUR as f32 };
+            let e = ease_fosl(p);
+            compose_transition(e);
+            if p >= 1.0 {
+                TRANS_T0 = 0;
+            }
+        }
+    }
+}
+
+/// FastOutSlowIn 近似（0.4,0,0.2,1）8 段查表（与 shared/glass 同款，避免
+/// 引入 motion 模块的重依赖）。
+fn ease_fosl(t: f32) -> f32 {
+    const Y: [f32; 9] = [0.0, 0.33, 0.60, 0.78, 0.89, 0.95, 0.98, 0.995, 1.0];
+    let t = t.clamp(0.0, 1.0);
+    let i = ((t * 8.0) as usize).min(7);
+    Y[i] + (Y[i + 1] - Y[i]) * (t * 8.0 - i as f32)
 }
 
 fn cursor_overlay_redraw() {
@@ -2409,10 +2580,30 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     store_flip();
     cursor_overlay_redraw();
     ttf_text::font_init();
+    // 标题字体按需加载（font_init 不再自动带粗体）：商店标题栏走粗体，显式加载。
+    ttf_text::font_init_bold();
     store_redraw();
     store_flip();
     cursor_overlay_redraw();
     print("[store] 就绪\n");
+    // 首屏卡片入场错峰（P0-6）：仅启动播放一次（首屏可见 ~8 卡）。
+    {
+        let t0 = now_us();
+        unsafe { ENTER_T0 = t0; }
+        let last_end = t0 + 7 * 25_000 + 200_000;
+        loop {
+            store_redraw();
+            store_flip();
+            if now_us() >= last_end {
+                break;
+            }
+            sleep_ms(8);
+        }
+        unsafe { ENTER_T0 = 0; }
+        store_redraw();
+        store_flip();
+        cursor_overlay_redraw();
+    }
 
     loop {
         let moved = if input >= 0 {
@@ -2447,6 +2638,12 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         if store_poll_key() {
             print("[store] ESC → 退出\n");
             break;
+        }
+        // 页面转场进行中：逐帧重绘推进（240ms）。
+        if transition_active() {
+            store_redraw();
+            store_flip();
+            cursor_overlay_redraw();
         }
         sleep_ms(16);
     }

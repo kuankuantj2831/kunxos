@@ -50,6 +50,9 @@ const SYS_NANOSLEEP: usize = 101;
 const SYS_EXIT: usize = 93;
 const SYS_LSEEK: usize = 62;
 const SYS_FTRUNCATE: usize = 46;
+const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
+const SYS_FSYNC: usize = 82;
 
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 const O_RDONLY: usize = 0;
@@ -163,6 +166,41 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     ret
 }
 
+/// renameat 等四参调用（文件信箱原子提交/认领）。
+#[inline(always)]
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
+        options(nostack)
+    );
+    ret
+}
+
+/// 同目录改名：目标已存在时内核按 POSIX 语义原子替换。成功 0。
+fn rename_path(old: &str, new: &str) -> isize {
+    let mut o = [0u8; 96];
+    let mut q = [0u8; 96];
+    let on = old.len().min(95);
+    o[..on].copy_from_slice(&old.as_bytes()[..on]);
+    let nn = new.len().min(95);
+    q[..nn].copy_from_slice(&new.as_bytes()[..nn]);
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            o.as_ptr() as usize,
+            AT_FDCWD,
+            q.as_ptr() as usize,
+        ) as isize
+    }
+}
+
 fn print(s: &str) {
     unsafe {
         syscall3(SYS_WRITE, 1, s.as_ptr() as usize, s.len());
@@ -253,14 +291,38 @@ fn read_file(path: &str, out: &mut [u8]) -> usize {
 }
 
 /// 写整个文件（O_CREAT|O_TRUNC）。返回是否成功。
+/// 写整个文件（临时文件 + fsync + rename 原子提交）。
+///
+/// 就地 O_TRUNC 重写掉电会留下半份文件（闹钟列表损坏 → 开机全部丢失）；
+/// rename 覆盖后任一时刻磁盘上都是完整旧文件或完整新文件。fsync 先把
+/// 数据与元数据落盘，再切换目录项。返回是否成功。
 fn write_file(path: &str, data: &[u8]) -> bool {
-    let fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    let mut tmp = [0u8; 96];
+    let n = path.len().min(90);
+    tmp[..n].copy_from_slice(&path.as_bytes()[..n]);
+    tmp[n..n + 4].copy_from_slice(b".tmp");
+    let tpath = core::str::from_utf8(&tmp[..n + 4]).unwrap_or("");
+    let fd = sys_open(tpath, O_WRONLY | 0x40 | 0x200); // O_CREAT | O_TRUNC
     if fd < 0 {
         return false;
     }
     let r = unsafe { syscall3(SYS_WRITE, fd as usize, data.as_ptr() as usize, data.len()) };
+    unsafe { syscall1(SYS_FSYNC, fd as usize) };
     unsafe { syscall1(SYS_CLOSE, fd as usize) };
-    (r as isize) == data.len() as isize
+    if (r as isize) != data.len() as isize {
+        return false;
+    }
+    if rename_path(tpath, path) == 0 {
+        return true;
+    }
+    // 极小概率 EBUSY（读方恰好持有目标打开）：退回就地写
+    let fd2 = sys_open(path, O_WRONLY | 0x40 | 0x200);
+    if fd2 < 0 {
+        return false;
+    }
+    let r2 = unsafe { syscall3(SYS_WRITE, fd2 as usize, data.as_ptr() as usize, data.len()) };
+    unsafe { syscall1(SYS_CLOSE, fd2 as usize) };
+    (r2 as isize) == data.len() as isize
 }
 
 fn mkdir(path: &str) {
@@ -482,9 +544,13 @@ fn next_fire(a: &Alarm, zone: usize, now_ep: u64) -> u64 {
         return midnight + 86400 + target;
     }
     // 每周重复：找 [今天..+7天] 首个启用且未来的日子。
+    // ★ 周几必须按本地日历日：day/86400 是 UTC 日，repeat 位掩码是本地
+    // 星期 —— 东八区早于 08:00 的闹钟（最典型的起床时段）会整体晚一天。
+    let off_min = tz::zone_offset_min(zone, now_ep as i64) as i64;
     for d in 0..9u64 {
         let day = midnight + d * 86400;
-        let wd = (day / 86400 + 4).rem_euclid(7) as u8; // 0=周日
+        let local_day_secs = day as i64 + off_min * 60;
+        let wd = (local_day_secs.div_euclid(86400) + 4).rem_euclid(7) as u8; // 0=周日
         let bit = ((wd + 6) % 7) as u8; // bit0=周一
         if (a.repeat >> bit) & 1 == 0 {
             continue;
@@ -516,7 +582,11 @@ fn is_due(a: &Alarm, zone: usize, now_ep: u64) -> bool {
     let midnight = now_ep.saturating_sub(tod);
     let target = midnight + a.hh as u64 * 3600 + a.mm as u64 * 60;
     if a.repeat != 0 {
-        let wd = (target / 86400 + 4).rem_euclid(7) as u8;
+        // ★ 同 next_fire：周几按本地日历日（此前 UTC 日使早于时区偏移的
+        // 每周闹钟晚一天触发）。
+        let off_min = tz::zone_offset_min(zone, now_ep as i64) as i64;
+        let local_day_secs = target as i64 + off_min * 60;
+        let wd = (local_day_secs.div_euclid(86400) + 4).rem_euclid(7) as u8;
         let bit = ((wd + 6) % 7) as u8;
         if (a.repeat >> bit) & 1 == 0 {
             return false;
@@ -769,22 +839,62 @@ fn find_index(id: u32) -> Option<usize> {
     None
 }
 
-/// 读取并清空命令信箱（读后 ftruncate 清零；信箱文件常驻——启动即创建，
-/// 若沿用「读后 unlink」语义，文件消失后主循环每次 open 都失败，串口被
-/// `[vfs] open 失败` 刷屏）。逐行执行，与 lifd 信箱语义一致。
+/// 读取并清空命令信箱（rename 认领取走；信箱文件常驻——读后立即重建，
+/// 主循环每次 open 仍成功，不触发 `[vfs] open 失败` 刷屏）。逐行执行。
+///
+/// 旧的「读后 ftruncate」在 read 与 ftruncate 之间写入方追加的命令会被
+/// 一并抹掉；认领后新命令落在重生的信箱文件上，留待下一轮。
 fn poll_ctl() {
-    let fd = sys_open(CTL_PATH, O_RDWR);
-    if fd < 0 {
+    // 认领名 "/var/run/alarmd.ctl.r"（NUL 结尾）
+    let mut taken = [0u8; 32];
+    let cb = CTL_PATH.as_bytes();
+    taken[..cb.len()].copy_from_slice(cb);
+    taken[cb.len()] = b'.';
+    taken[cb.len() + 1] = b'r';
+    let tpath = core::str::from_utf8(&taken[..cb.len() + 2]).unwrap_or("");
+    // 清理上次崩溃残留的认领文件（存在则 rename 失败）
+    let mut u = [0u8; 32];
+    u[..cb.len() + 2].copy_from_slice(&taken[..cb.len() + 2]);
+    unsafe { syscall3(SYS_UNLINKAT, AT_FDCWD, u.as_ptr() as usize, 0) };
+    if rename_path(CTL_PATH, tpath) != 0 {
+        return; // 无命令文件
+    }
+    // ★ 独立命令缓冲：handle_cmd("RELOAD") → reload_alarms 会用共享 BUF
+    // 读闹钟列表，同批后续命令（"RELOAD\nSNOOZE 3"）被列表字节覆写丢失。
+    static mut CTL_BUF: [u8; 512] = [0u8; 512];
+    let ctl = unsafe { &mut *core::ptr::addr_of_mut!(CTL_BUF) };
+    let mut got = 0usize;
+    let fd = sys_open(tpath, O_RDWR);
+    if fd >= 0 {
+        // 循环读到 EOF：排队超过缓冲的命令不截断（BUF 512，逐块读满）。
+        while got < ctl.len() {
+            let r = unsafe {
+                syscall3(
+                    SYS_READ,
+                    fd as usize,
+                    ctl.as_mut_ptr().add(got) as usize,
+                    ctl.len() - got,
+                )
+            } as isize;
+            if r <= 0 {
+                break;
+            }
+            got += r as usize;
+        }
+        unsafe { syscall1(SYS_CLOSE, fd as usize) };
+    }
+    let mut u2 = [0u8; 32];
+    u2[..cb.len() + 2].copy_from_slice(&taken[..cb.len() + 2]);
+    unsafe { syscall3(SYS_UNLINKAT, AT_FDCWD, u2.as_ptr() as usize, 0) };
+    // 重建空信箱文件（无 O_TRUNC：若认领后写入方已追加新命令，不截断）
+    let fd2 = sys_open(CTL_PATH, 0x40 | O_RDWR); // O_CREAT
+    if fd2 >= 0 {
+        unsafe { syscall1(SYS_CLOSE, fd2 as usize) };
+    }
+    if got == 0 {
         return;
     }
-    let ctl = unsafe { &mut BUF };
-    let got = unsafe { syscall3(SYS_READ, fd as usize, ctl.as_mut_ptr() as usize, 256) };
-    unsafe { syscall2(SYS_FTRUNCATE, fd as usize, 0) };
-    unsafe { syscall1(SYS_CLOSE, fd as usize) };
-    if (got as isize) <= 0 {
-        return;
-    }
-    let n = (got as usize).min(256);
+    let n = got;
     let mut i = 0usize;
     while i < n {
         let mut j = i;
@@ -946,6 +1056,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     // 命令信箱启动即创建（O_TRUNC 顺带清陈旧命令）：poll_ctl 以 O_RDWR
     // 打开，若等客户端首写才存在，主循环每次 open 都失败。
     write_file(CTL_PATH, b"");
+    // 闹钟列表也启动即建空文件：无闹钟时 reload_alarms 每 400ms 的
+    // open(ENOENT) 失败会刷满串口日志（淹没有效输出；CTL 同款先例）。
+    // 只 O_CREAT 不 O_TRUNC：已有列表原样保留。
+    let afd = sys_open(ALARM_LIST, O_RDWR | O_CREAT);
+    if afd >= 0 {
+        unsafe { syscall1(SYS_CLOSE, afd as usize) };
+    }
 
     let mut tick = 0u64;
     loop {

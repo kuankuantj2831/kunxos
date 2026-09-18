@@ -31,7 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ed25519
 
 DELTA_MAGIC = b"KUNXDELTA1"
-INDEX_MAX = 1 << 20
+# 与设备端 kunxpkg/src/repo.rs 的 INDEX_MAX=16384 对齐：超限索引会被
+# 客户端 fetch_full 直接拒绝（pkg update 整体不可用），生成期即报错。
+INDEX_MAX = 16384
 
 
 def load_key(path):
@@ -97,7 +99,8 @@ def build_index(repo_dir):
                 rec.append("Conflicts: " + ",".join(conf))
             if m.get("description"):
                 rec.append("Description: " + m["description"])
-            rec.append(f"Filename: {fn}")
+            # Filename 相对源根：包文件位于 files/ 子目录（客户端 join <src>/<Filename>）
+            rec.append(f"Filename: files/{fn}")
             rec.append(f"Size: {size}")
             rec.append(f"KunxHash: {h}")
             rec.append("SignedBy: kunx-repo")
@@ -168,6 +171,11 @@ def cmd_gen(args):
     state = json.load(open(state_path)) if os.path.exists(state_path) else {"revision": 0, "prev_packages": None}
     new_rev = state.get("revision", 0) + 1
 
+    if len(idx) > INDEX_MAX:
+        raise SystemExit(
+            f"[repo] 索引 {len(idx)} 字节超过设备端上限 {INDEX_MAX}（约 40-50 个包）；"
+            "需扩容 kunxpkg/src/repo.rs 的 INDEX_MAX 后重新生成"
+        )
     with open(os.path.join(args.repo, "Packages"), "wb") as f:
         f.write(idx)
     with open(os.path.join(args.repo, "Packages.sig"), "wb") as f:

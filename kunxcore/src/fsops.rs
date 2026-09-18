@@ -144,6 +144,18 @@ pub fn fs_write(dev: u32, ino: u32, offset: usize, buf: &[u8]) -> i32 {
     }
 }
 
+/// O_APPEND 原子追加（SFS：取尾与写入同临界区；FAT32：取尾+写入两步，
+/// 残余竞态——FAT32 仅用于 boot 分区挂载，文件信箱不落在其上）。
+pub fn fs_write_append(dev: u32, ino: u32, buf: &[u8]) -> i32 {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::fs_write_append(dev, ino, buf),
+        FsKind::Fat32 => {
+            let off = fat32::fs_size(dev, ino) as usize;
+            fat32::fs_write(dev, ino, off, buf)
+        }
+    }
+}
+
 /// 截断文件为 0。
 pub fn fs_truncate(dev: u32, ino: u32) -> i32 {
     match kind_of(dev) {
@@ -189,6 +201,22 @@ pub fn fs_total_blocks(dev: u32) -> u32 {
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_total_blocks(dev),
         FsKind::Fat32 => fat32::fs_total_blocks(dev),
+    }
+}
+
+/// 空闲 inode 数（FAT32 无 inode 概念，返回 None）。
+pub fn fs_free_inodes(dev: u32) -> Option<u32> {
+    match kind_of(dev) {
+        FsKind::Sfs => Some(fs_simple::fs_free_inodes(dev)),
+        FsKind::Fat32 => None,
+    }
+}
+
+/// inode 总数（FAT32 返回 None）。
+pub fn fs_total_inodes(dev: u32) -> Option<u32> {
+    match kind_of(dev) {
+        FsKind::Sfs => Some(fs_simple::fs_total_inodes(dev)),
+        FsKind::Fat32 => None,
     }
 }
 

@@ -459,12 +459,16 @@ fn bidi_levels(text: &str) -> (Vec<u8>, u8) {
     }
     let info = unicode_bidi::BidiInfo::new(text, None);
     let pl = info.paragraphs.first().map(|p| p.level.number()).unwrap_or(0);
+    // ★ unicode-bidi 的 levels 是**每字符**一条；消费方（directional_runs/
+    // reorder_visual/layout_line 的 &text[s..e]）全部按**字节**偏移切——
+    // 直接按 char 下标写 levels 再按字节切片，混合方向多字节文本的 run
+    // 边界会落在字符中间（str 切片 panic）。按字符字节宽度复制 level。
     let mut levels = Vec::with_capacity(text.len());
-    for (i, l) in info.levels.iter().enumerate() {
-        if i >= text.len() {
-            break;
+    for (ch, l) in text.chars().zip(info.levels.iter()) {
+        let n = ch.len_utf8();
+        for _ in 0..n {
+            levels.push(l.number());
         }
-        levels.push(l.number());
     }
     while levels.len() < text.len() {
         levels.push(pl);

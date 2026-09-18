@@ -497,7 +497,11 @@ fn apply_one(
             if !apply_remote {
                 return; // 客户端优先 / 手动：保留本地，不覆盖
             }
-            // 服务器优先：本地版本作废，继续应用远端（rev 递增）
+            // 服务器优先：本地版本作废，继续应用远端（rev 递增）。
+            // ★ 本地若带着墓碑（删除推送遇非网络错误未清除），必须先摘掉
+            // DELETED：否则 upsert 保留旧 flags → 远端重建的资源本地不可见，
+            // 且 query_dirty 下轮再发一次 DELETE 把服务器刚重建的数据真删。
+            store.recs[i].flags &= !FLAG_DELETED;
             rec.rrev = r.rrev.wrapping_add(1);
         } else {
             rec.rrev = r.rrev.wrapping_add(1);
@@ -560,7 +564,13 @@ fn apply_deleted(
             let rec = store.recs[i];
             if rec.is_dirty() {
                 // 双方删除 / 本地有改动：按策略
-                let _ = handle_conflict(resolve, store, i, &[][..], stats);
+                if handle_conflict(resolve, store, i, &[][..], stats) {
+                    // 服务器优先：本地改动让位 → 按远端删除落地（否则记录
+                    // 不 dirty 也未删，增量路径不再覆盖，永久分歧）。
+                    store.recs[i].flags |= FLAG_DELETED;
+                    store.recs[i].blen = 0;
+                    stats.deleted += 1;
+                }
             } else {
                 store.recs[i].flags |= FLAG_DELETED;
                 store.recs[i].blen = 0;

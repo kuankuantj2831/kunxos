@@ -93,6 +93,22 @@ fn write_fd(fd: usize, buf: &[u8]) -> usize {
     unsafe { syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len()) }
 }
 
+/// tty 全量写：TTY_FD 以 O_NONBLOCK 打开，方向键 3 字节 CSI 序列可能
+/// 短写（内核 in_q 满）——剩余丢失会让 shell 收到孤立 ESC（行编辑乱码）。
+/// 循环补写，最多重试 4 次。
+fn write_fd_all(fd: usize, buf: &[u8]) {
+    let mut off = 0usize;
+    let mut tries = 0;
+    while off < buf.len() && tries < 4 {
+        let n = write_fd(fd, &buf[off..]) as isize;
+        if n <= 0 {
+            tries += 1;
+            continue;
+        }
+        off += n as usize;
+    }
+}
+
 fn now_us() -> u64 {
     let mut tv = [0u8; 16];
     unsafe {
@@ -416,13 +432,28 @@ fn term_put(c: u8) {
         let esc = VT_ESC;
         if esc == 0 {
             if c == 0x1b {
+                decode_utf8_pending();
                 VT_ESC = 1;
             } else if c < 0x80 {
+                // ASCII 先排空 pending：未完成序列后紧跟 ASCII 时，滞留的
+                // 2 字节序列（°/· 等）会晚于已打印的 ASCII 渲染（乱序）。
+                decode_utf8_pending();
                 term_cp(c as u32);
             } else {
+                // 高位字节：UTF-8 组装。按首字节位型决定期望长度 —— 此前
+                // 「凑满 4 字节才解码」与 CJK 的 3 字节序列错位：第 4 字节
+                // 是下一字的 lead byte，触发 flush 后余量循环只转发 ASCII，
+                // lead byte 被静默丢弃，纯中文流只剩第一个字上屏。
                 VT_UTF8[VT_UTF8N] = c;
                 VT_UTF8N += 1;
-                if VT_UTF8N >= 4 {
+                let lead = VT_UTF8[0];
+                let expect = match lead {
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => 0, // 孤立 continuation：排空丢弃
+                };
+                if expect == 0 || VT_UTF8N >= expect {
                     decode_utf8_pending();
                 }
             }
@@ -568,16 +599,18 @@ fn decode_utf8_pending() {
             return;
         }
         VT_UTF8N = 0;
-        let (cp, used) = ttf_text::font_render::utf8_next(&VT_UTF8[..n], 0);
-        if cp >= 0x20 {
-            term_cp(cp);
-        }
-        let mut k = used;
+        // 逐序列消费整个缓冲（utf8_next 对非法首字节返回 (0,1) 丢弃一字节
+        // 续读 —— 不再只解第一个序列、丢弃非 ASCII 余量）。
+        let mut k = 0usize;
         while k < n {
-            if VT_UTF8[k] < 0x80 {
-                term_cp(VT_UTF8[k] as u32);
+            let (cp, used) = ttf_text::font_render::utf8_next(&VT_UTF8[..n], k);
+            if used == 0 {
+                break; // 无进展（防御）：放弃剩余
             }
-            k += 1;
+            if cp >= 0x20 {
+                term_cp(cp);
+            }
+            k += used;
         }
     }
 }
@@ -667,7 +700,10 @@ pub fn draw_terminal() {
             let idx = top + r;
             let y = y0 + r as i32 * 16;
             if idx < HIST_CNT {
-                let slot = idx % HIST_LINES;
+                // 环形缓冲：逻辑序号 idx 的最新行写在 slot (HIST_NEXT+idx)
+                // % HIST_LINES —— 此前 idx % HIST_LINES 在环回绕后（滚屏/
+                // clear 一次推 24+ 行）最新行会出现在最旧行上方（乱序）。
+                let slot = (HIST_NEXT + idx) % HIST_LINES;
                 draw_hist_row(8, y, slot);
             } else {
                 let s = idx - HIST_CNT;
@@ -762,29 +798,29 @@ fn send_key(code: u16, value: i32) {
             }
             KEY_UP => {
                 if value == 1 {
-                    write_fd(TTY_FD as usize, b"\x1b[A");
+                    write_fd_all(TTY_FD as usize, b"\x1b[A");
                 }
             }
             KEY_DOWN => {
                 if value == 1 {
-                    write_fd(TTY_FD as usize, b"\x1b[B");
+                    write_fd_all(TTY_FD as usize, b"\x1b[B");
                 }
             }
             KEY_LEFT => {
                 if value == 1 {
-                    write_fd(TTY_FD as usize, b"\x1b[D");
+                    write_fd_all(TTY_FD as usize, b"\x1b[D");
                 }
             }
             KEY_RIGHT => {
                 if value == 1 {
-                    write_fd(TTY_FD as usize, b"\x1b[C");
+                    write_fd_all(TTY_FD as usize, b"\x1b[C");
                 }
             }
             KEY_LEFTCTRL | KEY_RIGHTCTRL => CTRL = value == 1,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => SHIFT = value == 1,
             KEY_ESC => {
                 if value == 1 {
-                    write_fd(TTY_FD as usize, b"\x1b");
+                    write_fd_all(TTY_FD as usize, b"\x1b");
                 }
             }
             _ => {

@@ -21,7 +21,9 @@ const SYS_READ: usize = 63;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_EXIT: usize = 93;
-const SYS_REBOOT: usize = 169;
+// AArch64 asm-generic：reboot=142（169 是 x86_64 的号，内核按 ENOSYS 丢弃
+// → 菜单重启选项死循环 spin，设备永不重启）。
+const SYS_REBOOT: usize = 142;
 
 const SYS_KUNX_OTA: usize = 430;
 const OTA_CMD_INSTALL: usize = 1;

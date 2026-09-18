@@ -164,11 +164,17 @@ static ICON_INPUT: [u8; 8] = [
 #[derive(Clone, Copy)]
 pub(crate) struct IconDef {
     pub color: u32,
+    /// Phosphor-Bold 图标码点（shared/icons.rs `settings` 模块；24px 圆角底上
+    /// 按 16px 栅格化，抗锯齿灰度）。
+    pub cp: u32,
+    /// 8x8 点阵兜底字形（图标字体未就绪时经 draw_bits 放大绘制）。
     pub glyph: &'static [u8; 8],
     pub dark_glyph: bool,
 }
 
 // ==================== 图标索引 ====================
+
+use crate::ttf_text::font_render::icons::settings as si;
 
 pub(crate) const I_WIFI: usize = 0;
 pub(crate) const I_MOBILE: usize = 1;
@@ -204,38 +210,38 @@ pub(crate) const I_INPUT: usize = 30;
 pub(crate) const I_NOTIF: usize = 31;
 
 pub(crate) static ICONS: [IconDef; 32] = [
-    IconDef { color: IC_NET, glyph: &ICON_WIFI, dark_glyph: false },
-    IconDef { color: IC_NET, glyph: &ICON_MOBILE, dark_glyph: false },
-    IconDef { color: IC_NET, glyph: &ICON_VPN, dark_glyph: false },
-    IconDef { color: IC_BT, glyph: &ICON_BT, dark_glyph: false },
-    IconDef { color: IC_DISP, glyph: &ICON_SUN, dark_glyph: false },
-    IconDef { color: IC_DISP, glyph: &ICON_MOON, dark_glyph: false },
-    IconDef { color: IC_DISP, glyph: &FONT_A, dark_glyph: false },
-    IconDef { color: IC_SOUND, glyph: &ICON_SPEAK, dark_glyph: false },
-    IconDef { color: IC_NOTIF, glyph: &ICON_BELL, dark_glyph: false },
-    IconDef { color: IC_BATT, glyph: &ICON_BATT, dark_glyph: true },
-    IconDef { color: IC_STOR, glyph: &ICON_DISK, dark_glyph: false },
-    IconDef { color: IC_PRIV, glyph: &ICON_FINGER, dark_glyph: false },
-    IconDef { color: IC_PRIV, glyph: &ICON_LOCK, dark_glyph: false },
-    IconDef { color: IC_UPD, glyph: &ICON_UPDATE, dark_glyph: false },
-    IconDef { color: IC_PHONE, glyph: &ICON_PHONE, dark_glyph: false },
-    IconDef { color: IC_GRAY, glyph: &ICON_NAV, dark_glyph: false },
-    IconDef { color: IC_SYS, glyph: &ICON_APPS, dark_glyph: false },
-    IconDef { color: IC_RESET, glyph: &ICON_RESET, dark_glyph: false },
-    IconDef { color: IC_ACCT, glyph: &ICON_USER, dark_glyph: false },
-    IconDef { color: IC_CLOUD, glyph: &ICON_CLOUD, dark_glyph: false },
-    IconDef { color: IC_SYNC, glyph: &ICON_SYNC, dark_glyph: false },
-    IconDef { color: IC_CLOCK, glyph: &ICON_CLOCK, dark_glyph: false },
-    IconDef { color: IC_LANG, glyph: &ICON_LANG, dark_glyph: false },
-    IconDef { color: IC_KBD, glyph: &ICON_KBD, dark_glyph: false },
-    IconDef { color: IC_PAT, glyph: &ICON_PAT, dark_glyph: false },
-    IconDef { color: IC_INFO, glyph: &ICON_INFO, dark_glyph: false },
-    IconDef { color: IC_ACC, glyph: &ICON_ACC, dark_glyph: false },
-    IconDef { color: IC_DISP, glyph: &ICON_EYE, dark_glyph: false },
-    IconDef { color: IC_SYS, glyph: &ICON_GEAR, dark_glyph: false },
-    IconDef { color: IC_ACCT, glyph: &ICON_SAVE, dark_glyph: false },
-    IconDef { color: IC_GRAY, glyph: &ICON_INPUT, dark_glyph: false },
-    IconDef { color: IC_NOTIF, glyph: &ICON_BELL, dark_glyph: false },
+    IconDef { color: IC_NET, cp: si::WIFI, glyph: &ICON_WIFI, dark_glyph: false },
+    IconDef { color: IC_NET, cp: si::MOBILE, glyph: &ICON_MOBILE, dark_glyph: false },
+    IconDef { color: IC_NET, cp: si::VPN, glyph: &ICON_VPN, dark_glyph: false },
+    IconDef { color: IC_BT, cp: si::BT, glyph: &ICON_BT, dark_glyph: false },
+    IconDef { color: IC_DISP, cp: si::SUN, glyph: &ICON_SUN, dark_glyph: false },
+    IconDef { color: IC_DISP, cp: si::MOON, glyph: &ICON_MOON, dark_glyph: false },
+    IconDef { color: IC_DISP, cp: si::FONT, glyph: &FONT_A, dark_glyph: false },
+    IconDef { color: IC_SOUND, cp: si::SPEAK, glyph: &ICON_SPEAK, dark_glyph: false },
+    IconDef { color: IC_NOTIF, cp: si::BELL, glyph: &ICON_BELL, dark_glyph: false },
+    IconDef { color: IC_BATT, cp: si::BATT, glyph: &ICON_BATT, dark_glyph: true },
+    IconDef { color: IC_STOR, cp: si::DISK, glyph: &ICON_DISK, dark_glyph: false },
+    IconDef { color: IC_PRIV, cp: si::FINGER, glyph: &ICON_FINGER, dark_glyph: false },
+    IconDef { color: IC_PRIV, cp: si::LOCK, glyph: &ICON_LOCK, dark_glyph: false },
+    IconDef { color: IC_UPD, cp: si::UPDATE, glyph: &ICON_UPDATE, dark_glyph: false },
+    IconDef { color: IC_PHONE, cp: si::PHONE, glyph: &ICON_PHONE, dark_glyph: false },
+    IconDef { color: IC_GRAY, cp: si::NAV, glyph: &ICON_NAV, dark_glyph: false },
+    IconDef { color: IC_SYS, cp: si::APPS, glyph: &ICON_APPS, dark_glyph: false },
+    IconDef { color: IC_RESET, cp: si::RESET, glyph: &ICON_RESET, dark_glyph: false },
+    IconDef { color: IC_ACCT, cp: si::USER, glyph: &ICON_USER, dark_glyph: false },
+    IconDef { color: IC_CLOUD, cp: si::CLOUD, glyph: &ICON_CLOUD, dark_glyph: false },
+    IconDef { color: IC_SYNC, cp: si::SYNC, glyph: &ICON_SYNC, dark_glyph: false },
+    IconDef { color: IC_CLOCK, cp: si::CLOCK, glyph: &ICON_CLOCK, dark_glyph: false },
+    IconDef { color: IC_LANG, cp: si::LANG, glyph: &ICON_LANG, dark_glyph: false },
+    IconDef { color: IC_KBD, cp: si::KBD, glyph: &ICON_KBD, dark_glyph: false },
+    IconDef { color: IC_PAT, cp: si::PAT, glyph: &ICON_PAT, dark_glyph: false },
+    IconDef { color: IC_INFO, cp: si::INFO, glyph: &ICON_INFO, dark_glyph: false },
+    IconDef { color: IC_ACC, cp: si::ACC, glyph: &ICON_ACC, dark_glyph: false },
+    IconDef { color: IC_DISP, cp: si::EYE, glyph: &ICON_EYE, dark_glyph: false },
+    IconDef { color: IC_SYS, cp: si::GEAR, glyph: &ICON_GEAR, dark_glyph: false },
+    IconDef { color: IC_ACCT, cp: si::SAVE, glyph: &ICON_SAVE, dark_glyph: false },
+    IconDef { color: IC_GRAY, cp: si::INPUT, glyph: &ICON_INPUT, dark_glyph: false },
+    IconDef { color: IC_NOTIF, cp: si::BELL, glyph: &ICON_BELL, dark_glyph: false },
 ];
 
 // ==================== 液态玻璃面板 ====================
@@ -338,7 +344,16 @@ pub(crate) fn draw_gradient_bg() {
 
 pub(crate) fn draw_title_bar(title: &[u8]) {
     draw_glass(0, 0, DISPLAY_W as i32, TOP_TITLE_H, 0);
-    draw_bits(TOP_BACK_X + 11, TOP_BACK_Y + 10, &FONT_LT, 2, c_text());
+    // 返回箭头：Phosphor caret-left 矢量字形（点阵兜底见 draw_bits）。
+    if !draw_icon_glyph_centered(
+        TOP_BACK_X + TOP_BACK_SZ / 2,
+        TOP_BACK_Y + TOP_BACK_SZ / 2,
+        si::CARET_LEFT,
+        20.0,
+        c_text(),
+    ) {
+        draw_bits(TOP_BACK_X + 11, TOP_BACK_Y + 10, &FONT_LT, 2, c_text());
+    }
     let px = 16.0;
     let tw = text_width_px_bold(title, px);
     let tx = (DISPLAY_W as i32 - tw) / 2;
@@ -384,7 +399,10 @@ pub(crate) fn switch_inside(px: i32, py: i32, x: i32, y: i32) -> bool {
 // ==================== 箭头与分割线 ====================
 
 pub(crate) fn draw_arrow(x: i32, cy: i32) {
-    draw_bits(x, cy - 8, &FONT_GT, 2, C_SUB);
+    // 列表右箭头：Phosphor caret-right 矢量字形（16px 墨迹盒居中于原 16x16 位图位）。
+    if !draw_icon_glyph_centered(x + 8, cy, si::CARET_RIGHT, 16.0, C_SUB) {
+        draw_bits(x, cy - 8, &FONT_GT, 2, C_SUB);
+    }
 }
 
 pub(crate) fn draw_divider(y: i32) {
@@ -404,15 +422,20 @@ pub(crate) fn draw_group_header(y: i32, title: &[u8]) {
 /// 图标 + 标题 + 右侧值/箭头/开关 的列表行。
 pub(crate) fn draw_row(y: i32, icon: usize, title: &[u8], value: &[u8], arrow: bool, sw: bool) {
     let ic = &ICONS[icon];
+    let cy = y + ROW_H / 2;
     fill_round_rect(MARGIN, y + (ROW_H - ICON_SZ) / 2, ICON_SZ, ICON_SZ, ICON_R, ic.color);
     let gcolor = if ic.dark_glyph { C_BLACK } else { C_WHITE };
-    draw_bits(
-        MARGIN + (ICON_SZ - 16) / 2,
-        y + (ROW_H - ICON_SZ) / 2 + (ICON_SZ - 16) / 2,
-        ic.glyph,
-        2,
-        gcolor,
-    );
+    // 行图标：Phosphor-Bold 矢量字形按墨迹居中（抗锯齿）；图标字体未就绪时
+    // 退回 8x8 点阵 2 倍放大。
+    if !draw_icon_glyph_centered(MARGIN + ICON_SZ / 2, cy, ic.cp, 16.0, gcolor) {
+        draw_bits(
+            MARGIN + (ICON_SZ - 16) / 2,
+            y + (ROW_H - ICON_SZ) / 2 + (ICON_SZ - 16) / 2,
+            ic.glyph,
+            2,
+            gcolor,
+        );
+    }
     let px = font_px();
     draw_text_px(MARGIN + ICON_SZ + 12, text_top(px, y + ROW_H / 2), title, px, c_text());
     if sw {

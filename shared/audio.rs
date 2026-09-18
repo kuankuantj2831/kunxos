@@ -260,18 +260,24 @@ pub fn write_chunk(pcm: &[u8]) -> i32 {
         if fd < 0 {
             return ERR_NO_SERVICE;
         }
-        // 定位到槽首（lseek 绝对位置）
-        syscall3(SYS_LSEEK, fd as usize, slot, SEEK_SET);
-        // 写 [seq][len][pcm]
-        let mut hdr = [0u8; 8];
-        hdr[0..4].copy_from_slice(&seq.to_le_bytes());
-        hdr[4..8].copy_from_slice(&(CHUNK_BYTES as u32).to_le_bytes());
-        let mut hw = syscall3(SYS_WRITE, fd as usize, hdr.as_ptr() as usize, 8);
-        if hw == 8 {
-            hw += syscall3(SYS_WRITE, fd as usize, pcm.as_ptr() as usize, pcm.len());
+        // 先写 PCM、最后单写提交头：seq 是「本槽就绪」的提交标记。此前
+        // 先写头后写 PCM，消费方（audiod 2ms 轮询）可能在两写之间读到
+        // 「新 seq + 旧 PCM」→ 播 10ms 陈旧数据（爆音）。
+        syscall3(SYS_LSEEK, fd as usize, slot + 8, SEEK_SET);
+        let pw = syscall3(SYS_WRITE, fd as usize, pcm.as_ptr() as usize, pcm.len());
+        let mut hw = 0usize;
+        if pw == pcm.len() {
+            let mut hdr = [0u8; 8];
+            hdr[0..4].copy_from_slice(&seq.to_le_bytes());
+            hdr[4..8].copy_from_slice(&(CHUNK_BYTES as u32).to_le_bytes());
+            syscall3(SYS_LSEEK, fd as usize, slot, SEEK_SET);
+            let w = syscall3(SYS_WRITE, fd as usize, hdr.as_ptr() as usize, 8);
+            if w == 8 {
+                hw = 8;
+            }
         }
         syscall1(SYS_CLOSE, fd as usize);
-        if hw == 8 + CHUNK_BYTES {
+        if hw == 8 && pw == pcm.len() {
             SEQ = seq;
             0
         } else {

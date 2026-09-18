@@ -25,10 +25,14 @@ import struct
 import sys
 
 BLK_SIZE = 4096
-MAX_INODES = 256
+# 512：与内核 MAX_INODES 同步扩容（2026-09-18，256 → 512）。
+# rootfs 文件数增长到 196 后，sfsrace（48 文件）+ 守护进程信箱数秒内
+# 耗尽剩余 inode，全系统 create 失败。旧 256-inode 镜像会被内核
+# parse_sb 的 SB_NUM_INODES 护栏拒绝挂载，需 rm disk.img && make disk 重建。
+MAX_INODES = 512
 INODE_SIZE = 256
 INODES_PER_BLOCK = BLK_SIZE // INODE_SIZE  # 16
-INODE_BLOCKS = (MAX_INODES + INODES_PER_BLOCK - 1) // INODES_PER_BLOCK  # 8
+INODE_BLOCKS = (MAX_INODES + INODES_PER_BLOCK - 1) // INODES_PER_BLOCK  # 32
 NDIRECT = 24
 NINDIRECT = BLK_SIZE // 4  # 1024
 # 写入端只实现 直接块 + 一级间接（ind_buf 单块 1024 项）：容量按此封顶。
@@ -109,22 +113,32 @@ def crc32(data: bytes) -> int:
 
 def layout(total: int):
     jlog = max(JLOG_MIN, min(JLOG_MAX, total // 8))
-    bmap = 1
-    # 单调推进：bmap 增大 → data_start 后移 → ndata/need 减小，可能来回
-    # 振荡不收敛（如 total=33805 时在两值间死循环）。取历史最大值逼近。
-    best = bmap
-    while True:
+
+    def need_of(bmap: int) -> int:
+        # bmap 增大 → data_start 后移 → ndata/need 单调减小
         inode_start = BMAP_START + bmap
         jlog_start = inode_start + INODE_BLOCKS
         data_start = jlog_start + jlog
         ndata = max(0, total - data_start)
-        need = max(1, (ndata + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK)
-        if need == bmap:
-            return bmap, inode_start, jlog_start, jlog, data_start
-        bmap = need = max(need, bmap) if need < bmap else need
-        best = max(best, bmap)
-        if bmap == best and need == bmap:
-            continue
+        return max(1, (ndata + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK)
+
+    # need(bmap) 单调递减 → need(bmap) - bmap 严格递减，交点唯一。
+    # 此前的不动点迭代在 need 与 bmap 之间可能陷入 2-循环（如
+    # total=33813 永不返回，构建挂死）—— 改二分求最小可行 bmap。
+    lo, hi = 1, max(1, total)
+    if need_of(hi) > hi:
+        raise SystemExit(f"mkfs_sfs: total={total} 过小，放不下位图")
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if need_of(mid) <= mid:
+            hi = mid
+        else:
+            lo = mid + 1
+    bmap = lo
+    inode_start = BMAP_START + bmap
+    jlog_start = inode_start + INODE_BLOCKS
+    data_start = jlog_start + jlog
+    return bmap, inode_start, jlog_start, jlog, data_start
 
 
 def inode_crc(rec: bytearray) -> int:

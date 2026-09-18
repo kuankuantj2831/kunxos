@@ -15,6 +15,8 @@ pub const SYS_GETTIMEOFDAY: usize = 169;
 pub const SYS_IOCTL: usize = 29;
 pub const SYS_MKDIRAT: usize = 34;
 pub const SYS_UNLINKAT: usize = 35;
+pub const SYS_RENAMEAT: usize = 38;
+pub const SYS_FSYNC: usize = 82;
 pub const SYS_REBOOT: usize = 142;
 
 pub const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -141,6 +143,42 @@ pub unsafe fn mkdir(path: &str) -> isize {
     PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
     PATH_BUF[n] = 0;
     syscall3(SYS_MKDIRAT, AT_FDCWD, PATH_BUF.as_ptr() as usize, 0o755) as isize
+}
+
+/// rename 的两个路径缓冲（PATH_BUF 只有一份，两个路径不能共用）。
+static mut RENAME_SRC: [u8; 96] = [0; 96];
+static mut RENAME_DST: [u8; 96] = [0; 96];
+
+/// 同目录改名（jlog 事务内提交，掉电原子）。目标已存在时按 POSIX 语义
+/// 原子替换（普通文件/符号链接；目标仍被打开时返回 -16/EBUSY）。
+pub unsafe fn rename(old: &str, new: &str) -> isize {
+    let n = old.len().min(RENAME_SRC.len() - 1);
+    RENAME_SRC[..n].copy_from_slice(&old.as_bytes()[..n]);
+    RENAME_SRC[n] = 0;
+    let m = new.len().min(RENAME_DST.len() - 1);
+    RENAME_DST[..m].copy_from_slice(&new.as_bytes()[..m]);
+    RENAME_DST[m] = 0;
+    syscall4(
+        SYS_RENAMEAT,
+        AT_FDCWD,
+        RENAME_SRC.as_ptr() as usize,
+        AT_FDCWD,
+        RENAME_DST.as_ptr() as usize,
+    ) as isize
+}
+
+/// fsync(fd)：SFS 检查点（imap/位图/超级块 + 设备冲刷），保证已写数据与
+/// 元数据落盘。持久存储（短信箱）提交路径必调；信箱/状态文件可不调。
+pub unsafe fn fsync(fd: usize) -> isize {
+    syscall1(SYS_FSYNC, fd) as isize
+}
+
+/// 删除文件（信箱消息取走 / 原子重写的旧备份清理）。
+pub unsafe fn unlink(path: &str) -> isize {
+    let n = path.len().min(PATH_BUF.len() - 1);
+    PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);
+    PATH_BUF[n] = 0;
+    syscall3(SYS_UNLINKAT, AT_FDCWD, PATH_BUF.as_ptr() as usize, 0) as isize
 }
 
 pub unsafe fn read_fd(fd: usize, buf: &mut [u8]) -> isize {

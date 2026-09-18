@@ -102,7 +102,13 @@ pub fn has_glyph(cp: u32) -> bool {
         return false;
     }
     match char::from_u32(cp) {
-        Some(ch) => font().has_glyph(ch),
+        Some(ch) => {
+            if !font().has_glyph(ch) {
+                lazy_try_full(false);
+                return font().has_glyph(ch);
+            }
+            true
+        }
         None => false,
     }
 }
@@ -119,7 +125,13 @@ pub fn has_glyph_bold(cp: u32) -> bool {
         return false;
     }
     match char::from_u32(cp) {
-        Some(ch) => font_bold().has_glyph(ch),
+        Some(ch) => {
+            if !font_bold().has_glyph(ch) {
+                lazy_try_full(true);
+                return font_bold().has_glyph(ch);
+            }
+            true
+        }
         None => false,
     }
 }
@@ -146,6 +158,114 @@ fn font_bold() -> &'static Font {
 /// 从 cn.ttf 字节解析字体。失败返回 None。
 pub fn font_from_bytes(data: &[u8]) -> Option<Font> {
     Font::from_bytes(data, FontSettings::default()).ok()
+}
+
+// ==================== 缺字形懒加载兜底（仅用户态） ====================
+//
+// 构建期子集按「源码字符串字面量」裁剪（tools/make_fonts.py），覆盖全部
+// 系统 UI 文案，但运行期拼出来的字符（用户数据：联系人名/笔记内容/文件名）
+// 可能不在其中。首次栅格化遇到缺字形时，一次性同步加载全量 /fonts/cn.ttf、
+// /fonts/bold.ttf 顶替子集并清空字形缓存 —— 字体路径永不渲染豆腐块，且
+// UI 类应用（文案全在子集内）永远不付这次加载。
+// 由 ttf_text::font_init 在用户态开启；内核（ui_framework）共用本模块但
+// 不开启，懒加载路径（含 svc 文件读取）在内核镜像里永远不会执行。
+
+static mut LAZY_FULL_ON: bool = false;
+static mut FULL_TRIED_CN: bool = false;
+static mut FULL_TRIED_BOLD: bool = false;
+
+/// 用户态开启缺字形懒加载（内核不调用）。幂等。
+pub fn lazy_full_enable() {
+    unsafe { LAZY_FULL_ON = true; }
+}
+
+/// 懒加载是否已尝试过（cn, bold）——加载成败均只试一次，避免逐帧重试。
+fn lazy_tried(bold: bool) -> bool {
+    unsafe {
+        let tried = if bold { &mut FULL_TRIED_BOLD } else { &mut FULL_TRIED_CN };
+        if *tried {
+            return true;
+        }
+        *tried = true;
+        false
+    }
+}
+
+/// 子集缺该字形时的一次性全量兜底：读全量字体、替换字体槽、清字形缓存
+/// （缺字形时缓存的 notdef 结果必须失效）。非用户态（未开启）立即返回。
+fn lazy_try_full(bold: bool) {
+    unsafe {
+        if !LAZY_FULL_ON || lazy_tried(bold) {
+            return;
+        }
+    }
+    let data = lazy_read_font(if bold { b"/fonts/bold.ttf" } else { b"/fonts/cn.ttf" });
+    if data.is_empty() {
+        return;
+    }
+    if let Some(f) = font_from_bytes(&data) {
+        if bold {
+            font_set_bold(f);
+        } else {
+            font_set(f);
+        }
+        unsafe {
+            // 全量字体字形度量可能与子集完全一致（同源字体），但缓存里可能
+            // 已有缺字形时写入的 notdef 槽：整表清零（key 恒非 0，0 = 空槽）。
+            for k in GLYPH_KEYS.iter_mut() {
+                *k = 0;
+            }
+        }
+    }
+}
+
+/// 最小文件读取（svc 直连，仅懒加载路径使用）。文件不存在/读失败返回空。
+fn lazy_read_font(path: &[u8]) -> alloc::vec::Vec<u8> {
+    const SYS_OPENAT: usize = 56;
+    const SYS_READ: usize = 63;
+    const SYS_CLOSE: usize = 57;
+    const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
+    let fd = unsafe {
+        let mut p = [0u8; 32];
+        let n = path.len().min(p.len() - 1);
+        p[..n].copy_from_slice(path);
+        syscall3_lazy(SYS_OPENAT, AT_FDCWD, p.as_ptr() as usize, 0)
+    };
+    if (fd as isize) < 0 {
+        return alloc::vec::Vec::new();
+    }
+    let mut data = alloc::vec::Vec::new();
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = unsafe { syscall3_lazy(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len()) };
+        if n == 0 || (n as isize) < 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+    unsafe { syscall1_lazy(SYS_CLOSE, fd) };
+    data
+}
+
+#[inline(always)]
+unsafe fn syscall1_lazy(n: usize, a1: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall3_lazy(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
+    let ret: usize;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        options(nostack)
+    );
+    ret
 }
 
 /// 解码 `s[i..]` 处的下一个 UTF-8 码点，返回 `(码点, 字节数)`。
@@ -310,7 +430,8 @@ static mut GLYPH_CACHE_HEAD: usize = 0;
 static mut GLYPH_KEYS: [u64; GLYPH_CACHE_SLOTS] = [0; GLYPH_CACHE_SLOTS];
 
 /// 超大字形（> GLYPH_MAX_BYTES）备用缓冲：不写缓存，借用本缓冲返回。
-const GLYPH_SCRATCH_BYTES: usize = 8192;
+/// 容量需覆盖 OOBE 大图标字号（124px 字形位图 ~17KB，取 64KB 富余）。
+const GLYPH_SCRATCH_BYTES: usize = 65536;
 static mut GLYPH_SCRATCH: [u8; GLYPH_SCRATCH_BYTES] = [0; GLYPH_SCRATCH_BYTES];
 static mut GLYPH_SCRATCH_LEN: usize = 0;
 
@@ -447,6 +568,83 @@ pub fn rasterize_icon(fill: bool, cp: u32, px: f32) -> Option<Glyph> {
     rasterize_sel(if fill { SEL_ICON_FILL } else { SEL_ICON_LINE }, ch, px)
 }
 
+// ==================== 笔画加粗（小尺寸图标可读性） ====================
+//
+// 16~24px 的粗线图标笔画只有 ~2px，在彩色圆角底上偏纤细。栅格化后对 alpha
+// 做一次受控膨胀（正交邻域 72% / 对角 36% 的半透明环），笔画每侧视觉增粗
+// ~0.7px 且边缘仍平滑；几何形状不变。
+
+/// 膨胀结果缓冲（最大支持 ~180x180 字形；OOBE 大图标 124px 栅格化也放得下。
+/// 超出时返回 None，调用方回退 [`rasterize_icon`]）。
+const THICK_SCRATCH: usize = 65536;
+static mut THICK_BUF: [u8; THICK_SCRATCH] = [0; THICK_SCRATCH];
+
+/// 加粗栅格化结果（位图借用 [`THICK_BUF`]，下次调用覆盖——与 GLYPH_SCRATCH
+/// 同一借用约定：调用方绘制期间不得再次触发栅格化）。
+pub struct ThickGlyph {
+    pub xmin: i32,
+    pub ymin: i32,
+    pub width: usize,
+    pub height: usize,
+    pub advance: i32,
+    pub data: &'static [u8],
+}
+
+/// 以 Phosphor 图标字体栅格化并把笔画加粗约 1px。字形过大放不下缓冲时
+/// 返回 None（调用方回退 [`rasterize_icon`]）。
+pub fn rasterize_icon_thick(fill: bool, cp: u32, px: f32) -> Option<ThickGlyph> {
+    let g = rasterize_icon(fill, cp, px)?;
+    let (w, h) = (g.width, g.height);
+    if w == 0 || h == 0 || w * h > THICK_SCRATCH {
+        return None;
+    }
+    let src = g.data;
+    let dilate = |v: u32| -> u32 { v * 72 / 100 };
+    let dilate_diag = |v: u32| -> u32 { v * 36 / 100 };
+    unsafe {
+        let buf = core::ptr::addr_of_mut!(THICK_BUF) as *mut u8;
+        for y in 0..h {
+            for x in 0..w {
+                let c = src[y * w + x] as u32;
+                let mut m = c;
+                if x > 0 {
+                    m = m.max(dilate(src[y * w + x - 1] as u32));
+                }
+                if x + 1 < w {
+                    m = m.max(dilate(src[y * w + x + 1] as u32));
+                }
+                if y > 0 {
+                    m = m.max(dilate(src[(y - 1) * w + x] as u32));
+                }
+                if y + 1 < h {
+                    m = m.max(dilate(src[(y + 1) * w + x] as u32));
+                }
+                if x > 0 && y > 0 {
+                    m = m.max(dilate_diag(src[(y - 1) * w + x - 1] as u32));
+                }
+                if x + 1 < w && y > 0 {
+                    m = m.max(dilate_diag(src[(y - 1) * w + x + 1] as u32));
+                }
+                if x > 0 && y + 1 < h {
+                    m = m.max(dilate_diag(src[(y + 1) * w + x - 1] as u32));
+                }
+                if x + 1 < w && y + 1 < h {
+                    m = m.max(dilate_diag(src[(y + 1) * w + x + 1] as u32));
+                }
+                *buf.add(y * w + x) = m as u8;
+            }
+        }
+        Some(ThickGlyph {
+            xmin: g.xmin,
+            ymin: g.ymin,
+            width: w,
+            height: h,
+            advance: g.advance,
+            data: core::slice::from_raw_parts(buf, w * h),
+        })
+    }
+}
+
 fn rasterize_sel(sel: u64, ch: char, px: f32) -> Option<Glyph> {
     if !font_ready() {
         return None;
@@ -478,7 +676,22 @@ fn rasterize_sel(sel: u64, ch: char, px: f32) -> Option<Glyph> {
             }
         }
     }
-    // 未命中：栅格化并写缓存。
+    // 未命中：缺字形兜底（子集可能不含该字形——用户数据等运行期拼接字符；
+    // lazy_try_full 成功后字体槽已替换且缓存已清空，本次栅格化即用全量结果），
+    // 然后栅格化并写缓存。
+    match sel {
+        SEL_BOLD => {
+            if !font_bold().has_glyph(ch) {
+                lazy_try_full(true);
+            }
+        }
+        SEL_ICON_FILL | SEL_ICON_LINE => {}
+        _ => {
+            if !font().has_glyph(ch) {
+                lazy_try_full(false);
+            }
+        }
+    }
     let (m, data) = match sel {
         SEL_BOLD => font_bold().rasterize(ch, px),
         SEL_ICON_FILL => font_icon(true).rasterize(ch, px),

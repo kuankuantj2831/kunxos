@@ -396,10 +396,11 @@ impl Default for SimI2c {
 
 /// 3 个 i16 → 6 字节小端。
 fn raw6(x: i16, y: i16, z: i16) -> [u8; 6] {
+    // 真机寄存器是大端（H 在前）：夹具与解析侧同向，单测才有效。
     let mut b = [0u8; 6];
-    b[0..2].copy_from_slice(&x.to_le_bytes());
-    b[2..4].copy_from_slice(&y.to_le_bytes());
-    b[4..6].copy_from_slice(&z.to_le_bytes());
+    b[0..2].copy_from_slice(&x.to_be_bytes());
+    b[2..4].copy_from_slice(&y.to_be_bytes());
+    b[4..6].copy_from_slice(&z.to_be_bytes());
     b
 }
 
@@ -601,10 +602,12 @@ impl<I: I2cBus> Mpu6050<I> {
     fn read_axes(&mut self, reg: u8) -> Result<Vec3i16, SensorError> {
         let mut b = [0u8; 6];
         self.i2c.read_regs(self.addr, reg, &mut b)?;
+        // MPU 系列 16 位输出寄存器大端（H 在前：ACCEL_XOUT_H=0x3B 是高
+        // 字节；小端解析会把 1g=16384 读成 64 —— 全轴字节交换）。
         Ok(Vec3i16::new(
-            i16::from_le_bytes([b[0], b[1]]),
-            i16::from_le_bytes([b[2], b[3]]),
-            i16::from_le_bytes([b[4], b[5]]),
+            i16::from_be_bytes([b[0], b[1]]),
+            i16::from_be_bytes([b[2], b[3]]),
+            i16::from_be_bytes([b[4], b[5]]),
         ))
     }
 }
@@ -759,10 +762,11 @@ impl<I: I2cBus> Mpu9250<I> {
         self.imu
             .i2c
             .read_regs(self.mag_addr, ak8963_regs::HXL, &mut b)?;
+        // AK8963 磁力计同样大端（HXL=0x03 低字节在后）。
         let mut raw = Vec3i16::new(
-            i16::from_le_bytes([b[0], b[1]]),
-            i16::from_le_bytes([b[2], b[3]]),
-            i16::from_le_bytes([b[4], b[5]]),
+            i16::from_be_bytes([b[0], b[1]]),
+            i16::from_be_bytes([b[2], b[3]]),
+            i16::from_be_bytes([b[4], b[5]]),
         );
         // 灵敏度调整：val = raw * (adj + 128) / 256。
         let adj = |i: usize| -> i16 {
@@ -1286,8 +1290,9 @@ mod tests {
         dev.configure(&SensorConfig::default()).unwrap();
         // 磁力计数据注入（ST1 DRDY + HXL）。
         dev.imu.i2c.write_reg(0x0C, 0x02, 0x01).unwrap();
-        dev.imu.i2c.write_reg(0x0C, 0x03, 0x00).unwrap();
-        dev.imu.i2c.write_reg(0x0C, 0x04, 0x19).unwrap(); // x = 6400
+        // AK8963 大端：HXH(0x03)=0x19、HXL(0x04)=0x00 → x = 0x1900 = 6400
+        dev.imu.i2c.write_reg(0x0C, 0x03, 0x19).unwrap();
+        dev.imu.i2c.write_reg(0x0C, 0x04, 0x00).unwrap();
         dev.imu.i2c.write_reg(0x0C, 0x05, 0x00).unwrap();
         dev.imu.i2c.write_reg(0x0C, 0x06, 0x00).unwrap();
         dev.imu.i2c.write_reg(0x0C, 0x07, 0x00).unwrap();

@@ -27,6 +27,7 @@ const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_GETDENTS64: usize = 61;
 const SYS_UNLINKAT: usize = 35;
+const SYS_RENAMEAT: usize = 38;
 const SYS_MKDIRAT: usize = 34;
 const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
@@ -75,6 +76,21 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         inlateout("x0") a1 => ret,
         in("x1") a2,
         in("x2") a3,
+        options(nostack)
+    );
+    ret
+}
+
+#[inline(always)]
+unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    let ret: usize;
+    asm!(
+        "svc #0",
+        in("x8") n,
+        inlateout("x0") a1 => ret,
+        in("x1") a2,
+        in("x2") a3,
+        in("x3") a4,
         options(nostack)
     );
     ret
@@ -268,7 +284,7 @@ fn handle_request(fname: &[u8]) {
     // 内容 "<title>|<body>"（≤160B）
     let content = unsafe { &BUF[..got.min(BUF.len())] };
     let id = next_id();
-    // 转发 lifd：cmd_<pushd_pid> = "DELIVER <pid> <id> <title>|<body>"
+    // 转发 lifd：cmd_<pushd_pid>_<seq> = "DELIVER <pid> <id> <title>|<body>"
     let mut cmd = [0u8; 220];
     let mut m = 0usize;
     copy_str(&mut cmd, &mut m, "DELIVER ");
@@ -279,12 +295,12 @@ fn handle_request(fname: &[u8]) {
     let k2 = content.len().min(cmd.len() - m);
     cmd[m..m + k2].copy_from_slice(&content[..k2]);
     m += k2;
-    let mut ok = write_file(cmd_path_str(), &cmd[..m]);
+    let mut ok = publish_cmd(&cmd[..m]);
     if !ok {
         // lifd 未就绪窗口（/data/life 由 lifd 创建，启动顺序不保证）：补建
         // 目录后重试一次；仍失败则把请求文件原样写回，通知不丢。
         mkdir("/data/life");
-        ok = write_file(cmd_path_str(), &cmd[..m]);
+        ok = publish_cmd(&cmd[..m]);
         if !ok {
             let mut rp = [0u8; 96];
             let mut rn = 0usize;
@@ -313,17 +329,41 @@ fn next_id() -> u32 {
     }
 }
 
-fn cmd_path_str() -> &'static str {
-    // 命令信箱路径在进程启动后固定（pid 不变）
+/// 命令序号（每消息一文件的唯一名）。
+static mut CMD_SEQ: u64 = 0;
+
+/// 发布一条 lifd 命令（cmd_<pid>_<seq>，写 .tmp 后 rename）。
+/// 每消息一文件消除「O_TRUNC 覆盖 × lifd 读后删除」的丢命令竞态；
+/// 目标名含序号永不存在，rename 恒成功。
+fn publish_cmd(cmd: &[u8]) -> bool {
     unsafe {
-        let mut p = [0u8; 96];
+        CMD_SEQ = CMD_SEQ.wrapping_add(1);
+        let mut base = [0u8; 96];
         let mut n = 0usize;
-        copy_str(&mut p, &mut n, CMD_PREFIX);
-        push_dec_to(&mut p, &mut n, SELF_PID as u64);
-        // 静态缓冲（进程生命周期内固定）
-        static mut CMD_PATH: [u8; 96] = [0; 96];
-        CMD_PATH[..n].copy_from_slice(&p[..n]);
-        core::str::from_utf8(&CMD_PATH[..n]).unwrap_or("/data/life/cmd_0")
+        copy_str(&mut base, &mut n, CMD_PREFIX);
+        push_dec_to(&mut base, &mut n, SELF_PID as u64);
+        if n + 1 < base.len() {
+            base[n] = b'_';
+            n += 1;
+        }
+        push_dec_to(&mut base, &mut n, CMD_SEQ);
+        let mut tmp = [0u8; 104];
+        let tn = n.min(96);
+        tmp[..tn].copy_from_slice(&base[..tn]);
+        tmp[tn..tn + 4].copy_from_slice(b".tmp");
+        if !write_file(core::str::from_utf8(&tmp[..tn + 4]).unwrap_or(""), cmd) {
+            return false;
+        }
+        let mut newp = [0u8; 104];
+        newp[..tn].copy_from_slice(&base[..tn]);
+        syscall4(
+            SYS_RENAMEAT,
+            AT_FDCWD,
+            tmp.as_ptr() as usize,
+            AT_FDCWD,
+            newp.as_ptr() as usize,
+        ) as isize
+            == 0
     }
 }
 

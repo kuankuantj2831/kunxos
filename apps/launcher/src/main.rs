@@ -5,7 +5,7 @@
 //   2. 桌面：4x6 网格（可切换 5x6）+ 固定 Dock（电话/短信/浏览器/相机/设置）
 //      + 小组件（时钟/天气/日历/相册/电池）+ 系统工具文件夹（3x3、可重命名）
 //   3. 轮询 /dev/input/event0（触摸事件）；设备未就绪时回退为固定坐标模拟点击
-//   4. 交互：点击启动应用；长按 500ms 进入编辑模式（图标 2° 抖动、拖动换位、
+//   4. 交互：点击启动应用；长按 1000ms（1秒）进入编辑模式（图标 2° 抖动、拖动换位、
 //      点击移除、网格切换）；文件夹 350ms 弹簧缩放打开
 //
 // 说明：内核已实现用户态 fork（clone(SIGCHLD)）/ execve / wait4，因此点击
@@ -36,6 +36,10 @@ use sys_nav::*;
 
 // 控制中心（右上角下拉；含与通知中心的手势区分）。
 mod control_center;
+
+// 共享对话框组件（VIVO OriginOS 风格；桌面编辑的壁纸/小组件/桌面设置选择卡用）。
+#[path = "../../../shared/dialog.rs"]
+mod dialog;
 
 // 共享 CJK 16x16 点阵字库（GB2312 一级，由 tools/gen_cjk_font.py 生成）。
 #[path = "../../../shared/cjk_font_launcher.rs"]
@@ -429,6 +433,9 @@ const BATTERY_PATH: &str = "/data/oobe/battery";
 const CHARGING_PATH: &str = "/data/oobe/charging";
 const GRID_PATH: &str = "/data/oobe/grid_cols";
 const FOLDER_NAME_PATH: &str = "/data/oobe/folder_name";
+/// 小组件显示位掩码（桌面编辑器「小组件」卡持久化；bit0 时钟 / 1 天气 /
+/// 2 日历 / 3 相册 / 4 电池，缺省全显示）。
+const WIDGETS_MASK_PATH: &str = "/data/oobe/widgets_mask";
 
 #[derive(Clone, Copy, PartialEq)]
 enum ItemKind {
@@ -895,6 +902,8 @@ pub fn take_launch_anchor() -> Option<(i32, i32)> {
 
 static mut THEME_DARK: bool = false;
 static mut WALLPAPER: usize = 2;
+/// 小组件显示位掩码（bit0 时钟 bit1 天气 bit2 日历 bit3 相册 bit4 电池）。
+static mut WGT_MASK: u32 = 0x1F;
 static mut LANG_ZH: bool = true;
 static mut WIFI_ENABLED: bool = true;
 static mut BRIGHTNESS: u32 = 100;
@@ -906,6 +915,24 @@ static mut BRIGHTNESS_LUT_LEVEL: u32 = u32::MAX;
 static mut SHADE_OPEN: bool = false;
 static mut EDIT_MODE: bool = false;
 static mut EDIT_APP: usize = usize::MAX;
+
+/// 编辑模式抖动重绘节流：上一次抖动帧的绘制时刻（TCG 慢宿主下整帧渲染
+/// 50~150ms，60fps 追不动反而掉帧卡顿；~30fps 抖动观感无损、负载减半）。
+static mut EDIT_LAST_FRAME: u64 = 0;
+
+/// HyperOS 3 桌面编辑器：长按桌面空白处进入编辑模式并弹出底部编辑条
+/// （壁纸 / 小组件 / 桌面设置），点选后弹出 OriginOS 风格选择卡。
+static mut EDIT_MENU: bool = false;
+static mut EDIT_MENU_T0: u64 = 0;
+/// 编辑器选择卡：0 = 关闭，1 = 壁纸，2 = 小组件，3 = 桌面设置。
+static mut EDIT_SHEET: u8 = 0;
+static mut EDIT_SHEET_T0: u64 = 0;
+/// 选择卡临时状态：壁纸序号 / 小组件显示位掩码（确认时才提交）。
+static mut SHEET_WALL: usize = 0;
+/// 桌面设置卡（网格 4x6/5x6）的暂存值：与壁纸卡的 SHEET_WALL 分开存，
+/// 否则「打开桌面设置直接点确定」会把壁纸序号误当网格选择。
+static mut SHEET_GRID: i32 = 4;
+static mut SHEET_WGT_MASK: u32 = 0;
 static mut SHOW_BATTERY_PERCENT: bool = false;
 static mut SOUND_ENABLED: bool = true;
 static mut RECENT_APP: usize = usize::MAX;
@@ -949,6 +976,35 @@ static mut TOAST: &'static [u8] = b"";
 static mut TOAST_UNTIL: u64 = 0;
 /// Toast 出现时刻（入场动画 180ms：底部上滑 16px + 淡入）。
 static mut TOAST_T0: u64 = 0;
+
+// ==================== 音量 HUD（P0-4） ====================
+// 音量键弹出玻璃药丸：缩放 0.9→1.0 + 淡入 200ms LinearOutSlowIn，
+// 2s 后 150ms 淡出；进度条长度弹簧跟随（responsive ζ≈0.86，速度接续）。
+static mut VOL_HUD_T0: u64 = 0;
+static mut VOL_HUD_LAST: u64 = 0;
+static mut VOL_HUD_SPRING: Spring = Spring::fixed();
+/// 入场 200ms + 保持 2s + 淡出 150ms。
+const VOL_HUD_TOTAL_US: u64 = 200_000 + 2_000_000 + 150_000;
+
+fn vol_hud_active(now: u64) -> bool {
+    unsafe { VOL_HUD_T0 != 0 && now.saturating_sub(VOL_HUD_T0) < VOL_HUD_TOTAL_US }
+}
+
+/// 音量键步进 ±10：更新并落盘，重启 HUD 计时，条目标接续弹簧。
+unsafe fn volume_key_step(up: bool) {
+    let v = control_center::volume_bump(if up { 10 } else { -10 });
+    let now = now_us();
+    // 首次（或上一轮已完全结束）显示：弹簧从当前音量值起跑；
+    // 连按只改目标——条以当前速度追新值（鸿蒙 responsive 语义）。
+    if VOL_HUD_T0 == 0 || now.saturating_sub(VOL_HUD_T0) > VOL_HUD_TOTAL_US {
+        VOL_HUD_SPRING = Spring::ios(0.86, 0.0);
+        VOL_HUD_SPRING.pos = v as f32;
+        VOL_HUD_SPRING.vel = 0.0;
+    }
+    VOL_HUD_SPRING.target = v as f32;
+    VOL_HUD_T0 = now;
+    VOL_HUD_LAST = now;
+}
 static mut RIPPLE_X: i32 = 0;
 static mut RIPPLE_Y: i32 = 0;
 static mut RIPPLE_START: u64 = 0;
@@ -1054,6 +1110,10 @@ static mut LOCK_PATTERN_LEN: usize = 0;
 static mut LOCK_FAIL_TICKS: u32 = 0;
 /// 锁屏时钟分钟（分钟变化时重绘）。
 static mut LOCK_MINUTE: u64 = u64::MAX;
+/// 分钟切换转场：上一时刻文本 / 已落位显示的文本 / 转场起点（MAX = 无转场）。
+static mut LOCK_PREV_HHMM: [u8; 5] = *b"00:00";
+static mut LOCK_SHOWN_HHMM: [u8; 5] = *b"00:00";
+static mut LOCK_MIN_T0: u64 = u64::MAX;
 
 // ==================== 系统调用封装 ====================
 
@@ -1473,6 +1533,7 @@ fn load_preferences() {
         // 整屏翻转从 ~150 万次查表降到一次 2MB 拷贝（TCG 下收益显著）。
         BRIGHTNESS = read_number(BRIGHTNESS_PATH, 100).clamp(25, 100);
         GRID_COLS = if read_number(GRID_PATH, 4) == 5 { 5 } else { 4 };
+        WGT_MASK = read_number(WIDGETS_MASK_PATH, 0x1F) & 0x1F;
         let n = read_file(FOLDER_NAME_PATH, &mut FOLDER_NAME);
         if n > 0 {
             FOLDER_NAME_LEN = (n as usize).min(FOLDER_NAME.len());
@@ -1774,12 +1835,72 @@ fn page_count() -> usize {
     PAGE_COUNT
 }
 
+/// Toast 文本按 420px 最大宽度折行，返回各行字节区间与行数（最多 3 行，
+/// 超出截断）。折行点取「加入本字符即超宽」的字符前，UTF-8 边界天然保持。
+fn toast_wrap(text: &[u8]) -> ([(usize, usize); 3], usize) {
+    let mut lines = [(0usize, 0usize); 3];
+    let mut n = 0usize;
+    let mut start = 0usize;
+    let mut w = 0i32;
+    let mut i = 0usize;
+    while i < text.len() {
+        let (cp, step) = ttf_text::font_render::utf8_next(text, i);
+        let aw = if ttf_text::font_render::font_ready() {
+            ttf_text::font_render::advance(cp, ttf_text::font_render::FONT_PX)
+        } else {
+            bitmap_advance(cp, ttf_text::font_render::FONT_PX as i32)
+        };
+        if w + aw > 420 && i > start {
+            lines[n] = (start, i);
+            n += 1;
+            if n == 3 {
+                return (lines, n);
+            }
+            start = i;
+            w = 0;
+        }
+        w += aw;
+        i += step;
+    }
+    lines[n] = (start, text.len());
+    (lines, n + 1)
+}
+
 fn show_toast(text: &'static [u8]) {
     unsafe {
         TOAST = text;
         TOAST_T0 = now_us();
-        TOAST_UNTIL = now_us() + 2_000_000;
+        // 保持期按折行数延长：单行 1.67s（与旧行为一致），每多一行 +0.6s；
+        // 入场 180ms / 退场 150ms 动画窗口不变。
+        let (_, lines) = toast_wrap(text);
+        let hold = 1_670_000u64 + (lines as u64 - 1) * 600_000;
+        TOAST_UNTIL = TOAST_T0 + 180_000 + hold + 150_000;
         NEEDS_REDRAW = true;
+    }
+}
+
+/// Toast 是否处于入场（180ms）/退场（150ms）动画窗口。
+///
+/// 保持期画面静止（PIX_ALPHA=255 零混合），此前主循环把 `TOAST_UNTIL > now`
+/// 整体当动画源 —— 一条 2s 的 Toast 触发 2s × 60fps 的整屏重绘
+/// （TCG 下每帧 50~150ms，桌面全程卡顿）。只在动画窗口重绘。
+fn toast_anim_active(now: u64) -> bool {
+    unsafe {
+        TOAST_UNTIL > now
+            && (now.saturating_sub(TOAST_T0) < 180_000
+                || TOAST_UNTIL.saturating_sub(now) < 150_000)
+            // 过期后 16ms 内再补一帧：退场末帧 alpha 最低仍 ~13（8ms 轮询），
+            // 不补帧则淡出残影在局部刷新路径下长驻，直到下次整屏重绘。
+            || (TOAST_UNTIL > 0 && now >= TOAST_UNTIL && now - TOAST_UNTIL < 16_000)
+    }
+}
+
+/// 锁屏分钟切换转场（320ms）是否进行中（主循环动画期保持重绘）。
+fn lock_minute_anim_active(now: u64) -> bool {
+    unsafe {
+        LOCKED
+            && LOCK_MIN_T0 != u64::MAX
+            && now.saturating_sub(LOCK_MIN_T0) < 320_000
     }
 }
 
@@ -1850,14 +1971,17 @@ fn in_dock(idx: usize) -> bool {
 }
 
 /// 重建桌面页与系统工具文件夹内容（模块过滤后调用）。
+/// 小组件按 WGT_MASK 位掩码显隐（桌面编辑器「小组件」卡管理）。
 fn rebuild_pages() {
     unsafe {
         // 第一屏：时钟小组件（顶部 4x2）+ 常用应用
         PAGES[0].count = 0;
-        PAGES[0].items[0] = Item {
-            kind: ItemKind::Widget(WidgetKind::Clock),
-        };
-        PAGES[0].count = 1;
+        if WGT_MASK & 1 != 0 {
+            PAGES[0].items[0] = Item {
+                kind: ItemKind::Widget(WidgetKind::Clock),
+            };
+            PAGES[0].count = 1;
+        }
         for &key in PAGE0_APPS.iter() {
             if let Some(idx) = app_index_by_key(key) {
                 if app_visible(idx) && !in_dock(idx) && PAGES[0].count < MAX_PAGE_ITEMS {
@@ -1870,16 +1994,23 @@ fn rebuild_pages() {
         }
         // 第二屏：系统工具文件夹 + 小组件 + 其他应用
         PAGES[1].count = 0;
-        let seq: [ItemKind; 5] = [
-            ItemKind::Folder,
-            ItemKind::Widget(WidgetKind::Battery),
-            ItemKind::Widget(WidgetKind::Weather),
-            ItemKind::Widget(WidgetKind::Calendar),
-            ItemKind::Widget(WidgetKind::Gallery),
+        PAGES[1].items[PAGES[1].count] = Item {
+            kind: ItemKind::Folder,
+        };
+        PAGES[1].count += 1;
+        let widgets: [(u32, WidgetKind); 4] = [
+            (16, WidgetKind::Battery),
+            (2, WidgetKind::Weather),
+            (4, WidgetKind::Calendar),
+            (8, WidgetKind::Gallery),
         ];
-        for k in seq {
-            PAGES[1].items[PAGES[1].count] = Item { kind: k };
-            PAGES[1].count += 1;
+        for (bit, kind) in widgets {
+            if WGT_MASK & bit != 0 {
+                PAGES[1].items[PAGES[1].count] = Item {
+                    kind: ItemKind::Widget(kind),
+                };
+                PAGES[1].count += 1;
+            }
         }
         for &key in PAGE1_APPS.iter() {
             if let Some(idx) = app_index_by_key(key) {
@@ -2092,6 +2223,9 @@ static mut WIDGET_SCRATCH: [u32; WIDGET_SCRATCH_W * WIDGET_SCRATCH_H] =
 /// 文件夹打开时全屏压暗 LUT（blend(c, 0x00050A14, 150)）。
 static mut DIM_LUT: [u32; 256] = [0; 256];
 static mut DIM_LUT_READY: bool = false;
+/// 已压暗桌面缓存（文件夹打开期间桌面静止，整块 memcpy 替代逐像素 LUT）。
+static mut FOLDER_DIM_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0; DISPLAY_W * DISPLAY_H];
+static mut FOLDER_DIM_OK: bool = false;
 
 /// 星期「周X」组合缓冲。
 static mut WEEK_BUF: [u8; 6] = [0; 6];
@@ -2140,7 +2274,12 @@ fn put_pixel(x: i32, y: i32, color: u32) {
         }
         if TILE_MODE {
             if x >= 0 && y >= 0 && x < ICON_SIZE && y < ICON_SIZE {
-                ICON_TILE[y as usize * ICON_SIZE as usize + x as usize] = color;
+                // 旧约定（顶字节 0 = 不透明）在此归一化为贴图编码
+                // （0xFF 顶字节）：预乘双线性采样器把顶字节当 alpha，
+                // 几何回退图标（资产缺失时）原样写入会被当成全透明 ——
+                // draw_icon_rot 采到即丢弃、launch_blit 直接画黑方块。
+                ICON_TILE[y as usize * ICON_SIZE as usize + x as usize] =
+                    if a > 0 { color } else { 0xFF00_0000 | color };
             }
             return;
         }
@@ -2788,7 +2927,15 @@ impl glass::SmoothTarget for LauncherSmooth {
         }
         unsafe {
             let idx = y as usize * DISPLAY_W + x as usize;
-            BACK_BUF[idx] = blend(BACK_BUF[idx], color, alpha);
+            // 与 put_pixel 一致地乘上全局 PIX_ALPHA：编辑选择卡等入场淡入
+            // 期间白卡本体（smooth_fill_rr 经 put_aa 直写）才跟着渐显，
+            // 否则第 1 帧全不透明「弹出」而遮罩/文字仍在渐显。
+            let a = if PIX_ALPHA >= 255 {
+                alpha
+            } else {
+                alpha * PIX_ALPHA / 255
+            };
+            BACK_BUF[idx] = blend(BACK_BUF[idx], color, a);
         }
     }
 }
@@ -2842,9 +2989,74 @@ fn app_index_of(app: &App) -> usize {
     usize::MAX
 }
 
-/// 烘焙贴图最近邻缩放绘制（Dock 52px / 按压反馈 / 占位页 96px 等非
-/// ICON_SIZE 尺寸路径，以及瓦片缓存未预热时的 56px 直绘）。半透明边缘
-/// 像素交由 put_pixel 与目标混合；无贴图数据返回 false（走几何回退）。
+/// 四邻域预乘双线性混合：输入为 0x00RRGGBB | a<<24 编码的 2x2 采样块与
+/// 分数偏移 (tx, ty)。RGB 在预乘空间插值（透明邻域 rgb=0 不产生黑边），
+/// alpha 直接插值；结果保留 alpha 顶字节。sample_icon_bilinear_stride 与
+/// draw_icon_asset 共用。
+#[inline]
+fn bilinear_premul(c00: u32, c10: u32, c01: u32, c11: u32, tx: f32, ty: f32) -> u32 {
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let rnd = |v: f32| (v + 0.5) as u32;
+    let c = [c00, c10, c01, c11];
+    let mut rgb = [0u32; 3];
+    let mut a = 0u32;
+    for k in 0..4 {
+        // k=0..2 → R/G/B（预乘各自 alpha）；k=3 → alpha（直接插值）。
+        let mut ch = [0u32; 4];
+        for (i, &ci) in c.iter().enumerate() {
+            let av = (ci >> 24) & 0xFF;
+            let cv = if k < 3 {
+                ((ci >> (16 - 8 * k)) & 0xFF) * av
+            } else {
+                av
+            };
+            ch[i] = cv;
+        }
+        let top = lerp(ch[0] as f32, ch[1] as f32, tx);
+        let bot = lerp(ch[2] as f32, ch[3] as f32, tx);
+        let v = rnd(lerp(top, bot, ty));
+        if k < 3 {
+            rgb[k] = v;
+        } else {
+            a = v;
+        }
+    }
+    if a == 0 {
+        return 0;
+    }
+    // 反除回非预乘 RGB（预乘值 = rgb × a，同一 0..255 尺度）。
+    let r = (rgb[0] / a).min(255);
+    let g = (rgb[1] / a).min(255);
+    let b = (rgb[2] / a).min(255);
+    (a << 24) | (r << 16) | (g << 8) | b
+}
+
+/// 方形贴图（行主序 u32：0x00RRGGBB，半透明像素 alpha 编码在最高位字节；
+/// `stride` 为行距，`dim` 为内容边长）在连续坐标 (fx, fy) 处的预乘双线性
+/// 采样。fx/fy ≥ -dim（拖拽放大路径最小约 -3），边缘钳制采样。
+fn sample_icon_bilinear_stride(buf: &[u32], stride: usize, dim: usize, fx: f32, fy: f32) -> u32 {
+    let d = dim as i32;
+    let cl = |v: i32| -> usize { v.clamp(0, d - 1) as usize };
+    // floor 对 ≥ -dim 的坐标借 +dim 平移后截断实现（as 为向零截断）。
+    // 整数部分取未钳制的 floor 值，插值权重由未钳制值计算再钳到 [0,1]：
+    // 若从钳制后的 x0 反推权重，左/上边缘（fx<0）会得到负 tx —— lerp 变
+    // 线性外推，alpha 可超 255 溢出顶字节、暗色像素邻亮色产生黑边/镂空。
+    let xf = (fx + dim as f32) as i32 - d;
+    let x0 = cl(xf);
+    let yf = (fy + dim as f32) as i32 - d;
+    let y0 = cl(yf);
+    let x1 = cl(x0 as i32 + 1);
+    let y1 = cl(y0 as i32 + 1);
+    let tx = (fx - xf as f32).clamp(0.0, 1.0);
+    let ty = (fy - yf as f32).clamp(0.0, 1.0);
+    let at = |x: usize, y: usize| -> u32 { buf[y * stride + x] };
+    bilinear_premul(at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1), tx, ty)
+}
+
+/// 烘焙贴图双线性缩放绘制（Dock 52px / 按压反馈 / 占位页 96px 等非
+/// ICON_SIZE 尺寸路径，以及瓦片缓存未预热时的 56px 直绘）。源坐标取目标
+/// 像素中心做预乘双线性采样，非整数缩放无锯齿/马赛克；半透明边缘像素
+/// 经 put_pixel 与目标混合；无贴图数据返回 false（走几何回退）。
 fn draw_icon_asset(app: &App, x: i32, y: i32, size: i32) -> bool {
     let idx = app_index_of(app);
     let src = match app_icons::icon_rgba(idx) {
@@ -2853,21 +3065,38 @@ fn draw_icon_asset(app: &App, x: i32, y: i32, size: i32) -> bool {
     };
     let n = ICON_SIZE as usize;
     let sz = size.max(1) as usize;
+    let step = n as f32 / sz as f32;
+    // RGBA8888 字节 → u32（0x00RRGGBB | a<<24）。
+    let px = |sx: usize, sy: usize| -> u32 {
+        let o = (sy * n + sx) * 4;
+        ((src[o] as u32) << 16) | ((src[o + 1] as u32) << 8) | (src[o + 2] as u32)
+            | ((src[o + 3] as u32) << 24)
+    };
     for dy in 0..sz {
-        let sy = dy * n / sz;
+        let fy = (dy as f32 + 0.5) * step - 0.5;
+        let syf = (fy + n as f32) as i32 - n as i32;
+        let sy0 = syf.clamp(0, n as i32 - 1);
+        let sy1 = (sy0 + 1).min(n as i32 - 1);
+        // 权重由未钳制的 floor 值计算再钳 [0,1]，防上/左边缘外推（见
+        // sample_icon_bilinear_stride 注释）。
+        let ty = (fy - syf as f32).clamp(0.0, 1.0);
         for dx in 0..sz {
-            let sx = dx * n / sz;
-            let o = (sy * n + sx) * 4;
-            let a = src[o + 3] as u32;
-            if a == 0 {
-                continue;
-            }
-            let rgb = ((src[o] as u32) << 16) | ((src[o + 1] as u32) << 8) | (src[o + 2] as u32);
-            put_pixel(
-                x + dx as i32,
-                y + dy as i32,
-                if a >= 255 { rgb } else { (a << 24) | rgb },
+            let fx = (dx as f32 + 0.5) * step - 0.5;
+            let sxf = (fx + n as f32) as i32 - n as i32;
+            let sx0 = sxf.clamp(0, n as i32 - 1);
+            let sx1 = (sx0 + 1).min(n as i32 - 1);
+            let tx = (fx - sxf as f32).clamp(0.0, 1.0);
+            let c = bilinear_premul(
+                px(sx0 as usize, sy0 as usize),
+                px(sx1 as usize, sy0 as usize),
+                px(sx0 as usize, sy1 as usize),
+                px(sx1 as usize, sy1 as usize),
+                tx,
+                ty,
             );
+            if c != 0 {
+                put_pixel(x + dx as i32, y + dy as i32, c);
+            }
         }
     }
     true
@@ -2921,15 +3150,49 @@ fn fill_icon_cache_from_asset(idx: usize) -> bool {
     true
 }
 
-/// 把缓存瓦片 blit 到 (x, y)（跳过透明角像素）。
+/// 把缓存瓦片 blit 到 (x, y)（跳过透明像素）。
+///
+/// 性能：透明像素跳过不变；不透明段（无 alpha 字节）整段直写 BACK_BUF
+/// 行切片（编译为宽通道拷贝），带 alpha 的边缘像素逐像素 put_pixel 混合。
+/// 整屏重绘每帧 blit 全部图标（21 个 × 3136px），此前全量逐像素
+/// put_pixel（边界检查 + alpha 分支）是重绘热点之一。
 fn blit_icon(idx: usize, x: i32, y: i32) {
     unsafe {
         let n = ICON_SIZE as usize;
         for row in 0..ICON_SIZE {
-            for col in 0..ICON_SIZE {
-                let c = ICON_CACHE[idx][row as usize * n + col as usize];
-                if c != 0 {
-                    put_pixel(x + col, y + row, c);
+            let py = y + row;
+            if py < 0 || py >= DISPLAY_H as i32 {
+                continue;
+            }
+            let src = &ICON_CACHE[idx][row as usize * n..row as usize * n + n];
+            let base = py as usize * DISPLAY_W;
+            let mut col = 0usize;
+            while col < n {
+                let c = src[col];
+                if c == 0 {
+                    col += 1;
+                    continue;
+                }
+                if c >> 24 == 0 {
+                    // 连续不透明段：行内整段拷贝（越界时回退逐像素）。
+                    let mut end = col + 1;
+                    while end < n && src[end] != 0 && src[end] >> 24 == 0 {
+                        end += 1;
+                    }
+                    let px0 = x + col as i32;
+                    let px1 = x + end as i32;
+                    if px0 >= 0 && px1 <= DISPLAY_W as i32 {
+                        let dst = base + px0 as usize..base + px1 as usize;
+                        BACK_BUF[dst].copy_from_slice(&src[col..end]);
+                    } else {
+                        for k in col..end {
+                            put_pixel(x + k as i32, py, src[k]);
+                        }
+                    }
+                    col = end;
+                } else {
+                    put_pixel(x + col as i32, py, c);
+                    col += 1;
                 }
             }
         }
@@ -2984,7 +3247,7 @@ fn blit_icon_split(idx: usize, x: i32, y: i32, split: i32, fade: u32) {
 }
 
 fn draw_app_icon(app: &App, x: i32, y: i32, size: i32) {
-    if size == ICON_SIZE {
+    if size == ICON_SIZE && !unsafe { TILE_MODE } && !unsafe { FOLDER_TILE_ACTIVE } {
         let idx = app_index_of(app);
         if idx < APPS.len() && unsafe { ICON_CACHE_READY[idx] } {
             blit_icon(idx, x, y);
@@ -3140,16 +3403,87 @@ fn draw_status_bar() {
     }
 }
 
+/// 音量 HUD 绘制（P0-4）：顶部居中玻璃药丸 + 弹簧跟随的音量条。
+/// 入场 200ms 缩放 0.9→1.0 + 淡入（LinearOutSlowIn）；保持 2s（条以
+/// responsive 弹簧 ζ≈0.86 追目标，连按速度接续）；末 150ms 淡出。
+unsafe fn draw_volume_hud(now: u64) {
+    if VOL_HUD_T0 == 0 {
+        return;
+    }
+    let el = now.saturating_sub(VOL_HUD_T0);
+    if el >= VOL_HUD_TOTAL_US {
+        VOL_HUD_T0 = 0;
+        return;
+    }
+    // 弹簧推进（帧间隔 dt）
+    let dt = now.saturating_sub(VOL_HUD_LAST).min(40_000) as f32 / 1000.0;
+    VOL_HUD_LAST = now;
+    let _ = VOL_HUD_SPRING.step_ms(dt);
+    let e_in = Easing::LinearOutSlowIn.sample((el as f32 / 200_000.0).min(1.0));
+    let out_left = (VOL_HUD_TOTAL_US - el) as f32 / 150_000.0;
+    let alpha = ((255.0 * e_in) * out_left.min(1.0)).min(255.0) as u32;
+    if alpha == 0 {
+        return;
+    }
+    let scale = 0.9 + 0.1 * e_in;
+    let pw = (232.0 * scale) as i32;
+    let ph = (44.0 * scale) as i32;
+    let px = (DISPLAY_W as i32 - pw) / 2;
+    let py = 64 + ((44 - ph) / 2);
+    let prev = PIX_ALPHA;
+    PIX_ALPHA = alpha;
+    draw_glass(px, py, pw, ph, (ph / 2).min(22));
+    // 音量条：槽 + 弹簧填充 + 百分比
+    let vol = VOL_HUD_SPRING.pos.clamp(0.0, 100.0);
+    let bar_w = pw - 96;
+    let bar_x = px + 40;
+    let bar_y = py + ph / 2 - 3;
+    fill_rect(bar_x, bar_y, bar_w, 6, 0x00_D9_DE_E6);
+    let fill_w = (bar_w as f32 * vol / 100.0) as i32;
+    if fill_w > 0 {
+        fill_rect(bar_x, bar_y, fill_w, 6, COLOR_ACCENT);
+    }
+    let vi = vol as u32;
+    let mut t = [0u8; 8];
+    let mut n = 0usize;
+    if vi >= 100 {
+        t[n] = b'1';
+        t[n + 1] = b'0';
+        t[n + 2] = b'0';
+        n += 3;
+    } else {
+        if vi >= 10 {
+            t[n] = b'0' + (vi / 10) as u8;
+            n += 1;
+        }
+        t[n] = b'0' + (vi % 10) as u8;
+        n += 1;
+    }
+    t[n] = b'%';
+    n += 1;
+    draw_text(bar_x + bar_w + 8, py + (ph - 16) / 2, &t[..n], COLOR_TEXT_MAIN);
+    // 「音量」标签
+    draw_text(px + 12, py + (ph - 16) / 2, "音量".as_bytes(), COLOR_TEXT_MAIN);
+    PIX_ALPHA = prev;
+}
+
 fn draw_overlay() {
     unsafe {
         let now = now_us();
+        draw_volume_hud(now);
         if TOAST_UNTIL > now && !TOAST.is_empty() {
-            let w = text_width(TOAST).min(420) + 24;
+            let (ranges, lines) = toast_wrap(TOAST);
+            let mut w = 0i32;
+            for &(s, e) in ranges.iter().take(lines) {
+                w = w.max(text_width(&TOAST[s..e]));
+            }
+            let w = w.min(420) + 24;
             let x = (DISPLAY_W as i32 - w) / 2;
             // Toast 显示在 Dock 与导航栏之上方，避免被遮挡。
             let base_ty = DOCK_Y - 96;
             // 入场 180ms：底部上滑 16px + 淡入（FastOutSlowIn）；
-            // 结束前 150ms 淡出。保持期 PIX_ALPHA = 255，零混合开销。
+            // 结束前 150ms 淡出 + 上滑 8px（入场的反向完整性）。
+            // 保持期 PIX_ALPHA = 255，零混合开销。
             let e_in = if now > TOAST_T0 {
                 Easing::FastOutSlowIn.sample((((now - TOAST_T0) as f32) / 180_000.0).min(1.0))
             } else {
@@ -3160,12 +3494,19 @@ fn draw_overlay() {
             if alpha == 0 {
                 return;
             }
-            let ty = base_ty + (16.0 * (1.0 - e_in)) as i32;
+            let mut ty = base_ty + (16.0 * (1.0 - e_in)) as i32;
+            if out_left < 1.0 {
+                ty -= ((1.0 - out_left) * 8.0) as i32;
+            }
             // 液态玻璃 Toast：圆角药丸 + 模糊背景（浅色玻璃 + 深字）。
+            // 多行时药丸按行增高（每行 +24px），文字逐行绘制。
+            let pill_h = 40 + 24 * (lines as i32 - 1);
             let prev = PIX_ALPHA;
             PIX_ALPHA = alpha;
-            draw_glass(x, ty, w, 40, 20);
-            draw_text(x + 12, ty + 16, TOAST, COLOR_TEXT_MAIN);
+            draw_glass(x, ty, w, pill_h, 20);
+            for (idx, &(s, e)) in ranges.iter().take(lines).enumerate() {
+                draw_text(x + 12, ty + 16 + 24 * idx as i32, &TOAST[s..e], COLOR_TEXT_MAIN);
+            }
             PIX_ALPHA = prev;
         }
     }
@@ -3387,15 +3728,22 @@ fn draw_icon_rot(app: &App, cx: i32, cy: i32, size: i32, ang_deg: f32, scale: f3
     let sin = fsin(rad);
     let half = (size as f32 * scale * 0.5) as i32;
     let mid = size as f32 * 0.5;
+    // 逆映射 + 预乘双线性采样：倾斜缩放中的图标边缘平滑，无最近邻锯齿。
+    // （瓦片行距恒为 ICON_SIZE，内容边长为 size——此前按 size 行距索引，
+    // size ≠ ICON_SIZE 时读串行，此处一并修正。）
     for py in -half..=half {
         for px in -half..=half {
-            let sx = (px as f32 * cos + py as f32 * sin + mid) as i32;
-            let sy = (-px as f32 * sin + py as f32 * cos + mid) as i32;
-            if sx >= 0 && sy >= 0 && sx < size && sy < size {
-                let c = unsafe { ICON_TILE[sy as usize * size as usize + sx as usize] };
-                if c != 0 {
-                    put_pixel(cx + px, cy + py, c);
-                }
+            let sx = px as f32 * cos + py as f32 * sin + mid;
+            let sy = -px as f32 * sin + py as f32 * cos + mid;
+            let c = sample_icon_bilinear_stride(
+                unsafe { &ICON_TILE },
+                ICON_SIZE as usize,
+                size as usize,
+                sx,
+                sy,
+            );
+            if c != 0 {
+                put_pixel(cx + px, cy + py, c);
             }
         }
     }
@@ -3411,16 +3759,19 @@ fn draw_icon_rot_folder(cx: i32, cy: i32, ang_deg: f32) {
     let cos = fcos(rad);
     let sin = fsin(rad);
     let half = ICON_SIZE / 2;
-    let n = ICON_SIZE as usize;
     for py in -half..=half {
         for px in -half..=half {
-            let sx = (px as f32 * cos + py as f32 * sin + ICON_SIZE as f32 * 0.5) as i32;
-            let sy = (-px as f32 * sin + py as f32 * cos + ICON_SIZE as f32 * 0.5) as i32;
-            if sx >= 0 && sy >= 0 && sx < ICON_SIZE && sy < ICON_SIZE {
-                let c = unsafe { ICON_TILE[sy as usize * n + sx as usize] };
-                if c != 0 {
-                    put_pixel(cx + px, cy + py, c);
-                }
+            let sx = px as f32 * cos + py as f32 * sin + ICON_SIZE as f32 * 0.5;
+            let sy = -px as f32 * sin + py as f32 * cos + ICON_SIZE as f32 * 0.5;
+            let c = sample_icon_bilinear_stride(
+                unsafe { &ICON_TILE },
+                ICON_SIZE as usize,
+                ICON_SIZE as usize,
+                sx,
+                sy,
+            );
+            if c != 0 {
+                put_pixel(cx + px, cy + py, c);
             }
         }
     }
@@ -3445,9 +3796,6 @@ fn draw_page() {
             }
         } else {
             draw_page_at(CURRENT_PAGE, 0);
-        }
-        if EDIT_MODE {
-            draw_edit_hud();
         }
         if DRAG_ACTIVE && DRAG_APP != usize::MAX {
             draw_dragged_icon();
@@ -3512,17 +3860,7 @@ fn draw_edit_hud() {
             "编辑模式：拖动移动，点击移除",
         );
         draw_text_px(16, 36, hint, 12.0, COLOR_TEXT_DIM);
-        // 网格切换按钮（4x6 / 5x6）—— 液态玻璃（浅色玻璃 + 深字）。
-        let bx = DISPLAY_W as i32 - 128;
-        let by = 32;
-        draw_glass(bx, by, 112, 34, 16);
-        let label = if GRID_COLS == 4 {
-            txt("Grid 5x6", "网格 5x6")
-        } else {
-            txt("Grid 4x6", "网格 4x6")
-        };
-        let lw = text_width_px(label, 12.0);
-        draw_text_px(bx + (112 - lw) / 2, by + 11, label, 12.0, COLOR_TEXT_MAIN);
+        // 网格切换移入底部编辑条的「桌面设置」选择卡（HyperOS 3 语义）。
     }
 }
 
@@ -3623,6 +3961,9 @@ fn page_drag_allowed() -> bool {
             && FOLDER_PHASE == FolderPhase::Closed
             && !control_center::cc_visible()
             && !control_center::shade_drag_active()
+            // 返回转场中途输入已放行（连续启动打断），但转场期桌面不走
+            // draw_page 路径 —— 末行的 matches! 同时把 Return/Launch/Resume
+            // 等转场相位挡在跟手翻页之外。
             && !BOOT_ACTIVE
             && page_count() > 0
             && matches!(MOTION.phase, Phase::Idle | Phase::PressIn)
@@ -3797,6 +4138,69 @@ fn draw_dock() {
             let (size, ox, oy) = pressed_icon_rect(app.key);
             draw_app_icon(app, dx + ox, dy + oy, size);
         }
+    }
+}
+
+// ==================== 小组件毛玻璃缓存 ====================
+//
+// 小组件背景玻璃的模糊源只有壁纸（网格布局保证玻璃采样区无其他内容），
+// 键 = (调色板, 主题)。翻页动画/拖动/壁纸淡化期间模糊源是相邻页像素，
+// 退化为实时玻璃。五类小组件各占一个槽位（第二页 4 个小组件同帧重绘，
+// 单槽会逐帧互相踢出缓存）。
+const WG_CACHE_W: usize = 320;
+const WG_CACHE_H: usize = 160;
+static mut WGT_GLASS_BUF: [[u32; WG_CACHE_W * WG_CACHE_H]; 5] =
+    [[0; WG_CACHE_W * WG_CACHE_H]; 5];
+static mut WGT_GLASS_KEY: [((u32, u32, u32), bool, i32, i32, i32, i32); 5] =
+    [((u32::MAX, u32::MAX, u32::MAX), false, 0, 0, 0, 0); 5];
+
+fn widget_glass_slot(kind: WidgetKind) -> usize {
+    match kind {
+        WidgetKind::Clock => 0,
+        WidgetKind::Weather => 1,
+        WidgetKind::Calendar => 2,
+        WidgetKind::Gallery => 3,
+        WidgetKind::Battery => 4,
+    }
+}
+
+/// 命中缓存时按行恢复小组件玻璃背景；未命中时实算并回填。
+fn draw_widget_glass_cached(kind: WidgetKind, x: i32, y: i32, w: i32, h: i32, r: i32) {
+    unsafe {
+        let slot = widget_glass_slot(kind);
+        let wu = w as usize;
+        if PAGE_ANIM
+            || PAGE_DRAG
+            || PAGE_OFFSET != 0.0
+            || wallpaper_fade_active()
+            || wu > WG_CACHE_W
+            || h as usize > WG_CACHE_H
+            || x < 0
+            || y < 0
+            || x + w > DISPLAY_W as i32
+            || y + h > DISPLAY_H as i32
+        {
+            draw_glass(x, y, w, h, r);
+            return;
+        }
+        // 键含几何 (x,y,w,h)：小组件增删/网格切换改变布局后旧玻璃自动失效
+        // （否则恢复的是旧位置模糊出的壁纸，内容错位）。
+        let key = (wallpaper_colors(), THEME_DARK, x, y, w, h);
+        if WGT_GLASS_KEY[slot] == key {
+            for row in 0..h as usize {
+                let src = row * wu;
+                let dst = (y as usize + row) * DISPLAY_W + x as usize;
+                BACK_BUF[dst..dst + wu].copy_from_slice(&WGT_GLASS_BUF[slot][src..src + wu]);
+            }
+            return;
+        }
+        draw_glass(x, y, w, h, r);
+        for row in 0..h as usize {
+            let src = row * wu;
+            let dst = (y as usize + row) * DISPLAY_W + x as usize;
+            WGT_GLASS_BUF[slot][src..src + wu].copy_from_slice(&BACK_BUF[dst..dst + wu]);
+        }
+        WGT_GLASS_KEY[slot] = key;
     }
 }
 
@@ -4261,6 +4665,11 @@ fn draw_widget_weather(x: i32, y: i32, w: i32, h: i32) {
 }
 
 /// 日历小组件（2x1）：日期 + 下一个事件。
+/// 事件文字走 1s TTL 缓存（第二页动画每帧重绘不再读盘，与天气/电池一致）。
+static mut WGT_EVENT_BUF: [u8; 24] = [0; 24];
+static mut WGT_EVENT_LEN: usize = 0;
+static mut WGT_EVENT_EXP: u64 = 0;
+
 fn draw_widget_calendar(x: i32, y: i32, w: i32, h: i32) {
     let us = now_us();
     let secs = (us / 1_000_000) as i64;
@@ -4282,12 +4691,26 @@ fn draw_widget_calendar(x: i32, y: i32, w: i32, h: i32) {
     }
     draw_text_px(x + 52, y + 10, &mb[..m], 13.0, COLOR_TEXT_DIM);
     draw_text_px(x + 52, y + 26, weekday_label(wd), 13.0, COLOR_TEXT_DIM);
-    let mut ev = [0u8; 24];
-    let en = unsafe { read_file(NEXT_EVENT_PATH, &mut ev) };
-    let ev_s: &[u8] = if en > 0 {
-        &ev[..en as usize]
-    } else {
-        txt("No events today", "今日暂无安排")
+    unsafe {
+        let now = now_us();
+        if now >= WGT_EVENT_EXP {
+            WGT_EVENT_EXP = now + 1_000_000;
+            WGT_EVENT_LEN = 0;
+            let mut ev = [0u8; 24];
+            let en = read_file(NEXT_EVENT_PATH, &mut ev);
+            if en > 0 {
+                let en = (en as usize).min(WGT_EVENT_BUF.len());
+                WGT_EVENT_BUF[..en].copy_from_slice(&ev[..en]);
+                WGT_EVENT_LEN = en;
+            }
+        }
+    }
+    let ev_s: &[u8] = unsafe {
+        if WGT_EVENT_LEN > 0 {
+            &WGT_EVENT_BUF[..WGT_EVENT_LEN]
+        } else {
+            txt("No events today", "今日暂无安排")
+        }
     };
     draw_label_trunc(x + 10, y + h - 20, ev_s, 11.0, w - 20, COLOR_TEXT_DIM);
 }
@@ -4372,7 +4795,7 @@ fn draw_widget(kind: WidgetKind, x: i32, y: i32, w: i32, h: i32, wc: i32, hc: i3
         // 编辑模式：浅色实心玻璃 + 浅灰描边（避免每帧模糊开销）。
         draw_glass_solid(x, y, w, h, r, COLOR_PANEL_ROW, 220, COLOR_BORDER);
     } else {
-        draw_glass(x, y, w, h, r);
+        draw_widget_glass_cached(kind, x, y, w, h, r);
     }
     match kind {
         WidgetKind::Clock => draw_widget_clock(x, y, w, h),
@@ -4394,6 +4817,478 @@ fn widget_launch(kind: WidgetKind) {
     };
     if let Some(idx) = app_index_by_key(key) {
         start_launch(idx);
+    }
+}
+
+// ==================== 桌面编辑器（HyperOS 3：长按空白处编辑桌面） ====================
+
+const EDIT_BAR_W: i32 = 444;
+const EDIT_BAR_H: i32 = 104;
+const EDIT_BAR_X: i32 = (DISPLAY_W as i32 - EDIT_BAR_W) / 2;
+const EDIT_ITEM_NUM: usize = 3;
+/// 编辑条入场 200ms（上滑 14px + 淡入）。
+const EDIT_MENU_IN_US: u64 = 200_000;
+/// 选择卡入场 180ms。
+const EDIT_SHEET_IN_US: u64 = 180_000;
+
+fn edit_bar_y() -> i32 {
+    DOCK_Y - EDIT_BAR_H - 14
+}
+
+fn edit_item_center(i: usize) -> (i32, i32) {
+    let seg = EDIT_BAR_W / EDIT_ITEM_NUM as i32;
+    (
+        EDIT_BAR_X + seg * i as i32 + seg / 2,
+        edit_bar_y() + 36,
+    )
+}
+
+fn edit_item_hit(x: i32, y: i32) -> Option<usize> {
+    for i in 0..EDIT_ITEM_NUM {
+        let (cx, cy) = edit_item_center(i);
+        let dx = x - cx;
+        let dy = y - cy;
+        if dx * dx + dy * dy <= 32 * 32 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 进入编辑模式（HyperOS 语义）：图标抖动 + 底部编辑条入场。
+fn enter_edit_mode() {
+    unsafe {
+        if EDIT_MODE {
+            return;
+        }
+        EDIT_MODE = true;
+        EDIT_MENU = true;
+        EDIT_MENU_T0 = now_us();
+        EDIT_SHEET = 0;
+        NEEDS_REDRAW = true;
+    }
+}
+
+/// 退出编辑模式（编辑条 / 选择卡一并收起）。
+fn exit_edit_mode() {
+    unsafe {
+        if !EDIT_MODE && !EDIT_MENU && EDIT_SHEET == 0 {
+            return;
+        }
+        EDIT_MODE = false;
+        EDIT_MENU = false;
+        EDIT_SHEET = 0;
+        NEEDS_REDRAW = true;
+    }
+}
+
+/// 编辑条 / 选择卡入场动画是否进行中（主循环保持重绘判定）。
+fn edit_overlay_anim_active(now: u64) -> bool {
+    unsafe {
+        (EDIT_MENU && now.saturating_sub(EDIT_MENU_T0) < EDIT_MENU_IN_US)
+            || (EDIT_SHEET != 0 && now.saturating_sub(EDIT_SHEET_T0) < EDIT_SHEET_IN_US)
+    }
+}
+
+/// 编辑模式抖动重绘是否到期（~30fps 节流，TCG 慢宿主下整帧太贵）。
+fn edit_anim_due(now: u64) -> bool {
+    unsafe { EDIT_MODE && now.saturating_sub(EDIT_LAST_FRAME) >= 33_000 }
+}
+
+/// 把壁纸序号写回 desktop_meta（"w:N" 标记，与设置应用同格式；缺失时追加）。
+fn save_wallpaper_meta(n: usize) {
+    unsafe {
+        let mut buf = [0u8; 128];
+        let len = read_file(DESKTOP_META_PATH, &mut buf);
+        if len > 0 {
+            let len = len as usize;
+            // 先取容量判定所需的信息，再进入可变借用作用域。
+            let has_marker = buf[..len]
+                .windows(2)
+                .any(|w| w[0] == b'w' && w[1] == b':');
+            if has_marker {
+                let data = &mut buf[..len];
+                let mut i = 0usize;
+                while i + 2 < data.len() {
+                    if data[i] == b'w' && data[i + 1] == b':' {
+                        data[i + 2] = b'0' + n as u8;
+                        break;
+                    }
+                    i += 1;
+                }
+                write_file(DESKTOP_META_PATH, data);
+            } else if len + 4 <= buf.len() {
+                // 无标记：追加 ",w:N"。
+                buf[len] = b',';
+                buf[len + 1] = b'w';
+                buf[len + 2] = b':';
+                buf[len + 3] = b'0' + n as u8;
+                write_file(DESKTOP_META_PATH, &buf[..len + 4]);
+            }
+        } else {
+            let m = [b'w', b':', b'0' + n as u8];
+            write_file(DESKTOP_META_PATH, &m);
+        }
+    }
+}
+
+/// 应用壁纸选择（ColorOS 交叉淡化动效；玻璃/压暗缓存一并失效）。
+fn apply_wallpaper(n: usize) {
+    unsafe {
+        let old = wallpaper_colors();
+        WALLPAPER = n;
+        save_wallpaper_meta(n);
+        WP_FADE_FROM = old;
+        WP_FADE_T0 = now_us();
+        WP_FADE_ACTIVE = true;
+        REC_BG_OK = false;
+        FOLDER_DIM_OK = false;
+        NEEDS_REDRAW = true;
+    }
+}
+
+/// 编辑模式下点击小组件 → 从桌面移除（清位掩码并持久化）。
+fn edit_remove_widget(kind: WidgetKind) {
+    unsafe {
+        let bit = match kind {
+            WidgetKind::Clock => 1u32,
+            WidgetKind::Weather => 2,
+            WidgetKind::Calendar => 4,
+            WidgetKind::Gallery => 8,
+            WidgetKind::Battery => 16,
+        };
+        WGT_MASK &= !bit;
+        save_number(WIDGETS_MASK_PATH, WGT_MASK);
+        rebuild_pages();
+        layout_current();
+        show_toast(txt("Widget removed", "小组件已移除"));
+        NEEDS_REDRAW = true;
+    }
+}
+
+/// 打开编辑器选择卡（0=壁纸 1=小组件 2=桌面设置 → EDIT_SHEET 1..=3）。
+fn edit_open_sheet(menu_idx: usize) {
+    unsafe {
+        EDIT_SHEET = menu_idx as u8 + 1;
+        EDIT_SHEET_T0 = now_us();
+        SHEET_WALL = WALLPAPER;
+        SHEET_WGT_MASK = WGT_MASK;
+        SHEET_GRID = GRID_COLS;
+        NEEDS_REDRAW = true;
+    }
+}
+
+fn close_edit_sheet() {
+    unsafe {
+        if EDIT_SHEET != 0 {
+            EDIT_SHEET = 0;
+            NEEDS_REDRAW = true;
+        }
+    }
+}
+
+/// 选择卡条目（标题, 选项, 多选）。
+fn edit_sheet_spec() -> (&'static [u8], [&'static [u8]; 5], usize, bool) {
+    unsafe {
+        match EDIT_SHEET {
+            1 => (
+                txt("Wallpaper", "壁纸"),
+                [
+                    txt("Sky Blue", "晨曦蓝"),
+                    txt("Mint Green", "薄荷绿"),
+                    txt("Sunset Orange", "暖阳橙"),
+                    txt("Nebula Purple", "星云紫"),
+                    b"",
+                ],
+                4,
+                false,
+            ),
+            2 => (
+                txt("Widgets", "小组件"),
+                [
+                    txt("Clock", "时钟"),
+                    txt("Weather", "天气"),
+                    txt("Calendar", "日历"),
+                    txt("Photos", "相册"),
+                    txt("Battery", "电池"),
+                ],
+                5,
+                true,
+            ),
+            _ => (
+                txt("Home settings", "桌面设置"),
+                [txt("Grid 4x6", "网格 4x6"), txt("Grid 5x6", "网格 5x6"), b"", b"", b""],
+                2,
+                false,
+            ),
+        }
+    }
+}
+
+/// 选择卡选中态（壁纸 = 暂存值，小组件 = 位掩码，桌面设置 = 当前列数）。
+fn edit_sheet_sel(n: usize) -> u32 {
+    unsafe {
+        match EDIT_SHEET {
+            1 => (SHEET_WALL as u32).min((n.max(1) - 1) as u32),
+            2 => SHEET_WGT_MASK,
+            _ => {
+                if GRID_COLS == 5 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// 确认选择卡：提交临时状态并关闭。
+fn edit_sheet_confirm() {
+    unsafe {
+        match EDIT_SHEET {
+            1 => apply_wallpaper(SHEET_WALL),
+            2 => {
+                WGT_MASK = SHEET_WGT_MASK & 0x1F;
+                save_number(WIDGETS_MASK_PATH, WGT_MASK);
+                rebuild_pages();
+                layout_current();
+                NEEDS_REDRAW = true;
+            }
+            _ => {
+                let cols = if SHEET_GRID == 5 { 5 } else { 4 };
+                if GRID_COLS != cols {
+                    GRID_COLS = cols;
+                    save_number(GRID_PATH, GRID_COLS as u32);
+                    layout_current();
+                }
+                NEEDS_REDRAW = true;
+            }
+        }
+        EDIT_SHEET = 0;
+    }
+}
+
+/// 选择卡点击（模态：吞掉全部点击）。
+fn edit_sheet_tap(x: i32, y: i32) {
+    unsafe {
+        let (_, _items, n, _multi) = edit_sheet_spec();
+        let w = dialog::DLG_W;
+        let h =
+            dialog::DLG_TITLE_H + n as i32 * dialog::DLG_OPT_H + dialog::DLG_BTN_H;
+        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let opts_top = py + dialog::DLG_TITLE_H;
+        if let Some(idx) = dialog::hit_options(x, y, px, opts_top, w, n) {
+            match EDIT_SHEET {
+                1 => SHEET_WALL = idx,
+                2 => SHEET_WGT_MASK ^= 1 << idx,
+                _ => {
+                    // 桌面设置：单选即应用并关闭（OriginOS 快捷语义）。
+                    SHEET_GRID = if idx == 1 { 5 } else { 4 };
+                    edit_sheet_confirm();
+                    return;
+                }
+            }
+            NEEDS_REDRAW = true;
+            return;
+        }
+        match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
+            Some(false) => close_edit_sheet(),
+            Some(true) => edit_sheet_confirm(),
+            None => {
+                if dialog::outside(x, y, px, py, w, h) {
+                    close_edit_sheet();
+                }
+            }
+        }
+    }
+}
+
+/// 编辑条上的图标（壁纸 / 小组件 / 桌面设置，程序化几何绘制）。
+fn draw_edit_icon(i: usize, cx: i32, cy: i32) {
+    let main = COLOR_TEXT_MAIN;
+    match i {
+        0 => {
+            // 壁纸：相框 + 太阳 + 山。
+            draw_round_rect(cx - 17, cy - 13, 34, 26, 6, main);
+            for dy in -4..=4 {
+                for dx in -4..=4 {
+                    if dx * dx + dy * dy <= 14 {
+                        put_pixel(cx - 7 + dx, cy - 6 + dy, COLOR_ACCENT);
+                    }
+                }
+            }
+            draw_line(cx - 13, cy + 9, cx - 2, cy - 4, main);
+            draw_line(cx - 2, cy - 4, cx + 13, cy + 9, main);
+        }
+        1 => {
+            // 小组件：2x2 圆角方块。
+            for (ox, oy) in [(-14i32, -14i32), (2, -14), (-14, 2), (2, 2)] {
+                fill_round_rect(cx + ox, cy + oy, 12, 12, 4, main);
+            }
+        }
+        _ => {
+            // 桌面设置：齿轮（圆环 + 齿 + 中芯）。
+            draw_circle(cx, cy, 11, main);
+            for k in 0..8 {
+                let a = k as f32 * PI / 4.0;
+                let s = fsin(a);
+                let c = fcos(a);
+                draw_line(
+                    cx + (s * 11.0) as i32,
+                    cy - (c * 11.0) as i32,
+                    cx + (s * 16.0) as i32,
+                    cy - (c * 16.0) as i32,
+                    main,
+                );
+            }
+            for dy in -3..=3 {
+                for dx in -3..=3 {
+                    if dx * dx + dy * dy <= 8 {
+                        put_pixel(cx + dx, cy + dy, main);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 底部编辑条（HyperOS 3 风格：磨砂圆角条 + 三个圆形功能按钮）。
+fn draw_edit_menu() {
+    unsafe {
+        let now = now_us();
+        let t = (now.saturating_sub(EDIT_MENU_T0) as f32 / EDIT_MENU_IN_US as f32).min(1.0);
+        let e = Easing::FastOutSlowIn.sample(t);
+        if e <= 0.01 {
+            return;
+        }
+        let dy = (14.0 * (1.0 - e)) as i32;
+        let prev = PIX_ALPHA;
+        PIX_ALPHA = (255.0 * e) as u32;
+        let by = edit_bar_y() + dy;
+        draw_glass(EDIT_BAR_X, by, EDIT_BAR_W, EDIT_BAR_H, 26);
+        let labels: [&[u8]; EDIT_ITEM_NUM] = [
+            txt("Wallpaper", "壁纸"),
+            txt("Widgets", "小组件"),
+            txt("Home settings", "桌面设置"),
+        ];
+        for i in 0..EDIT_ITEM_NUM {
+            let (cx0, cy0) = edit_item_center(i);
+            let cx = cx0;
+            let cy = cy0 + dy;
+            draw_glass(cx - 28, cy - 28, 56, 56, 28);
+            draw_edit_icon(i, cx, cy);
+            let lw = text_width_px(labels[i], 11.0);
+            draw_text_px(cx - lw / 2, cy + 34, labels[i], 11.0, COLOR_TEXT_MAIN);
+        }
+        PIX_ALPHA = prev;
+    }
+}
+
+/// launcher 管线适配 shared/dialog（put_pixel 自带 PIX_ALPHA 全局淡入）。
+struct DlgUi;
+
+impl dialog::DialogUi for DlgUi {
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        put_pixel(x, y, color);
+    }
+    fn back(&self, x: i32, y: i32) -> u32 {
+        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        } else {
+            0
+        }
+    }
+    fn text(&mut self, x: i32, y: i32, s: &[u8], px: f32, color: u32) {
+        draw_text_px(x, y, s, px, color);
+    }
+    fn text_bold(&mut self, x: i32, y: i32, s: &[u8], px: f32, color: u32) {
+        draw_text_px(x, y, s, px, color);
+    }
+    fn text_w(&self, s: &[u8], px: f32) -> i32 {
+        text_width_px(s, px)
+    }
+    fn text_top(&self, px: f32, cy: i32) -> i32 {
+        cy - (px as i32 + 1) / 2
+    }
+    fn fill_row(&mut self, y: i32, x0: i32, x1: i32, color: u32, alpha: u32) {
+        if y < 0 || y >= DISPLAY_H as i32 || x1 <= x0 {
+            return;
+        }
+        let xa = x0.max(0);
+        let xb = x1.min(DISPLAY_W as i32);
+        if xb <= xa {
+            return;
+        }
+        // 选择卡入场期间跟随 PIX_ALPHA 整体淡入（与卡片/文字一致）。
+        unsafe {
+            let a = alpha.min(255) * PIX_ALPHA.min(255) / 255;
+            if a == 0 {
+                return;
+            }
+            let base = y as usize * DISPLAY_W;
+            for idx in base + xa as usize..base + xb as usize {
+                BACK_BUF[idx] = blend(BACK_BUF[idx], color, a);
+            }
+        }
+    }
+}
+
+fn dlg_fill(
+    _ui: &mut dyn dialog::DialogUi,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    c: u32,
+    _a: u32,
+) {
+    fill_round_rect(x, y, w, h, r, c);
+}
+
+fn dlg_stroke(
+    _ui: &mut dyn dialog::DialogUi,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    c: u32,
+    a: u32,
+) {
+    glass::smooth_stroke_rr(&mut LauncherSmooth, x, y, w, h, r, c, a);
+}
+
+/// OriginOS 风格选择卡（壁纸 / 小组件 / 桌面设置）。
+fn draw_edit_sheet() {
+    unsafe {
+        let now = now_us();
+        let t = (now.saturating_sub(EDIT_SHEET_T0) as f32 / EDIT_SHEET_IN_US as f32).min(1.0);
+        let e = Easing::FastOutSlowIn.sample(t);
+        if e <= 0.01 {
+            return;
+        }
+        let (title, items, n, _multi) = edit_sheet_spec();
+        let w = dialog::DLG_W;
+        let h = dialog::DLG_TITLE_H + n as i32 * dialog::DLG_OPT_H + dialog::DLG_BTN_H;
+        let (x, y) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let prev = PIX_ALPHA;
+        PIX_ALPHA = (255.0 * e) as u32;
+        let mut ui = DlgUi;
+        dialog::scrim(&mut ui, DISPLAY_W as i32, DISPLAY_H as i32, 115);
+        dialog::draw_card(&mut ui, dlg_fill, dlg_stroke, x, y, w, h);
+        dialog::draw_title(&mut ui, x, y, w, title);
+        let sel = edit_sheet_sel(n);
+        dialog::draw_options(&mut ui, x, y + dialog::DLG_TITLE_H, w, &items[..n], sel, EDIT_SHEET == 2);
+        dialog::draw_buttons(
+            &mut ui,
+            x,
+            y + h - dialog::DLG_BTN_H,
+            w,
+            txt("Cancel", "取消"),
+            Some((txt("OK", "确定"), false)),
+        );
+        PIX_ALPHA = prev;
     }
 }
 
@@ -4585,6 +5480,7 @@ fn folder_start_open() {
         FOLDER_ANCHOR_X = ax;
         FOLDER_ANCHOR_Y = ay;
         FOLDER_TILE_DIRTY = true;
+        FOLDER_DIM_OK = false;
         NEEDS_REDRAW = true;
         print("[launcher] 已打开文件夹\n");
     }
@@ -4843,18 +5739,24 @@ fn edit_drop(x: i32, y: i32) {
     }
 }
 
-/// 鼠标长按 → 进入编辑模式（与触摸长按一致）。
+/// 鼠标长按 → 进入编辑模式（与触摸长按一致：图标或桌面空白处）。
 fn mouse_long_press(x: i32, y: i32) {
     unsafe {
         if EDIT_MODE || FOLDER_PHASE != FolderPhase::Closed || RENAME_OPEN {
             return;
         }
-        if let Some(p) = hit_item(x, y) {
-            if let ItemKind::App(_) = p.kind {
-                EDIT_MODE = true;
-                show_toast(txt("Edit mode", "编辑模式"));
-                NEEDS_REDRAW = true;
-            }
+        // 控制中心/通知中心展开时不进编辑模式（鼠标长按是主循环按
+        // MOUSE_DOWN 计时触发的，不经过手势分类，需要显式判定；
+        // 触摸路径在 on_blank 分支已有同款检查）。
+        if control_center::cc_visible() {
+            return;
+        }
+        let on_blank = match hit_item(x, y) {
+            Some(p) => matches!(p.kind, ItemKind::App(_)),
+            None => hit_dock(x, y).is_none() && y >= STATUS_H && y < DOCK_Y,
+        };
+        if on_blank {
+            enter_edit_mode();
         }
     }
 }
@@ -4886,6 +5788,38 @@ fn draw_big_text(cx: i32, y: i32, s: &[u8], scale: i32, color: u32) {
     for &c in s {
         draw_big_glyph(x, y, c, scale, color);
         x += 8 * scale;
+    }
+}
+
+/// 8x8 字形文本按浮点倍率居中绘制（最近邻采样）。经 put_pixel 落笔，
+/// 因此支持 PIX_ALPHA 整体透明度（fill_rect 快路径不吃 PIX_ALPHA）。
+/// 供锁屏分钟切换（双时刻错位淡入淡出）与解锁时钟「先扩后散」使用。
+fn draw_big_text_f(cx: i32, y: i32, s: &[u8], scale: f32, color: u32) {
+    if !(scale > 0.0) {
+        return;
+    }
+    let gw = ((8.0 * scale + 0.5) as i32).max(1);
+    let total_w = s.len() as i32 * gw;
+    let mut x = cx - total_w / 2;
+    for &c in s {
+        let g = glyph(c);
+        for oy in 0..gw {
+            let sy = (oy as f32 / scale) as usize;
+            if sy >= 8 {
+                break;
+            }
+            let bits = g[sy];
+            if bits == 0 {
+                continue;
+            }
+            for ox in 0..gw {
+                let sx = (ox as f32 / scale) as usize;
+                if sx < 8 && bits & (0x80 >> sx) != 0 {
+                    put_pixel(x + ox, y + oy, color);
+                }
+            }
+        }
+        x += gw;
     }
 }
 
@@ -5025,10 +5959,56 @@ fn draw_lock_content(off: i32) {
         } else {
             COLOR_TEXT_MAIN
         };
-        // 大时钟 HH:MM（8x8 字形 5 倍放大）。
+        // 大时钟 HH:MM（8x8 字形 5 倍放大）。分钟切换时旧时刻上移 12px
+        // 淡出、新时刻自上方 12px 下移入场（320ms Emphasized，鸿蒙锁屏
+        // 时钟规格）；解锁转场中时钟「先扩后散」（scale 1.0→1.12 + 淡出）。
         let mut hhmm = [0u8; 5];
         time_hhmm(&mut hhmm);
-        draw_big_text(DISPLAY_W as i32 / 2, 150 + off, &hhmm, 5, clock_col);
+        let base_y = 150 + off;
+        if LOCK_PHASE == LockPhase::Unlocking {
+            let span = DISPLAY_H as f32 + LOCK_FROM;
+            let e = if span > 0.0 {
+                ((LOCK_FROM - off as f32) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let pa = PIX_ALPHA;
+            PIX_ALPHA = ((255.0 * (1.0 - e)) as u32).min(255);
+            draw_big_text_f(
+                DISPLAY_W as i32 / 2,
+                base_y,
+                &hhmm,
+                5.0 * (1.0 + 0.12 * e),
+                clock_col,
+            );
+            PIX_ALPHA = pa;
+        } else if LOCK_MIN_T0 != u64::MAX
+            && now_us().saturating_sub(LOCK_MIN_T0) < 320_000
+        {
+            let e = Easing::Emphasized
+                .sample((now_us().saturating_sub(LOCK_MIN_T0)) as f32 / 320_000.0);
+            let pa = PIX_ALPHA;
+            PIX_ALPHA = ((255.0 * (1.0 - e)) as u32).min(255);
+            draw_big_text_f(
+                DISPLAY_W as i32 / 2,
+                base_y - (12.0 * e) as i32,
+                &LOCK_PREV_HHMM,
+                5.0,
+                clock_col,
+            );
+            PIX_ALPHA = ((255.0 * e) as u32).min(255);
+            draw_big_text_f(
+                DISPLAY_W as i32 / 2,
+                base_y - (12.0 * (1.0 - e)) as i32,
+                &hhmm,
+                5.0,
+                clock_col,
+            );
+            PIX_ALPHA = pa;
+        } else {
+            draw_big_text(DISPLAY_W as i32 / 2, base_y, &hhmm, 5, clock_col);
+            LOCK_SHOWN_HHMM = hhmm;
+        }
         // 日期行（YYYY-MM-DD，8x8 字形 1 倍）。
         let us = now_us();
         let secs = (us / 1_000_000) as i64;
@@ -5419,10 +6399,26 @@ fn render_frame() {
         match MOTION.phase {
             // 转场期间：从快照缩放合成，避免重绘桌面内容
             Phase::Launch => {
-                launch_blit(MOTION.cur_scale, MOTION.cx, MOTION.cy, MOTION.cur_fade);
+                launch_blit(
+                    MOTION.cur_scale,
+                    MOTION.cx,
+                    MOTION.cy,
+                    MOTION.cur_fade,
+                    MOTION.cur_stretch,
+                );
             }
             Phase::Return => {
-                zoom_blit(MOTION.cur_scale, MOTION.cx, MOTION.cy, MOTION.cur_fade);
+                if app_launch::desk_prerendered() {
+                    // 桌面预渲染模式：缩回的应用帧叠加在预渲染桌面上，
+                    // ColorOS 式「缩回图标、桌面在四周浮现」，无白闪。
+                    app_launch::return_blit_over_desktop(
+                        MOTION.cur_scale,
+                        MOTION.cx,
+                        MOTION.cy,
+                    );
+                } else {
+                    zoom_blit(MOTION.cur_scale, MOTION.cx, MOTION.cy, MOTION.cur_fade);
+                }
             }
             // 恢复转场：应用末帧快照（FRAME_BUF）从图标原位放大到全屏。
             Phase::Resume => {
@@ -5458,7 +6454,16 @@ fn draw_desktop_full() {
         draw_dock();
         // 文件夹（含打开/关闭 350ms 弹簧缩放动画）
         if FOLDER_PHASE != FolderPhase::Closed {
-            dim_screen();
+            // 压暗桌面缓存：文件夹打开期间桌面静止，首帧 LUT 压暗一次存档，
+            // 后续帧整块 memcpy（52 万像素 ×3 通道查表 → 2MB 拷贝）。
+            // 失效：横幅入退场（桌面内容变化）/ 壁纸淡化 / 重新打开。
+            if FOLDER_DIM_OK && !banner_anim_active() && !wallpaper_fade_active() {
+                BACK_BUF.copy_from_slice(&FOLDER_DIM_BUF);
+            } else {
+                dim_screen();
+                FOLDER_DIM_BUF.copy_from_slice(&BACK_BUF);
+                FOLDER_DIM_OK = true;
+            }
             if FOLDER_TILE_DIRTY {
                 folder_build_tile();
             }
@@ -5476,6 +6481,16 @@ fn draw_desktop_full() {
         }
         // 控制中心 / 通知中心（覆盖桌面与最近任务，导航栏之上）。
         control_center::cc_draw();
+        // 桌面编辑器（HyperOS 3）：底部编辑条 + OriginOS 选择卡（导航栏之下）。
+        if unsafe { EDIT_MODE } {
+            draw_edit_hud();
+        }
+        if unsafe { EDIT_MENU } {
+            draw_edit_menu();
+        }
+        if unsafe { EDIT_SHEET != 0 } {
+            draw_edit_sheet();
+        }
         draw_nav_bar();
         // 打断动画（ColorOS 撕裂）：应用图标（桌面原位已被隐藏）在飞行位置
         // 撕成上下两半绘制；撕裂进度越大，向白色淡出越明显。
@@ -5914,14 +6929,33 @@ fn draw_recents() {
                 cy += back_off;
             }
             cy += drop;
+            // 伪 3D 纵深（鸿蒙多任务透视，纯缩放近似）：距首位（最近应用）
+            // 第 i 槽的卡 scale = 1-0.055i、y 下移 9i px、整体 alpha = 1-0.08i，
+            // 围绕卡片中心缩放。跟手清理的卡随上拖抬升回全尺寸（60px 内）。
+            let di = i as f32;
+            let mut s = 1.0f32 - 0.055 * di;
+            if REC_DRAG_SLOT == i {
+                let lift = ((REC_DRAG_Y.min(0).abs()) as f32 / 60.0).min(1.0);
+                s += (1.0 - s) * lift;
+            }
+            let cw = (RECENTS_CARD_W as f32 * s) as i32;
+            let ch = (RECENTS_CARD_H as f32 * s) as i32;
+            let gx = cx + (RECENTS_CARD_W - cw) / 2;
+            let gy = cy + (9 * i as i32) + (RECENTS_CARD_H - ch) / 2;
+            let depth_alpha =
+                (((1.0f32 - 0.08 * di) * 255.0).max(0.0) as u32).min(255);
+            let prev_alpha = PIX_ALPHA;
+            PIX_ALPHA = (prev_alpha * depth_alpha / 255).min(255);
             // 液态玻璃卡片（模糊压暗的桌面 + 圆角 + 高光描边）。
-            draw_glass(cx, cy, RECENTS_CARD_W, RECENTS_CARD_H, 18);
-            let ix = cx + (RECENTS_CARD_W - ICON_SIZE) / 2;
-            let iy = cy + 24;
-            draw_app_icon(app, ix, iy, ICON_SIZE);
+            draw_glass(gx, gy, cw, ch, (18.0 * s) as i32);
+            let isize = (ICON_SIZE as f32 * s) as i32;
+            let ix = gx + (cw - isize) / 2;
+            let iy = gy + (24.0 * s) as i32;
+            draw_app_icon(app, ix, iy, isize);
             let name = app.display_name().as_bytes();
-            let tx = cx + (RECENTS_CARD_W - text_width(name)) / 2;
-            draw_text(tx, iy + ICON_SIZE + 10, name, COLOR_TEXT_MAIN);
+            let tx = gx + (cw - text_width(name)) / 2;
+            draw_text(tx, iy + isize + (10.0 * s) as i32, name, COLOR_TEXT_MAIN);
+            PIX_ALPHA = prev_alpha;
         }
         // 上飞中的卡最后绘制（位于最上层，200ms FastOutLinearIn 上飞出屏）。
         if REC_FLY_APP != usize::MAX {
@@ -6136,7 +7170,7 @@ fn remove_app(app_idx: usize) {
             }
             filter_modules();
             CURRENT_PAGE = CURRENT_PAGE.min(page_count() - 1);
-            EDIT_MODE = false;
+            exit_edit_mode();
             EDIT_APP = usize::MAX;
             show_toast(txt("App removed", "应用已移除"));
         }
@@ -6151,9 +7185,9 @@ const TOUCH_MAX_Y: i32 = 960;
 
 /// 手势分类阈值。
 const TAP_MAX_DIST: i32 = 10; // 点击最大位移（px）
-const TAP_MAX_MS: u64 = 500; // 点击最大持续时间（ms）
+const TAP_MAX_MS: u64 = 1000; // 点击最大持续时间（ms）
 const SWIPE_MIN_DIST: i32 = 30; // 滑动最小位移（px）
-const LONG_PRESS_MS: u64 = 500; // 长按最小持续时间（ms，进入编辑模式）
+const LONG_PRESS_MS: u64 = 1000; // 长按最小持续时间（ms，进入编辑模式）
 
 /// linux input_event 事件类型 / 码。
 const EV_SYN: u16 = 0x00;
@@ -6166,6 +7200,8 @@ const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
 const BTN_TOUCH: u16 = 0x14a; // 330
 const BTN_LEFT: u16 = 0x110; // 272
+const KEY_VOLUMEUP: u16 = 115;
+const KEY_VOLUMEDOWN: u16 = 116;
 
 /// 鼠标指针状态：位置（屏幕像素，相对移动累积）、是否按下、是否已移动进入系统。
 static mut CURSOR_X: i32 = 270;
@@ -6332,7 +7368,11 @@ fn process_events(buf: &[u8]) -> (Option<Gesture>, bool) {
                 }
             },
             EV_KEY => {
-                if code == BTN_LEFT {
+                if code == KEY_VOLUMEUP && value == 1 {
+                    unsafe { volume_key_step(true) };
+                } else if code == KEY_VOLUMEDOWN && value == 1 {
+                    unsafe { volume_key_step(false) };
+                } else if code == BTN_LEFT {
                     // 鼠标左键（QEMU GUI 的 virtio-tablet 点击也以 BTN_LEFT 上报）：
                     // 与 BTN_TOUCH 共用同一套完整手势识别 —— 点击 / 滑动 /
                     // 底部上滑 / 边缘返回 / 长按，使 QEMU 下全面屏手势同样可用。
@@ -6593,20 +7633,34 @@ fn handle_gesture(g: Gesture) -> bool {
                     edit_drop(x, y);
                     return true;
                 }
-                if grid_toggle_hit(x, y) {
-                    toggle_grid();
+                // 编辑选择卡打开：模态，吞掉全部点击。
+                if unsafe { EDIT_SHEET != 0 } {
+                    edit_sheet_tap(x, y);
                     return true;
+                }
+                // 底部编辑条：壁纸 / 小组件 / 桌面设置（HyperOS 3）。
+                if unsafe { EDIT_MENU } {
+                    if let Some(i) = edit_item_hit(x, y) {
+                        edit_open_sheet(i);
+                        return true;
+                    }
+                    let by = edit_bar_y();
+                    if x >= EDIT_BAR_X && x < EDIT_BAR_X + EDIT_BAR_W && y >= by && y < by + EDIT_BAR_H {
+                        // 点编辑条空白（非按钮）不退出编辑。
+                        return true;
+                    }
                 }
                 if let Some(p) = hit_item(x, y) {
                     match p.kind {
                         ItemKind::App(app) => remove_app(app),
-                        ItemKind::Folder => folder_start_open(),
-                        _ => {}
+                        ItemKind::Folder => {
+                            exit_edit_mode();
+                            folder_start_open();
+                        }
+                        ItemKind::Widget(k) => edit_remove_widget(k),
                     }
                 } else {
-                    unsafe {
-                        EDIT_MODE = false;
-                    }
+                    exit_edit_mode();
                 }
                 return true;
             }
@@ -6675,7 +7729,7 @@ fn handle_gesture(g: Gesture) -> bool {
                 cancel_press();
                 return true;
             }
-            if dx.abs() > SWIPE_MIN_DIST {
+            if dx.abs() > SWIPE_MIN_DIST && unsafe { MOTION.phase != Phase::Return } {
                 if unsafe { BOOT_ACTIVE } {
                     // 渐进式启动期间保持瞬切（相邻页图标缓存尚未按需构建）。
                     unsafe {
@@ -6708,16 +7762,16 @@ fn handle_gesture(g: Gesture) -> bool {
                         edit_drop(ex, ey);
                     }
                 } else if FOLDER_PHASE == FolderPhase::Closed && !RENAME_OPEN {
-                    // 长按 500ms 进入编辑模式（仅应用图标）。
-                    if let Some(p) = hit_item(x, y) {
-                        if let ItemKind::App(_) = p.kind {
-                            EDIT_MODE = true;
-                            show_toast(txt(
-                                "Edit mode: drag to move, tap to remove",
-                                "编辑模式：拖动移动，点击移除",
-                            ));
-                            NEEDS_REDRAW = true;
-                        }
+                    // 长按应用图标 / 桌面空白处（HyperOS 3）→ 编辑模式 + 底部编辑条。
+                    let on_blank = match hit_item(x, y) {
+                        Some(p) => matches!(p.kind, ItemKind::App(_)),
+                        None => hit_dock(x, y).is_none()
+                            && y >= STATUS_H
+                            && y < DOCK_Y
+                            && !control_center::cc_visible(),
+                    };
+                    if on_blank {
+                        enter_edit_mode();
                     }
                 }
             }
@@ -6760,7 +7814,7 @@ fn handle_gesture(g: Gesture) -> bool {
                         CURRENT_PAGE = 0;
                         SHADE_OPEN = false;
                         recents_close();
-                        EDIT_MODE = false;
+                        exit_edit_mode();
                         RENAME_OPEN = false;
                         FOLDER_PHASE = FolderPhase::Closed;
                         FOLDER_LAUNCH = usize::MAX;
@@ -7165,7 +8219,12 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             unsafe {
                 LAST_MINUTE = minute;
                 if LOCKED || FOLDER_PHASE != FolderPhase::Closed || RENAME_OPEN {
-                    // 覆盖层（锁屏/文件夹/重命名）按原整屏路径
+                    // 覆盖层（锁屏/文件夹/重命名）按原整屏路径。文件夹打开
+                    // 期间压暗缓存会把重绘的新帧 memcpy 抹回旧帧（状态栏
+                    // 时间停走）——重绘前先失效缓存。
+                    if FOLDER_PHASE != FolderPhase::Closed {
+                        FOLDER_DIM_OK = false;
+                    }
                     NEEDS_REDRAW = true;
                 } else if CURRENT_PAGE != 0 {
                     // 其余页面：状态栏行局部重绘
@@ -7187,10 +8246,15 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         if unsafe { sec != LAST_SECOND } {
             unsafe {
                 LAST_SECOND = sec;
+                // 页 0 时钟小组件被编辑器移除（WGT_MASK bit0=0）且最近任务
+                // 未开时，秒级无内容可更新：跳过 —— 否则局部重绘恒返回
+                // false，退化为每秒一次整屏 render_frame（TCG 50~150ms 常驻
+                // 卡顿）。
                 if CURRENT_PAGE == 0
                     && !LOCKED
                     && FOLDER_PHASE == FolderPhase::Closed
                     && !RENAME_OPEN
+                    && (WGT_MASK & 1 != 0 || RECENTS_OPEN)
                 {
                     // 秒针更新走小组件局部重绘（~5ms），不再整屏 render_frame
                     //（整屏路径 TCG 下 50~150ms，每秒卡顿一次即「鼠标非常卡」）。
@@ -7213,7 +8277,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
             }
         }
-        // 1.4 鼠标长按（500ms）进入编辑模式。
+        // 1.4 鼠标长按（1000ms / 1秒）进入编辑模式。
         if unsafe { MOUSE_DOWN && !MOUSE_LONG && now > MOUSE_PRESS_US + LONG_PRESS_MS * 1000 } {
             unsafe {
                 MOUSE_LONG = true;
@@ -7225,6 +8289,15 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // cloud 应用写 /data/oobe/locked=1；launcher 每秒检查一次即时上锁）。
         if unsafe { LOCKED && minute != LOCK_MINUTE } {
             unsafe {
+                if LOCK_MINUTE != u64::MAX && LOCK_MIN_T0 != u64::MAX {
+                    // 分钟切换转场：记录上一时刻，320ms 双时刻错位入场。
+                    LOCK_PREV_HHMM = LOCK_SHOWN_HHMM;
+                    LOCK_MIN_T0 = now;
+                } else {
+                    // 首次上屏无旧值，直接落位并解锁转场标记。
+                    time_hhmm(&mut LOCK_SHOWN_HHMM);
+                    LOCK_MIN_T0 = u64::MAX;
+                }
                 LOCK_MINUTE = minute;
                 NEEDS_REDRAW = true;
             }
@@ -7408,7 +8481,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
         // 2.5 运动推进：活动动画期间每帧重绘（按压反馈 / 启动转场 / 返回转场
         //     / 文件夹打开关闭 / 控制中心展开收起与按压回弹 / 通知中心 /
-        //     编辑模式图标抖动 / 桌面翻页吸附 / 最近任务动效 / 锁屏转场）。
+        //     编辑模式图标抖动（~30fps 节流）/ 桌面翻页吸附 / 最近任务动效 /
+        //     锁屏转场 / Toast 入退场动画窗口 / 编辑条与选择卡入场）。
         if motion_advance(now)
             || folder_advance(now)
             || control_center::cc_advance(now)
@@ -7417,8 +8491,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             || lock_advance(now)
             || wallpaper_fade_active()
             || lock_charging_anim()
+            || lock_minute_anim_active(now)
             || banner_anim_active()
-            || unsafe { RIPPLE_ACTIVE || TOAST_UNTIL > now || EDIT_MODE }
+            || unsafe { RIPPLE_ACTIVE }
+            || toast_anim_active(now)
+            || vol_hud_active(now)
+            || edit_anim_due(now)
+            || edit_overlay_anim_active(now)
         {
             unsafe {
                 NEEDS_REDRAW = true;
@@ -7433,6 +8512,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             // 整屏重绘后，把光标以 overlay 形式画回显存 FB（小脏区 present）。
             draw_cursor_overlay();
             unsafe {
+                // 编辑模式抖动帧节流基准（edit_anim_due 据此保持 ~30fps）。
+                if EDIT_MODE {
+                    EDIT_LAST_FRAME = now;
+                }
                 NEEDS_REDRAW = false;
             }
             unsafe {

@@ -5,9 +5,18 @@ Permissions: STORAGE
 Depends: libc >=1.0.0,libm >=1.0.0
 Conflicts: legacy-notes
 Description: 备忘录（示例应用）
-Filename: notes-0.9.0.kunx
-Size: 120544
-KunxHash: 7be89122819fee94f9f8d6582db7d938
+Filename: files/notes-0.9.0.kunx
+Size: 124640
+KunxHash: dc4a0ed987583d3fac3798e46905c08b
+SignedBy: kunx-repo
+
+Package: badsig
+Version: 1.0.0
+ApiLevel: 1
+Description: 签名损坏示例：有效证书链 + 被篡改的包签名（负例，必须拒绝安装）
+Filename: files/badsig-1.0.0.kunx
+Size: 655
+KunxHash: 1ca9ff6a994a36fa277fba95f9c1f40e
 SignedBy: kunx-repo
 
 Package: calculator
@@ -17,9 +26,59 @@ Permissions: INTERNET,LOCATION
 Depends: libc >=1.0.0
 Provides: calc
 Description: KunxOS 计算器（示例）
-Filename: calculator-1.0.0.kunx
-Size: 108266
-KunxHash: 1423eed9a9195b70bdef698656fd560b
+Filename: files/calculator-1.0.0.kunx
+Size: 112362
+KunxHash: b5759d76945e5876d86e2cd91ee47fd4
+SignedBy: kunx-repo
+
+Package: cyc-a
+Version: 1.0.0
+ApiLevel: 1
+Depends: cyc-b >=1.0.0
+Description: 依赖环示例：cyc-a 依赖 cyc-b（负例，安装必须报环错误）
+Filename: files/cyc-a-1.0.0.kunx
+Size: 631
+KunxHash: deab9fa58634c21913c524138baa9858
+SignedBy: kunx-repo
+
+Package: cyc-b
+Version: 1.0.0
+ApiLevel: 1
+Depends: cyc-a >=1.0.0
+Description: 依赖环示例：cyc-b 依赖 cyc-a（负例，安装必须报环错误）
+Filename: files/cyc-b-1.0.0.kunx
+Size: 631
+KunxHash: 7d09f4c4d712010652d68f0898ae92f4
+SignedBy: kunx-repo
+
+Package: depdemo
+Version: 1.0.0
+ApiLevel: 1
+Depends: libgfx >=1.0.0,libbase >=1.2.0
+Description: 依赖链示例：目标应用（菱形依赖 libgfx + libbase）
+Filename: files/depdemo-1.0.0.kunx
+Size: 109491
+KunxHash: 0750b6ab48240798999478f88215b95e
+SignedBy: kunx-repo
+
+Package: missingdep
+Version: 1.0.0
+ApiLevel: 1
+Depends: ghost-lib >=9.0.0
+Description: 缺失依赖示例：依赖软件源中不存在的 ghost-lib（负例）
+Filename: files/missingdep-1.0.0.kunx
+Size: 652
+KunxHash: c6db16b71d4462ae1d367e83802f8a6a
+SignedBy: kunx-repo
+
+Package: libgfx
+Version: 1.1.0
+ApiLevel: 1
+Depends: libc >=1.0.0,libbase >=1.0.0
+Description: 依赖链示例：图形库（依赖 libbase，二级依赖）
+Filename: files/libgfx-1.1.0.kunx
+Size: 109483
+KunxHash: 8f43e40275b4501453ff2eee602af054
 SignedBy: kunx-repo
 
 Package: terminal
@@ -29,8 +88,18 @@ Permissions: INTERNET
 Depends: libc >=1.0.0
 Provides: term
 Description: 系统终端模拟器
-Filename: terminal-1.1.0.kunx
-Size: 150177
-KunxHash: 48eefbe42007a1d6f53506c2afc24d2a
+Filename: files/terminal-1.1.0.kunx
+Size: 154081
+KunxHash: e56f775b25df58b8526592ceb86ef81a
+SignedBy: kunx-repo
+
+Package: libbase
+Version: 1.2.0
+ApiLevel: 1
+Depends: libc >=1.0.0
+Description: 依赖链示例：基础库（多级依赖的底层）
+Filename: files/libbase-1.2.0.kunx
+Size: 109456
+KunxHash: 872b4768de1ce337d8b0240fab991cbb
 SignedBy: kunx-repo
 

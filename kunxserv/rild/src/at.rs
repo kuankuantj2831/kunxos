@@ -21,7 +21,10 @@ pub enum Final {
 }
 
 /// 单行缓冲上限（AT 命令 / URC 行）。
-const LINE_CAP: usize = 160;
+/// 行缓冲上限：内核虚拟 modem 的 CMGR 回吐 PDU hex 最长 420 字符
+/// （PDU_HEX_MAX），160 会把正文 >~50 个 GSM7 字符的短信截成半截 PDU
+/// （解码失败、短信滞留 modem 槽位，用户永远看不到）。
+const LINE_CAP: usize = 448;
 /// 命令响应缓冲上限（+CMGR 的 PDU 行等）。
 pub const RESP_CAP: usize = 512;
 /// 命令超时（毫秒）。
@@ -216,6 +219,13 @@ impl At {
                 self.pending = false;
                 return;
             }
+            // ★ 已知 URC 前缀仍派发：pending 期间到达的 +CMTI（新短信）/
+            // +CRING（来电）此前被拷进响应缓冲后丢弃 —— 发一条短信的
+            // 3 秒窗口内到达的短信从此无人取、来电完全不可见。
+            if is_urc(line) {
+                crate::ril::on_urc(line);
+                return;
+            }
             // 普通响应行：拷入响应缓冲
             if !line.is_empty() && self.resp_len + line.len() + 1 <= self.resp_cap {
                 unsafe {
@@ -231,6 +241,17 @@ impl At {
             crate::ril::on_urc(line);
         }
     }
+}
+
+/// 已知 URC 前缀（命令等待期也不可吞）。
+fn is_urc(line: &[u8]) -> bool {
+    const PREFIXES: [&[u8]; 5] = [b"+CMTI:", b"+CRING", b"RING", b"+CREG:", b"NO CARRIER"];
+    for p in PREFIXES.iter() {
+        if line.len() >= p.len() && &line[..p.len()] == *p {
+            return true;
+        }
+    }
+    false
 }
 
 /// 解析最终结果行：OK / ERROR / +CME ERROR: n / +CMS ERROR: n。

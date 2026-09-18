@@ -29,7 +29,11 @@ mod cjk_font;
 #[path = "../../../shared/app_kit.rs"]
 mod kit;
 
+#[path = "../../../shared/motion.rs"]
+mod motion;
+
 use kit::*;
+use motion::{PrState, PullRefresh};
 
 mod store;
 mod modem;
@@ -80,6 +84,93 @@ static mut INPUT_STAGE: u8 = 0;
 static mut NOTICE: [u8; 48] = [0; 48];
 static mut NOTICE_LEN: usize = 0;
 static mut NOTICE_TILL: u64 = 0;
+/// 会话列表下拉刷新（P1-6：跟手 1:1 → 越界 0.35x 阻尼 → 松手回弹 + 三圆点 loader）。
+static mut PULL: PullRefresh = PullRefresh::new();
+
+// ==================== 页面切换转场（P0-2，settings 同款整页滑动） ====================
+
+/// 离场页整帧快照（2MB BSS，与 BACK_BUF 同级）。
+static mut SNAP_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+/// 转场起始时刻；0 = 无转场。
+static mut TRANS_T0: u64 = 0;
+/// true = 推入（列表 → 子页）；false = 弹出（子页 → 列表）。
+static mut TRANS_PUSH: bool = false;
+/// 转场时长（鸿蒙页面转场 240ms FastOutSlowIn）。
+const TRANS_DUR: u64 = 240_000;
+
+/// 向黑色压暗 `a/255`。
+fn shade(c: u32, a: u32) -> u32 {
+    let r = ((c >> 16) & 0xFF) * a / 255;
+    let g = ((c >> 8) & 0xFF) * a / 255;
+    let b = (c & 0xFF) * a / 255;
+    (r << 16) | (g << 8) | b
+}
+
+/// 把离场页整帧从 BACK_BUF 拷贝到 SNAP_BUF（切换 VIEW 前调用）。
+fn snapshot_page() {
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            BACK_BUF.as_ptr(),
+            SNAP_BUF.as_mut_ptr(),
+            DISPLAY_W * DISPLAY_H,
+        );
+    }
+}
+
+/// 发起转场：记录时刻与方向。
+fn begin_transition(push: bool, now: u64) {
+    unsafe {
+        TRANS_PUSH = push;
+        TRANS_T0 = now;
+    }
+}
+
+/// 页面转场合成（行级平移 + 快照补底 + 10px 接缝阴影，settings 同款）：
+/// push = 新页自右滑入、左侧 off 列补旧页快照；pop = 父页左移入位、
+/// 右侧 off 列被子页快照覆盖。
+fn compose_transition(e: f32) {
+    if e >= 1.0 {
+        return;
+    }
+    unsafe {
+        let w = DISPLAY_W;
+        let off = ((1.0 - e) * w as f32) as usize;
+        if off == 0 {
+            return;
+        }
+        for y in 0..DISPLAY_H {
+            let row = y * w;
+            if TRANS_PUSH {
+                for x in (off..w).rev() {
+                    BACK_BUF[row + x] = BACK_BUF[row + x - off];
+                }
+                for x in 0..off {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x];
+                }
+                for s in 0..10 {
+                    if s < off {
+                        let x = off - 1 - s;
+                        BACK_BUF[row + x] = shade(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            } else {
+                for x in 0..w - off {
+                    BACK_BUF[row + x] = BACK_BUF[row + x + off];
+                }
+                for x in (w - off)..w {
+                    BACK_BUF[row + x] = SNAP_BUF[row + x - (w - off)];
+                }
+                let c = w - off;
+                for s in 0..10 {
+                    if s < off && c > s {
+                        let x = c - 1 - s;
+                        BACK_BUF[row + x] = shade(BACK_BUF[row + x], (90 - 9 * s) as u32);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ==================== 文件工具 ====================
 
@@ -196,7 +287,29 @@ fn draw_list() {
     draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("短信".as_bytes());
     draw_notice();
-    let mut y = LIST_TOP;
+    // 下拉刷新指示：Pulling 单圆点随位移放大；Loading 三圆点错峰缩放。
+    unsafe {
+        let off = PULL.pull as i32;
+        match PULL.state {
+            PrState::Pulling => {
+                if off > 4 {
+                    let cy = LIST_TOP + (off / 2).min(28);
+                    let r = 3 + (off * 5 / PULL.trigger as i32).min(5);
+                    draw_disc(DISPLAY_W as i32 / 2, cy, r, C_ACCENT);
+                }
+            }
+            PrState::Loading => {
+                let now = kit::now_us();
+                for d in 0..3usize {
+                    let r = 2 + (PULL.loader_phase(now, d) * 3.0) as i32;
+                    let cx = DISPLAY_W as i32 / 2 + (d as i32 - 1) * 16;
+                    draw_disc(cx, LIST_TOP + 20, r, C_ACCENT);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut y = LIST_TOP + unsafe { PULL.pull as i32 };
     for c in 0..unsafe { CONV_N } {
         let conv = unsafe { &CONVS[c] };
         let m = unsafe { &MSGS[conv.last] };
@@ -339,6 +452,15 @@ fn render() {
                 }
             }
         }
+        // 页面转场合成（目标页已画进 BACK_BUF，叠加滑动 + 快照补底）。
+        if TRANS_T0 != 0 {
+            let now = kit::now_us();
+            let p = motion::progress(TRANS_T0, TRANS_DUR, now);
+            compose_transition(motion::Easing::FastOutSlowIn.eval(p));
+            if p >= 1.0 {
+                TRANS_T0 = 0;
+            }
+        }
     }
 }
 
@@ -359,6 +481,8 @@ fn send_message() {
         INPUT_LEN = 0;
         INPUT_NUM_LEN = 0;
         INPUT_STAGE = 0;
+        snapshot_page();
+        begin_transition(false, crate::kit::now_us());
         VIEW = u32::MAX;
     }
 }
@@ -392,7 +516,37 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             unsafe { exit(nav_exit_code(ev.nav)); }
         }
 
-        if let Some((x, y)) = ev.tap {
+        // 下拉刷新（仅会话列表页；起点在列表区、避开底部按钮）。
+        let pull_ok = unsafe {
+            VIEW == u32::MAX && TOUCH_PY > LIST_TOP && TOUCH_PY < DISPLAY_H as i32 - 96
+        };
+        if unsafe { PULL.frame(pull_ok && TOUCH_DOWN, CUR_Y, TOUCH_PY, kit::now_us()) } {
+            dirty = true;
+        }
+        if unsafe { PULL.just_triggered() } {
+            store::init_db();
+            modem::poll();
+            unsafe { PULL.mark_ready(); }
+            set_notice("已刷新".as_bytes());
+        }
+        if unsafe { PULL.step(kit::now_us()) } {
+            dirty = true;
+        }
+        // 下拉松手不是点击：吞掉本帧 tap。
+        let mut tap = ev.tap;
+        if tap.is_some() && unsafe { PULL.ate_tap() } {
+            tap = None;
+        }
+        // 转场进行中：逐帧重绘推进。
+        if unsafe { TRANS_T0 != 0 } {
+            dirty = true;
+        }
+        // 光随指动：玻璃高光缓动中则重绘。
+        if kit::light_animating() {
+            dirty = true;
+        }
+
+        if let Some((x, y)) = tap {
             let view = unsafe { VIEW };
             match view {
                 u32::MAX => {
@@ -404,22 +558,37 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= DISPLAY_H as i32 - 84
                         && y < DISPLAY_H as i32 - 24
                     {
-                        unsafe { VIEW = 0xFE; }
+                        unsafe {
+                            snapshot_page();
+                            begin_transition(true, kit::now_us());
+                            VIEW = 0xFE;
+                        }
                         dirty = true;
                         continue;
                     }
-                    // 会话行
-                    let row = (y - LIST_TOP - unsafe { SCROLL }) / ROW_H;
-                    if row >= 0 && (row as usize) < unsafe { CONV_N } {
-                        unsafe { VIEW = row as u32; }
-                        print("[sms] 已打开会话\n");
-                        store::mark_conv_read(row as usize);
-                        dirty = true;
+                    // 会话行（★ y < LIST_TOP 时负数整除向零截断：-56/84 == 0，
+                    // 点标题栏/通知条会误开第一个会话——先做下界检查）
+                    if y >= LIST_TOP + unsafe { SCROLL } {
+                        let row = (y - LIST_TOP - unsafe { SCROLL }) / ROW_H;
+                        if row >= 0 && (row as usize) < unsafe { CONV_N } {
+                            unsafe {
+                                snapshot_page();
+                                begin_transition(true, kit::now_us());
+                                VIEW = row as u32;
+                            }
+                            print("[sms] 已打开会话\n");
+                            store::mark_conv_read(row as usize);
+                            dirty = true;
+                        }
                     }
                 }
                 0xFE => {
                     if back_hit(x, y) {
-                        unsafe { VIEW = u32::MAX; }
+                        unsafe {
+                            snapshot_page();
+                            begin_transition(false, kit::now_us());
+                            VIEW = u32::MAX;
+                        }
                         dirty = true;
                     } else if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= DISPLAY_H as i32 - 110
                         && y < DISPLAY_H as i32 - 46
@@ -432,7 +601,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
                 _ => {
                     if back_hit(x, y) {
-                        unsafe { VIEW = u32::MAX; }
+                        unsafe {
+                            snapshot_page();
+                            begin_transition(false, kit::now_us());
+                            VIEW = u32::MAX;
+                        }
                         dirty = true;
                     }
                 }
@@ -475,7 +648,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                             unsafe { INPUT_NUM_LEN -= 1; }
                             dirty = true;
                         } else {
-                            unsafe { VIEW = u32::MAX; }
+                            unsafe {
+                                snapshot_page();
+                                begin_transition(false, kit::now_us());
+                                VIEW = u32::MAX;
+                            }
                             dirty = true;
                         }
                     } else if unsafe { INPUT_LEN } > 0 {
@@ -522,7 +699,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             KeyAction::Esc => {
                 let view = unsafe { VIEW };
                 if view != u32::MAX {
-                    unsafe { VIEW = u32::MAX; }
+                    unsafe {
+                        snapshot_page();
+                        begin_transition(false, kit::now_us());
+                        VIEW = u32::MAX;
+                    }
                     dirty = true;
                 } else {
                     print("[sms] ESC -> 退出\n");

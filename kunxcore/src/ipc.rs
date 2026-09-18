@@ -543,6 +543,11 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
     if page == 0 {
         return 0;
     }
+    // ★ 记录登记 + refs 更新是竞态临界区：syscall 上下文 IRQ 使能，tick
+    // 抢占夹在 refs 读-改-写之间、与另一任务对同一 shm 的 map/close 并发，
+    // 会丢一次递增/递减 → refs 提前归零释放仍被映射的物理页（UAF）。
+    // 与 shm_close_index 同款屏蔽（本文件其余 add/drop 均有）。
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         let mut recorded = false;
         let mut free_slot = false;
@@ -561,6 +566,7 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
         // 建立页表映射但不加入记录——刷新引用归零后该进程页表仍引用已释放的
         // 物理页（use-after-free）。记录表满时**拒绝本次映射**，不留无记录映射。
         if !recorded && !free_slot {
+            unsafe { asm!("msr daifclr, #2") };
             return 0;
         }
         // 只对「新登记」+1：已登记（幂等重复映射）不重复计数——此前重复映射会
@@ -569,6 +575,7 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
             SHMS[entry.index].refs = SHMS[entry.index].refs.saturating_add(1);
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
     process::map_user_page(vaddr, page);
     page
 }
@@ -577,6 +584,30 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
 #[allow(dead_code)]
 pub fn shm_attach(fd: i32, vaddr: usize) -> usize {
     shm_map(fd, vaddr)
+}
+
+/// 只撤销一次 fd 引用（dup 失败回滚专用）。
+///
+/// ★ 不能用 `shm_close_index` 回滚：它按「进程已退出、页表已销毁」设计，
+/// 会清光该进程的映射记录并按 1+maps 归还引用——回滚时进程活着且可能已
+/// shm_map：记录被清但 PTE 仍在，后续 close 按空记录跳过 unmap 直接归零
+/// 释放 → 用户态 vaddr 指向已归还的物理页（use-after-free）。
+pub fn shm_drop_one_ref(index: usize) {
+    if index >= MAX_SHMS {
+        return;
+    }
+    unsafe { asm!("msr daifset, #2") };
+    unsafe {
+        let s = &mut SHMS[index];
+        if s.used && s.refs > 0 {
+            s.refs -= 1;
+            if s.refs == 0 {
+                crate::allocator::free_page(s.page);
+                *s = Shm::empty();
+            }
+        }
+    }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 /// 增加共享内存引用计数（供 fork 复制 fd 表时调用，防止子进程 close 导致提前释放）。
@@ -762,9 +793,13 @@ pub fn shm_close(fd: i32) {
     };
     let pid = process::current_pid();
     let root = process::current_root();
+    // ★ 同 shm_map：refs 读-改-写与并发 map/add_ref 的交错会丢更新 → 提前
+    // 归零释放仍被映射的物理页。全程屏蔽 IRQ。
+    unsafe { asm!("msr daifset, #2") };
     unsafe {
         let s = &mut SHMS[entry.index];
         if !s.used || s.refs == 0 {
+            unsafe { asm!("msr daifclr, #2") };
             return;
         }
         // 解除本进程的映射（每次映射 -1）
@@ -785,6 +820,7 @@ pub fn shm_close(fd: i32) {
             *s = Shm::empty();
         }
     }
+    unsafe { asm!("msr daifclr, #2") };
 }
 
 

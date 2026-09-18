@@ -272,17 +272,24 @@ fn page_index(addr: usize) -> usize {
 
 /// 标记一页进入共享池（ELF 加载只读段时调用）：引用计数置 1。
 pub fn mark_shared_page(addr: usize) {
+    let saved = unsafe { irq_save() };
     unsafe {
         PAGE_REFS[page_index(addr)] = 1;
     }
+    unsafe { irq_restore(saved) };
 }
 
 /// fork 共享：引用计数 +1（饱和，防溢出）。
 pub fn share_page(addr: usize) {
+    // RMW 必须 IRQ 屏蔽：进程上下文（IRQ 使能）与另一核的 exit→
+    // free_user_pages 交错在 load/store 之间会丢一次递增/递减 —— 计数
+    // 永不归零 = 4KB 泄漏（与 free_page 同款防护）。
+    let saved = unsafe { irq_save() };
     unsafe {
         let r = &mut PAGE_REFS[page_index(addr)];
         *r = r.saturating_add(1);
     }
+    unsafe { irq_restore(saved) };
 }
 
 /// COW fork 共享：把一页私有页（计数 0）转为共享并 +1。
@@ -291,6 +298,7 @@ pub fn share_page(addr: usize) {
 /// 转为 COW 后父子各持有一份引用：计数 0 → 1（父）→ 2（父+子）。
 /// 若该页此前已是共享/COW 页（计数 > 0），仅 +1（子进程加入）。
 pub fn cow_share(addr: usize) {
+    let saved = unsafe { irq_save() };
     unsafe {
         let r = &mut PAGE_REFS[page_index(addr)];
         if *r == 0 {
@@ -298,16 +306,20 @@ pub fn cow_share(addr: usize) {
         }
         *r = r.saturating_add(1);
     }
+    unsafe { irq_restore(saved) };
 }
 
 /// fork/退出释放共享引用：引用计数 -1。返回 `true` 表示归零，
 /// 调用方应随后 `free_page` 归还物理页。
 pub fn unshare_page(addr: usize) -> bool {
-    unsafe {
+    let saved = unsafe { irq_save() };
+    let zero = unsafe {
         let r = &mut PAGE_REFS[page_index(addr)];
         if *r > 0 {
             *r -= 1;
         }
         *r == 0
-    }
+    };
+    unsafe { irq_restore(saved) };
+    zero
 }

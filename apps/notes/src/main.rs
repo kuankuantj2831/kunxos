@@ -375,8 +375,19 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             cursor_overlay_move();
         }
         if ev.nav != NavAction::None {
-            print("[nav] 系统导航 -> 退出\n");
-            unsafe { exit(nav_exit_code(ev.nav)); }
+            // 编辑器内系统返回（手势/三键）= 回列表，与标题栏返回、ESC 一致；
+            // 桌面/最近任务仍退出应用。
+            if ev.nav == NavAction::Back && unsafe { PAGE == 1 } {
+                print("[notes] 系统返回 -> 列表\n");
+                unsafe {
+                    PAGE = 0;
+                    SEARCH_FOCUS = false;
+                }
+                dirty = true;
+            } else {
+                print("[nav] 系统导航 -> 退出\n");
+                unsafe { exit(nav_exit_code(ev.nav)); }
+            }
         }
 
         if let Some((x, y)) = ev.tap {
@@ -434,8 +445,19 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 dirty = true;
             }
             KeyAction::Esc => {
-                print("[notes] ESC -> 退出\n");
-                break;
+                // 编辑器内 ESC = 回列表（逐级返回，标题栏返回已是分级）；
+                // 列表页 ESC 才退出应用。
+                if unsafe { PAGE == 1 } {
+                    unsafe {
+                        PAGE = 0;
+                        SEARCH_FOCUS = false;
+                    }
+                    print("[notes] ESC → 返回列表\n");
+                    dirty = true;
+                } else {
+                    print("[notes] ESC -> 退出\n");
+                    break;
+                }
             }
             _ => {}
         }

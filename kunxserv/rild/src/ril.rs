@@ -433,7 +433,9 @@ pub fn init_modem() {
         }
     }
 
-    // 收件箱 / 发件箱计数
+    // 收件箱 / 发件箱计数（先做启动恢复：上次重写中途掉电时从 .old
+    // 备份拿回完整旧箱）。
+    recover_store();
     unsafe {
         RIL.inbox = count_records(INBOX_PATH);
         RIL.outbox = count_records(OUTBOX_PATH);
@@ -930,7 +932,9 @@ fn receive_sms(idx: u32) {
         let num_len = d.oa_len;
         let scts_copy = d.scts;
         let cref = d.concat_ref;
-        let ctotal = d.concat_total;
+        // ★ total 以槽内封顶值为准（>8 段的级联：槽封顶 8，此处若用原始
+        // total 匹配则永远找不到槽 → 凑齐也整条丢弃）。
+        let ctotal = (d.concat_total as usize).min(CONCAT_MAX_PARTS) as u8;
         let complete = concat_add(d);
         if !complete {
             crate::log("[rild] 拼接分段已缓冲\n");
@@ -1107,7 +1111,9 @@ fn append_record(path: &str, id: u32, num: &[u8], stamp: &[u8], read: u8, text: 
             sys::write_fd(fd as usize, b"KXSMS1\n");
         }
         // 只拼装本条新记录：<id>\x1F<num>\x1F<stamp>\x1F<read>\x1F<text>
-        let mut out = [0u8; 300];
+        // ★ ≥1600：级联重组文本最长 8×200=1600 字节（此前 300/200 截断，
+        // 两段长短信重组成功也只落盘 200）。
+        let mut out = [0u8; 1700];
         let mut pos = 0;
         {
             let mut tmp = [0u8; 40];
@@ -1131,7 +1137,7 @@ fn append_record(path: &str, id: u32, num: &[u8], stamp: &[u8], read: u8, text: 
         pos += 1;
         out[pos] = 0x1F;
         pos += 1;
-        let tl = text.len().min(200).min(out.len().saturating_sub(pos + 1));
+        let tl = text.len().min(1600).min(out.len().saturating_sub(pos + 1));
         // 文本中的换行替换为空格（保持行格式）
         for i in 0..tl {
             out[pos + i] = if text[i] == b'\n' || text[i] == b'\r' { b' ' } else { text[i] };
@@ -1141,6 +1147,9 @@ fn append_record(path: &str, id: u32, num: &[u8], stamp: &[u8], read: u8, text: 
         pos += 1;
         sys::syscall3(sys::SYS_LSEEK, fd as usize, 0, sys::SEEK_END);
         sys::write_fd(fd as usize, &out[..pos]);
+        // 短信本体落盘（SFS 检查点：数据块 + 位图/inode 元数据）——收到
+        // 即持久，掉电不丢；也把行尾与位图中的新块一起提交。
+        sys::fsync(fd as usize);
         sys::syscall1(sys::SYS_CLOSE, fd as usize);
     }
 }
@@ -1199,6 +1208,13 @@ pub fn mark_read(id: u32) {
 }
 
 /// 重写收件箱：删除（或标记已读）指定 id 的记录。
+///
+/// 原子提交（/data 上的 SFS jlog 事务保证改名掉电原子）：旧箱改名
+/// `.old` 备份 → 以 O_TRUNC 全新写 `path` → 成功后删备份；任意时点掉电，
+/// 启动恢复（`recover_store`）都能拿回一份完整旧箱。同时根治两个旧缺陷：
+/// 就地 lseek(0)+write 不 ftruncate，删除记录后新内容更短、旧尾巴残留
+/// （count_records 数 `\n` 把陈尾当记录 → 已删短信「复活」）；以及写到
+/// 一半掉电导致的半行损坏不可恢复。
 fn rewrite_store(path: &str, id: u32, delete: bool) {
     unsafe {
         // 分块读入整个文件（SMS_STORE_CAP 上限）：旧实现单次 read 8KB，
@@ -1210,8 +1226,8 @@ fn rewrite_store(path: &str, id: u32, delete: bool) {
         }
         sys::syscall3(sys::SYS_LSEEK, fd as usize, 0, sys::SEEK_SET);
         let n = read_whole_file(fd as usize, &mut buf);
+        sys::syscall1(sys::SYS_CLOSE, fd as usize);
         if n == 0 || !buf[..n].starts_with(b"KXSMS1") {
-            sys::syscall1(sys::SYS_CLOSE, fd as usize);
             return;
         }
         let mut out = [0u8; SMS_STORE_CAP];
@@ -1275,12 +1291,78 @@ fn rewrite_store(path: &str, id: u32, delete: bool) {
             }
             line_start = line_end + 1;
         }
-        sys::syscall3(sys::SYS_LSEEK, fd as usize, 0, sys::SEEK_SET);
-        sys::write_fd(fd as usize, &out[..p]);
-        sys::syscall1(sys::SYS_CLOSE, fd as usize);
+        // 原子提交：旧箱改名备份 → 全新写 → fsync → 删备份。
+        const OLD_PATH: &str = "/data/rild/inbox.old";
+        sys::unlink(OLD_PATH);
+        if sys::rename(path, OLD_PATH) != 0 {
+            // 改名失败（被占用等）：退回就地写（先 ftruncate(0) 清尾再写，
+            // 内核 ftruncate 仅支持 0；语义弱化但不阻塞删除/标记操作）。
+            let fd2 = sys::open(path, sys::O_RDWR);
+            if fd2 < 0 {
+                return;
+            }
+            sys::syscall3(sys::SYS_LSEEK, fd2 as usize, 0, sys::SEEK_SET);
+            sys::syscall3(sys::SYS_FTRUNCATE, fd2 as usize, 0, 0);
+            sys::write_fd(fd2 as usize, &out[..p]);
+            sys::fsync(fd2 as usize);
+            sys::syscall1(sys::SYS_CLOSE, fd2 as usize);
+        } else {
+            let wfd = sys::open(path, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC);
+            if wfd < 0 {
+                // 新箱写失败：把备份改回来，保持旧箱完整。
+                sys::unlink(path);
+                sys::rename(OLD_PATH, path);
+                return;
+            }
+            sys::write_fd(wfd as usize, &out[..p]);
+            // ★ 删备份前必须落盘：掉电若发生在 unlink 备份之后、新数据
+            // 落盘之前，正身空、备份已删，recover_store 两侧都拿不到，
+            // 整个收件箱丢失（append_record 已 fsync，此处对齐）。
+            sys::fsync(wfd as usize);
+            sys::syscall1(sys::SYS_CLOSE, wfd as usize);
+            sys::unlink(OLD_PATH);
+        }
         RIL.inbox = count_records(INBOX_PATH);
         RIL.seq = RIL.seq.wrapping_add(1);
         DIRTY = true;
+    }
+}
+
+/// 启动恢复：上次 rewrite 中途掉电时，`inbox.dat` 缺失/非法而
+/// `inbox.old` 完整 —— 把备份改回正身（丢失的只是一次删除/标记，
+/// 记录本体无损）。
+pub fn recover_store() {
+    unsafe {
+        let ok = {
+            let fd = sys::open(INBOX_PATH, sys::O_RDONLY);
+            if fd < 0 {
+                false
+            } else {
+                let mut head = [0u8; 8];
+                let hn = sys::read_fd(fd as usize, &mut head);
+                sys::syscall1(sys::SYS_CLOSE, fd as usize);
+                let hn = if hn > 0 { hn as usize } else { 0 };
+                hn > 0 && head[..hn.min(6)].starts_with(b"KXSMS1")
+            }
+        };
+        if ok {
+            sys::unlink("/data/rild/inbox.old");
+            return;
+        }
+        let old = sys::open("/data/rild/inbox.old", sys::O_RDONLY);
+        if old < 0 {
+            return;
+        }
+        let mut head = [0u8; 8];
+        let hn = sys::read_fd(old as usize, &mut head);
+        sys::syscall1(sys::SYS_CLOSE, old as usize);
+        let hn = if hn > 0 { hn as usize } else { 0 };
+        if hn > 0 && head[..hn.min(6)].starts_with(b"KXSMS1") {
+            sys::unlink(INBOX_PATH);
+            if sys::rename("/data/rild/inbox.old", INBOX_PATH) == 0 {
+                crate::log("[rild] 短信存储已从备份恢复\n");
+            }
+        }
     }
 }
 
@@ -1295,13 +1377,22 @@ pub fn load_contacts() {
             return;
         }
         let mut buf = [0u8; 2048];
-        let n = sys::read_fd(fd as usize, &mut buf);
+        // 循环读到 EOF：此前单次 read 最多 2048B，联系人超过 ~17 条后第
+        // 17 条起不进缓存（来电/短信不显示姓名）。与同文件 read_whole_file
+        // 同款循环。
+        let mut n = 0usize;
+        while n < buf.len() {
+            let r = sys::read_fd(fd as usize, &mut buf[n..]);
+            if r <= 0 {
+                break;
+            }
+            n += r as usize;
+        }
         sys::syscall1(sys::SYS_CLOSE, fd as usize);
-        if n <= 0 {
+        if n == 0 {
             CONTACTS_N = 0;
             return;
         }
-        let n = n as usize;
         CONTACTS_N = 0;
         let mut start = 0usize;
         while start < n && CONTACTS_N < CONTACTS.len() {
@@ -1439,10 +1530,22 @@ pub fn write_state() {
         line!(b"ROUTE", &fmt_dec(audio_route_now()));
         line!(b"SEQ", &fmt_dec(RIL.seq));
 
-        let fd = sys::open(STATE_PATH, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC);
+        // 临时文件 + rename 原子发布：launcher/应用轮询读 rild.state，
+        // 就地 O_TRUNC 重写会让读方拿到半份状态（如 NUM 行被拦腰截断）。
+        // rename 覆盖（内核 POSIX 替换语义）后读方要么全旧、要么全新。
+        const STATE_TMP: &str = "/var/run/rild.state.tmp";
+        let fd = sys::open(STATE_TMP, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC);
         if fd >= 0 {
             sys::write_fd(fd as usize, &buf[..p]);
             sys::syscall1(sys::SYS_CLOSE, fd as usize);
+            if sys::rename(STATE_TMP, STATE_PATH) != 0 {
+                // 极小概率 EBUSY（读方恰好持有打开）：退回就地写
+                let fd2 = sys::open(STATE_PATH, sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC);
+                if fd2 >= 0 {
+                    sys::write_fd(fd2 as usize, &buf[..p]);
+                    sys::syscall1(sys::SYS_CLOSE, fd2 as usize);
+                }
+            }
         }
         DIRTY = false;
         LAST_STATE_WRITE = sys::now_us();
@@ -1454,6 +1557,7 @@ fn fmt_dec(v: u32) -> [u8; 16] {
     let mut tmp = [0u8; 16];
     let mut i = 16;
     if v == 0 {
+        i = 15; // ★ v==0 时 i 不回退 → n=0 输出空串（SIG/START/SEQ 为 0 时值字段缺失）
         tmp[15] = b'0';
     } else {
         let mut x = v;
@@ -1473,8 +1577,13 @@ fn fmt_dec(v: u32) -> [u8; 16] {
 
 /// 周期刷新 SIM 状态（支持热插拔与测试注入的 SIM:READY/ABSENT）。
 pub fn refresh_sim() {
+    // ★ 无 modem（fd<0）时不轮询：NoModem 落 Unknown 分支会把启动路径
+    // 显式设置的 ABSENT 覆写，「无 SIM 仅紧急呼叫」门随之失效。
     let mut resp = [0u8; at::RESP_CAP];
     let at = unsafe { &mut *core::ptr::addr_of_mut!(AT) };
+    if at.fd < 0 {
+        return;
+    }
     let new_sim = match at.command(b"AT+CPIN?", &mut resp) {
         Final::Ok => SimState::Ready,
         Final::Cme(10) => SimState::Absent,

@@ -2,13 +2,13 @@
 //
 // 由 launcher 经 fork + execve 拉起（/bin/browser）。职责：
 //   1. 简化版浏览器引擎：HTML 解析、CSS 样式计算、流式布局、CPU 光栅化
-//   2. 网络：HTTP/1.1 客户端（重定向 + 内存缓存）；file:// 与 kunxos:// 协议
+//   2. 网络：HTTP/1.1 + TLS 1.2（ECDHE_RSA_AES128_GCM_SHA256，证书链验证）；file:// 与 kunxos://
 //   3. 导航：地址栏、前进/后退、主页、书签；单标签（多标签预留）
 //   4. 滚动：内容区拖拽滚动 + 右侧滚动条
 //   5. 表单：文本输入聚焦编辑、复选框/单选钮切换、GET 表单提交
 //   6. 安全基线：无 Cookie、无插件、无 JS；图片仅同源/内置加载
 //
-// 模块：url / html / css / style / layout / paint / net / image / pages。
+// 模块：url / tls / html / css / style / layout / paint / net / image / pages。
 
 #![no_std]
 #![no_main]
@@ -17,6 +17,7 @@
 
 #[macro_use]
 extern crate alloc;
+extern crate kunxsec as kxsec;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -25,6 +26,8 @@ use core::panic::PanicInfo;
 mod kit;
 
 mod url;
+#[path = "tls/mod.rs"]
+mod tls;
 mod html;
 mod css;
 mod style;
@@ -81,12 +84,16 @@ struct Bookmark {
     url: &'static str,
 }
 
-static BOOKMARKS: [Bookmark; 5] = [
+static BOOKMARKS: [Bookmark; 7] = [
     Bookmark { label: "主页", url: "kunxos://home" },
     Bookmark { label: "新闻", url: "kunxos://news" },
     Bookmark { label: "应用", url: "kunxos://apps" },
     Bookmark { label: "表单", url: "kunxos://demo/form" },
     Bookmark { label: "关于", url: "kunxos://about" },
+    // 仍支持纯 HTTP 的真实站点：主流网站明文端口普遍 302 强跳 HTTPS
+    // （TLS 未启用打不开），这两个站点可在 HTTP 下直接浏览。
+    Bookmark { label: "Example", url: "http://example.com/" },
+    Bookmark { label: "CERN", url: "http://info.cern.ch/" },
 ];
 
 // ==================== 全局状态 ====================
@@ -647,7 +654,75 @@ fn go_forward() {
 // ==================== 主循环 ====================
 
 #[no_mangle]
-pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
+pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
+    // 无头自测：`run /bin/browser --selftest <url>`。跳过 GUI（不需要
+    // /dev/fb0），直接走 net::fetch 全链路（http/https/file/kunxos），
+    // 结果打到串口，供无头 QEMU 断言。退出码：0 成功 / 1 失败。
+    let arg1 = unsafe {
+        if argc > 1 && *argv.add(1) != 0 {
+            let mut p = *argv.add(1) as *const u8;
+            let mut s = String::new();
+            while *p != 0 {
+                s.push(*p as char);
+                p = p.add(1);
+            }
+            s
+        } else {
+            String::new()
+        }
+    };
+    if arg1 == "--selftest" {
+        let url = unsafe {
+            if argc > 2 && *argv.add(2) != 0 {
+                let mut p = *argv.add(2) as *const u8;
+                let mut s = String::new();
+                while *p != 0 {
+                    s.push(*p as char);
+                    p = p.add(1);
+                }
+                s
+            } else {
+                String::from("https://www.baidu.com")
+            }
+        };
+        print("[browser-selftest] URL: ");
+        print(&url);
+        print("\n");
+        let parsed = match url::parse(&url) {
+            Some(u) => u,
+            None => {
+                print("[browser-selftest] FAIL: URL 解析失败\n");
+                unsafe { exit(1); }
+                unreachable!();
+            }
+        };
+        let t0 = kit::now_us();
+        match net::fetch(&parsed) {
+            net::FetchResult::Ok { bytes, final_url } => {
+                let dt = (kit::now_us() - t0) / 1000;
+                let dom = html::parse(&bytes);
+                let title = dom.title();
+                print("[browser-selftest] OK ");
+                print_dec(bytes.len() as u64);
+                print(" 字节 ");
+                print_dec(dt);
+                print("ms 标题: ");
+                print(&title);
+                print(" 最终URL: ");
+                print(&final_url);
+                print("\n[browser-selftest] PASS\n");
+                unsafe { exit(0); }
+                unreachable!();
+            }
+            net::FetchResult::Err { msg } => {
+                print("[browser-selftest] FAIL: ");
+                print(&msg);
+                print("\n");
+                unsafe { exit(1); }
+                unreachable!();
+            }
+        }
+    }
     print("[browser] 启动中\n");
     if !fb_init() {
         print("[browser] /dev/fb0 mmap 失败\n");

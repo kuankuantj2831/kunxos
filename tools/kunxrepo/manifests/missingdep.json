@@ -1,0 +1,13 @@
+{
+  "name": "missingdep",
+  "version": "1.0.0",
+  "api_level": 1,
+  "description": "缺失依赖示例：依赖软件源中不存在的 ghost-lib（负例）",
+  "author": "KunxOS Team",
+  "main": "bin/missingdep",
+  "permissions": [],
+  "dependencies": {"ghost-lib": ">=9.0.0"},
+  "provides": [],
+  "conflicts": [],
+  "_elf_text": "KUNXTEST-MISSING"
+}

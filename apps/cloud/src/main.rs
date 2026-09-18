@@ -562,6 +562,10 @@ fn server_fail_hint(srv: &[u8]) -> &'static [u8] {
 /// 返回响应总字节数；失败返回负值。
 fn http_request(ip: u32, port: u16, req: &[u8], resp: &mut [u8]) -> isize {
     unsafe {
+        // 失败路径不再更新 LAST_RESP_LEN（入口先清零）：否则 resp_err_hint
+        // 会用上一轮成功响应的长度去切本轮可能只写了半截的 RESP，错误
+        // 横幅显示陈旧提示或乱码。
+        LAST_RESP_LEN = 0;
         let fd = sock_open();
         if fd < 0 {
             return -1;
@@ -957,8 +961,12 @@ fn api_restore() -> bool {
                 continue;
             }
             let p = core::str::from_utf8(&path_b[..pl]).unwrap_or("");
-            // 安全校验：只允许恢复到 /data/oobe/
-            if !starts_with(p.as_bytes(), CLOUD_DIR.as_bytes()) {
+            // 安全校验：只允许恢复到 /data/oobe/ 下，且路径不得含 ".." ——
+            // 内核 VFS 真实解析 ..（目录项天然支持相对行走），此前仅前缀
+            // 校验可被 /data/oobe/../../bin/x 穿越到任意可写路径。
+            if !starts_with(p.as_bytes(), CLOUD_DIR.as_bytes())
+                || find_sub(p.as_bytes(), b"..").is_some()
+            {
                 continue;
             }
             if write_file(p, &data_b[..dl]) {
@@ -1210,6 +1218,23 @@ fn exec_command(line: &[u8]) {
     print(unsafe { core::str::from_utf8(ctype) }.unwrap_or(""));
     print("\n");
 
+    // 设备端最后一道策略闸门：OOBE/设置里明确关闭的远程控制能力必须拒绝
+    // 执行（此前只在渲染层展示开关，服务器下发 lock/wipe 仍无条件执行）。
+    if ctype == b"find" && unsafe { !CTRL_FIND } {
+        print("[cloud] find 被本机关闭，拒绝\n");
+        let _ = api_ack(id, b"denied");
+        return;
+    }
+    if ctype == b"lock" && unsafe { !CTRL_LOCK } {
+        print("[cloud] lock 被本机关闭，拒绝\n");
+        let _ = api_ack(id, b"denied");
+        return;
+    }
+    if ctype == b"wipe" && unsafe { !CTRL_WIPE } {
+        print("[cloud] wipe 被本机关闭，拒绝\n");
+        let _ = api_ack(id, b"denied");
+        return;
+    }
     if ctype == b"find" {
         // 上报 IP（服务端以 ack 结果刷新设备 ip/last_seen）
         let mut r = [0u8; 32];
@@ -1397,8 +1422,65 @@ fn render_lock() {
     draw_text(tx, by + (bh - 8) / 2, "解锁".as_bytes(), C_ON_ACCENT);
 }
 
-/// 长按解锁的按压起点（0 = 未按）。
-static mut UNLOCK_PRESS_T0: u64 = 0;
+/// 本轮按压已触发长按解锁（抬起后吞掉一次点击，防误触主界面按钮）。
+static mut UNLOCK_HOLD_FIRED: bool = false;
+
+/// 长按解锁的按住检测（每帧调用，无需抬起）：按下起点与当前位置都在
+/// 解锁按钮内且持续 ≥2s 即解锁。此前实现只在抬起帧判定 —— 实际语义是
+/// 「两次点击间隔 2-3s」，真长按（按住 2s 再抬）反而无法解锁。
+fn unlock_hold_check() {
+    unsafe {
+        if !LOCKED {
+            UNLOCK_HOLD_FIRED = false;
+            return;
+        }
+        if !TOUCH_DOWN {
+            UNLOCK_HOLD_FIRED = false;
+            return;
+        }
+        if UNLOCK_HOLD_FIRED {
+            return;
+        }
+        if TOUCH_US == 0 {
+            return;
+        }
+        let held = now_us().saturating_sub(TOUCH_US);
+        if held >= 2_000_000
+            && unlock_hit(TOUCH_PX, TOUCH_PY)
+            && unlock_hit(CUR_X, CUR_Y)
+        {
+            UNLOCK_HOLD_FIRED = true;
+            LOCKED = false;
+            if !write_file(F_LOCKED, b"0") {
+                print("[cloud] 写入 F_LOCKED 失败\n");
+                show_error("解锁状态保存失败".as_bytes());
+            }
+            let mut line = [0u8; 64];
+            let la = read_oobe("local_account");
+            let mut m = 0usize;
+            let tag = b"[unlock] local long-press user=";
+            for &c in tag {
+                line[m] = c;
+                m += 1;
+            }
+            for &c in &la[..la.len().min(line.len() - m - 1)] {
+                if c == b':' || c == b'\n' {
+                    break;
+                }
+                line[m] = c;
+                m += 1;
+            }
+            line[m] = b'\n';
+            m += 1;
+            append_file("/data/cloud/unlock.log", &line[..m]);
+            print("[cloud] 长按解锁成功\n");
+            set_status("设备已解锁（长按确认）".as_bytes());
+            render();
+            flip();
+            cursor_overlay_redraw();
+        }
+    }
+}
 
 /// 墙钟微秒（失败返回 0，长按计时退化为不可用即不可解锁 —— 安全方向）。
 fn now_us() -> u64 {
@@ -1551,6 +1633,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     loop {
         let pr = poll_input();
+        // 长按解锁：按住 ≥2s 每帧检测（无需抬起）。
+        unlock_hold_check();
         let tap = pr.tap;
         let moved = pr.moved;
         if moved {
@@ -1572,52 +1656,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 break;
             }
             if unsafe { LOCKED } {
-                // 解锁防误触 + 留痕：远程锁定的本地点按式解锁形同虚设。
-                // 现要求长按 2s（持续按在按钮上），并落一条审计记录。
-                // （完整鉴权需服务端 unlock 流程/文本输入 UI，产品侧待定。）
-                if unlock_hit(x, y) {
-                    let now = now_us();
-                    let pressed_for = unsafe {
-                        if UNLOCK_PRESS_T0 == 0 {
-                            u64::MAX
-                        } else {
-                            now.saturating_sub(UNLOCK_PRESS_T0)
-                        }
-                    };
-                    if pressed_for > 3_000_000 {
-                        unsafe { UNLOCK_PRESS_T0 = now; }
-                    } else if pressed_for >= 2_000_000 {
-                        unsafe { UNLOCK_PRESS_T0 = 0; }
-                        unsafe { LOCKED = false; }
-                        if !write_file(F_LOCKED, b"0") {
-                            print("[cloud] 写入 F_LOCKED 失败\n");
-                            show_error("解锁状态保存失败".as_bytes());
-                        }
-                        let mut line = [0u8; 64];
-                        let la = read_oobe("local_account");
-                        let mut m = 0usize;
-                        let tag = b"[unlock] local long-press user=";
-                        for &c in tag {
-                            line[m] = c;
-                            m += 1;
-                        }
-                        for &c in &la[..la.len().min(line.len() - m - 1)] {
-                            if c == b':' || c == b'\n' {
-                                break;
-                            }
-                            line[m] = c;
-                            m += 1;
-                        }
-                        line[m] = b'\n';
-                        m += 1;
-                        append_file("/data/cloud/unlock.log", &line[..m]);
-                        set_status("设备已解锁（长按确认）".as_bytes());
-                        render();
-                        flip();
-                        cursor_overlay_redraw();
+                // 解锁走 unlock_hold_check 的按住检测；这里只吞掉长按后的
+                // 首次抬起（解锁按钮区与主界面按钮区有重叠，不吞会误触
+                // 「立即同步/注册设备」），并吞掉锁定态的全部点击。
+                unsafe {
+                    if UNLOCK_HOLD_FIRED && !TOUCH_DOWN {
+                        UNLOCK_HOLD_FIRED = false;
                     }
-                } else {
-                    unsafe { UNLOCK_PRESS_T0 = 0; }
                 }
                 continue;
             }

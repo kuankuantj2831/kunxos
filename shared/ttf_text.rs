@@ -389,6 +389,7 @@ pub fn font_init_bold() -> bool {
 /// OOBE 启动路径专用：只加载向导超小子集（oobe-cn.ttf 正文／oobe-bold.ttf
 /// 标题，同源于 uiputong/bold 更纱黑体子集）。体积小 → QEMU TCG 慢宿主下
 /// 首帧即平滑，无需像素兜底。桌面与其他应用仍用全量子集（font_init）。
+/// Phosphor 图标字体一并加载（向导步骤图标矢量绘制，替换像素几何图标）。
 pub fn font_init_oobe() -> bool {
     let ready = font_render::font_ready();
     if !ready {
@@ -407,12 +408,15 @@ pub fn font_init_oobe() -> bool {
             }
         }
     }
+    font_init_icons();
+    font_render::lazy_full_enable();
     font_render::font_ready()
 }
 
-/// 桌面启动器专用：加载超大子集（launcher-cn.ttf 正文／launcher-bold.ttf 标题，
-/// 仅桌面文案 ~947 字形）。桌面首帧即平滑，慢 TCG 宿主不再卡在「正在进入系统」。
+/// 桌面启动器专用：加载超大子集（launcher-cn.ttf 正文，仅桌面文案 ~947 字形）。
+/// 桌面首帧即平滑，慢 TCG 宿主不再卡在「正在进入系统」。
 /// Phosphor 图标字体一并加载（行内 emoji / 天气小组件图标）。
+/// 桌面未使用粗体字形，标题字体不再随启动加载（见 [`font_init`] 懒加载说明）。
 pub fn font_init_launcher() -> bool {
     let ready = font_render::font_ready();
     if !ready {
@@ -423,15 +427,8 @@ pub fn font_init_launcher() -> bool {
             }
         }
     }
-    if !font_render::font_bold_ready() {
-        let data = read_file(LAUNCHER_BOLD_PATH);
-        if !data.is_empty() {
-            if let Some(f) = font_render::font_from_bytes(&data) {
-                font_render::font_set_bold(f);
-            }
-        }
-    }
     font_init_icons();
+    font_render::lazy_full_enable();
     font_render::font_ready()
 }
 
@@ -489,8 +486,13 @@ fn perf_font_ms(total_ms: u64) {
     }
 }
 
-/// 从 rootfs 的 `/fonts/cn.ttf` 加载常规字体、`/fonts/bold.ttf` 加载标题字体
-/// （幂等；常规字体加载完成后等待 launcher 启动动画的门控，与动画并行启动时）。
+/// 从 rootfs 的 `/fonts/cn.ttf` 加载常规字体（幂等；常规字体加载完成后等待
+/// launcher 启动动画的门控，与动画并行启动时）。
+///
+/// 标题字体（bold.ttf，~220KB）改为**按需加载**：应用启动的最大耗时项是
+/// fontdue 解析，而 21 个应用中仅 settings/store 使用粗体 —— 全量应用
+/// 逐一解析一份用不到的子集是纯浪费。需要粗体的应用在启动时显式调用
+/// [`font_init_bold`]；未加载时粗体绘制自动回退常规字形（font_render）。
 pub fn font_init() -> bool {
     let t0 = now_us();
     let ready = font_render::font_ready();
@@ -503,14 +505,20 @@ pub fn font_init() -> bool {
         }
         drop(data);
     }
-    // 标题字体（bold.ttf）一并加载；失败不影响常规文字渲染。
-    font_init_bold();
     // Phosphor 图标字体（emoji/图标）；失败同样不影响文字渲染。
     font_init_icons();
+    // 子集字体按「源码字符串字面量」裁剪（构建期），运行期拼出的字符
+    // （用户数据等）可能缺字形：开启一次性全量字体兜底（font_render）。
+    font_render::lazy_full_enable();
     if !font_render::font_ready() {
         return false;
     }
-    perf_font_ms((now_us().saturating_sub(t0)) / 1000);
+    let ms = (now_us().saturating_sub(t0)) / 1000;
+    if ms > 0 {
+        // 仅在实际发生字体加载时打印（clock 等应用每帧做 font_init 热重载
+        // 检查，幂等 0ms 路径打印会刷屏串口日志）。
+        perf_font_ms(ms);
+    }
     // 字体加载完成（耗时部分与启动动画并行），等 launcher 放行后再绘制首帧。
     wait_launch_gate();
     true

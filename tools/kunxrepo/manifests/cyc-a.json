@@ -1,0 +1,13 @@
+{
+  "name": "cyc-a",
+  "version": "1.0.0",
+  "api_level": 1,
+  "description": "依赖环示例：cyc-a 依赖 cyc-b（负例，安装必须报环错误）",
+  "author": "KunxOS Team",
+  "main": "bin/cyc-a",
+  "permissions": [],
+  "dependencies": {"cyc-b": ">=1.0.0"},
+  "provides": [],
+  "conflicts": [],
+  "_elf_text": "KUNXTEST-CYC-A"
+}

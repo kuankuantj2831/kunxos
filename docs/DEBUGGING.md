@@ -254,8 +254,12 @@ QEMU 的加速器要求 **宿主与客户机同架构**：
 
 > 说明：任务描述中的"x86 宿主 KVM"在 QEMU 上**不可行**——KVM 只能加速
 > 与宿主同架构的客户机，x86 宿主无法 KVM 加速 aarch64 客户机；x86 宿主
-> 请用 TCG（默认）。多线程 TCG：`-accel tcg,thread=multi -smp 2`（当前
-> 内核 SMP 需 PSCI，`-kernel` 直载模式观察单核回退，见 `make run-smp`）。
+> 请用 TCG（默认）。多线程 TCG：`-accel tcg,thread=multi -smp 2`——SMP
+> 已打通（PSCI CPU_ON 经 DTB `/psci` 检测的 hvc conduit 唤醒副核，见
+> `kunxcore/src/smp.rs` 与 `make run-smp`；verbose 启动可见
+> `[smp] cpu1 已上线`）。注意：`-smp 2` 仍为**实验性**配置，sfsrace 全量
+> 并发压测在双核下偶发任务表踩踏（已列 SMP 债务之外的深层竞态），默认
+> 回归与发布仍以单核为准。
 
 ```sh
 # x86 Linux 宿主（默认 TCG，多线程加速）

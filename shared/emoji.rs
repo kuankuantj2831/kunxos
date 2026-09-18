@@ -57,6 +57,23 @@ fn rd_u32(d: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
 }
 
+/// 越界安全的读取（畸形/截断字体不 panic，返回 None 由调用方放弃解析）。
+fn rd_u16c(d: &[u8], off: usize) -> Option<u16> {
+    if off + 2 <= d.len() {
+        Some(rd_u16(d, off))
+    } else {
+        None
+    }
+}
+
+fn rd_u32c(d: &[u8], off: usize) -> Option<u32> {
+    if off + 4 <= d.len() {
+        Some(rd_u32(d, off))
+    } else {
+        None
+    }
+}
+
 impl EmojiFont {
     /// 从 TTF/OTF 字节解析 CBDT/CBLC。无 CBDT/CBLC 表返回 None。
     pub fn from_bytes(data: &[u8]) -> Option<EmojiFont> {
@@ -88,30 +105,35 @@ impl EmojiFont {
 
         // ---- CBLC：第一个 strike 的 BitmapSizeTable（48 字节） ----
         // 头：version(4) + numSizes(4)，之后紧邻 BitmapSizeTable 数组。
-        let num_sizes = rd_u32(data, cblc + 4) as usize;
+        // ★ 全链越界安全：截断的 emoji.ttf 直接放弃解析（None），不 panic。
+        let num_sizes = rd_u32c(data, cblc.checked_add(4)?)? as usize;
         if num_sizes == 0 {
             return None;
         }
-        let size_base = cblc + 8;
-        let sub_array_off = rd_u32(data, size_base) as usize; // 相对 CBLC 基址
-        let sub_count = rd_u32(data, size_base + 8) as usize;
-        let ppem = data[size_base + 44] as u16;
+        let size_base = cblc.checked_add(8)?;
+        let sub_array_off = rd_u32c(data, size_base)? as usize; // 相对 CBLC 基址
+        let sub_count = rd_u32c(data, size_base.checked_add(8)?)? as usize;
+        let ppem = if size_base + 44 < data.len() {
+            data[size_base + 44] as u16
+        } else {
+            return None;
+        };
 
         // ---- 解析全部 indexSubTable，统一字形范围 ----
         if sub_count == 0 {
             return None;
         }
-        let arr = cblc + sub_array_off;
-        let mut subs = Vec::with_capacity(sub_count);
+        let arr = cblc.checked_add(sub_array_off)?;
+        let mut subs = Vec::with_capacity(sub_count.min(1024));
         for e in 0..sub_count {
-            let first_glyph = rd_u16(data, arr + e * 8);
-            let last_glyph = rd_u16(data, arr + e * 8 + 2);
+            let first_glyph = rd_u16c(data, arr.checked_add(e * 8)?)?;
+            let last_glyph = rd_u16c(data, arr.checked_add(e * 8 + 2)?)?;
             // additionalOffsetToIndexSubtable 相对 indexSubTableArray 起点。
-            let sub_rel = rd_u32(data, arr + e * 8 + 4) as usize;
-            let sub = cblc + sub_array_off + sub_rel;
-            let index_format = rd_u16(data, sub);
-            let image_format = rd_u16(data, sub + 2);
-            let image_data_off = rd_u32(data, sub + 4);
+            let sub_rel = rd_u32c(data, arr.checked_add(e * 8 + 4)?)? as usize;
+            let sub = cblc.checked_add(sub_array_off)?.checked_add(sub_rel)?;
+            let index_format = rd_u16c(data, sub)?;
+            let image_format = rd_u16c(data, sub.checked_add(2)?)?;
+            let image_data_off = rd_u32c(data, sub.checked_add(4)?)?;
             if image_format != 17 {
                 continue; // 仅支持 PNG 位图（Noto Color Emoji 全部为 17）
             }

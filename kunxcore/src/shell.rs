@@ -519,6 +519,13 @@ fn exec_one(cmd: &Command, input: &[u8], output: &mut [u8]) -> (usize, bool, boo
             flags |= vfs::O_TRUNC;
         }
         out_file = vfs::open(path, flags);
+        if out_file < 0 {
+            // 打开失败必须报错：静默回退 stdout 会把内容直接上屏，与
+            // 「写入成功」无法区分（排查 /data inode 耗尽时只能靠猜）。
+            crate::uart_send_str("sh: 无法打开 ");
+            crate::uart_send_str(path);
+            crate::uart_send_str("\n");
+        }
         if out_file >= 0 && cmd.append {
             vfs::seek(out_file, 0, vfs::SEEK_END);
         }
@@ -967,6 +974,47 @@ fn cmd_cat(cmd: &Command, input: &[u8], sink: &mut Sink) {
     }
 }
 
+/// 把当前环境表打包成 "NAME=VALUE" 静态串（供子进程初始栈 envp）。
+/// 返回静态切片；无环境时为空。
+fn envp_pack() -> &'static [&'static str] {
+    static mut ENV_STRS: [[u8; 96]; MAX_ENV] = [[0u8; 96]; MAX_ENV];
+    static mut ENV_PTRS: [&'static str; MAX_ENV] = [""; MAX_ENV];
+    unsafe {
+        let mut n = 0usize;
+        for i in 0..ENV_COUNT {
+            if n >= MAX_ENV {
+                break;
+            }
+            let nm = static_str(&ENV_NAMES[i]);
+            let vl = static_str(&ENV_VALUES[i]);
+            // "NAME=VALUE"（含 NUL ≤ 96：NAME≤31 + '=' + VALUE≤63）
+            let mut len = 0usize;
+            for &b in nm.as_bytes() {
+                if len >= 94 {
+                    break;
+                }
+                ENV_STRS[n][len] = b;
+                len += 1;
+            }
+            if len >= 94 {
+                continue;
+            }
+            ENV_STRS[n][len] = b'=';
+            len += 1;
+            for &b in vl.as_bytes() {
+                if len >= 94 {
+                    break;
+                }
+                ENV_STRS[n][len] = b;
+                len += 1;
+            }
+            ENV_PTRS[n] = core::str::from_utf8(&ENV_STRS[n][..len]).unwrap_or("");
+            n += 1;
+        }
+        &ENV_PTRS[..n]
+    }
+}
+
 fn cmd_run(cmd: &Command, sink: &mut Sink) {
     if cmd.argc < 2 {
         sink.emit_str("用法：run <elf> [args...]\n");
@@ -979,7 +1027,7 @@ fn cmd_run(cmd: &Command, sink: &mut Sink) {
         argv[n] = word_str(&cmd.argv[i]);
         n += 1;
     }
-    let pid = elf::spawn_from_path(path, &argv[..n]);
+    let pid = elf::spawn_from_path_env(path, &argv[..n], envp_pack());
     if pid < 0 {
         sink.emit_str("run: 加载失败：");
         sink.emit_str(path);
@@ -1006,7 +1054,7 @@ fn cmd_busybox(cmd: &Command, sink: &mut Sink) {
         argv[n] = word_str(&cmd.argv[i]);
         n += 1;
     }
-    let pid = elf::spawn_from_path("/bin/busybox", &argv[..n]);
+    let pid = elf::spawn_from_path_env("/bin/busybox", &argv[..n], envp_pack());
     if pid < 0 {
         sink.emit_str("busybox: 未找到\n");
         return;
@@ -1919,7 +1967,7 @@ fn cmd_help(_cmd: &Command, sink: &mut Sink) {
         "builtins: cd echo export exit pwd ls cat run busybox pkg ps uname clear mkdir rm touch cp mv wc head tail grep df history uptime ping sysinfo calc sort netstat tcp_echo udp_echo http_serve http_get gdb nslookup poweroff reboot power sleep kill date which uniq sha1sum stat dmesg od tee verbose true false basename dirname help\n",
     );
     sink.emit_str(
-        "debug: top mount ifconfig log crash perf (see docs/DEBUGGING.md)\n",
+        "debug: top mount ifconfig log crash perf irqstat netdiag (see docs/DEBUGGING.md)\n",
     );
 }
 
@@ -2035,7 +2083,7 @@ fn cmd_grep(cmd: &Command, input: &[u8], sink: &mut Sink) {
 
 /// `df`：列出已挂载文件系统（设备 / 挂载点 / 容量 / 已用 / 空闲）。
 fn cmd_df(_cmd: &Command, sink: &mut Sink) {
-    sink.emit_str("设备  挂载点        块数    已用  空闲\n");
+    sink.emit_str("设备  挂载点        块数    已用  空闲   inode空闲/总量\n");
     let s = &mut *sink;
     vfs::for_each_mount(&mut |mp: &str, dev: u32| {
         // 按挂载设备真实文件系统类型分派：此前直调 fs_simple 版本，FAT32
@@ -2057,6 +2105,20 @@ fn cmd_df(_cmd: &Command, sink: &mut Sink) {
         s.emit_u32(total.saturating_sub(free));
         s.emit_str("  ");
         s.emit_u32(free);
+        s.emit_str("  ");
+        // inode 余量（SFS 卷；inode 耗尽时 create 全体失败，此前只能靠
+        // 串口日志反推——第二十轮 /data 耗尽排查的直接出口）。FAT 无此概念。
+        match crate::fsops::fs_free_inodes(dev) {
+            Some(fi) => {
+                s.emit_u32(fi);
+                s.emit_str("/");
+                match crate::fsops::fs_total_inodes(dev) {
+                    Some(ti) => s.emit_u32(ti),
+                    None => s.emit_str("?"),
+                }
+            }
+            None => s.emit_str("-"),
+        }
         s.emit_str("\n");
     });
 }
@@ -3580,6 +3642,8 @@ fn run_builtin(cmd: &Command, input: &[u8], sink: &mut Sink) {
         "log" => cmd_log(cmd, sink),
         "crash" => cmd_crash(cmd, sink),
         "perf" => cmd_perf(cmd, sink),
+        "irqstat" => cmd_irqstat(cmd, sink),
+        "netdiag" => cmd_netdiag(cmd, sink),
         "verbose" => cmd_verbose(cmd, sink),
         "true" => cmd_true(cmd, sink),
         "false" => cmd_false(cmd, sink),
@@ -3712,7 +3776,7 @@ const BUILTINS: &[&str] = &[
     "false", "basename", "dirname", "dmesg", "od", "tee", "ln", "beep",
     "verbose",
     "audio", "audiolat",
-    "top", "mount", "ifconfig", "log", "crash", "perf",
+    "top", "mount", "ifconfig", "log", "crash", "perf", "irqstat", "netdiag",
 ];
 
 /// 在内置命令中匹配前缀；唯一匹配时写入 `out`，返回匹配数。
@@ -4101,6 +4165,9 @@ fn read_line() -> Line {
 /// Shell 进程入口。
 pub fn shell_main(_: usize) -> ! {
     set_cwd("/");
+    // 默认 HOME：nsmonkey/NetSurf 等按 ~ 解析资源路径的程序依赖（缺失时
+    // 解析成 /~/.netsurf/... 的无害但持续的警告）；用户可 export 覆盖。
+    env_set("HOME", "/data");
     loop {
         crate::uart_send_str(shell_prompt_str());
         let mut line = read_line();
@@ -4575,6 +4642,137 @@ fn cmd_crash(cmd: &Command, sink: &mut Sink) {
 }
 
 /// `perf [on|off|stats]`：性能 overlay 与统计。
+/// Sink 输出 u64（十进制；Sink 仅内建 emit_u32）。
+fn emit_u64(sink: &mut Sink, v: u64) {
+    if v == 0 {
+        sink.emit_str("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut v = v;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    sink.emit(&buf[i..]);
+}
+
+/// Sink 输出置位位列表（如 act0=0x5 → "0,2"；定位 SGI/PPI 活动源）。
+fn emit_set_bits(sink: &mut Sink, v: u32) {
+    let mut any = false;
+    for b in 0..32 {
+        if v & (1 << b) != 0 {
+            if any {
+                sink.emit_str(",");
+            }
+            sink.emit_u32(b);
+            any = true;
+        }
+    }
+    if !any {
+        sink.emit_str("-");
+    }
+}
+
+/// `irqstat`：中断观测点（技术债：中断风暴 act0 待复现）。
+///   - 每 IRQ 分发计数：定位高频源 / 风暴贡献者的常态分布；
+///   - 风暴 episode 历史：转储阈值（2000/20000/200000 次重入）时刻的
+///     GIC 状态快照（含 act0 及其置位位解码），事后回溯不必盯串口抓现场。
+fn cmd_irqstat(_cmd: &Command, sink: &mut Sink) {
+    sink.emit_str("IRQ 分发计数（irq 次数）：\n");
+    crate::interrupt::for_each_irq_count(&mut |irq, n| {
+        sink.emit_str("  ");
+        sink.emit_u32(irq);
+        sink.emit_str("  ");
+        emit_u64(sink, n);
+        sink.emit_str("\n");
+    });
+    sink.emit_str("风暴 episode（新→旧；act0/pend0 bit N = irq N）：\n");
+    let mut eps = 0u32;
+    crate::interrupt::for_each_storm_ep(&mut |e| {
+        eps += 1;
+        sink.emit_str("  irq=");
+        sink.emit_u32(e.irq);
+        sink.emit_str(" 重入=");
+        emit_u64(sink, e.n);
+        sink.emit_str(" t=");
+        emit_u64(sink, e.t_us);
+        sink.emit_str("us pend0=");
+        sink.emit_u32(e.pend0);
+        sink.emit_str("(");
+        emit_set_bits(sink, e.pend0);
+        sink.emit_str(") pend1=");
+        sink.emit_u32(e.pend1);
+        sink.emit_str(" act0=");
+        sink.emit_u32(e.act0);
+        sink.emit_str("(");
+        emit_set_bits(sink, e.act0);
+        sink.emit_str(") act1=");
+        sink.emit_u32(e.act1);
+        sink.emit_str(" rpr=");
+        sink.emit_u32(e.rpr);
+        sink.emit_str(" pid=");
+        emit_u64(sink, e.pid as u64);
+        sink.emit_str("\n");
+    });
+    if eps == 0 {
+        sink.emit_str("  （无：尚未触发转储阈值，连续同号重入 2000 次）\n");
+    }
+}
+
+/// `netdiag`：virtio-net DMA 缓存行（64B）隔离审计（技术债：DMA 64B 缓存行
+/// 隔离，Pi4/KVM）。输出环布局与 DMA 缓冲对齐的运行时事实；「共享行」为真
+/// 即真实缓存平台上缓存维护越界覆盖的前提（TCG 无缓存仿真不可复现，诊断
+/// 在任何平台确定性可得）。
+fn cmd_netdiag(_cmd: &Command, sink: &mut Sink) {
+    let d = crate::net_virtio::cache_line_diag();
+    if !d.ready {
+        sink.emit_str("netdiag: 网卡未就绪（无 virtio-net 设备）\n");
+        return;
+    }
+    sink.emit_str("virtio-net DMA 缓存行(64B)隔离审计：\n");
+    sink.emit_str("  RX 环 ");
+    emit_u64(sink, d.rx_ring as u64);
+    sink.emit_str(" TX 环 ");
+    emit_u64(sink, d.tx_ring as u64);
+    sink.emit_str("（页对齐");
+    sink.emit_str(if d.rx_ring & 63 == 0 && d.tx_ring & 63 == 0 { "，独立成行）\n" } else { "，[风险] 非 64B 对齐）\n" });
+    sink.emit_str("  used_off=");
+    sink.emit_u32(d.used_off as u32);
+    sink.emit_str(" %64=");
+    sink.emit_u32((d.used_off & 63) as u32);
+    if d.used_line_shared {
+        sink.emit_str("  [风险] used 头与 avail 尾共享行");
+        if d.avail_clean_overreach {
+            sink.emit_str("，且 clean(avail) 行取整越过 avail 末尾：回写可把 CPU 陈旧 used 头字节覆盖设备 DMA 写入（真机/KVM）\n");
+        } else {
+            sink.emit_str("\n");
+        }
+    } else {
+        sink.emit_str("  [安全] used 头独立成行\n");
+    }
+    sink.emit_str("  RX DMA 缓冲 64B 对齐：");
+    sink.emit_u32(d.rx_buf_aligned as u32);
+    sink.emit_str("/");
+    sink.emit_u32(d.rx_buf_total as u32);
+    if d.rx_buf_aligned < d.rx_buf_total {
+        sink.emit_str("  [风险] 未对齐缓冲 invalidate 可丢弃共享行上相邻所有者脏数据（堆损坏，真机/KVM）\n");
+    } else {
+        sink.emit_str("  [安全] 全部独占行\n");
+    }
+    sink.emit_str("  TX DMA 缓冲 64B 对齐：");
+    sink.emit_u32(d.tx_buf_aligned as u32);
+    sink.emit_str("/");
+    sink.emit_u32(d.tx_buf_total as u32);
+    if d.tx_buf_aligned < d.tx_buf_total {
+        sink.emit_str("  [提示] TX 仅 clean（回写自身数据不丢弃），共享行无数据丢失风险\n");
+    } else {
+        sink.emit_str("  [安全] 全部独占行\n");
+    }
+}
+
 fn cmd_perf(cmd: &Command, sink: &mut Sink) {
     let sub = if cmd.argc > 1 { word_str(&cmd.argv[1]) } else { "stats" };
     match sub {

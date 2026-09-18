@@ -504,14 +504,15 @@ pub fn build_request(
     let string_to_sign = &sts[..sn];
 
     // ---- 签名密钥 ----
-    // kDate = HMAC("AWS4"+secret, date)
+    // kDate = HMAC("AWS4"+secret, date) —— date 是 HMAC 的 **message**，
+    // 不进密钥。此前把 date 拼进 key、message 传空：派生密钥与服务端
+    // 不一致，对真实 S3/R2 所有请求必然 403（本地 stub 不校验所以没测出）。
     let mut akf = [0u8; 96];
     let mut afn = 0usize;
     afn = push_out(&mut akf, afn, b"AWS4");
     afn = push_out(&mut akf, afn, &cfg.secret_key[..cfg.secret_key_len]);
-    afn = push_out(&mut akf, afn, &date_stamp);
     let mut kdate = [0u8; 32];
-    hmac_sha256(&akf[..afn], &[], &mut kdate);
+    hmac_sha256(&akf[..afn], &date_stamp, &mut kdate);
     let mut kregion = [0u8; 32];
     hmac_sha256(&kdate, &cfg.region[..cfg.region_len], &mut kregion);
     let mut kservice = [0u8; 32];
@@ -760,9 +761,12 @@ pub fn transact(
             rb[cur..cur + m].copy_from_slice(&chunk[..m]);
         } else if out_fd >= 0 {
             let w = write_fd(out_fd, &chunk[..m]);
-            if w < 0 {
+            // write_fd 返回实际写入字节数（磁盘满/介质错误时为短写，永不
+            // 返回负值 —— `w < 0` 是死条件）：短写必须立即报错，否则下载
+            // “成功”落盘残缺文件，直到验签才失败且报错误导。
+            if w != m as isize {
                 sock_close(fd);
-                return w;
+                return R2_ERR_RECV;
             }
             if !prog.is_null() {
                 unsafe { *prog = body_cnt as u32 + m as u32 };

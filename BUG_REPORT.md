@@ -1284,3 +1284,1049 @@ QEMU GUI 模式偶发 `EL0 fault pid=N ESR=... ELR=0`（eret 到 PC=0，用户�
 
 - `make` exit 0 / 0 警告；sfsrace PASS / wifi PASS / power 21/21 /
   lifecycle-core 38/38；宿主 sync 57 / wireless 105；全应用回归结果见下。
+
+---
+
+## 十八、2026-09-09 通宵修复轮（9 路并行审查 → 45+ 项修复）
+
+> 方法：4 路审查未提交的 2026-09-08 改动（launcher 连续启动打断/手势、
+> OOBE 步骤图标光锥、settings 导航保留区、图标字体管线）+ 5 路子系统深挖
+> （内核 syscall/进程、内核驱动/网络栈、pkg/boot/tools、系统服务守护进程、
+> 媒体类应用），全部发现逐条人工复核后修复。基线：`make` exit 0 / 0 警告、
+> sync_tests 57、wireless 105、power 21、lifecycle-core 38。
+
+### 一、未提交改动审查（2026-09-08 轮的遗留缺陷）
+
+- **launcher 双线性采样左/上边缘外推**（sample_icon_bilinear_stride +
+  draw_icon_asset 两处同款）：整数部分钳制后才计算插值权重，fx<0 时 tx 为
+  负 —— lerp 变线性外推：alpha 可超 255 溢出顶字节（不透明边缘变半透明
+  垃圾色）、暗像素邻亮像素外推出负 RGB 饱和成黑边、拖拽路径 1.12 倍外扩
+  采样 fx 至 -3 直接把图标边缘"咬掉"。修法：权重由未钳制 floor 值计算后
+  clamp 到 [0,1]（右/下边缘本就无害，伪影只出现在左/上）。
+- **launcher start_launch 打断失败路径污染 Return**：return_interrupted +
+  快照压暗发生在 gate/fork 之前 —— gate 写失败或 fork 失败时 Return 转场
+  带着压暗中途帧继续播、BG_RECENTS 已被误清。重排为 gate→fork 成功后才
+  清挂起状态/快照/压暗/瓦片预渲染；失败路径原样返回，Return 以原快照播完
+  （完成后照常开最近任务）。
+- **launcher resume_app_at 恢复转场零帧**：launch_spring 未赋 pos/target
+  （Spring::launch() 恒 0），step_ms 首调即 settled —— 恢复动画 0 帧播完，
+  屏幕停在旧帧直到应用 SIGCONT 自绘（返回中途点后台应用图标时必现）。
+- **launcher TRANS_FRAMES 串账 + page_drag_allowed 死条件**：被打断的
+  Return 帧数计入下一次启动的「启动过渡：N frames」日志（打断时清零）；
+  `phase != Return` 被 `matches!(Idle|PressIn)` 完全覆盖且注释误导，删除。
+- **OOBE 光锥扫光抹掉光标**：play_icon_cone 每帧整屏 flip 把 overlay 写进
+  FB 的光标擦掉且结束后不恢复 —— 鼠标会话每次步骤切换光标凭空消失直到
+  再次移动。render_and_flip 把 cursor_overlay_init 移到光锥之后。
+- **OOBE 光锥恢复矩形削标题 + 逐帧全量栅格化**：restore 矩形下缘 y=210
+  越过 PAGE_TITLE_Y=208（标题墨迹被擦且随终态驻留），下缘钳到标题行上方；
+  124px 加粗字形 ~17KB 远超 1KB 字形缓存，14 帧每帧全量栅格化+膨胀 ——
+  拆出 blit_icon_gradient 整段动效只栅格化一次。
+- **OOBE 完成页「上一步」照样进桌面**：step 12 的 wait_for_tap_next_button
+  返回值被丢弃（`let _ =`）——「上一步」在该页仍绘制且可命中，点击直接
+  enter_desktop。返回 -1 现回退 step 11（与普通步骤语义一致）。
+- **settings 保留区短拖变「抬起位置点击」**：NAV_EXCLUDE 内 pointer_up 恒
+  sliding=false，classify 无手势时 tap 用抬起点 —— 保留区内 11~47px 短拖
+  误开列表项/开关。加 12px slop（触摸/鼠标两路）：位移超 slop 不产生 tap。
+- **settings press_feedback_up 裸拷绕过 LUT**：恢复循环把 BACK_BUF 直写 FB，
+  默认亮度 85 下 LUT 非恒等 —— 抬起处留一块偏亮 ~18% 的方块并踩掉光标
+  sprite。恢复走 flip 同款 lut_px。
+- **settings 底部保留区吞滚动起点且不分手势模式**：BOTTOM_ZONE=130 比导航
+  条(56px)高 74px；buttons 模式 classify_swipe 恒 None，保留区纯属滚动死区
+  （列表最后 1~2 行起手滚不动）。NAV_EXCLUDE 现仅 MODE_GESTURE 生效。
+- **settings 滑条/滚轮无变化也写盘+重绘**：滑条抓取时纯竖直移动每事件
+  slider_set→cfg 落盘 + 整屏重绘（x 未变返回 false）；REL_WHEEL 在钳位端
+  不再置 redraw（wheel_by 返回是否实际变化）。
+- **calculator 释放落空按钮卡在按下态**：本 diff 给鼠标路径新接
+  press_feedback_begin 后，拖出网格松开的 else 分支只置 HOLD_BTN=-1 不置
+  HOLD_CHANGED —— 下沉画面驻留到下一次点击/动画（触摸路径同款旧患一并修）。
+- **图标字体管线核查干净**：246 码点 ↔ make_fonts.py ↔ 子集字体三方一致、
+  settings/ui/weather 全部新码点存在于 Phosphor 2.1.1 cmap 且与官方
+  name→码点映射零错配、Packages/available 逐字节一致、Packages.sig 与三个
+  .kunx 包签名全部验签通过 —— 无需修复。
+
+### 二、内核
+
+- **PM_FREEZE / SET_CPU_CAP 无权限校验（High）**：任意 uid 10000+ 应用可把
+  launcher/系统服务限到 1% 或软冻结（cpu_cap==0 的任务 pick_next 直接跳过）。
+  加与 sys_kill 同级检查（root / 自身 / 目标父进程），EPERM 拒绝。
+- **reap() 可重入/双跑（High，SMP）**：多线程父进程两个线程被同一次 exit
+  的 wake_pid 同时唤醒会扫到同一僵尸，reap 无互斥 —— 双重
+  free_process_tables（把已复用的页二次归还分配器，后续 alloc 把同一物理页
+  发给两个进程）+ fd 引用错减。reap 改原子认领：关中断窗口内 Zombie→Free，
+  只有认领者释放；竞争失败/护栏命中返回 None，wait 循环重试（让出防紧转，
+  重试阻塞保持屏蔽窗口防丢唤醒）。**wait() 误报成功**（护栏早退只返回退出码、
+  wait 当回收成功 → 同一僵尸可被报两次）随 Option 化一并修复。
+- **sleep_until 不恢复 DAIF（Medium）**：入口无条件 daifset 且所有返回路径
+  都不恢复 —— 调用方从此永久关中断运行（fs_lock 退避把整个后续 FS 临界区
+  拖进关中断窗口；perflog 线程第一次睡眠后恒关中断）。与 yield_now 同模式
+  保存/恢复。
+- **write(2)/pwrite(2) >4KB 静默截断（Low）**：read 侧已按块循环，write 侧
+  仍 `count.min(4096)` 单趟 —— 朴素应用不重试即丢数据。File 循环写（中途
+  错误返回已完成部分，Linux 语义）；管道保持单趟 ≤4KB（读者不消费时循环会
+  无限阻塞，且 POSIX 允许管道短写）。
+- **sys_pipe2 无视创建失败（Medium）**：池满/fd 表满把两个 -1 写给用户还
+  返回成功，应用拿 fd=-1 后续全乱。补 EMFILE（与 sys_socketpair 对齐）。
+- **getdents64 缓冲半满丢目录项（Medium）**：readdir_next 消费式推进后才
+  判断放不放得下 —— 放不下时该条目被静默跳过，枚举从此丢项；缓冲装不下
+  一条记录时误报 EOF（POSIX 应 EINVAL）。新增 vfs::readdir_back 回退流位置。
+- **SIG_TABLES / ELF_PROCS 回收不清理（Medium）**：reap 不清信号 handler 表
+  也不调 elf::release（reap_forced 有）—— pid 复用后 kill 会把本应默认
+  终止的信号跳转到新地址空间里的陈旧 handler 地址。补齐。
+- **PAGE_REFS 引用计数 RMW 无 IRQ 屏蔽（Low）**：cow_break（IRQ 使能）与他核
+  exit→free_user_pages 交错丢一次递减 → 共享页计数永不归零（4KB 泄漏）。
+  mark/share/cow_share/unshare 四函数加 irq_save/restore。
+- **帧统计冲刷跨上下文竞态（Low）**：perf::poll_report / anim
+  report_frame_stats 的读-排序-清零可被 note_frame(IRQ) 打断 —— 抹掉新样本
+  /跨窗口混算。快照+复位收进关中断窗口，UART 打印留在可中断上下文（不回退
+  上轮「IRQ 内忙等打满帧预算」的修复）。
+- **net_virtio 只 ACK bit0（Medium）**：virtio-mmio InterruptStatus bit1=
+  config-change 永不应答 —— 纯 config-change 中断电平持续 → GIC 立即重
+  投递 → 风暴护栏把整块网卡禁掉。无条件 ACK 全部 cause，drain 仍只对 used。
+- **TCP 裸 FIN 重传不回 ACK（Low）**：CLOSE_WAIT/FIN_WAIT2 等状态对我方
+  首个 ACK 丢失后的对端纯 FIN 重传不响应（fin_seq<rcv_nxt 分支缺 ACK）——
+  对端只能 RTO 重传到放弃，拆除卡在 CLOSE_WAIT 直到本端 close()。补与
+  TIME_WAIT 分支同语义的重发 ACK。
+- **输入缓冲全满劈帧（Low）**：满时按单事件丢最旧，可能把 DOWN 帧劈开
+  （BTN_TOUCH=1 与它的 ABS_X/ABS_Y 分离 → 用户态按下点退化为悬停旧位置）。
+  改为丢弃最旧的一个完整帧（到首个 SYN 含）。
+- **BTN_TOUCH/ABS 顺序（待验证项→结论，无需修）**：内核唯一注入路径
+  FRAME_DOWN 的发射顺序是 ABS_X→ABS_Y→BTN_TOUCH→SYN（同批同时间戳），环形
+  缓冲单生产者顺序保真 —— 用户态在 BTN_TOUCH=1 时记录按下点的做法正确。
+
+### 三、系统服务
+
+- **后台应用被外部杀死 → 僵尸 + lifd 注册槽永久泄漏（High）**：launcher 只
+  在前台态 waitpid；lifd alive()=kill(pid,0) 对 Zombie 恒真（process_exists
+  对 Zombie 返回 true）→ 双方互等。泄漏 8 次后全部新应用登记失败（应用
+  lc_home 死循环假死）、16 个僵尸后 fork 失败，无自愈路径。
+  poll_background_events 补 waitpid_nohang：回收成功即清 launcher 状态并
+  report_exited（不走 handle_app_exit —— 其假设 fb0 仍是应用末帧并播返回
+  动画，后台被杀时屏上已是桌面）。
+- **BG_RECENTS 恒 false（Medium）**：lifd 写的 reason 是 7 字节 "RECENTS"，
+  launcher `windows(8)` 的 8 字节窗口与 7 字节模式永不相等 —— 最近任务
+  手势返回后动画结束不开最近任务面板。改 windows(7)。
+- **lifd BTASK 截断绕过白名单（Low）**：BTASK 256 经 u64→u8 截断成音频类型
+  (0)，白名单对截断后的值检查形同虚设；超长 dur 回绕。先按 u64 校验再收窄。
+- **wifid FORGET 只删文件（Low）**：NETS 条目一旦加载永不变 inactive ——
+  已「忘记」的网络仍被 AUTO 开机自连；同 ssid 重新 SAVE 时旧 psk 留内存。
+  FORGET 失配失活；SAVE 成功后同 ssid 就地更新内存表。
+- **wifid getdents 解析缺守卫（Low）**：缺 reclen<19 与末记录越界检查
+  （lifd/pushd 都有）—— 目录流异常时切片 panic。对齐。
+- **alarmd 信箱 256B 截断（Low）**：单次 read(256) 后立即 ftruncate，超长
+  排队命令尾部被静默丢弃（BUF 实为 512）。改循环读到 EOF（networkd 语义）。
+- **rild 联系人缓存只读 2KB（Low）**：load_contacts 单次 read，联系人 >17
+  条后不进缓存（来电/短信不显示姓名）。改循环读到 EOF。
+- **audiod best_seq 以 0 为基准（Low）**：`seq.wrapping_sub(0)<2^31` 只接受
+  seq<2^31 —— 客户端 100Hz 计数约 248 天越过后两槽全被拒收，该客户端音频
+  永久静默。基准取 last_seq（顺带修掉陈槽重投递）。
+- **音频双槽提交顺序（Low）**：write_chunk 先写 seq 头后写 PCM —— audiod
+  2ms 轮询在两写之间读到「新 seq + 旧 PCM」→ 播 10ms 陈旧数据（爆音）。
+  改为 PCM 先写、seq 头最后单写提交。
+
+### 四、应用
+
+- **camera 预览帧路径差一（High）**：read_preview_frame 用 `&path[..n-1]`
+  把结尾 'v' 切掉 —— open 的永远是 /tmp/cam/frame_X.yu，恒 ENOENT，
+  取景器/缩略图完全失效（camerad 模式下主功能全废）。一行修复。
+- **camera 系统导航退出不停预览流（Medium）**：手势/三键退出走 exit() 不经
+  camera_stop —— camerad 侧环形帧文件被持续覆写。nav 分支先停流再退出。
+- **camera REQ_ID 位数越界（Low）**：digits[4]/prefix[8] 无位数上限，
+  id≥10000（约万次拍照/录像切换）越界 panic。扩到 10 位（prefix 12）。
+- **cloud 恢复路径 .. 穿越（Medium）**：api_restore 只做前缀校验，内核 VFS
+  真实解析 ..（目录项天然支持相对行走）—— 恶意服务器可写 /data/oobe 外
+  任意可写路径。路径含 ".." 一律拒绝。
+- **cloud lock/wipe 无视本机开关（Medium）**：CTRL_LOCK/CTRL_WIPE/CTRL_FIND
+  只在渲染层展示，服务器命令无条件执行 —— 明确关闭远程锁定/擦除的设备仍
+  被锁定/擦除。设备端加最后一道策略闸门（关闭即 ack denied）。
+- **cloud 失败响应提示用陈旧 RESP（Low）**：http_request 失败路径不更新
+  LAST_RESP_LEN —— resp_err_hint 用上一轮成功长度切本轮半截缓冲。入口清零。
+- **files del_tree 无深度上限（Low）**：dir_total/copy_tree 都限 10 层，删除
+  路径没有 —— 每层栈帧含 raw[2048]≈2.3KB，深目录链打穿 1MB 用户栈。补
+  depth 参数（del_tree_depth）。
+- **contacts 同步页密码框点不中（Low）**：字段命中区上界 260，第三字段
+  (290..380) 漏掉 —— 只能靠 Enter 切焦点（calendar 同类 bug 的漏改残留）。
+  上界改 380。
+
+### 五、包管理 / 存储 / boot / 构建系统
+
+- **ramdisk 变更不触发内核重编译（High，实测复现）**：cb9ca35 诊断出 build.rs声明 rerun-if-changed 会遮蔽 cargo 对 include_bytes!（dep-info）的变更检测，但只删了 ramdisk 一行 —— linker 脚本行本身仍在遮蔽：纯 rootfs 变化（sfsrace/audiotest 标记、rootfs 内容更新）不触发重编译，objcopy 把陈旧 .rodata 重新包装成 kernel.img（表象：测试标记「间歇性」丢失 —— 本轮实测 test-sfsrace 的/sfsrace-test 标记在镜像里、kernel.img 里却没有，内核走正常启动 → 测试超时 FAIL）。kunxcore 唯一的 include_bytes 就是 ramdisk.img，build.rs 显式声明 rerun-if-changed=ramdisk.img 即完备。
+- **store SigV4 kDate 派生错误（High）**：date 被拼进 HMAC 密钥、message
+  传空 —— 与 AWS SigV4 规范（date 是 message）必然不一致，对真实 S3/R2
+  所有请求 403；本地 stub 不校验 Authorization 所以从未测出。按规范修正。
+- **store 下载路径目录逃逸（High）**：索引 name/version 未经字符白名单即拼
+  `/data/store/cache/<name>-<version>.kunx` 且写入先于验签 —— 恶意/被劫持
+  源用 `../x` 可在任意目录创建/截断 .kunx 文件（失败路径还会 unlink）。
+  index::parse_pkg 加白名单（拒绝 '/'、'..'、控制字节，与 kunxpkg
+  valid_path 同级防线）。
+- **store 流式下载短写不可检测（Low）**：write_fd 永不返回负值，`w < 0` 是
+  死条件 —— 磁盘满时「下载成功」落盘残缺文件，直到验签才失败且报错误导。
+  比较写入字节数，短写即 R2_ERR_RECV。
+- **mkfs_sfs layout() 死循环（Medium，实测复现）**：need<bmap 时的复合赋值
+  把两值同时钉死，`layout(33813)` 永不返回 —— sys 分区扩到 ~132MB 以上或
+  自定义 total 落进窗口即构建挂死。改为二分求唯一不动点（need 关于 bmap
+  单调递减）；33812/33813/33814/65536/131072/262144 与 4096..40000 全扫描
+  收敛，total=4096 结果与旧实现一致（data_start=532, jlog=512，镜像不变）。
+- **kunxpkg 注册写失败漏 restore_backup（Medium）**：升级时已安装记录写
+  失败只 rollback 不恢复备份 —— 旧记录声称 vX 已安装而二进制已删。与另
+  两条失败路径对齐。
+- **kunxpkg 升级回滚丢旧版 /res（Medium）**：rollback_files 无条件清空
+  /res/<name>/ 而备份不含 res —— 升级失败后旧版未覆盖资源永久丢失。逐项
+  unlink 已覆盖新包文件；整目录清空移到卸载路径自行执行。
+- **kunxpkg semver 通配误判（Low）**：对整段 any 检测 'x' —— "1.2.3-next"
+  的 pre 段命中 → 整条约束退化 1.x 全匹配。仅末段恰为 x/X/* 才算通配。
+- **kunxpkg alloc_uid 收集表饱和（Low）**：>64 包时 UID 未收集全仍继续分配
+  —— 可能两应用共享 UID 破坏沙箱隔离。饱和即拒绝安装。
+- **kunxboot dtb insert_props 越界 3 字节（Low）**：容量检查未计 insert_off
+  —— 畸形 DTB（chosen 名字 NUL 恰在结构块末尾且缺 END_NODE）写入尾可越出
+  scratch 最多 3 字节（踩进 .bss 相邻变量）。insert_off 计入约束。
+
+### 六、记录在案（本轮未修，移交）
+
+- 信箱 read→clear 竞态（系统性 6 处：launcher evt / lifd cmd / alarmd /
+  audiod / networkd / wifid / rild）：普通文件模拟 FIFO，写方 O_TRUNC/append
+  与读方 read→清空之间无原子提交。需 commit 标记、写临时名换名或内核 rename。
+- rild rewrite_store 就地重写 inbox.dat：掉电点可整箱短信丢失（同需 rename
+  或墓碑标记）。
+- kunxpkg 依赖不递归安装：依赖在索引中「存在」即放行，装出的包运行即坏
+  （需递归安装 + 防环访问集，或至少显式警告用户）。
+- kunxpkg 索引/记录写入无原子性无 fsync（需内核 rename/fsync 支持）。
+- store Packages.json.sig 缺失时仅告警照收（强制验签需 e2e 配套改造）。
+- SMP 专项·已修三债 + 新发现竞态（2026-09-16 SMP 打通轮，详见下文
+  「SMP 打通记录」）：原三项（PROCESSES 槽位分配非原子 / execve 兄弟线程
+  跨核 kill_req 待兑现窗口 / fs_unlock 迁移+嵌套释放）已修复；新暴露
+  `TASKS`/`CURRENT` 等调度器静态表的无锁并发面（sfsrace 双核压测偶发
+  任务表踩踏，时序敏感）——`-smp 2` 定位实验性，默认回归仍单核。
+- cloud 长按解锁实为「间隔 2-3s 双击」（poll_input 只在抬起产 tap；需 kit
+  暴露 press 事件或改文案）。
+- clock/notes 编辑子页标题栏返回/ESC 直接退出应用（与 calendar/contacts 的
+  逐级返回不一致，用户编辑中误触即丢应用）。
+- 历史遗留：compositor SX_TABLE 1024 上限、fb_present IRQ 窗口偏大、DMA 64B
+  缓存行隔离（Pi4/KVM）、中断风暴 act0 诊断（待复现采集）。
+
+### 验证
+
+- `make` 全量构建 exit 0 / 0 警告。
+- 宿主：sync_tests **57/57**、wireless **105/105**（全部修复后复跑）。
+- 内核无头回归：power **21/21**、lifecycle-core **38/38**（reap Option 化、
+  sleep_until DAIF、PM 权限等内核修复后）。
+- mkfs_sfs layout()：死循环修复后 33812/33813/33814/65536/131072/262144
+  与 4096..40000 步进 7 全范围收敛；total=4096 与旧实现结果一致（镜像不变）。
+- 全应用回归（apps_regression.py）：**14/14 PASS**（phone 拨号 / calendar
+  翻月 / music 播放暂停 / browser 书签 4 项交互抽查全过）。
+- **sfsrace PASS**（4 进程 ×12 轮并发创建/读写/截断/删除，vfs::readdir_back
+  与 getdents64 回退/EINVAL 改动覆盖）、**wifi PASS**（wifid 解析守卫与
+  SAVE-FORGET 内存表同步覆盖）。
+- 无头冒烟（-kernel -nographic）：启动链完整、0 PANIC / 0 EL0 fault。
+- 注：sfsrace 首轮 FAIL 即上方构建系统根因的实证 —— 标记已入 ramdisk
+  （116 inodes）而 kernel.img 仍嵌旧镜像（115 inodes），内核走正常启动
+  超时；build.rs 修复 + 重编后 PASS。
+
+---
+
+## 十九、2026-09-12～16 TLS/NetSurf 移植轮（内核 musl 兼容缺口 + 验证环境治理）
+
+> 方法：以「musl 静态 Linux 程序」为靶子（nsmonkey / netsurf-fb / tlstest
+> 实机驱动）逐个暴露并补齐内核缺口，每条发现均实机复现后修复；轮末全量
+> 回归时揪出一例**验证环境退化**（非代码回归）。基线：`make` exit 0 /
+> 0 警告、sync_tests 57、wireless 105、power 21、lifecycle-core 38、
+> tlstest PASS、nsmonkey 冒烟 PASS。
+
+### 一、内核 musl/Linux 兼容缺口（修复清单）
+
+- **auxv 缺失（阻塞级）**：内核 execve 栈布局只有 argv/envp，无 auxv ——
+  musl 静态程序 __init_libc 依赖 AT_PHDR 定位程序头表（读动态段/初始化
+  TLS），缺失即启动即死。补全 AT_PHDR/PHENT/PHNUM/PAGESZ/ENTRY/UID/EUID/
+  GID/EGID/HWCAP/CLKTCK/SECURE/RANDOM/EXECFN；AT_RANDOM 熵源优先 virtio-rng、
+  时间回退；phdr_va 由「程序头表落在哪个 PT_LOAD 段内」推算。
+- **CLONE_CHILD_CLEARTID 缺失（阻塞级）**：musl 新线程以
+  clone(CLONE_CHILD_CLEARTID, child_tidptr=&__thread_list_lock) 创建 ——
+  线程退出需内核向该地址清零并 futex 唤醒等待者，否则 pthread_join 永远
+  挂死、__tl_lock 死锁。补 set_tid_address 记录槽 + exit_thread_notify
+  （ dying 线程地址空间仍活跃时写 0 + wake，含用户指针校验）。
+- **ppoll 缺失（本轮验证期发现）**：pselect6 已实现，但 musl 的 poll()
+  走 **ppoll**（aarch64 nr 73）—— 此前未分发恒 ENOSYS，nsmonkey 的
+  select 轮询事件循环永不读 stdin/不建窗口（现象：`GENERIC POLL TIMED`
+  倒计时刷屏、WINDOW NEW 无输出）。与 pselect6 合并为 sys_poll_family
+  （仅超时参数寄存器不同：x[4] / x[2]）。
+- **UART read 返回 0 = EOF（阻塞级）**：/dev/ttyS0 无数据时返回 0 ——
+  POSIX 语义 0 = EOF，musl fgets 立即结束，nsmonkey 等交互程序启动即退。
+  改为阻塞至 ≥1 字符再取走当时可用全部（无数据 yield 让出）。
+- **write/pwrite >4KB 静默截断（High）**：`count.min(4096)` 单趟写 ——
+  超过 4KB 的写不报错也不重试提示，朴素调用方丢数据且不自知。改按 4KB
+  块循环写（中途错误返回已完成部分，Linux 语义）；管道保持单趟 ≤4KB
+  （POSIX 允许管道短写，且写循环在读者不消费时会无限阻塞）。
+- **writev 零长 iov 死循环（Medium）**：零长 iov 项此前 `n == 0` 即 break
+  —— musl 无缓冲流（stdout 按行刷新）首项为零长时死循环。改为 continue。
+- **rt_sigprocmask ENOSYS（Low）**：musl 启动路径 __block_all_sigs 调用并
+  忽略返回值，ENOSYS 亦可行但语义上应答成功桩（内核无信号投递队列）。
+- **TCP 固定接收窗口（Medium，吞吐）**：通告窗口恒 16KB —— 对端在接收
+  缓冲（16KB）填满后继续超发，丢段只能等 RTO；取走数据后也不立即 ACK，
+  窗口重开靠对端零窗口探测。改通告真实可用空间（缓冲 − 未取走），取数后
+  立即 ACK；另补对端 FIN 重传重 ACK（此前不回，对端 RTO 重传到放弃，
+  拆除卡在 CLOSE_WAIT 直到本端 close）。
+- **页故障 DFSC 误判（High，mmap 路径）**：mmap 匿名区落在继承自内核的
+  2MB 块映射地址范围内时，访问报 L2 权限错误而非 translation —— 旧代码
+  按 DFSC 精确分类，LAZY 预留页永不落地。改为掩码归一后统一「先 LAZY
+  落地、再 COW、均失败才 SIGSEGV」，wild 指针语义不变。
+- **用户栈 1MB 不足（Medium）**：NetSurf 深递归（libcss 选择器匹配等）
+  打穿 1MB 栈。扩到 8MB（预留区间上限内，仍按需映射）。
+
+### 二、内核健壮性（移植期顺带修复）
+
+- **wait 收尸防重入（High）**：多线程父进程两个线程可被同一次 exit 的
+  wake_pid 同时唤醒、扫到同一僵尸 —— 双重 reap = 双重 free_process_tables
+  （同一物理页二次归还，后续 alloc 把同一页发给两个进程）+ fd 引用错减。
+  reap 改为关中断窗口内原子认领（Zombie → Free），失败方返回 None 由
+  wait 循环重扫。
+- **pid 复用残留（Medium）**：收尸未清 ELF 运行时信息与 SIG handler 表 ——
+  pid 复用给新进程时，陈旧 ASLR 栈基址/brk 被 current_stack_base()/
+  current_brk() 当作新进程的值，残留 SIG handler 把默认终止信号跳转到新
+  地址空间的垃圾地址。reap 时对齐清空。
+- **virtio-mmio IRQ 只 ACK used-ring（Medium）**：设备发纯 config-change
+  （InterruptStatus=0b10）时永不写 ACK 寄存器 —— 电平中断被 GIC 立即
+  重投递 → 风暴护栏触发把整块网卡禁掉。改为无条件 ACK 全部 cause，drain
+  仍只在真有 used 更新时执行。
+- **页引用计数 RMW 竞态（Medium，SMP/IRQ）**：mark_shared_page/share_page/
+  cow_share 的读-改-写无 IRQ 屏蔽 —— 与另一核 exit→free_user_pages 交错
+  丢一次递增/递减，计数永不归零 = 4KB 页永久泄漏。全部补 irq_save/restore
+  （与 free_page 同款防护）。
+- **readlink errno 语义（Low）**：不存在与非符号链接都返回 -1 —— musl
+  realpath 逐组件调 readlink 且只容忍 EINVAL，其他错误码使 realpath 对
+  一切路径失败。区分 ENOENT / EINVAL。
+- **readdir_back 丢目录项（Low）**：getdents64 用户缓冲装不下「刚被消费」
+  的条目时直接丢项，目录枚举从此缺文件。补 readdir_back 回退目录流位置。
+- **kunxcore/build.rs ramdisk 跟踪补全**：cb9ca35 只删了 ramdisk 一行，
+  linker 行的 rerun-if-changed 仍在遮蔽 include_bytes! 的 dep-info 跟踪
+  （纯 rootfs 变化不触发重编译）—— 显式声明 rerun-if-changed=ramdisk.img
+  即完备（本包唯一 include_bytes）。
+
+### 三、验证环境：disk.img /data 卷 inode 耗尽（本轮新发现，环境性）
+
+- **现象**：lifecycle-core 回归 23/38（且逐轮波动 23→25→12）——失败集中在
+  文件信箱命令（reg_/cmd_* 写入无 ack），`ls /data/life` 仅剩 evt_8/evt_11/
+  launcher_evt/recents 残留；对 /data/life/cmd_0 的 O_CREAT 创建**稳定**
+  返回 -1，而同目录读取（recents）不受影响。
+- **定位**：vfs::open 失败日志加临时全量记录 + shell 重定向失败临时打印 →
+  `[vfs] open 失败 err=-1 used=8/256`（打开文件表仅 8/256，排除 fd 表耗尽）
+  → fs_create 在 inode_alloc 无空闲位时返回 -1 —— **SFS imap 满**。
+- **根因**：disk.img 为跨测试轮持久卷（/data 256 inode 上限，mkfs 仅在无
+  SFS 签名时执行）。lifecycle 每轮注册的 evt_<pid>/pending/state 等文件在
+  关机路径不清理，pid 漂移即新增永不删除的残留文件；一周多轮测试（本轮
+  netsurf/tlstest 高频上机）后 imap 渐满，create 开始失败 —— 表现为「测试
+  间歇性挂」的假回归。
+- **处置**：重建 disk.img（`rm disk.img && make disk`）后 lifecycle-core
+  38/38。注意：**新盘首启会触发全盘 mkfs，与守护进程启动存在竞态**（首轮
+  reg 全失败 12/38），第二轮起正常 —— 回归脚本在新盘上需先跑一次热身引导。
+- **移交**：① 关机/收尾路径清理 /data 测试残留（或测试脚本自带 teardown）；
+  ② df/sysinfo 暴露卷空闲 inode 数（本次只能靠串口日志反推）；③ vfs::open
+  失败 errno 细分（ENOSPC/EEXIST/ENOENT 混同为 -1，排查期只能全量开日志）。
+
+### 四、记录在案（本轮未修，移交）
+
+- **shell 重定向 open 失败静默回退 stdout**：`echo x > 不可写路径` 不报错、
+  内容直接上屏（排查期临时加过错误打印，已还原）——建议回退前打印
+  「sh: 无法打开 <path>」。
+- **alarmd 每 400ms open(/data/alarms.txt) ENOENT 刷屏**：无闹钟文件时
+  永久失败重试，淹没有效串口日志（建议启动时创建空文件——CTL_PATH 已有
+  同款先例——或失败后降频）。
+- **HOME 环境变量未设置**：nsmonkey 资源路径解析成 /~/.netsurf/...（无害
+  警告）；建议 shell 默认 export HOME=/data。
+- **vtimer PPI（irq 27）风暴**：既有「风暴探测器 + 护栏」已兜底（episode
+  自行消散，输入不丢），根因（GICv2 PPI eoi 时序）仍待复现采集。
+- **信箱 read→clear 竞态（十八已记录）**：本轮 lifd「先删除再处理」路径
+  与 shell O_TRUNC 写入的窗口依旧存在，测试时序依赖的偶发丢命令属此列。
+
+### 验证（2026-09-16）
+
+- `make` 全量构建 exit 0 / 0 警告。
+- 宿主：sync_tests **57/57**、wireless **105/105**。
+- 内核无头回归：power **21/21**；lifecycle-core 共享树复跑受二十·附所记
+  信箱回归 + 同机并发 QEMU 干扰受阻（根因已修复，隔离树 38/38），终验待
+  收敛后复跑。
+- 浏览器 TLS：来宾侧 tlstest **PASS**（QEMU slirp 真网，www.baidu.com:443
+  全握手 + 证书链验证 + 取页）；宿主侧 hosttest PASS（同源码 std TcpStream，
+  握手 35ms、3 级证书链）。
+- NetSurf：nsmonkey 无头冒烟 **PASS**（WINDOW NEW → file:// 取页 → 解析 →
+  排版，TITLE/UPDATE_EXTENT 事件齐全）。
+- 无头冒烟（-kernel -nographic）：启动链完整、0 PANIC / 0 EL0 fault。
+
+---
+
+## 二十、2026-09-16 通宵修复轮（三路并行审查 → 15 项修复 + 5 组动画）
+
+> 方法：3 个并行审查代理（① 未提交的 2026-09-11 对话框统一轮 diff 逐文件
+> 回归审查 → F1~F11；② 信箱 read→clear 竞态全仓盘点（10 站点 + rename
+> 内核语义约束）；③ clock/notes/cloud 挂起项方案盘点）+ 主会话实施。
+> 另注：本轮与另一并行会话同期作业（内核 / kunxpkg / var/run 守护进程信箱
+> 由该会话负责），本轮边界为 launcher/动画/应用侧与 lifd 族信箱，无文件
+> 冲突。全部通过 `make` 全量构建（exit 0）+ 宿主 sync 57 / wireless 105。
+
+### 未提交 diff（对话框统一轮）回归修复（审查①发现）
+
+- **F1（高）blit_icon 不透明段直写 BACK_BUF 绕过 TILE_MODE/FOLDER_TILE**：
+  本轮性能优化给 blit_icon 加的「不透明段整段 copy_from_slice」快路径不看
+  渲染目标模式 —— 图标缓存就绪后任何 `TILE_MODE=true; draw_app_icon(0,0)`
+  把图标主体写进 BACK_BUF 左上角（污染状态栏），瓦片本身只剩边缘像素
+  （启动转场放大瓦片错图标/编辑模式抖动图标损坏）。`draw_app_icon` 入口
+  对两模式跳过缓存快路径，回退 put_pixel 路径（put_pixel 正确路由瓦片）。
+- **F2（高）小组件玻璃缓存键不含几何**：布局变化（编辑模式移除小组件 /
+  桌面设置切网格列数）后命中旧缓存，把旧位置模糊出的壁纸玻璃 blit 到新
+  位置（内容错位）。缓存键加入 (x,y,w,h)。
+- **F3（中）「桌面设置」卡直接点确定把壁纸序号误当网格选择**：sheet 3 与
+  壁纸卡共用 SHEET_WALL 暂存 —— 打开即被赋为 WALLPAPER(0..3)，直接点
+  OK 时 `SHEET_WALL==1` 会把 4x6 用户悄悄切成 5x6（默认壁纸=2 时反向）。
+  新增独立暂存 SHEET_GRID（打开时 = GRID_COLS，直接 OK = 无变化）。
+- **F4（中）Toast 退场残影长驻**：退场末帧 alpha ~13（8ms 轮询），过期后
+  不再触发重绘，局部刷新路径下淡出轮廓停留数分钟。`toast_anim_active`
+  过期后 16ms 内补一帧清理（此时 draw_overlay 已不绘制 → 干净帧）。
+- **F5（中）文件夹压暗缓存冻结分钟级 UI**：`FOLDER_DIM_OK` 命中时把缓存
+  memcpy 回 BACK_BUF，会抹掉分钟沿刚重绘的状态栏（文件夹打开跨分钟时
+  状态栏时间停走）。分钟沿分支对 `FOLDER_PHASE != Closed` 先失效缓存。
+- **F6（中）browser decode_chunked 整数溢出 → 远程可触发 panic**：分块
+  大小 "FFFFFFFFFFFFFFFF" 解析为 usize::MAX，`i + size` 回绕绕过边界检查，
+  切片终点小于起点直接 panic（no_std 应用即 abort）。size 上限 + 双
+  checked_add。
+- **F7（中低）编辑选择卡白卡入场淡入不生效**：卡片填充/描边走
+  `LauncherSmooth::put_aa` 直写，不乘全局 PIX_ALPHA —— 第 1 帧全不透明
+  「弹出」而遮罩/文字在渐显。put_aa 与 put_pixel 一致乘 PIX_ALPHA。
+- **F8（低）dialog draw_check 未选中态角弧描边缺口**：`qx+qy>r` 的 L1
+  判定漏掉弧中点（四角 1px 缺口）。改欧氏环带 `(r-1)²` 判定。
+- **F9（低）鼠标长按缺控制中心判定**：鼠标长按是主循环按 MOUSE_DOWN 计时
+  触发的，不经过手势分类 —— 控制中心/通知中心展开时长按误进编辑模式。
+  补 `cc_visible()` 早退（触摸路径 on_blank 分支已有同款）。
+- **F10（存疑，未修）连续启动打断后旧后台应用的单槽状态被覆盖**：回收
+  路径未完整核验，移交后续轮补验。
+- **F11（低）dialog.rs 文档示例 scrim 签名过期**：doc 修正。
+
+### 挂起项清剿（审查②③方案落地）
+
+- **rild rewrite_store 双缺陷**：(a) 就地 lseek(0)+write 不 ftruncate ——
+  删除记录后新内容更短、旧尾巴残留，`count_records` 数 `\n` 把陈尾当记录
+  → **已删短信「复活」**（比掉电更高频的日常 bug，本轮新发现）；(b) 重写
+  中途掉电 → 半行损坏不可恢复。修复：旧箱 rename 为 `.old` 备份 → O_TRUNC
+  全新写 → 成功后删备份；新箱写失败把备份改回（旧箱完整）；启动时
+  `recover_store()` 检测正身缺失/非法而备份有效即回滚（丢的只是一次
+  删除/标记，记录本体无损）。改名失败回退「ftruncate(0) + 写」就地路径。
+- **clock 编辑子页返回/ESC 逐级返回**：闹钟编辑页（TAB_ALARM+APAGE_EDIT）
+  的标题栏返回与 ESC 原本直接 `break` 退出整个应用（编辑中误触即丢）。
+  现回闹钟列表（与「取消」按钮同语义：APAGE=APAGE_LIST + EDIT_FOCUS=0），
+  根页才退出（对齐 calendar/contacts 的分级返回）。
+- **notes ESC 逐级返回**：编辑器页 ESC 原本直接退出（标题栏返回已是分级）。
+  现编辑器 ESC 回列表（PAGE=0 + 清搜索焦点），列表页才退出。
+- **cloud 长按解锁改真长按**：原实现只在 tap（抬起）帧判定 —— 实际语义是
+  「两次点击间隔 2-3s」，真长按（按住 2s 再抬）反而无法解锁。改为每帧
+  检测 kit 静态量（TOUCH_DOWN/TOUCH_US/TOUCH_PX/CUR_X）：按下起点与当前
+  位置都在解锁按钮内且持续 ≥2s 即解锁；解锁后吞掉本次抬起（解锁按钮区
+  与主界面按钮区有重叠，不吞会误触「立即同步」）。
+- **信箱 read→clear 竞态（lifd 族，系统性缺陷的 /data/life 部分）**：
+  - `shared/lifecycle.rs`：`lc_write_cmd` 改 **每消息一文件**（`cmd_<pid>_<seq>`，
+    写 `.tmp` 后 rename 发布 —— 目标名永不存在，rename 恒成功，lifd 的
+    getdents 扫描 + parse_dec 到非数字停止，读方零改动）；`lc_read_evt` 改
+    **rename 取走**（`evt_<pid>` → `.r` 再读再删 —— 取走与读取之间新发布
+    的事件落在重生文件上，不再被 unlink 吞掉）；`lc_init` 就绪探测从
+    「evt 文件存在」改为「/data/life 目录存在」（取走语义下文件不常驻）。
+  - `lifd`：`send_evt`/`send_launcher` 改 `.new` 写入 + unlink + rename
+    发布（新增 `publish_file`/`rename_file`/syscall4）；**`poll_mailbox`
+    改两段式扫描**（先收集名字、关目录、再处理 —— 处理中的同目录 rename
+    会使 getdents 游标错位跳过后续 cmd 文件）；`publish_file` rename 失败
+    （目标被 cat 打开等）时重试后退回就地覆写并清理临时名（防 `.new`
+    泄漏 inode）。两处均为隔离验证揪出的回归，详见下方「附」。
+  - `pushd`：DELIVER 命令改 `publish_cmd`（每消息一文件），保留 lifd
+    未就绪时的补建目录重试。
+  - `launcher app_life`：`request_fg`/`report_exited` 改每消息一文件；
+    `read_launcher_evt` 改 rename 取走。
+  - 未迁移（移交）：`/var/run` 守护进程信箱（alarmd/audiod/networkd/
+    wifid/camerad/sensord/positiond）由同期并行会话处理；rild.cmd
+    读方该会话已改 rename 认领。
+
+### 动画（对齐 docs/animations-roadmap.md，详见 animations.md 新节）
+
+- **Toast**：长文案按 420px 折行（最多 3 行，药丸随行增高），保持期按
+  行数延长（单行 1.67s 不变，每多一行 +0.6s）；退场上滑 8px（入场的
+  反向完整性）。
+- **最近任务伪 3D 纵深（P2-3）**：卡片按槽位（距最近应用的次序）
+  scale = 1-0.055i、y 下移 9i px、整体 alpha = 1-0.08i（纯缩放近似，
+  围绕卡片中心；跟手清理的卡随上拖 60px 内抬升回全尺寸）。
+- **锁屏分钟切换 + 解锁先扩后散（P1-4 部分）**：分钟变化时旧时刻上移
+  12px 淡出、新时刻自上方 12px 下移入场（320ms `Emphasized`，双时刻
+  错位）；解锁转场中时钟 scale 1.0→1.12 + 淡出（鸿蒙解锁质感）。新增
+  `draw_big_text_f`（8x8 字形浮点倍率最近邻 + PIX_ALPHA 支持 ——
+  fill_rect 快路径不吃 PIX_ALPHA）。
+- **settings 主列表 / store 卡片入场错峰（P0-6）**：每行/卡错峰 25ms、
+  自下方 20px 上滑入位（200ms `EaseOut`），仅启动首次进入播放
+  （滚动/搜索过滤不重播），阻塞推进与页面转场同模式。
+
+### 本轮验证
+
+- `make` 全量构建 exit 0；宿主 sync_tests **57/57**、wireless **105/105**。
+- lifecycle-core（lifd 信箱协议的直接覆盖）：**隔离验证 38/38 PASS**
+  （HEAD 干净 worktree + 本轮全部文件；共享树复测受同期并行会话的内核
+  在制回归阻塞，见「附」）。
+
+### 附：lifecycle-core 失败的定位与修复记录（本轮自查自纠）
+
+本轮 lifecycle-core 实测 12/38（共享树）/ 20/38（隔离树）。三步定位：
+
+1. **隔离对照**：HEAD 干净 worktree（纯 HEAD = 38/38 ✅）+ 仅叠加本轮
+   lifd 族文件 = 20/38 → **确认本轮信箱迁移引入回归**，逐段探针证明
+   pushd 发布 → lifd DELIVER 链路本身工作正常。
+2. **根因一（已修复）**：lifd `poll_mailbox` 在 getdents 迭代中经
+   handle_cmd → send_evt 于**同一目录** rename 发布事件（`evt_*.new` →
+   `evt_*`），目录项增删使扫描游标错位 → 后续 cmd/reg 文件被跳过
+   （FG/BTASK 静默不执行）+ 跳过的文件永不清理逐个泄漏 inode → 测试
+   中后期 shell 连根目录创建都失败（`echo a1 > /t1` 回退上屏）。
+   修复：扫描改**两段式**（先收集全部名字并关闭目录，再逐个处理）。
+3. **根因二（已修复）**：`publish_file` 的 rename 在目标被第三方打开
+   （shell `cat` 观测 evt 文件）时 unlink 被拒 → rename 失败 → 事件丢失
+   且 `.new` 残留泄漏 inode。修复：短暂重试后仍失败退回就地覆写（旧
+   O_TRUNC 语义），并清理临时名。
+
+修复后隔离树 lifecycle-core **38/38 PASS**。共享树复测仍失败 ——
+另有**同期并行会话的内核在制回归**：启动期（无任何生命周期活动时）
+`/var/run/sensord.state`、`/data/alarms.txt` 等创建即失败、shell 重定向
+连根目录都回退上屏、其自身 sfsrace 同窗口 `FAIL: creat`；读路径全部
+正常、df 显示 581 空闲块、镜像 196/256 inode（远未耗尽）——签名指向
+FS 写路径（fs_simple/vfs/smp 在改，rename 覆盖 + SMP 专项）的中间态。
+待该会话收敛后共享树复跑即可全绿。
+
+## 二十一、2026-09-16 SMP/PSCI 打通轮（副核唤醒 + 三债修复 + 每核状态）
+
+### 打通路径（此前结论为何错误）
+
+旧结论「`-kernel` 直载模式无 PSCI（smc 触发 UNDEF / EL3 桩不实现）」的
+错误在 **conduit 选错**：QEMU virt（secure=off）的 DTB `/psci` 节点
+`method = "hvc"`——QEMU 自身拦截 `hvc #0` 分派 PSCI，不依赖 EL3 固件
+（与 `plat_qemu` 的 PSCI hvc 关机同机制）；`smc #0` 在无 EL3 时才是
+UNDEF。`smp_init` 改为 DTB 检测 conduit（hvc/smc）+ 函数号，先
+`PSCI_VERSION` 探测（-1 则显式单核降级），再逐核 `CPU_ON`。QEMU 11.1
+实测 `PSCI version=0x10001`，`-smp 2` 两核在线、副核实际执行用户任务。
+
+### 副核上线的四个真实阻塞点（依次排障实录）
+
+1. **GICC 每核偏移错误**：`gicc_base()` 误加 `cpu_id()*0x20000`，cpu1
+   写 0x08030000（GICV 区，NS EL1 不可访问）→ Data Abort DFSC 0x10。
+   GICv2 CPU interface 是**每核 banked**（各核同一地址），去掉偏移。
+2. **副核栈对齐**：`SECONDARY_STACKS: [u8; N]` 默认 1 字节对齐且被链接
+   进 .rodata（实测 0x4012eb46），副核 SP 歪 → 函数序言 `str/stp`
+   Alignment fault 风暴（ESR 0x96000061）。`#[repr(align(16))]` 包装 +
+   入口汇编 `bic x0,x0,#0xF; mov sp,x0` 兜底。
+3. **副核栈只读映射**：不可变 `static` 全零初始化落 .rodata，恒等映射
+   把 text..data 段标只读 → 副核开 MMU 后首次栈写 Permission fault
+   （ESR 0x9600004F）。改 `static mut` 落 .bss（可写区）。
+4. **每核地址翻译状态缺失**：MAIR/TCR/TTBR0/SCTLR/PAN 均为每核寄存器，
+   仅 CPU0 的 `mmu::init` 配置过 → cpu1 首次切入用户任务（换用户页表）
+   即以复位值翻译 → Instruction Abort（init 在 cpu1 首调即 SIGILL
+   @0x400000，`mapped=1` 但取指中止）。新增 `mmu::init_secondary()`。
+
+### 三项已列 SMP 债务修复
+
+- **PROCESSES 槽位分配原子化**：`PROC_CLAIM[pid]` 认领位（AtomicU32）。
+  `alloc_pid` CAS 认领 + 复查，持至 `state=Running` 写回或失败清零；
+  `reap`/`reap_forced` 在置 Free/清零前认领、完成后释放——消灭
+  「他核 fork 与 reap 的 Free 窗口互相踩 PCB/释放新页表」。认领只独占
+  单槽位，fork 的长地址空间复制不放大临界区。
+- **execve 跨核 kill_req 窗口**：`kill_siblings_of` 标记后新增**静默
+  等待**（sched_lock 下轮询「无 Running 兄弟」，1ms 睡眠退避，1s 上界
+  超时打印诊断后继续）——等他核 tick 兑现 kill_req 后才允许
+  `replace_address_space` 释放旧页表。配套堵复活洞：`pick_next` 对带
+  kill_req 的 Ready 任务（标记后阻塞→唤醒）就地兑现 Exited，不再拉回
+  Running（否则其将在新地址空间上执行旧映像 PC）。
+- **fs_unlock 迁移+嵌套释放**：`fs_lock/fs_unlock` 持有身份从
+  (CPU,TID) 双令牌改为 **TID 单令牌**（CPU 位仅诊断记录）。此前迁移后
+  的持有者解锁会因 `w>>32 != 当前核` 误走「非持有者」分支**无条件清零**
+  ——嵌套深度丢失，外层临界区未退出锁已被他人取得；且迁移后重入
+  fs_lock 会误判他人持有而退避死锁。unlock 改 CAS 减深度、归零才真正
+  释放；防御清零仅限持有者已死（自愈），存活持有者不再被误清。
+
+### 验证矩阵（QEMU 11.1 TCG，隔离 worktree）
+
+- 单核：boot 正常（`[smp] cpus=1`）、`make test-sfsrace` PASS、
+  `make power-test` 21/21。
+- `-smp 2`：`PSCI version=0x10001 在线核数=2`、`cpu1 已上线`、0 PANIC；
+  QEMU `-d int` 实证 cpu1 有定时器 IRQ + 19 次 SVC + 用户缺页
+  （负载均衡真实发生）；sfsrace 全量一次 PASS；power-test 20~21/21
+  （FAIL 项为串口 shell 时序敏感，双核 TCG 吞吐下降所致，非确定性错误）。
+- **遗留（新发现，未修）**：sfsrace 双核压测**时序敏感地偶发**任务表
+  踩踏（`[tasks]` 全零 + 用户态跳 0，Instruction Abort ELR=0）——
+  指向 `TASKS`/`CURRENT` 等 `static mut` 调度器状态的无锁并发读写面
+  （tick/唤醒/调度路径的广泛裸读）与 tick IRQ 上下文的锁纪律，属
+  三债之外的系统性工程。`-smp 2` 因此定位**实验性**：默认回归、发布
+  与文档指引仍单核；`make run-smp`（verbose）供 SMP 开发观察。
+
+### 顺带修复（构建系统，Makefile 范围）
+
+- `test-sfsrace` 间歇性 FAIL 根因：mkfs 重写 ramdisk 与上次 cargo 编译
+  **同秒**时，mtime 粒度内 cargo 误判 Fresh → 测试标记不重嵌
+  kernel.img。mkfs 后 `touch $(RAMDISK)` 强制 mtime 前进触发重编。
+- `make run-smp` 更新为真实 SMP 说明 + verbose；`docs/DEBUGGING.md`
+  同步（删除「观察单核回退」的过时表述）。
+
+### 2026-09-17 回退记录：smp.rs 暂退 HEAD（PSCI WIP 存档）
+
+`-smp 2` 启动概率性挂死，二分定位最小挂死集合 {smp.rs, mmu.rs,
+gic.rs}；其余 22 项内核改动全叠加、仅 smp.rs 取 HEAD 时 3/3 稳定
+（cpu1 不上线，退化单核）。mmu.rs（每核翻译寄存器）与 gic.rs（GICC
+banked）为正确独立修复，保留。根因是调度器 `TASKS`/`CURRENT` 无锁
+static 的双核竞态（本节上文「遗留」项），需单独的锁纪律改造轮。
+**处置**：smp.rs 回退至 HEAD，`make run-smp` 稳定单核。PSCI 打通
+代码（DTB conduit 检测 + hvc/smc + CPU_ON，已验证 cpu1 可上线、有
+SVC/IRQ/缺页活动）完整存档于 `/tmp/smp_psci_wip.patch`
+（11076 字节，sha256
+`6b8fe86a866d4e6bae1759fe6a7ecc58cd7c4f2ae13a62be2ee4dc55fd3f233a`，
+`git apply` 可直接重放）。**待办**：调度器锁纪律改造完成后重新合入。
+
+---
+
+## 二十二、2026-09-18 修复轮（四路并行审查 → 19 项修复 + inode 容量根因 + 4 组动画）
+
+> 方法：4 个并行审查代理（内核 diff / launcher+OOBE diff / 应用+shared diff /
+> 服务+kunxpkg diff）对未提交的在制改动（约 8600 行插入）做回归审查，全部
+> 发现逐条人工复核后修复。另在批次验证中揪出 sfsrace BASELINE FAIL 的根因
+> —— SFS inode 容量耗尽（第二十轮「共享树 /var/run 创建即失败」的真正答案，
+> 非中间态）。基线：`make` exit 0 / 0 警告、sync 57、wireless 105。
+
+### Critical/High：SFS inode 容量耗尽（第二十轮遗留症状的根因）
+
+- **`MAX_INODES=256` 容量跟不上 rootfs 增长**（fs_simple.rs / mkfs_sfs.py）：
+  rootfs 文件数涨到 196 后，sfsrace（4 进程 × 12 轮 = 48 文件）+ 守护进程
+  信箱/状态文件在数秒内耗尽剩余 60 个 inode —— `inode_alloc` 恒失败，
+  全系统 create 返回 -1。表象：sfsrace `BASELINE FAIL: creat`（间歇性，
+  取决于守护进程先烧掉多少）、`[vfs] open 失败 /var/run/rild.state.tmp`、
+  sensord/alarms 等状态文件创建失败。第二十轮归因为「并行会话内核在制
+  回归的中间态」，实为容量问题（该会话的信箱改造大量增加 /var/run 与
+  /data 的 create churn，把潜伏的容量不足推到了必然触发）。
+  修复：`MAX_INODES` 256 → **512**（内核 + mkfs 同步；imap 块 4096B =
+  32768 位远未触顶，inode 表 32 块 = 128KB 磁盘、零 RAM 常驻成本）；
+  `parse_sb` 新增 `SB_NUM_INODES == MAX_INODES` 护栏 —— 旧 256-inode
+  镜像的 jlog 紧跟 16 块 inode 表，新内核按 32 块推位会把 ino 256..511
+  的读写打进旧日志区（静默损坏），必须拒绝挂载（`rm disk.img && make disk`
+  重建）。定位手段：fs_create_unlocked 四个失败分支临时诊断打印
+  （exists/inode_alloc+free 数/write_inode/dir_add），一轮即锁定
+  `free=0`。修复后 sfsrace **PASS**（4 子进程全 0 退出）。
+
+### 内核（6）
+
+- **O_APPEND 整条追加链路是死代码**（High，linux_compat.rs:753）：
+  `sys_openat` 转发标志时丢弃 O_APPEND(0x400)——`vfs::write` 的追加分支、
+  `fs_write_append` 全部不可达；多写者信箱（audiod.ctl / rild.cmd）各自
+  「open 时 seek 尾」取到同一尾偏移互相覆盖（本轮 diff 想修的原 bug 原样
+  存在）。转发掩码加回 0x400 + vfs 定义 `O_APPEND` 常量，一处激活全链路。
+- **SYS_PPOLL 按 pselect6 的 fd_set 语义解析 pollfd 数组**（High，
+  linux_compat.rs）：ppoll 的 ABI 是 x0=pollfd 数组指针、x1=条数，本实现
+  把 x0 当 nfds、x1 当 fd_set 基址 —— musl 的 poll() 走 ppoll，实际效果
+  恒「无就绪」（readfds=条数 非映射地址 → user_ok 失败跳过）+ 若 x1 恰为
+  映射地址会按位图改写用户内存（且只过了可读校验，违反 COW 写纪律）。
+  重写 `sys_ppoll`：解析 `{fd,events,revents}` 数组、就绪写 revents
+  （copy_to_user 走可写校验）、fd<0 忽略、未登记 fd 报 POLLNVAL；
+  pselect6 维持 fd_set 语义不变。
+- **fb_present 像素阶段被 kill 打断后 BUSY 永久卡死**（High，
+  compositor.rs）：三阶段结构的阶段 2（canvas→back 搬运）开中断运行且持
+  BUSY=true，tick 兑现 kill_req 可把当前任务直接置 Exited 切走（多线程
+  兄弟 exit / launcher kill 应用）→ 死亡属主走不到阶段 3 的复位 → 之后
+  所有 fb_present 弃帧、composite 恒让路，**整机画面永久冻结**。BUSY 改
+  记录属主 tid（`BUSY_TID`）：后来者发现属主已死即复位接管（fs_lock 死
+  持有者自愈同模式），composite 对死属主放行。
+- **wait() 重试路径丢唤醒**（Medium，process.rs）：找到僵尸 → 开中断
+  reap → 护栏失败（还有存活线程）→ 重新屏蔽后**不复查**直接 block——
+  窗口内最后一个存活线程退出的 wake 只唤醒 Blocked 任务（此刻本任务
+  Running）→ 唤醒丢失 → wait 永久睡眠。与首路径对齐改 `yield_now() +
+  continue`（让出后外层重扫）。
+- **vfs::rename 目标打开检查在 FS 锁外**（Low，vfs.rs）：`is_open`/类型
+  检查与 `fs_rename` 取锁之间被抢占、恰好有人 open 目标 → rename 仍会
+  回收打开中的 inode（fd 与新文件别名，H-6 竞态版）。检查与 rename 封进
+  同一 `fs_lock` 临界区（TID 令牌可重入；fs_lock/fs_unlock 转 pub）。
+- **CLEAR_TID 槽位跨 tid 复用残留**（Low，bionic_shim.rs / sched_cfs.rs）：
+  经 kill_req / 进程整体 exit 死亡的线程不经过 `exit_thread_notify`，槽位
+  残留旧用户地址；tid 复用后新任务退出时向无关地址清零 + 误触 futex。
+  kill_pid / kill_siblings_of / reap_pid / exit_thread_current 四处统一
+  `clear_tid_slot`。
+- 另：`USER_STACK_SIZE` 注释谎称「8MB 按需映射」实为 2MB 饿式映射 ——
+  注释改为如实描述（8MB 需先做栈区按需落地；实测 2MB nsmonkey 冒烟通过）。
+
+### 系统服务（4）
+
+- **networkd 认领后 open 失败提前 return → 管道永久失效**（High）：
+  rename(PIPE_PATH→.r) 成功后 open(.r) 失败即 return——残留清理会删掉
+  .r、rename 因 PIPE_PATH 不存在恒失败，此后全部网络命令静默丢失直到
+  重启。对齐 wifid/audiod/alarmd：open 失败仅跳过读取，照常清认领 +
+  重建管道。
+- **audiod 同 pid 重开不重置 last_seq → pid 复用后长时间静默**（Medium）：
+  原进程被杀后 pid 槽被新进程复用（内核 pid 无单调性），新进程 seq 从 0
+  起、`seq.wrapping_sub(last_seq) ≥ 2^31` 全部拒收——旧进程播多久新实例
+  就静默多久。`cmd_open` 命中同 pid 时重置 `last_seq=0 / has_chunk=false`
+  （OPEN 语义上就是新流）。
+- **rild rewrite_store 新箱未 fsync 就删备份**（Medium）：掉电落在
+  unlink 备份之后、新数据落盘之前 → 正身空、备份已删，整箱短信丢失。
+  删备份前对 wfd fsync（就地写回退路径同理；append_record 已 fsync，
+  此处对齐）。
+- **audiod write_status 回退分支缺 O_TRUNC**（Low）：状态行变短时旧尾
+  残留，读方多解析垃圾行。回退 open 补 `| 0x200`。
+
+### kunxpkg（2）
+
+- **菱形依赖去重短路跳过约束校验**（High，deps.rs）：`plan.contains` 在
+  版本约束校验**之前**返回 —— A→B(>=1) 与 A→C→B(>=2) 时第二条边不校验
+  ≥2，装出 C 的坏依赖（正是本 diff 想杜绝的）。约束校验上移到去重之前。
+- **finish_atomic 先 unlink 再 rename**（Low，fsio.rs）：注释「内核 rename
+  不覆盖已存在目标」与实现相反（fs_rename 是 POSIX 原子替换）；先 unlink
+  引入丢档窗口（unlink 成功 → rename 失败 → 旧记录已删）。删掉 unlink
+  直接 rename + 失败时 recover 触发检查点重试一次。
+
+### 应用 / launcher（6）
+
+- **browser HTTPS socket fd 泄漏**（High，net.rs）：`Wire::Tls(c) =>
+  { c.close(); }` 只发 close_notify 永不关 fd —— 每个 HTTPS 请求（含重
+  定向每跳、每张同源图片）泄漏 1 个 socket，内核 socket 表仅 16 槽，十
+  几次后浏览器 + 天气 + 云同步全部无法联网直到重启。`Wire::Tls` 变体
+  携带 fd，close 时 `sock_close`。
+- **sfsrace 认领协议自身丢消息 → 假阳性 FAIL**（中高，sfsrace/main.rs）：
+  写者 open→write 之间被 rename 认领时，迟到 append 落在 .r 上；下一轮
+  循环开头的盲删 `unlink(taken)` 把它销毁 → 「丢失消息」FAIL 把协议竞态
+  误报成内核 bug（作为内核验证工具的假阳性会误导排查/诱使弱化断言）。
+  循环开头先排干（open+read+parse）再删。
+- **launcher draw_placeholder 首帧守卫恒假**（High，app_launch.rs）：
+  `fb_sample()` 后几微秒即 `fb_matches(&自己)` —— 恒不相等 → 守卫失效，
+  占位页无条件整屏覆盖；应用首帧若在 launcher 填充/flip 期间落屏会被盖掉
+  （不重绘的应用占位页驻留到下次交互）。基线采样移回 `gate_release()`
+  之前、以参数传入比较。
+- **launcher TILE_MODE 几何回退图标编码不一致**（Low，main.rs）：预乘双
+  线性采样把顶字节当 alpha，几何回退写入的 0x00RRGGBB 顶字节 0 被当全
+  透明 —— 资产缺失时图标不绘制/启动缩放画黑方块。TILE_MODE 的 put_pixel
+  把旧约定归一化为 `0xFF000000|rgb`。
+- **launcher read_launcher_evt 改名后 open 失败丢事件**（Low，app_life.rs）：
+  rename 成功、open 失败即 return 0 —— 事件内容还在 .r 里但会被下一条
+  事件的 rename 覆盖（BG 丢失 → 应用停留前台态）。open 失败把 .r 改名回
+  原名让下轮重取。
+- **launcher 时钟小组件移除后每秒整屏重绘**（Low，main.rs）：秒级 tick 的
+  `!redraw_clock_widget_fast()` 在无时钟小组件时恒 true → 每秒一次整屏
+  render_frame（TCG 50~150ms 常驻卡顿）。tick 前置 `WGT_MASK & 1 != 0 ||
+  RECENTS_OPEN` 门控。
+
+### 动画（对齐 docs/animations-roadmap.md，详见 animations.md 新节）
+
+- **P1-6 下拉刷新**：`shared/motion.rs` 新增 `PullRefresh` 状态机（跟手
+  1:1 → 越界 0.35x 阻尼 → 松手弹簧回弹 + Loading 三圆点错峰缩放 900ms；
+  `ate_tap` 吞击 / `just_triggered` 数据刷新钩子 / retarget 速度接续）。
+  接入 sms 会话列表（重载 /data/sms + rild 增量导入）。
+- **P1-2 gallery 一镜到底**：缩略图 → 大图 300ms `Emphasized` 矩形补间
+  （x/y/w/h），中点切换底页；返回反向缩回缩略图位，**中途打断从当前矩形
+  续跑**。
+- **P0-2 sms 页面转场**：settings 同款整页滑动（240ms FastOutSlowIn +
+  快照补底 + 10px 接缝阴影），列表↔会话/新建页 7 个切换点全覆盖。
+- **P2-2 光随指动**：`shared/glass.rs` 全局光源偏移（触摸点相对屏幕中心
+  ×0.15、±24px 钳制、120ms FastOutSlowIn 跟随、离手 300ms 回零）；高光
+  带随光源垂直移动、斜向光泽沿对角移动；app_kill poll_input 的 ABS 事件
+  自动喂点，sms/gallery 接入 `light_animating()` 重绘。
+
+### 验证
+
+- `make` 全量构建 exit 0 / 0 警告（含 networkd/launcher 编译错修复 +
+  networkd 预存双分号警告清理）。
+- 宿主：sync_tests **57/57**、wireless **105/105**。
+- **sfsrace PASS**（inode 扩容 + rename 锁 + O_APPEND + sfsrace 排干
+  修复的联合覆盖；修复前 BASELINE FAIL / iter 2-3 必失败）。
+- disk.img 重建（512-inode 新格式）。
+- QEMU 无头冒烟 / GUI 应用回归：见 CHANGELOG（本轮动画改动 4 应用就绪
+  0 PANIC 的中间验证后，全量回归在收尾轮补跑）。
+
+---
+
+## 二十三、2026-09-18 第二波修复轮（两路并行审查 → 19 项修复，TLS 安全 + 信箱迁移收官）
+
+> 方法：2 个并行审查代理（① phone/calendar/music/video/weather/map/terminal/
+> mail + camerad/sensord/positiond/logd/pushd 全量读码；② kunxboot/kunxhal/
+> kunxinit/recovery/probe/modemtest + tools + browser TLS 栈逐行深挖）。
+> 与第二十二轮互补（无重叠文件）。
+
+### TLS 栈（安全敏感，5 + 1 个连带根因）
+
+- **（Critical）证书链无 CA/basicConstraints 校验 → 持有效叶子证书者可冒充
+  任意域名**（x509.rs verify_chain）：链构建只做 issuer/subject 匹配 + 逐级
+  RSA 验签。攻击路径：攻击者用自己域名的合法叶子证书 L 的私钥自签
+  `CN=victim.com` 的伪造叶子 F，发送 `[F, L, 真实中间]`——逐级验签全部
+  通过，MITM 完整冒充。修复：`parse_cert` 解析 basicConstraints（OID
+  2.5.29.19），链中作为签发者的中间证书必须 cA=TRUE 且在有效期内。
+- **（连带根因，本轮实证发现）critical 扩展解析拿错 tag → basicConstraints
+  永远解析不出来**（x509.rs 扩展循环）：跳过 critical BOOLEAN（01 01 FF）
+  后重读 value TLV，却仍用 BOOLEAN 的 0x01 当 tag 判 `!= OCTET` ——
+  **所有 critical 扩展被静默跳过**（basicConstraints 按 RFC 5280 恒为
+  critical；SAN 非 critical 故未暴露）。hosttest chaindump 实测：修复前
+  baidu 真实中间证书 is_ca=false，修复后 true。此缺陷使上面的 CA 校验
+  在加上后立刻拒绝全部真站点——两修联合验证：对 www.baidu.com 完整
+  握手 + HTTP 200（43ms）。
+- **（High）畸形告警记录（0/1 字节）索引越界 panic——可远程触发**
+  （mod.rs 两处 CT_ALERT）：明文阶段注入 5 字节空告警记录即可杀浏览器
+  进程。记录日志前判长度。
+- **（Medium）close_notify 记录 AAD/长度硬编码 24**：明文 2 字节时正确值
+  是 AAD=2、记录长 = 2+24=26；硬编码让对端解密失败 + 流上残留 2 字节。
+- **（Low）零长度 application_data 记录被当 EOF**：RFC 5246 允许（部分
+  服务器作 keepalive），返回 Ok(0) 会静默截断 HTTP 响应 → continue 续读。
+- **（Low）HelloRequest 计入握手哈希**：RFC 5246 §7.4.1.1 明确禁止——
+  服务器中途发 HelloRequest 会使 Finished 校验失败。ty==0 不更新哈希。
+- **（Low）write_tlv DER 长端编码错误**：无 0x8N 计数字节且最低位在前
+  （len=300 输出 AC 01，正确 82 01 2C）；≥128 字节的 issuer DN 全是废 DER。
+  改大端压栈 + 前缀 0x80|字节数。
+
+### 信箱竞态收官（rename 认领迁移，4 处）
+
+第二十轮迁移了 lifd 族，本轮补齐全部 /var/run 漏网站点（rild 方案照抄）：
+
+- **camerad**（High）：read→ftruncate 两步之间相机应用（cam_send）的新
+  命令被抹掉 → 拍照/预览偶发卡死（应用满超时）。
+- **sensord**（Medium）：同族（QUIT 丢失 → 守护进程停不下来）。
+- **positiond**（Low）：同族（命令面低频）。
+- **lc_notify_local**（Low，shared/lifecycle.rs）：本地通知直接 create→
+  write，pushd 的 getdents 扫到 create 与 write 之间的空文件即读 0 字节
+  + unlink —— 通知永久丢失。改 `.tmp` + rename 原子发布（半写清临时名）。
+
+### 其它
+
+- **（High）terminal UTF-8 组装器丢 CJK**：「凑满 4 字节才解码」与 3 字节
+  CJK 序列错位——第 4 字节（下一字 lead byte）触发 flush 后余量循环只转
+  发 ASCII，lead byte 静默丢弃，纯中文流只剩第一个字上屏；且 ASCII 不
+  flush pending 导致乱序。改按首字节位型定长、凑齐即解码、逐序列消费、
+  ASCII/ESC 先排空。
+- **（Medium）terminal 回看历史环形缓冲乱序**：`idx % HIST_LINES` 在环
+  回绕后（滚屏/clear 一次推 24+ 行）把最新行显示在最旧行上方。改
+  `(HIST_NEXT + idx) % HIST_LINES`。
+- **（Medium）calendar 23:00 新建事件 DTEND 早于 DTSTART**：`(h+1)%24=0`
+  产生同日 00:00，RFC 5545 非法（CalDAV 服务器拒收 → 同步冲突）。改
+  `dtstart.to_epoch() + 3600` 反推。
+- **（Medium）camerad parse_cmd 硬拒 id > 999**：相机应用 REQ_ID 递增
+  不回绕（10 位），长会话第 1000 条命令起全部丢弃 → 每个操作都超时。
+  digits[4]→[10] + checked_mul 防溢出。
+- **（Medium）kunxboot dtb insert_props 边界用错端点**：上界按 insert_off
+  计算，实际最高写入点是 content_end（chosen 通常在结构块前部，差整个
+  DTB 主体）——近 128KB 的 DTB 注入 ~212B 属性即越出 scratch 写穿 .bss。
+  改按 max(insert_off, content_end)。
+- **（Low）recovery SYS_REBOOT=169**（x86_64 号；AArch64 是 142）：重启
+  菜单 ENOSYS → 死循环 spin，设备永不重启。
+- **（Low）MPU6050/9250 + AK8963 轴数据小端解析**：MPU 系列寄存器大端
+  （H 在前），小端解析全轴字节交换（1g=16384 读成 64）——同文件
+  fifo_count 却按大端，自相矛盾。改 from_be_bytes + 测试夹具/注入同步
+  （kunxhal 测试 36/36）。
+- **（Low）terminal 方向键 CSI 短写**：O_NONBLOCK tty 上 3 字节序列可能
+  短写，剩余丢失 → shell 收到孤立 ESC。write_fd_all 循环补写。
+- **（Low）kunxrepo.py 索引无上限校验**：设备端 INDEX_MAX=16384（约
+  40-50 包），仓库扩大后 pkg update 整体不可用。生成期即报错对齐。
+
+### 验证（本轮）
+
+- `make` 全量构建 0 错误 0 警告；kunxhal 宿主测试 36/36（含字节序夹具）。
+- TLS hosttest（对 www.baidu.com 真网）：完整握手 + 证书链（3 级）+
+  HTTP 200 全过（chaindump 证实中间证书 is_ca 解析正确）。
+- 全量回归矩阵见第二十二轮补记（本轮改动后复跑：make / sync 57 /
+  wireless 105 / sfsrace / power 21 / lifecycle-core 38 / GUI 应用回归）。
+
+---
+
+## 二十四、2026-09-18 第三波修复轮（内核核心 + shared 全量读码 → 17 项修复，含本会话新动画代码自纠）
+
+> 方法：2 个并行审查代理（① 内核核心子系统全量读码：heap/ipc/signal/
+> timer/gdbstub/syscall_table/perf/anim/input/gesture；② shared 库全量 +
+> **本会话新写的 motion/glass/sms/files/gallery 动画代码**）。第②路对本会
+> 话新代码报出 2 条真缺陷（PullRefresh 弹簧饿死、glass 回零 tween 每帧
+> 重启），验证了「新代码也要过审查」的流程价值。
+
+### 内核（4）
+
+- **shm_map/shm_close 引用计数无 IRQ 屏蔽**（High，ipc.rs）：syscall 上下
+  文 IRQ 使能，refs 读-改-写与并发 map/close/add_ref 交错丢更新 → refs
+  提前归零 `free_page` 释放仍被页表映射的物理页（UAF）。两函数全程屏蔽
+  （与同文件其余 add/drop 对齐，唯独这两个漏了）。
+- **dup 失败回滚对活进程调 `shm_close_index`**（中高，linux_compat.rs
+  两处）：该函数按「进程已退出、页表已销毁」设计，清光映射记录但不
+  unmap——回滚时进程活着且可能已 shm_map：记录被清、PTE 残留，后续
+  close 按空记录跳过 unmap 直接归零释放 → UAF。用户传 `newfd >= FD_MAX`
+  即可稳定触发。新增 `shm_drop_one_ref`（只撤销一次 fd 引用）替换。
+- **signal_clear/signal_send 位图 RMW 无屏蔽**（Low，process.rs）：
+  handle_pending 的 clear 与他进程 kill 的 send 交错丢新置位（含 SIGKILL
+  静默丢弃）。保存-恢复 DAIF。
+- **`now_us()` 频率换算整除截断**（Low，timer.rs）：`freq/1_000_000`
+  先截断（62.5MHz → d=62），时间戳每秒慢 ~0.8%——perf 帧统计/交互
+  deadline/网络超时全部同比失真。改 `(cnt/freq)*1e6 + (cnt%freq)*1e6/freq`。
+
+### shared / 应用（13）
+
+- **（本会话新代码）PullRefresh 弹簧积分被饿死 16 倍**（High，
+  motion.rs）：`frame()` 无条件盖 `last`——应用按文档「每帧 frame + step」
+  接线时两次 `now_us()` 仅隔几微秒，step 的帧间隔恒被钳到下限 1ms（真实
+  16ms），回弹/Loading 以 ~1/16 实时速度播。last 只在手势期 stamp，
+  Loading/Settling 交给 step 独占。
+- **（本会话新代码）PullRefresh `ate` 残留吞后续手势 tap**（Low）：
+  Loading 期的陈旧 ate 会吞掉下一次真实点击。按下即清（不论状态）。
+- **（本会话新代码）glass 光随指动回零段每帧重启 tween**（Low）：触发
+  条件置 0 后恒真，每帧重设 FX/T0 → 实际逐帧指数收敛而非一次 120ms
+  缓动。加 `LIGHT_DECAY` 锚定标志，回零完成才停。
+- **glass 双线性放大顶/左边缘外插暗边**（Low，既有）：`fy=dy/4-0.5` 在
+  dy=0 时 ty=-0.5 线性外插，负值 `as u32` 饱和 0。tx/ty 钳 [0,1]。
+- **sync 墓碑残留：远端重建资源不可见 + 周期性误删**（Medium，
+  sync.rs/store.rs）：本地墓碑（DELETE 推送遇非网络错误）遇服务器重建 →
+  server-wins 应用远端但 FLAG_DELETED 保留 → 本地不可见 + query_dirty
+  下轮再发 DELETE 真删服务器数据（拉回→再删循环）。应用前清 DELETED。
+- **sync apply_deleted 服务器优先不落删除**（Medium）：handle_conflict
+  返回值被丢弃——记录既不 dirty 也未删，增量路径不再覆盖，本地永显已删
+  事件。server-wins 补 `FLAG_DELETED + blen=0`。
+- **sms 标题栏点击误开第一个会话**（Medium）：`y < LIST_TOP` 时负数整除
+  向零截断（-56/84==0）通过 row>=0 检查。加下界守卫。
+- **text_engine BiDi 字符/字节偏移错位**（Medium，潜伏——模块暂无消费
+  者）：每字符 levels 被按字节偏移切片，混合方向多字节文本 run 边界落在
+  字符中间（str 切片 panic）。按字符字节宽度复制 level。
+- **l10n 阿拉伯语复数公式解析失败**（Medium）：`&&/||` 在 parse_cmp 内
+  只消费一次，链式表达式剩余字节使 eval 失败 → 恒回退形态 0（六种复数
+  全退化）。新增左结合 `parse_and`/`parse_or` 链层（?: < || < && < 比较）。
+- **jpeg 编码器尺寸 >65535 静默回绕**（Low）：SOF0 字段 u16，65536→0。
+  入口显式 BadDimensions。
+- **gallery 网格命中测试覆盖未绘制的第 5 行**（Low）：渲染在
+  `y+TILE_H>DISPLAY_H` break，tap 循环遍历全部 18 格——点底部空带打开
+  不可见照片。命中加同款可见性条件。
+- **emoji CBLC 解析大量未检查索引**（Low）：截断字体启动期 panic。全链
+  checked_add + rd_u16c/rd_u32c，越界放弃解析。
+- **cursor_overlay 首次 redraw 前 move 画 25×25 黑块**（Low）：
+  CUR_UNDER_X<0（备份全 0）时恢复跳过。
+
+### 验证（本轮）
+
+- `make` 全量构建 0 错误 0 警告；kunxhal 宿主 36/36（上一轮）。
+- 宿主 sync 57/57、wireless 105/105；sfsrace PASS；wifi selftest PASS；
+  GUI 应用回归视觉验证（14 应用 + 4 交互截图，0 PANIC；串口就绪行被
+  vtimer 风暴洪泛吞掉，以截图为准）。
+
+### 附（同日续）：store 设置页不可达 + P0-2 store 转场
+
+- **store VIEW_SETTINGS 从未被赋值**（High，apps/store/src/main.rs）：
+  设置页代码完整（5 字段编辑 + R2 源配置）但无任何入口——`VIEW =
+  VIEW_SETTINGS` 全仓不存在（HEAD 同样），而错误提示引导用户「到设置页
+  配置 R2 软件源」→ 无 R2 配置时用户被指向一个打不开的页面。补列表页
+  标题栏右上「设置」玻璃按钮 + 命中。
+- P0-2 转场迁移补齐 store（列表↔详情/设置，含 ESC 返回），至此路线图
+  P0-2 的五个应用（settings/sms/files/store + gallery 缩放）全部完成。
+
+---
+
+## 二十五、2026-09-18 第四波修复轮（网络/FAT32 + rild/audiod 深挖 → 20 项修复）
+
+> 方法：2 个并行审查代理（① net_stack/socket/fat32/net_virtio 全量读码；
+> ② rild/audiod/logd/camerad/alarmd 逐行深挖）。
+
+### FAT32 / 网络（4 + 1 移交）
+
+- **（High）FAT32 目录项首簇 HI/LO 与规范相反**（fat32.rs + mkdisk.py）：
+  规范偏移 20-21 = FstClus**HI**、26-27 = FstClus**LO**，本驱动读点把 20
+  当低位、写点把低位写 20 —— mkdisk.py 同向写反，自产镜像内部自洽掩盖。
+  后果：挂载 mkfs.vfat/Windows/Linux 标准卷时小簇号文件全部读空；在标准
+  卷上写入后宿主解码首簇错乱。全部读写点对调 + mkdisk 同步 + disk.img
+  重建 + run-disk 引导验证。
+- **（Medium）TCP 发送段可组 2048 字节帧（超 MTU）**（socket.rs）：按内部
+  缓冲极限放行 ~1994 字节载荷，QEMU slirp 侥幸可过，真实网卡/交换机一律
+  丢弃超长帧 → 大段黑洞、连接卡死。上限收紧 1460（MTU 1500−20−20）。
+- **（Low）FAT32 mount 不校验 reserved_sectors/num_fats**：reserved=0 时
+  FAT1 覆盖引导扇区（首次写即毁 BPB）；num_fats=0 时数据区与 FAT1 重叠。
+  probe 增加 reserved≥1、num_fats∈{1,2}。
+- **（Medium，SMP-only，移交）net_virtio IRQ 上下文 drain 与他核任务路径
+  无跨核互斥**：GIC 只路由 core0，irq_handler 不取 net_lock 直接
+  drain_impl —— SMP 下与他核 send/recv 并发改 TX 环/堆。单核（当前默认）
+  无此问题（C-5 修复的本核屏蔽已足够）。随 SMP 锁纪律轮一并处理
+  （与 TASKS/CURRENT 无锁面同族）。
+
+### rild（8）
+
+- **（High）AT 行缓冲 LINE_CAP=160 截断 PDU**：内核 modem 的 CMGR 回吐
+  最长 420 hex，160 把正文 >~50 字符的短信截成半截 PDU → 解码失败滞留
+  modem 槽位，**正常长度短信永远收不到**（modemtest 只注入短 PDU 所以
+  全过）。LINE_CAP → 448。
+- **（Medium）命令等待期 URC 全部被吞**：发短信的 3 秒窗口内到达的
+  +CMTI（新短信）无人取、+CRING（来电）完全不可见。pending 期对已知
+  URC 前缀（+CMTI/+CRING/RING/+CREG:/NO CARRIER）仍派发 on_urc。
+- **（Medium-low）无 modem 时 SIM 状态被周期轮询覆写**：NoModem 落
+  Unknown 分支，启动设置的 ABSENT 3 秒后被改，「无 SIM 仅紧急呼叫」门
+  失效。refresh_sim 在 fd<0 时直接返回。
+- **（Low）级联短信段数上限不一致**：槽 total 封顶 8，receive 按原始
+  total 匹配 → >8 段长短信凑齐也整条丢弃。匹配用封顶值。
+- **（Low）重组长短信落盘仍截 200 字节**：重组缓冲按 1600 设计，
+  append_record 的 out[300]/min(200) 把两段长短信截回单段长度。out →
+  1700、上限 1600。
+- **（Low）命令管道单次 read 1024**：排队多条命令时尾部随认领文件删除。
+  循环读到 EOF。
+- **（Low）fmt_dec(0) 输出空串**：SIG/START/SEQ 为 0 时值字段缺失。
+- **（Low）pdu.c SCTS 半八位解码 nibble>9 越界读**：hexd 只有 10 字节，
+  畸形 PDU 的 BCD A-F 读越界。扩成 16 字节表。
+
+### alarmd / audiod / camerad / logd（8）
+
+- **（High）每周闹钟周几按 UTC 日界计算**（alarmd）：repeat 位掩码是本地
+  星期、计算用 UTC 日 —— 东八区早于 08:00 的每周闹钟（起床闹钟时段）
+  **整体晚一天响**。周几改按本地日历日（zone_offset_min 校正后求）。
+- **（Medium）alarmd RELOAD 共享 BUF 自踩**：handle_cmd(RELOAD) →
+  reload_alarms 用同一个 BUF 读列表，同批后续命令被列表字节覆写。
+  poll_ctl 独立 CTL_BUF。
+- **（Medium）camerad 无相机后端时任一命令 panic**：k_main 对无后端是
+  优雅降级设计，handle_cmd 里 9 处 `.expect("no camera backend")` 让第
+  一条相机命令杀掉守护进程。全部改 Option + "ERR no backend"。
+- **（Medium-low）camerad 录像文件无 O_TRUNC**：漏 REC_STOP/崩溃后同名
+  文件残留，16B 头覆写旧头、新帧追加旧尾。首帧重建容器（O_TRUNC）。
+- **（Low）camerad 尾行无换行被丢弃**：分发循环 0..len 改 0..=len。
+- **（Low）audiod 陈旧块无限重播**：客户端停写不 CLOSE 时最后 10ms 块
+  每 10ms 循环混音。chunk_age 计数，连续 3 周期无新块即停（新块恢复）。
+- **（Low）audiod /dev/audio 写 -1 被当成功**（usize 巨值恒假分支）+
+  pid 复用重开继承 focused。
+- **（Low）logd 每轮只读一条 kmsg 就睡 100ms**：突发日志（开机风暴）使
+  内核环形日志被覆盖、持久化缺记录。读到记录即继续排空，读空才睡。
+
+---
+
+## 二十六、2026-09-18 GUI 应用前台路径调查（已知问题存档 + 测试修正）
+
+> 本会话末段对「GUI 模式下应用启动后整批回归 FAIL」做了长时间定位。结论：
+> **非本会话修复引入的回归**，是未提交生命周期重设计（app_life 前台态 + 
+> 输入独占设计）中的真实缺陷 + 测试断言过期两者的叠加。证据链完整存档如下。
+
+### 现象
+
+- `apps_regression.py`：14 应用全部 FAIL，应用截图为**纯色**（启动缩放的
+  末帧），桌面截图正常；串口只有第一个应用打印「就绪」。
+- `launcher_test.py`：应用成功启动（fork/execve/就绪/FG 登记全正常），
+  但应用内的返回点击/底部上滑都无法退出应用，launcher 恢复不了桌面输入。
+
+### 关键证据（逐条实证）
+
+1. **输入帧到达内核**：UART 0xAA 帧全部被解析（rxdbg 计数 56+）。
+2. **launcher 前台期设计性不读输入**（`main.rs:8168` 注释明示「应用前台/
+   恢复期间，launcher 不渲染桌面、不读输入（应用独占 fb0 与输入设备）」，
+   该设计**已提交于 HEAD**）。launcher 主循环在前台态只做 wait4(WNOHANG)
+   + lifd 轮询 + 8ms 睡眠（任务转储实证：tid13 恒 Blocked 于 nanosleep，
+   睡眠槽 deadline 随时间正常推进——**launcher 没有冻结，是设计行为**）。
+3. **应用侧不消费输入**：event0 成功读取计数全部来自 launcher（pid=13），
+   应用（pid=14）只有首次 EAGAIN 登记、从未成功读到事件 → 返回点击/
+   上滑手势永远到不了应用 → 无法退出 → 回归流程卡死在第一个应用。
+4. **历史「通过」是退化的**：纯 HEAD（干净 worktree）跑 launcher_test
+   3/3「通过」——但日志显示 HEAD 上 gate_write **失败**（256-inode ramdisk
+   耗尽 → `.launch_gate` 写不进 → 应用从未启动 → launcher 保持桌面态读
+   输入 → 断言碰巧成立）。本会话的 inode 512 扩容让 gate 首次真正写成功、
+   应用真正启动，才暴露前台路径的真缺陷。
+5. **诊断自身会投毒**：在 UART RX IRQ 上下文里 print（busy-wait TX）会
+   拖慢 RX 导致帧字节丢失（BTN 事件丢失、只剩 ABS 移动对）——中期所有
+   「复现」都被此污染过，清理后症状回归一致形态。
+
+### 已修复的测试缺陷
+
+- `launcher_test.py` 的 wait_for 会匹配启动期的陈旧标记（「已退出」是
+  OOBE 的退出行）→ 加偏移锚点只搜新增内容；第二次点击断言按前台设计
+  改为「应用内返回 → 应用退出 → 桌面点击恢复输入」的真实流程；新增
+  底部上滑兜底。
+- `apps_regression.py` 的就绪等待同样存在陈旧匹配风险（后续轮处理）。
+
+### 移交（下一轮的已知问题）
+
+- **应用前台期不读 event0**（探针实证）：kit 的 poll_input 在应用生命
+  周期内只成功读到 **1 次**输入事件（一次性 kitdbg 探针恰好在退出前
+  触发一次、返回点击后无任何后续读取）——应用的主循环没有持续轮询
+  输入，或其读取路径在首次 FBIO_PRESENT 后的帧循环形态中不再经过
+  poll_input 的 read。下一步：核对 clock 主循环的 poll_input 调用点与
+  帧预算睡眠路径（8ms 自适应预算是否吞掉了输入轮询）。
+- **应用首帧不上屏**：应用就绪后持续 present（perf 直绘渲染统计在增长）
+  但截图纯色——FBIO_PRESENT 在前台路径被弃帧（BUSY_TID 属主存活？）
+  或画布/扫描缓冲指向不一致。任务转储显示 launcher 在前台态不渲染，
+  BUSY_TID 应为空闲，需在 fb_present 弃帧分支加计数确认。
+- **VTIMER 风暴（irq=27）**：GUI 高负载下 episode 出现率上升（anim1 61
+  条/局），与前台卡死无因果但污染串口观测（UART 洪泛丢打印）。
