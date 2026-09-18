@@ -1692,15 +1692,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
 
     loop {
-        print("[ckdbg] loop top\n");
         let ev = poll_input();
-        print("[ckdbg] poll done\n");
         if ev.moved {
-            print("[ckdbg] moved\n");
             cursor_overlay_move();
-            print("[ckdbg] moved done\n");
         }
-        print("[ckdbg] nav check\n");
         if ev.nav != NavAction::None {
             // 编辑子页内系统返回（手势/三键）= 回闹钟列表，与标题栏返回、
             // ESC 一致；桌面/最近任务仍退出应用。
@@ -1718,11 +1713,9 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 unsafe { exit(nav_exit_code(ev.nav)); }
             }
         }
-        print("[ckdbg] key check\n");
         if ev.key != KeyAction::None {
             handle_key(ev.key);
         }
-        print("[ckdbg] tap check\n");
         if let Some((x, y)) = ev.tap {
             if back_hit(x, y) {
                 // 编辑子页的标题栏返回 = 回闹钟列表（与 calendar/contacts 的
@@ -1816,11 +1809,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             dirty = true;
         }
         if dirty {
-            print("[ckdbg] render...\n");
             render();
-            print("[ckdbg] render done, flip...\n");
             flip();
-            print("[ckdbg] flip done\n");
             cursor_overlay_redraw();
             dirty = false;
             kit::font_init_checked();

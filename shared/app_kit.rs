@@ -1664,8 +1664,21 @@ pub fn poll_input() -> PollResult {
 
 /// 轮询 /dev/tty（fd 0）是否收到 ESC。
 pub fn poll_tty_esc() -> bool {
+    // ★ 独立非阻塞 tty fd：fd 0（stdin）是阻塞语义（musl fgets 需要），
+    // 直接读会在无串口数据时把 GUI 应用卡死在内核 yield 循环。开自己的
+    // O_NONBLOCK fd 轮询，musl 兼容不受影响。
+    static mut TTY_POLL_FD: isize = -1;
+    let fd = unsafe {
+        if TTY_POLL_FD < 0 {
+            TTY_POLL_FD = open("/dev/tty", O_RDONLY | O_NONBLOCK);
+        }
+        TTY_POLL_FD
+    };
+    if fd < 0 {
+        return false;
+    }
     let mut buf = [0u8; 8];
-    let n = unsafe { syscall3(SYS_READ, 0, buf.as_mut_ptr() as usize, buf.len()) } as isize;
+    let n = unsafe { syscall3(SYS_READ, fd as usize, buf.as_mut_ptr() as usize, buf.len()) } as isize;
     if n <= 0 {
         return false;
     }

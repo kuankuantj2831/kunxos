@@ -195,11 +195,17 @@ fn mem_write(minor: u32, buf: &[u8]) -> i32 {
 /// /dev/tty（minor 0）：非阻塞读取 UART 接收 FIFO 中已有字节。
 /// /dev/ttyN（minor ≥ 1 的会话终端，图形终端主侧）：读取从侧（Shell）
 /// 镜像到 out_q 的屏幕输出字节。
-fn tty_read(minor: u32, _flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
+fn tty_read(minor: u32, flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
     if minor == TTY_MINOR {
         // 阻塞语义：POSIX read 在无数据时应阻塞而非返回 0（返回 0 会被
         // musl/glibc 当作 EOF，fgets 立即结束——nsmonkey 等交互程序死因）。
         // 至少等到一个字符，再一次性取走当时可用的全部字符。
+        //
+        // ★ O_NONBLOCK 必须尊重：GUI 应用的主循环每帧 poll_tty_esc()
+        // 读 fd 0——阻塞语义下无数据时 yield 死循环，应用永远回不到
+        // 用户态（不渲染/不读输入/不上屏——「14 应用全挂 + 纯色截图」
+        // 家族的根因）。非阻塞打开返回 -EAGAIN，调用方按无数据处理。
+        let nonblock = flags & crate::vfs::O_NONBLOCK != 0;
         loop {
             let mut n = 0usize;
             while n < buf.len() {
@@ -213,6 +219,9 @@ fn tty_read(minor: u32, _flags: u32, _offset: usize, buf: &mut [u8]) -> i32 {
             }
             if n > 0 {
                 return n as i32;
+            }
+            if nonblock {
+                return -11; // -EAGAIN
             }
             crate::sched_cfs::yield_now();
         }

@@ -2516,8 +2516,24 @@ fn cursor_overlay_move() {
 }
 
 fn store_poll_key() -> bool {
+    // ★ 独立非阻塞 tty fd：fd 0 是阻塞语义（musl fgets），无数据时直读
+    // 会把应用卡死在内核 yield 循环（tty_read 此前无视 O_NONBLOCK——
+    // 内核已修，此处也换非阻塞 fd 双保险）。
+    static mut TTY_POLL_FD: isize = -1;
+    let fd = unsafe {
+        if TTY_POLL_FD < 0 {
+            let mut p = [0u8; 16];
+            let s = b"/dev/tty\0";
+            p[..s.len()].copy_from_slice(s);
+            TTY_POLL_FD = syscall3(SYS_OPENAT, 0xFFFF_FFFF_FFFF_FF9Cusize, p.as_ptr() as usize, 0x800) as isize;
+        }
+        TTY_POLL_FD
+    };
+    if fd < 0 {
+        return false;
+    }
     let mut buf = [0u8; 8];
-    let n = unsafe { syscall3(SYS_READ, 0, buf.as_mut_ptr() as usize, buf.len()) };
+    let n = unsafe { syscall3(SYS_READ, fd as usize, buf.as_mut_ptr() as usize, buf.len()) };
     // 读失败 -1（usize 天文数字）按 isize 判负，否则越界 panic
     let n = n as isize;
     if n <= 0 {

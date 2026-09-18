@@ -654,26 +654,6 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         }
         FB_ACTIVE = true;
         fb_damage(rects);
-        // 临时诊断：launcher 的前 6 次 + 非 launcher 全打
-        static mut FBDG_N: u32 = 0;
-        let fbdg = unsafe {
-            let n = FBDG_N;
-            FBDG_N = n.wrapping_add(1);
-            n < 6 || crate::process::current_pid() != 13
-        };
-        if fbdg {
-            let pid = crate::process::current_pid();
-            let cw = C.width as usize;
-            crate::uart_send_str("[fbdg] pid=");
-            crate::print_dec(pid as u64);
-            crate::uart_send_str(" canvas[0]=0x");
-            crate::print_hex(*C.canvas as u64);
-            crate::uart_send_str(" canvas[mid]=0x");
-            crate::print_hex(*C.canvas.add(cw * (C.height as usize / 2) + cw / 2) as u64);
-            crate::uart_send_str(" ndirty=");
-            crate::print_dec(C.app_dirty_count as u64);
-            crate::uart_send_str("\n");
-        }
         // 无应用脏区、无内核失效、无上一帧残留 → 无需呈现
         if C.app_dirty_count == 0 && C.dirty_count == 0 && C.prev_app_count == 0 {
             irq_restore(saved);

@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### 2026-09-18 深夜续轮：GUI 应用全挂的根因修复（tty_read 无视 O_NONBLOCK）
+
+> 第十九轮为 musl fgets 把 /dev/tty read 改成阻塞语义时，yield 循环实现
+> 无视 O_NONBLOCK——所有 GUI 应用主循环的 `poll_tty_esc()` 读阻塞 fd 0
+> 即被拖进内核 yield 死循环：应用永远回不到用户态，不渲染/不读输入/
+> 不上屏（14 应用全挂 + 纯色截图 + 前台输入死路的完整根因）。双层修复：
+> 内核 tty_read 尊重 O_NONBLOCK（无数据返回 -EAGAIN）；kit 的
+> poll_tty_esc 改用独立非阻塞 tty fd（fd 0 保持阻塞给 musl）。修复后
+> launcher_test 全链路 PASS（启动→就绪→应用内返回退出→launcher 恢复
+> 输入），此前 100% 挂死。**apps_regression 14/14 全 PASS（fail=0）**，
+> 截图 15/19 有真实 UI 内容（修复前 0/14 全纯色）——带真实应用启动的
+> 首次全绿（历史「通过」全部是 gate 写失败的退化形态）。calculator/
+> settings/stub/store 各自的 `poll_key()` 直读 fd 0 同族修复。详见
+> `BUG_REPORT.md` 第二十六节根因修复段。
+
 ### 2026-09-18 GUI 前台路径调查 + 测试修正（存档）
 
 > inode 512 扩容让启动门控首次真正写成功、应用真正启动，暴露未提交生命

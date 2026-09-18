@@ -6,8 +6,8 @@ Depends: libc >=1.0.0,libm >=1.0.0
 Conflicts: legacy-notes
 Description: 备忘录（示例应用）
 Filename: files/notes-0.9.0.kunx
-Size: 124640
-KunxHash: dc4a0ed987583d3fac3798e46905c08b
+Size: 124648
+KunxHash: 5715f421365cd54304095c68a5e70feb
 SignedBy: kunx-repo
 
 Package: badsig
@@ -27,8 +27,8 @@ Depends: libc >=1.0.0
 Provides: calc
 Description: KunxOS 计算器（示例）
 Filename: files/calculator-1.0.0.kunx
-Size: 112362
-KunxHash: b5759d76945e5876d86e2cd91ee47fd4
+Size: 112370
+KunxHash: a889200864004aaa802314fd8d7be897
 SignedBy: kunx-repo
 
 Package: cyc-a

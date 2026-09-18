@@ -2316,17 +2316,44 @@ SVC/IRQ/缺页活动）完整存档于 `/tmp/smp_psci_wip.patch`
   底部上滑兜底。
 - `apps_regression.py` 的就绪等待同样存在陈旧匹配风险（后续轮处理）。
 
+### ★ 根因已修复（2026-09-18 深夜续轮）
+
+**`tty_read` 无视 O_NONBLOCK → GUI 应用主循环在内核 yield 死循环中饿死**。
+
+- **机制**：第十九轮为 musl fgets 兼容把 `/dev/tty` 的 read 改为阻塞语义
+  （「至少等到一个字符」），实现是无数据时 `yield_now()` 循环——但
+  **`_flags` 参数完全未用**：O_NONBLOCK 打开的读者同样被拖进死循环。
+  所有 GUI 应用的主循环每帧调 `poll_tty_esc()`（读 fd 0 / stdin，继承自
+  execve 的阻塞 tty）→ 无串口数据 → 内核 yield 循环 → 应用永远回不到
+  用户态 → 不渲染、不读输入、不上屏——**「14 应用全挂 + 纯色截图 +
+  前台输入死路」一整族症状的完整根因**。
+- **定位路径**（证据链）：截图色值 = `APPS[phone].color`（占位页）→
+  fbdg 探针 = 应用 present 恒为零 → ckdbg 逐句打印 = 卡在 tap 块与
+  `if dirty` 之间 → 任务转储 lastsys=101 + ELR 落在 openat+read 循环
+  （`wait_launch_gate` 同款模式但 3s 超时会断）→ 逐行核对两点之间的
+  代码发现 `poll_tty_esc()` → 读 `tty_read` 实现确认 yield 循环无视
+  O_NONBLOCK。
+- **修复**（双层 + 应用自建读）：
+  1. 内核 `tty_read` 尊重 O_NONBLOCK：无数据时返回 `-EAGAIN`（-11），
+     阻塞语义只对默认（阻塞打开）的 fd 生效——musl 兼容不受影响。
+  2. `shared/app_kit` 的 `poll_tty_esc` 改用自己的 `O_NONBLOCK` tty fd
+     （`/dev/tty` 独立 open）：fd 0 保持阻塞给 musl fgets，GUI 应用的
+     ESC 轮询走非阻塞路径。
+  3. **calculator / settings / stub / store 各自实现了 `poll_key()` 直读
+     fd 0**（不走 kit）——同族修复：改为各自独立 `O_NONBLOCK` tty fd。
+- **验证**：
+  - `launcher_test` 全链路 PASS（启动→就绪→应用内返回退出→launcher
+    恢复输入），此前该链路 100% 挂死。
+  - **apps_regression 14/14 全 PASS（fail=0）**，截图 15/19 有真实 UI
+    内容（修复前 0/14 全纯色）——这是**带真实应用启动**的全绿（历史
+    「通过」全部是 gate 写失败的退化形态，应用从未启动过）。
+
 ### 移交（下一轮的已知问题）
 
-- **应用前台期不读 event0**（探针实证）：kit 的 poll_input 在应用生命
-  周期内只成功读到 **1 次**输入事件（一次性 kitdbg 探针恰好在退出前
-  触发一次、返回点击后无任何后续读取）——应用的主循环没有持续轮询
-  输入，或其读取路径在首次 FBIO_PRESENT 后的帧循环形态中不再经过
-  poll_input 的 read。下一步：核对 clock 主循环的 poll_input 调用点与
-  帧预算睡眠路径（8ms 自适应预算是否吞掉了输入轮询）。
-- **应用首帧不上屏**：应用就绪后持续 present（perf 直绘渲染统计在增长）
-  但截图纯色——FBIO_PRESENT 在前台路径被弃帧（BUSY_TID 属主存活？）
-  或画布/扫描缓冲指向不一致。任务转储显示 launcher 在前台态不渲染，
-  BUSY_TID 应为空闲，需在 fb_present 弃帧分支加计数确认。
+- ~~**应用前台期不读 event0**~~：已由上述 tty_read 修复解决——应用
+  卡死在 poll_tty_esc 的内核 yield 循环里，根本没机会持续轮询输入。
+- ~~**应用首帧不上屏**~~：同上——应用卡在 poll_tty_esc 后从未到达
+  render/flip，perf 统计里的「直绘渲染」计数全部来自 launcher 的
+  启动转场帧。
 - **VTIMER 风暴（irq=27）**：GUI 高负载下 episode 出现率上升（anim1 61
   条/局），与前台卡死无因果但污染串口观测（UART 洪泛丢打印）。
