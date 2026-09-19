@@ -1,7 +1,8 @@
 /*
  * KunxOS surface backend for libnsfb.
  *
- * 输出：/dev/fb0（XRGB8888，内核合成器 + FBIO_PRESENT 翻页提交）。
+ * 输出：/dev/fb0（XRGB8888，内核合成器 + FBIO_PRESENT 脏区增量提交）。
+ *       软件光标：claim 清精灵 → 应用重绘 → update 重画并入脏区。
  * 输入：/dev/input/event0（Linux evdev：触摸 = BTN_TOUCH/BTN_LEFT + ABS_X/Y，
  *       键盘 = EV_KEY）。按 Linux input_event(24B) 读取。
  */
@@ -20,11 +21,13 @@
 
 #include "libnsfb.h"
 #include "libnsfb_plot.h"
+#include "libnsfb_plot_util.h"
 #include "libnsfb_event.h"
 
 #include "nsfb.h"
 #include "surface.h"
 #include "plot.h"
+#include "cursor.h"
 
 /* ---- 内核 fb ioctl（与 KunxOS devfs 约定一致，24 字节 varinfo） ---- */
 #define KX_FBIOGET_VSCREENINFO 0x4600
@@ -54,6 +57,8 @@ static int kx_fbfd = -1;
 static int kx_evfd = -1;
 static unsigned char *fbin = NULL;
 static unsigned int kx_stride_px = 0;
+/* 屏幕几何（present 裁剪用），几何锁定时记录 */
+static unsigned int kx_width = 0, kx_height = 0;
 
 /* 触摸状态（跨 read 调用保持） */
 static int kx_have_pos = 0;
@@ -195,6 +200,8 @@ static int kx_open_and_lock_geometry(nsfb_t *nsfb)
     nsfb->height = (int)vi.yres;
     nsfb->format = NSFB_FMT_XRGB8888;
     kx_stride_px = vi.xres_virtual ? vi.xres_virtual : vi.xres;
+    kx_width = vi.xres;
+    kx_height = vi.yres;
     select_plotters(nsfb);
     return 0;
 }
@@ -297,7 +304,8 @@ static bool kunxos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         }
         {
             struct timespec ts;
-            int slice = 20; /* ms */
+            int slice = 8; /* ms；内核输入到达会提前唤醒 nanosleep，
+                            * 切片只是唤醒竞态丢失时的延迟上界 */
             if (timeout > 0 && timeout - waited < slice) {
                 slice = timeout - waited;
             }
@@ -309,15 +317,115 @@ static bool kunxos_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
     }
 }
 
-static int kunxos_update(nsfb_t *nsfb, nsfb_bbox_t *box)
+/* ---- 增量呈现 + 软件光标 ---- */
+
+/* 把屏幕坐标 bbox 作为脏区增量提交（FBIO_PRESENT 用户缓冲布局：
+ * [count:u32][rect × count]，rect = {x:i32, y:i32, w:u32, h:u32}，
+ * 与内核 devfs/linux_compat 约定一致）。空区域直接跳过。 */
+static void kx_present_box(const nsfb_bbox_t *box)
 {
-    (void)nsfb;
-    (void)box;
-    /* 整帧提交：内核合成器翻页 */
-    if (kx_fbfd >= 0) {
-        ioctl(kx_fbfd, KX_FBIO_PRESENT, NULL);
+    unsigned char buf[4 + 16];
+    int x0 = box->x0;
+    int y0 = box->y0;
+    int x1 = box->x1;
+    int y1 = box->y1;
+    unsigned int w, h;
+    int i;
+
+    if (kx_fbfd < 0) {
+        return;
+    }
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (kx_width != 0 && x1 > (int)kx_width) {
+        x1 = (int)kx_width;
+    }
+    if (kx_height != 0 && y1 > (int)kx_height) {
+        y1 = (int)kx_height;
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return; /* 无有效损伤：不触发呈现 */
+    }
+    w = (unsigned int)(x1 - x0);
+    h = (unsigned int)(y1 - y0);
+
+    buf[0] = 1; /* count = 1（小端） */
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    for (i = 0; i < 4; i++) {
+        buf[4 + i] = (unsigned char)(((unsigned int)x0 >> (i * 8)) & 0xff);
+        buf[8 + i] = (unsigned char)(((unsigned int)y0 >> (i * 8)) & 0xff);
+        buf[12 + i] = (unsigned char)((w >> (i * 8)) & 0xff);
+        buf[16 + i] = (unsigned char)((h >> (i * 8)) & 0xff);
+    }
+    ioctl(kx_fbfd, KX_FBIO_PRESENT, buf);
+}
+
+/* 应用（浏览器重绘）即将直接写入该区域：若软件光标与其相交，先恢复
+ * 底图清除光标精灵，由随后的 kunxos_update 重画 —— SDL surface 同款
+ * claim/clear → 重绘 → update/plot 时序。 */
+static int kunxos_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
+{
+    struct nsfb_cursor_s *cursor = nsfb->cursor;
+
+    if ((cursor != NULL) && cursor->plotted &&
+        nsfb_plot_bbox_intersect(box, &cursor->loc)) {
+        nsfb_cursor_clear(nsfb, cursor);
     }
     return 0;
+}
+
+/* 增量提交：本帧应用重绘区域（box）∪ 需重画的光标区域，按脏区呈现。
+ * 取代旧版「每次整帧 FBIO_PRESENT(NULL)」——内核对无脏区呈现回退
+ * prev_app 整屏拷贝（启动转场后 prev_app = 全屏，TCG 下每次鼠标
+ * 移动 ~2MB canvas→back 拷贝）是浏览器卡顿主因。 */
+static int kunxos_update(nsfb_t *nsfb, nsfb_bbox_t *box)
+{
+    struct nsfb_cursor_s *cursor = nsfb->cursor;
+    nsfb_bbox_t allbox;
+
+    if ((cursor != NULL) && !cursor->plotted) {
+        nsfb_cursor_plot(nsfb, cursor);
+        if (box != NULL) {
+            nsfb_plot_add_rect(box, &cursor->savloc, &allbox);
+            box = &allbox;
+        } else {
+            box = &cursor->savloc;
+        }
+    }
+    if (box != NULL) {
+        kx_present_box(box);
+    }
+    return 0;
+}
+
+/* 光标位置/形状变更（nsfb_cursor_set / nsfb_cursor_loc_set 触发）：
+ * 恢复旧位置底图、在新位置画精灵，两处并集作为小脏区增量呈现 ——
+ * 光标移动的呈现成本从整屏 2MB 拷贝降到 ~2×精灵面积。 */
+static int kunxos_cursor(nsfb_t *nsfb, struct nsfb_cursor_s *cursor)
+{
+    nsfb_bbox_t box;
+    bool was_plotted = cursor->plotted;
+
+    if (was_plotted) {
+        box = cursor->savloc;
+        nsfb_cursor_clear(nsfb, cursor);
+    }
+    if (!nsfb_cursor_plot(nsfb, cursor)) {
+        return 0; /* OOM 等异常：本帧不呈现 */
+    }
+    if (was_plotted) {
+        nsfb_plot_add_rect(&box, &cursor->savloc, &box);
+    } else {
+        box = cursor->savloc;
+    }
+    kx_present_box(&box);
+    return 1; /* 已处理（bool 语义） */
 }
 
 const nsfb_surface_rtns_t kunxos_rtns = {
@@ -326,7 +434,9 @@ const nsfb_surface_rtns_t kunxos_rtns = {
     .finalise = kunxos_finalise,
     .input = kunxos_input,
     .geometry = kunxos_set_geometry,
+    .claim = kunxos_claim,
     .update = kunxos_update,
+    .cursor = kunxos_cursor,
 };
 
 NSFB_SURFACE_DEF(kunxos, NSFB_SURFACE_KUNXOS, &kunxos_rtns)

@@ -30,6 +30,7 @@ null
 # 已快照至 tools/netsurf-port/overlay）
 vendor/
 tools/musl-cross/
+tools/riscv64-musl-cross/
 tools/musl-1.2.5/
 tools/musl-1.2.5.tar.gz
 tools/musl-test/

@@ -1,11 +1,11 @@
-//! 物理页分配器：用位图管理 0x40000000 - 0x7FFFFFFF（1GB）物理内存。
+//! 物理页分配器：用位图管理 0x80000000 - 0xBFFFFFFF（1GB）物理内存。
 
 use core::arch::asm;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 
 /// 管理的内存范围（1GB）
-pub const RAM_START: usize = 0x4000_0000;
-pub const RAM_END: usize = 0x8000_0000;
+pub const RAM_START: usize = 0x8000_0000;
+pub const RAM_END: usize = 0xC000_0000;
 
 /// 页大小：4KB
 pub const PAGE_SIZE: usize = 4096;
@@ -18,13 +18,13 @@ pub const TOTAL_PAGES: usize = (RAM_END - RAM_START) / PAGE_SIZE;
 /// 读-改-写与 IRQ 侧（如 `net_virtio` used-ring 回收) 的并发破坏空闲链表。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(saved: u64) {
-    asm!("msr daif, {}", in(reg) saved);
+    asm!("csrw sstatus, {}", in(reg) saved);
 }
 
 /// 位图：每个 u64 管理 64 页，1 = 已用，0 = 空闲
@@ -212,7 +212,7 @@ pub fn free_page(addr: usize) {
     let bad = !(addr >= RAM_START && addr < RAM_END && addr % PAGE_SIZE == 0);
     if bad {
         let lr: u64;
-        unsafe { core::arch::asm!("mov {}, x30", out(reg) lr) };
+        unsafe { core::arch::asm!("mv {}, ra", out(reg) lr) };
         crate::uart_send_str("[free] BAD addr=");
         crate::print_hex(addr as u64);
         crate::uart_send_str(" lr=");

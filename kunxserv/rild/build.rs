@@ -15,24 +15,36 @@ fn main() {
     println!("cargo:rerun-if-changed=linker.ld");
 
     // ---- C PDU 编解码库 ----
-    let cc = env::var("KUNXOS_CC").unwrap_or_else(|_| "aarch64-linux-gnu-gcc".to_string());
-    let ar = env::var("KUNXOS_AR").unwrap_or_else(|_| "aarch64-linux-gnu-ar".to_string());
+    let target = env::var("TARGET").unwrap_or_default();
+    let (cc, ar) = if target.contains("riscv") {
+        // clang 交叉（宿主无 riscv gcc）：lld 链接，medium-any 代码模型
+        ("clang".to_string(), "llvm-ar".to_string())
+    } else {
+        (
+            env::var("KUNXOS_CC").unwrap_or_else(|_| "aarch64-linux-gnu-gcc".to_string()),
+            env::var("KUNXOS_AR").unwrap_or_else(|_| "aarch64-linux-gnu-ar".to_string()),
+        )
+    };
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let obj = out.join("pdu.o");
     let lib = out.join("libpdu.a");
 
-    let status = Command::new(&cc)
-        .args([
-            "-nostdlib",
-            "-ffreestanding",
-            "-fno-stack-protector",
-            "-fno-pic",
-            "-fno-pie",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-c",
-        ])
+    let mut cc_cmd = Command::new(&cc);
+    cc_cmd.args([
+        "-nostdlib",
+        "-ffreestanding",
+        "-fno-stack-protector",
+        "-fno-pic",
+        "-fno-pie",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-c",
+    ]);
+    if target.contains("riscv") {
+        cc_cmd.arg("--target=riscv64").arg("-march=rv64gc").arg("-mabi=lp64d").arg("-mcmodel=medany");
+    }
+    let status = cc_cmd
         .arg(format!("{}/src/pdu/pdu.c", dir))
         .arg("-o")
         .arg(&obj)

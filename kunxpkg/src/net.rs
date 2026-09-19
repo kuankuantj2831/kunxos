@@ -19,7 +19,7 @@ pub const SOCK_STREAM: usize = 1;
 #[inline(always)]
 unsafe fn syscall1(n: usize, a1: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
     ret
 }
 
@@ -27,10 +27,10 @@ unsafe fn syscall1(n: usize, a1: usize) -> usize {
 unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
         options(nostack)
     );
     ret
@@ -40,11 +40,11 @@ unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
 unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret
@@ -53,8 +53,8 @@ unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
 #[inline(always)]
 unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret,
-        in("x1") a2, in("x2") a3, in("x3") a4, in("x4") a5, in("x5") a6, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
+        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, in("a5") a6, options(nostack));
     ret
 }
 

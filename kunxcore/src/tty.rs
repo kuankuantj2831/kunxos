@@ -71,13 +71,13 @@ static mut SESSIONS: [Session; MAX_TTY] = [EMPTY_SESSION; MAX_TTY];
 /// 屏蔽 IRQ（镜像可能来自中断被压栈的打印路径；环形操作需原子）。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(d: u64) {
-    asm!("msr daif, {}", in(reg) d);
+    asm!("csrw sstatus, {}", in(reg) d);
 }
 
 fn minor_to_idx(minor: u32) -> usize {

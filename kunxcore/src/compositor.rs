@@ -26,13 +26,13 @@ unsafe fn irq_save() -> u64 {
     // apply → set_scale/move_window），无条件 daifclr 会在中断处理器中途
     // 重新开中断 → 嵌套中断 → 栈/状态破坏（跳转垃圾地址）。
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(saved: u64) {
-    asm!("msr daif, {}", in(reg) saved);
+    asm!("csrw sstatus, {}", in(reg) saved);
 }
 
 /// 最大窗口（图层）数。

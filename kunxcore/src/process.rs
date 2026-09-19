@@ -229,30 +229,44 @@ global_asm!(
     .global do_fork
     .type do_fork, %function
 do_fork:
-    // 暂存入参（陷阱帧指针）到 x9（调用者保存寄存器）
-    mov x9, x0
-    // 在栈上保存 callee-saved 寄存器（x19-x30），作为子进程上下文
-    sub sp, sp, #96
-    stp x19, x20, [sp, #0x00]
-    stp x21, x22, [sp, #0x10]
-    stp x23, x24, [sp, #0x20]
-    stp x25, x26, [sp, #0x30]
-    stp x27, x28, [sp, #0x40]
-    stp x29, x30, [sp, #0x50]
-    // x0 = 保存现场指针，x1 = 陷阱帧指针，调用 Rust 创建子进程
-    mov x1, x9
-    mov x0, sp
-    bl fork_parent
+    // 暂存入参（陷阱帧指针）到 t2（调用者保存寄存器）
+    mv t2, a0
+    // 在栈上保存 callee-saved 寄存器（ra + s0-s11），作为 fork 现场锚点
+    addi sp, sp, -112
+    sd ra, 0x00(sp)
+    sd s0, 0x08(sp)
+    sd s1, 0x10(sp)
+    sd s2, 0x18(sp)
+    sd s3, 0x20(sp)
+    sd s4, 0x28(sp)
+    sd s5, 0x30(sp)
+    sd s6, 0x38(sp)
+    sd s7, 0x40(sp)
+    sd s8, 0x48(sp)
+    sd s9, 0x50(sp)
+    sd s10, 0x58(sp)
+    sd s11, 0x60(sp)
+    // a0 = 保存现场指针，a1 = 陷阱帧指针，调用 Rust 创建子进程
+    mv a1, t2
+    mv a0, sp
+    call fork_parent
     // 父进程路径：恢复现场并返回 pid
-    mov x9, x0
-    ldp x19, x20, [sp, #0x00]
-    ldp x21, x22, [sp, #0x10]
-    ldp x23, x24, [sp, #0x20]
-    ldp x25, x26, [sp, #0x30]
-    ldp x27, x28, [sp, #0x40]
-    ldp x29, x30, [sp, #0x50]
-    add sp, sp, #96
-    mov x0, x9
+    mv t2, a0
+    ld ra, 0x00(sp)
+    ld s0, 0x08(sp)
+    ld s1, 0x10(sp)
+    ld s2, 0x18(sp)
+    ld s3, 0x20(sp)
+    ld s4, 0x28(sp)
+    ld s5, 0x30(sp)
+    ld s6, 0x38(sp)
+    ld s7, 0x40(sp)
+    ld s8, 0x48(sp)
+    ld s9, 0x50(sp)
+    ld s10, 0x58(sp)
+    ld s11, 0x60(sp)
+    addi sp, sp, 112
+    mv a0, t2
     ret
 "#
 );
@@ -570,7 +584,7 @@ fn create_child_process(
 #[no_mangle]
 extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
     // 屏蔽 IRQ，保护栈拷贝与任务表写入的临界区
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let t0 = timer::now_us();
 
     let (stack_base, stack_top) = sched_cfs::current_stack();
@@ -583,7 +597,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
     // 子进程内核栈：分配失败（OOM）时本次 fork 明确失败（此前 panic，
     // fork/clone 风暴可打挂内核）。
     let Some(child_stack_top) = sched_cfs::alloc_stack() else {
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         crate::uart_send_str("[fork] 子进程栈分配失败（OOM）\n");
         return -12; // -ENOMEM
     };
@@ -598,12 +612,12 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
         );
     }
 
-    // 子进程陷阱帧放在**子栈顶部**（child_stack_top - 272），而不是拷贝区
-    // 中部：子进程首次 eret 后内核 sp = child_stack_top，其后的系统调用帧
+    // 子进程陷阱帧放在**子栈顶部**（child_stack_top - 832），而不是拷贝区
+    // 中部：子进程首次 sret 后内核 sp = child_stack_top，其后的系统调用帧
     // 从栈顶向下分配 —— 与下方拷贝区（含 exec 的 exec_path 等残留数据）
-    // 完全隔离，杜绝「残留数据污染 syscall 帧的 elr 字段 → eret 到 0」。
-    // 副本中 x[0] 置 0（fork 返回 0），elr/spsr/sp_el0 保持父进程副本值。
-    const TRAP_FRAME_SIZE: usize = 800;
+    // 完全隔离，杜绝「残留数据污染 syscall 帧的 elr 字段 → sret 到 0」。
+    // 副本中 a0（x[10]）置 0（fork 返回 0），elr/sstatus/sp_el0 保持父副本值。
+    const TRAP_FRAME_SIZE: usize = 832;
     let child_frame = child_stack_top - TRAP_FRAME_SIZE;
     if trap_frame >= saved_sp && trap_frame + TRAP_FRAME_SIZE <= stack_top {
         unsafe {
@@ -612,20 +626,21 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 child_frame as *mut u8,
                 TRAP_FRAME_SIZE,
             );
-            *(child_frame as *mut u64) = 0;
+            // a0 槽（x10）@0x50：fork 子进程返回 0
+            *((child_frame + 0x50) as *mut u64) = 0;
         }
-        // 防御护栏：校验子进程恢复现场（elr/sp_el0/spsr）的合理性。若父进程
-        // 陷阱帧损坏（elr=0、elr 越界、sp_el0 不在用户栈区、spsr 非 EL0t），
-        // 直接让本次 fork 失败——而不是调度一个「eret 到坏地址」的必死子进程。
-        let c_elr = unsafe { *((child_frame + 0x100) as *const u64) };
-        let c_sp = unsafe { *((child_frame + 0xf8) as *const u64) };
-        let c_spsr = unsafe { *((child_frame + 0x108) as *const u64) };
-        let c_x30 = unsafe { *((child_frame + 0xf0) as *const u64) };
+        // 防御护栏：校验子进程恢复现场（elr/sp_el0/sstatus）的合理性。若父
+        // 陷阱帧损坏（elr=0、elr 越界、sp_el0 不在用户栈区、sstatus.SPP=1），
+        // 直接让本次 fork 失败——而不是调度一个「sret 到坏地址」的必死子进程。
+        let c_elr = unsafe { *((child_frame + 0x108) as *const u64) };
+        let c_sp = unsafe { *((child_frame + 0x100) as *const u64) };
+        let c_spsr = unsafe { *((child_frame + 0x110) as *const u64) };
+        let c_x30 = unsafe { *((child_frame + 0x08) as *const u64) };
         if c_elr == 0
             || c_elr >= crate::vm::USER_VA_TOP as u64
             || c_sp >= crate::vm::USER_STACK_TOP as u64
             || c_sp == 0
-            || c_spsr & 0xF != 0
+            || c_spsr & 0x100 != 0
         {
             // 陷阱帧护栏失败：归还已分配的子栈（此前 fork 失败路径漏释放，
             // 反复失败 fork 会永久泄漏 256KB/次）。
@@ -635,7 +650,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                     allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
                 }
             }
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return -1;
         }
         // [诊断] 记录每次 fork 子进程的恢复现场，用于核对 PC=0 残余故障是否
@@ -645,9 +660,9 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
             crate::print_hex(c_elr);
             crate::uart_send_str(" sp=");
             crate::print_hex(c_sp);
-            crate::uart_send_str(" x30=");
+            crate::uart_send_str(" ra=");
             crate::print_hex(c_x30);
-            crate::uart_send_str(" spsr=");
+            crate::uart_send_str(" sstatus=");
             crate::print_hex(c_spsr);
             crate::uart_send_str("\n");
         }
@@ -660,7 +675,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
             }
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return -1;
     }
 
@@ -676,7 +691,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
             }
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return -1;
     }
     // 根页表 OOM：物理内存可被用户 brk/文件 mmap 耗尽后 fork 触发，必须
@@ -691,7 +706,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
                 }
             }
             proc_claim_release(pid);
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return -1;
         }
     };
@@ -711,7 +726,7 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
             }
         }
         proc_claim_release(pid);
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return -1;
     }
     // 子进程继承父进程的 ELF 运行时信息（ASLR 栈基址/初始 sp/堆基址）：
@@ -733,27 +748,16 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
         crate::uart_send_str("us\n");
     }
 
-    // 子进程上下文：首次调度直接进入 syscall_return_restore，sp 指向子进程
-    // **拷贝的陷阱帧**（x0 已置 0，elr/spsr/sp_el0 均为子进程自身副本值）。
+    // 子进程上下文：首次调度直接进入 trap_return，sp 指向子进程**拷贝的
+    // 陷阱帧**（a0 已置 0，elr/sstatus/sp_el0 均为子进程自身副本值）。
     // 完全不经过 syscall_dispatch：既不把返回值写回父进程陷阱帧（跨栈写），
-    // 也不沿父调用链回卷 —— eret 直接回到用户态 fork() 调用点，x0 = 0。
-    let parent_tpidr: u64;
-    unsafe { asm!("mrs {}, tpidr_el0", out(reg) parent_tpidr) };
-    // 父进程当前 SP_EL0（用户栈指针）：子进程首次被调度前必须保存，
-    // 否则 switch_to 恢复的是空/错值，子进程带错误用户栈运行。
-    let parent_sp_el0: u64;
-    unsafe { asm!("mrs {}, sp_el0", out(reg) parent_sp_el0) };
+    // 也不沿父调用链回卷 —— sret 直接回到用户态 fork() 调用点，a0 = 0。
+    // RISC-V：用户现场全部在陷阱帧内（sepc/sstatus 由 trap_return 从帧回写
+    // CSR），TaskContext 只需 ra（恢复入口）+ sp（帧地址）+ satp_root。
     let mut ctx = TaskContext::empty();
-    ctx.x30 = el0_resume_entry as *const () as usize as u64;
+    ctx.ra = el0_resume_entry as *const () as usize as u64;
     ctx.sp = child_frame as u64;
-    ctx.spsr = 0x5;
-    // 初始 ELR 直接取陷阱帧副本中的 EL0 返回地址（偏移 0x100）：子进程首次
-    // 调度后若在 syscall_return_restore 的 msr elr_el1 之前被抢占，switch_to
-    // 保存/恢复的 ELR 是有效地址而非 0 —— 消除「ELR=0 在飞」窗口。
-    ctx.elr = unsafe { *((child_frame + 0x100) as *const u64) };
-    ctx.tpidr = parent_tpidr;
-    ctx.ttbr0_el1 = child_ttbr0 as u64;
-    ctx.sp_el0 = parent_sp_el0;
+    ctx.satp_root = child_ttbr0 as u64;
 
     let class = sched_cfs::current_class();
     let nice = sched_cfs::current_nice();
@@ -800,12 +804,12 @@ extern "C" fn fork_parent(saved_sp: usize, trap_frame: usize) -> i32 {
             }
         }
         proc_claim_release(child_pid);
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return -1;
     }
 
     proc_claim_release(child_pid);
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     child_pid as i32
 }
 
@@ -1005,7 +1009,12 @@ pub fn assign_fd(pid: u32, fd: usize, entry: FdEntry) -> i32 {
 /// 汇总提示（安静模式不上串口）；重复登记本身意味着该页退出时会被
 /// `free_user_pages` 释放两次，需排查登记来源。
 pub fn check_double_allocations() {
-    // 1) 全进程对（含自身）私有页重复物理地址检查
+    // 1) 全进程对（含自身）私有页重复物理地址检查。
+    // 打印限流：COW 共享（fork 后父子同物理页）会合法命中本检查，进程数
+    // 多时一次故障可产生数万条输出（实测 5.6 万行 ≈ 35s 串口墙钟，整机
+    // 观感冻结）。只打前 8 条 + 末尾汇总（与下方同 VA 重复登记的降噪同风格）。
+    static mut DA_PRINTED: usize = 0;
+    static mut DA_SUPPRESSED: u64 = 0;
     for a in 0..MAX_PROC {
         let pa = unsafe { &PROCESSES[a] };
         if pa.pt.ttbr0 == 0 {
@@ -1032,17 +1041,24 @@ pub fn check_double_allocations() {
                         && !(a == b && q.vaddr == p.vaddr)
                         && !(vm::is_user_ro(q.flags) && !vm::is_cow(q.flags))
                     {
-                        crate::uart_send_str("\n[DOUBLE-ALLOC] paddr=");
-                        crate::print_hex(p.paddr as u64);
-                        crate::uart_send_str(" proc ");
-                        crate::print_dec(a as u64);
-                        crate::uart_send_str(" va=");
-                        crate::print_hex(p.vaddr as u64);
-                        crate::uart_send_str(" 与 proc ");
-                        crate::print_dec(b as u64);
-                        crate::uart_send_str(" va=");
-                        crate::print_hex(q.vaddr as u64);
-                        crate::uart_send_str("\n");
+                        unsafe {
+                            if DA_PRINTED < 8 {
+                                DA_PRINTED += 1;
+                                crate::uart_send_str("\n[DOUBLE-ALLOC] paddr=");
+                                crate::print_hex(p.paddr as u64);
+                                crate::uart_send_str(" proc ");
+                                crate::print_dec(a as u64);
+                                crate::uart_send_str(" va=");
+                                crate::print_hex(p.vaddr as u64);
+                                crate::uart_send_str(" 与 proc ");
+                                crate::print_dec(b as u64);
+                                crate::uart_send_str(" va=");
+                                crate::print_hex(q.vaddr as u64);
+                                crate::uart_send_str("\n");
+                            } else {
+                                DA_SUPPRESSED += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1283,7 +1299,7 @@ fn reap(pid: u32) -> Option<i32> {
             return None; // 他核正在分配/回收此槽位：wait 循环稍后重试
         }
         let saved = crate::sched_cfs::read_daif();
-        core::arch::asm!("msr daifset, #2");
+        core::arch::asm!("csrci sstatus, 2");
         if PROCESSES[pid as usize].state != ProcessState::Zombie {
             crate::sched_cfs::write_daif(saved);
             proc_claim_release(pid);
@@ -1309,7 +1325,7 @@ fn reap(pid: u32) -> Option<i32> {
         // 并放弃（wait 循环重试），只返回退出码。
         if crate::sched_cfs::has_live_tasks(pid) {
             let saved2 = crate::sched_cfs::read_daif();
-            core::arch::asm!("msr daifset, #2");
+            core::arch::asm!("csrci sstatus, 2");
             PROCESSES[pid as usize].state = ProcessState::Zombie;
             crate::sched_cfs::write_daif(saved2);
             proc_claim_release(pid);
@@ -1376,11 +1392,11 @@ fn adopt_orphans(pid: u32) {
 /// 当前进程退出（唤醒等待者，回收当前线程，不再返回）。
 pub fn exit(code: i32) -> ! {
     // 屏蔽 IRQ，保证「终止兄弟线程 → 标记僵尸 → 唤醒等待者 → 切走」整个过程原子。
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let pid = current_pid();
     unsafe {
         let ttbr: u64;
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr);
+        core::arch::asm!("csrr {}, satp", out(reg) ttbr);
         crate::kinfo! {
             crate::uart_send_str("[exit] pid=");
             crate::print_dec(pid as u64);
@@ -1557,7 +1573,7 @@ pub fn wait(pid: i32) -> (i32, i32) {
             // 子进程 exit 的 wake_pid 只唤醒 Blocked 任务（此时父进程是 Ready）
             // → 父进程随后阻塞且再无人唤醒。把检查到阻塞包进 IRQ 屏蔽窗口。
             let saved = unsafe { sched_cfs::read_daif() };
-            unsafe { core::arch::asm!("msr daifset, #2") };
+            unsafe { core::arch::asm!("csrci sstatus, 2") };
             let mut zombie2 = None;
             unsafe {
                 for i in 0..MAX_PROC {
@@ -1593,7 +1609,7 @@ pub fn wait(pid: i32) -> (i32, i32) {
             //（此时父进程是 Ready）→ 父进程随后阻塞且再无人唤醒。
             // 把「状态检查 + 登记 + 阻塞」包进 IRQ 屏蔽窗口。
             let saved = unsafe { sched_cfs::read_daif() };
-            unsafe { core::arch::asm!("msr daifset, #2") };
+            unsafe { core::arch::asm!("csrci sstatus, 2") };
             let action = unsafe {
                 let p = &mut PROCESSES[pid as usize];
                 if p.state == ProcessState::Free {
@@ -1722,7 +1738,7 @@ pub fn sig_table_copy(parent: u32, child: u32) {
 pub fn signal_clear(pid: u32, sig: u32) {
     if (pid as usize) < MAX_PROC && (sig as usize) < 64 {
         let saved = unsafe { sched_cfs::read_daif() };
-        unsafe { core::arch::asm!("msr daifset, #2") };
+        unsafe { core::arch::asm!("csrci sstatus, 2") };
         unsafe {
             PROCESSES[pid as usize].signals &= !(1u64 << sig);
         }
@@ -1735,7 +1751,7 @@ pub fn signal_send(pid: u32, sig: u32) {
         return;
     }
     let saved = unsafe { sched_cfs::read_daif() };
-    unsafe { core::arch::asm!("msr daifset, #2") };
+    unsafe { core::arch::asm!("csrci sstatus, 2") };
     unsafe {
         PROCESSES[pid as usize].signals |= 1u64 << sig;
     }

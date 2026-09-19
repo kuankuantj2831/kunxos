@@ -221,14 +221,14 @@ pub(crate) static mut PM_STATUS: u64 = 0;
 #[inline(always)]
 pub(crate) unsafe fn syscall1(n: usize, a1: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
     ret
 }
 
 #[inline(always)]
 pub(crate) unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, in("x1") a2, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
     ret
 }
 
@@ -236,11 +236,11 @@ pub(crate) unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
 pub(crate) unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret
@@ -250,14 +250,14 @@ pub(crate) unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usiz
 pub(crate) unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
-        in("x3") a4,
-        in("x4") a5,
-        in("x5") a6,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
+        in("a3") a4,
+        in("a4") a5,
+        in("a5") a6,
         options(nostack)
     );
     ret
@@ -1557,13 +1557,13 @@ global_asm!(
     ".global _start",
     ".type _start, %function",
     "_start:",
-    "    mov x2, sp",
-    "    ldr x0, [x2], #8",
-    "    mov x1, x2",
-    "    bl k_main",
-    "    mov x8, #93",
-    "    svc #0",
-    "    b .",
+    "    mv a1, sp",
+    "    ld a0, 0(a1)",
+    "    addi a1, a1, 8",
+    "    call k_main",
+    "    li a7, 93",
+    "    ecall",
+    "    j .",
 );
 
 #[panic_handler]

@@ -99,10 +99,10 @@ unsafe fn dcache_clean(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        core::arch::asm!("dc cvac, {}", in(reg) a);
+        core::arch::asm!("fence iorw, iorw");
         a += 64;
     }
-    core::arch::asm!("dsb sy");
+    core::arch::asm!("fence iorw, iorw");
 }
 
 // ==================== 正弦波 ====================

@@ -76,8 +76,8 @@ static mut READ_CURSOR: usize = 0;
 /// 写入一条日志记录（IRQ 安全：保存/恢复 DAIF，可从任意上下文调用）。
 pub fn log_write(level: u8, tag: &str, msg: &str) {
     let saved: u64;
-    unsafe { asm!("mrs {}, daif", out(reg) saved) };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrr {}, sstatus", out(reg) saved) };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let idx = (HEAD + COUNT) % LOG_CAP;
         let rec = &mut RING[idx];
@@ -100,7 +100,7 @@ pub fn log_write(level: u8, tag: &str, msg: &str) {
         }
     }
     unsafe {
-        asm!("msr daif, {}", in(reg) saved);
+        asm!("csrw sstatus, {}", in(reg) saved);
     }
 }
 

@@ -22,12 +22,12 @@ const SYS_EXIT: usize = 93;
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") SYS_WRITE,
-        in("x0") fd,
-        in("x1") buf.as_ptr() as usize,
-        in("x2") buf.len(),
-        lateout("x0") ret,
+        "ecall",
+        in("a7") SYS_WRITE,
+        in("a0") fd,
+        in("a1") buf.as_ptr() as usize,
+        in("a2") buf.len(),
+        lateout("a0") ret,
         options(nostack),
     );
     ret
@@ -68,7 +68,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         "ill" => {
             print("[crashme] 执行未定义指令（预期 SIGILL）\n");
             unsafe {
-                asm!(".word 0x00000000"); // 未定义指令
+                asm!(".word 0x00000000"); // 未定义指令（riscv 全 0 = illegal instruction）
             }
         }
         "div0" => {
@@ -76,7 +76,9 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             unsafe {
                 let a: u64 = 1;
                 let b: u64 = 0;
-                asm!("udiv {r}, {a}, {b}", r = out(reg) _, a = in(reg) a, b = in(reg) b);
+                // riscv 除零：divu 结果为全 1（不触发异常），改用「读只读 csr 后跳 0」类
+                // 故障由上方 illegal 路径覆盖；此处保留一个非对齐访存触发
+                asm!("lw {r}, 1({a})", r = out(reg) _, a = in(reg) a);
             }
         }
         _ => {
@@ -93,13 +95,13 @@ global_asm!(
     ".global _start",
     ".type _start, %function",
     "_start:",
-    "    mov x2, sp",
-    "    ldr x0, [x2], #8",
-    "    mov x1, x2",
-    "    bl k_main",
-    "    mov x8, #93",
-    "    svc #0",
-    "    b .",
+    "    mv a1, sp",
+    "    ld a0, 0(a1)",
+    "    addi a1, a1, 8",
+    "    call k_main",
+    "    li a7, 93",
+    "    ecall",
+    "    j .",
 );
 
 #[panic_handler]
@@ -123,7 +125,7 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         write_fd(2, b"PANIC: crashme\n");
         write_fd(2, &w.buf[..w.len]);
-        asm!("mov x8, #93", "svc #0", options(nostack));
+        asm!("li a7, 93", "ecall", options(nostack));
     }
     loop {}
 }

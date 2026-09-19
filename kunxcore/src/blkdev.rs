@@ -101,8 +101,8 @@ static BLK_LOCKED: AtomicU64 = AtomicU64::new(0);
 fn blk_lock() -> u64 {
     let saved: u64;
     unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) saved);
-        core::arch::asm!("msr daifset, #2");
+        core::arch::asm!("csrr {}, sstatus", out(reg) saved);
+        core::arch::asm!("csrci sstatus, 2");
     }
     let cpu = crate::smp::cpu_id() as u64;
     loop {
@@ -132,7 +132,7 @@ fn blk_unlock(saved: u64) {
     } else {
         BLK_LOCKED.store(0, Ordering::Release);
     }
-    unsafe { core::arch::asm!("msr daif, {}", in(reg) saved) };
+    unsafe { core::arch::asm!("csrw sstatus, {}", in(reg) saved) };
 }
 
 /// 分区名缓冲（注册分区时格式化 "sda3" 之类名字，返回 &'static str）。

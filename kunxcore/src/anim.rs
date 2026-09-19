@@ -27,13 +27,13 @@ use crate::timer;
 /// 调用方可能本身就在 IRQ 上下文，恢复式写回避免嵌套中断。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(saved: u64) {
-    asm!("msr daif, {}", in(reg) saved);
+    asm!("csrw sstatus, {}", in(reg) saved);
 }
 // ==================== 缓动曲线 ====================
 
@@ -625,7 +625,7 @@ fn report_frame_stats() {
         // FRAME_STATS，可被抢占的读-清零会把新样本抹掉或跨窗口混算。
         // UART 打印（毫秒级忙等）留在可中断上下文。
         let saved = crate::sched_cfs::read_daif();
-        core::arch::asm!("msr daifset, #2");
+        core::arch::asm!("csrci sstatus, 2");
         let s = &mut FRAME_STATS;
         let n = s.count.min(STAT_WINDOW);
         let mut buf = [0u64; STAT_WINDOW];
@@ -1005,13 +1005,13 @@ pub fn perf_test() {
         let start = timer::now_us();
         let deadline = start + 1_000_000;
         unsafe {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
         }
         while active() && timer::now_us() < deadline {
             core::hint::spin_loop();
         }
         unsafe {
-            asm!("msr daifset, #2");
+            asm!("csrci sstatus, 2");
         }
         let frames = frames_presented();
         uart(" [anim-perf] 300ms 动画内定时器驱动帧数：");

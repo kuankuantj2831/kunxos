@@ -29,7 +29,7 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::allocator;
-use crate::gic;
+use crate::plic;
 use crate::interrupt;
 
 // ==================== 设备常量 ====================
@@ -202,11 +202,11 @@ fn r8(off: usize) -> u8 {
 
 #[inline]
 fn mb() {
-    unsafe { asm!("dmb sy") }
+    unsafe { asm!("fence rw, rw") }
 }
 #[inline]
 fn dsb() {
-    unsafe { asm!("dsb sy") }
+    unsafe { asm!("fence iorw, iorw") }
 }
 
 /// 按缓存行清洗数据缓存到内存，使设备 DMA 可读到。
@@ -215,10 +215,10 @@ unsafe fn dcache_clean(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc cvac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 /// 按缓存行作废数据缓存，使后续读取直接取内存（设备写入的数据可见）。
@@ -227,10 +227,10 @@ unsafe fn dcache_invalidate(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc ivac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 // ==================== 环访问辅助 ====================
@@ -663,9 +663,9 @@ pub fn start() {
     }
     // 注册中断并启用 GIC
     interrupt::register_handler(unsafe { IRQ }, irq_handler);
-    gic::gic_enable_irq(unsafe { IRQ });
-    gic::gic_set_priority(unsafe { IRQ }, 0x80);
-    gic::gic_set_target(unsafe { IRQ }, 0x01);
+    plic::plic_enable_irq(unsafe { IRQ });
+    plic::plic_set_priority(unsafe { IRQ }, 0x80);
+    plic::plic_set_target(unsafe { IRQ }, 0x01);
 
     unsafe {
         let st = ctl_simple(SND_R_PCM_START);
@@ -718,27 +718,27 @@ pub fn submit(data: &[u8]) -> i32 {
         return -1;
     }
     unsafe {
-        asm!("msr daifset, #2");
+        asm!("csrci sstatus, 2");
         if TX_INFLIGHT >= TX_SLOTS {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         let h = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if h == 0xFFFF {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         let d = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if d == 0xFFFF {
             free_desc(&mut TX_FREE_HEAD, TX_RING, h);
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         let s = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if s == 0xFFFF {
             free_desc(&mut TX_FREE_HEAD, TX_RING, d);
             free_desc(&mut TX_FREE_HEAD, TX_RING, h);
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         let buf = allocator::alloc_page();
@@ -748,7 +748,7 @@ pub fn submit(data: &[u8]) -> i32 {
                 free_desc(&mut TX_FREE_HEAD, TX_RING, s);
                 free_desc(&mut TX_FREE_HEAD, TX_RING, d);
 free_desc(&mut TX_FREE_HEAD, TX_RING, h as u16);
-                asm!("msr daifclr, #2");
+                asm!("csrsi sstatus, 2");
                 return -1;
             }
         };
@@ -787,7 +787,7 @@ free_desc(&mut TX_FREE_HEAD, TX_RING, h as u16);
         TX_INFLIGHT += 1;
         dsb();
         w32(REG_QUEUE_NOTIFY, 2); // kick tx 队列
-        asm!("msr daifclr, #2");
+        asm!("csrsi sstatus, 2");
         0
     }
 }

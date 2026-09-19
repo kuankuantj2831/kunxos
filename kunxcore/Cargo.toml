@@ -21,6 +21,10 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 opt-level = 2
+# fat LTO 曾因 global_asm! 内的 fsd/fld（需 D 扩展）在 LTO 重汇编时被拒而
+# 关闭；现 FP 现场保存已移入 inline asm! 辅助函数（trap_save_fp/
+# trap_restore_fp，走 LLVM 代码生成不受限），global_asm 无浮点指令，恢复
+# LTO 换回跨 crate 内联（启动阶段实测 -30% 差距的主要来源）。
 lto = true
 
 [lints.rust]

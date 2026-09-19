@@ -261,7 +261,7 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
         _ => return 0,
     };
     let idx = entry.index;
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let mut written = 0usize;
     while written < data.len() {
         // 缓冲满：登记并阻塞（block_current 内部管理 DAIF，返回时恢复 IRQ）
@@ -271,27 +271,27 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
                 // （used == false，refs 归零）时，写者不应再等待——此前只检查
                 // 缓冲满、读者全部关闭后写者永久挂起。
                 if !PIPES[idx].used || PIPES[idx].readers == 0 {
-                    asm!("msr daifclr, #2");
+                    asm!("csrsi sstatus, 2");
                     return written;
                 }
                 if !wait_reg(&mut PIPES[idx].writer_wait, sched_cfs::current_tid()) {
                     // 等待者表满（≥5 并发等待者）：让出 CPU 后重试登记。
                     // 此前直接 return written —— written==0 时被调用方误判
                     // 为"写入 0 字节成功"，实际数据未写。
-                    asm!("msr daifclr, #2");
+                    asm!("csrsi sstatus, 2");
                     sched_cfs::yield_now();
-                    asm!("msr daifset, #2");
+                    asm!("csrci sstatus, 2");
                     continue;
                 }
             }
             sched_cfs::block_current();
-            unsafe { asm!("msr daifset, #2") };
+            unsafe { asm!("csrci sstatus, 2") };
         }
         unsafe {
             let pipe = &mut PIPES[idx];
             if !pipe.used || pipe.readers == 0 {
                 // 等待期间对端全部关闭：不再写入
-                asm!("msr daifclr, #2");
+                asm!("csrsi sstatus, 2");
                 return written;
             }
             pipe.buf[pipe.tail] = data[written];
@@ -302,7 +302,7 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
         }
         written += 1;
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     written
 }
 
@@ -319,25 +319,25 @@ pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
         return 0;
     }
     let idx = entry.index;
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     // 阻塞直到至少 1 字节；所有写端关闭（writers == 0）或槽位清空 = EOF。
     while unsafe { PIPES[idx].count == 0 && PIPES[idx].used && PIPES[idx].writers > 0 } {
         unsafe {
             if !wait_reg(&mut PIPES[idx].reader_wait, sched_cfs::current_tid()) {
                 // 等待者表满：让出 CPU 后重试登记。此前 return 0 会被应用
                 // 当作 EOF（管道关闭），实际只是并发读者过多。
-                asm!("msr daifclr, #2");
+                asm!("csrsi sstatus, 2");
                 sched_cfs::yield_now();
-                asm!("msr daifset, #2");
+                asm!("csrci sstatus, 2");
                 continue;
             }
         }
         sched_cfs::block_current();
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
     }
     // EOF：槽位已清空或写端全部关闭且无数据 → 返回 0（read 的 EOF 语义）
     if unsafe { !PIPES[idx].used || (PIPES[idx].count == 0 && PIPES[idx].writers == 0) } {
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return 0;
     }
     // 读取当前全部可读字节（不超过 out.len()），原子完成
@@ -352,7 +352,7 @@ pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
         // 唤醒全部等待中的写者
         wait_wake(&mut pipe.writer_wait);
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     n
 }
 
@@ -386,11 +386,11 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
         _ => return 0,
     };
     let len = data.len().min(MSG_SIZE);
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     loop {
         // 阻塞唤醒后槽位可能已被清空：按发送失败处理（0 字节）
         if !unsafe { QUEUES[entry.index].used } {
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return 0;
         }
         let slot = unsafe {
@@ -408,7 +408,7 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
                 q.msgs[s].data[..len].copy_from_slice(&data[..len]);
                 // 唤醒全部等待中的接收者（多接收者场景不丢唤醒）
                 wait_wake(&mut q.recv_wait);
-                asm!("msr daifclr, #2");
+                asm!("csrsi sstatus, 2");
                 return len;
             },
             None => {
@@ -417,14 +417,14 @@ pub fn msgq_send(fd: i32, data: &[u8], prio: i32) -> usize {
                     if !wait_reg(&mut QUEUES[entry.index].send_wait, sched_cfs::current_tid()) {
                         // 等待者表满：让出重试。此前 return 0 被调用方当作
                         // "发送成功 0 字节"，实际消息未入队。
-                        asm!("msr daifclr, #2");
+                        asm!("csrsi sstatus, 2");
                         sched_cfs::yield_now();
-                        asm!("msr daifset, #2");
+                        asm!("csrci sstatus, 2");
                         continue;
                     }
                 }
                 sched_cfs::block_current();
-                unsafe { asm!("msr daifset, #2") };
+                unsafe { asm!("csrci sstatus, 2") };
             }
         }
     }
@@ -439,11 +439,11 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
         Some(e) if e.kind == FdKind::MsgQueue => e,
         _ => return (0, 0),
     };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     loop {
         if !unsafe { QUEUES[entry.index].used } {
             // 队列已关闭：EOF 语义
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return (0, 0);
         }
         // 找出最高优先级、同优先级最早入队（按 seq）的消息
@@ -476,7 +476,7 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
                 q.msgs[s].used = false;
                 // 唤醒全部等待中的发送者
                 wait_wake(&mut q.send_wait);
-                asm!("msr daifclr, #2");
+                asm!("csrsi sstatus, 2");
                 return (n, m.prio);
             },
             None => {
@@ -484,14 +484,14 @@ pub fn msgq_recv(fd: i32, out: &mut [u8]) -> (usize, i32) {
                     if !wait_reg(&mut QUEUES[entry.index].recv_wait, sched_cfs::current_tid()) {
                         // 等待者表满：让出重试。此前 return (0,0) 被调用方
                         // 当作"空消息成功"，实际队非空只是并发读者过多。
-                        asm!("msr daifclr, #2");
+                        asm!("csrsi sstatus, 2");
                         sched_cfs::yield_now();
-                        asm!("msr daifset, #2");
+                        asm!("csrci sstatus, 2");
                         continue;
                     }
                 }
                 sched_cfs::block_current();
-                unsafe { asm!("msr daifset, #2") };
+                unsafe { asm!("csrci sstatus, 2") };
             }
         }
     }
@@ -547,7 +547,7 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
     // 抢占夹在 refs 读-改-写之间、与另一任务对同一 shm 的 map/close 并发，
     // 会丢一次递增/递减 → refs 提前归零释放仍被映射的物理页（UAF）。
     // 与 shm_close_index 同款屏蔽（本文件其余 add/drop 均有）。
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let mut recorded = false;
         let mut free_slot = false;
@@ -566,7 +566,7 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
         // 建立页表映射但不加入记录——刷新引用归零后该进程页表仍引用已释放的
         // 物理页（use-after-free）。记录表满时**拒绝本次映射**，不留无记录映射。
         if !recorded && !free_slot {
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return 0;
         }
         // 只对「新登记」+1：已登记（幂等重复映射）不重复计数——此前重复映射会
@@ -575,7 +575,7 @@ pub fn shm_map(fd: i32, vaddr: usize) -> usize {
             SHMS[entry.index].refs = SHMS[entry.index].refs.saturating_add(1);
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     process::map_user_page(vaddr, page);
     page
 }
@@ -596,7 +596,7 @@ pub fn shm_drop_one_ref(index: usize) {
     if index >= MAX_SHMS {
         return;
     }
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let s = &mut SHMS[index];
         if s.used && s.refs > 0 {
@@ -607,18 +607,18 @@ pub fn shm_drop_one_ref(index: usize) {
             }
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 增加共享内存引用计数（供 fork 复制 fd 表时调用，防止子进程 close 导致提前释放）。
 pub fn shm_add_ref(index: usize) {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         if index < MAX_SHMS && SHMS[index].used {
             SHMS[index].refs = SHMS[index].refs.saturating_add(1);
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 按下标释放共享内存引用（进程退出/回收清理 fd 时调用）。
@@ -631,11 +631,11 @@ pub fn shm_close_index(pid: u32, index: usize) {
     if index >= MAX_SHMS {
         return;
     }
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let s = &mut SHMS[index];
         if !s.used || s.refs == 0 {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return;
         }
         // 清掉该进程的映射记录（页表已销毁，无需 unmap），并按清除的
@@ -656,7 +656,7 @@ pub fn shm_close_index(pid: u32, index: usize) {
             *s = Shm::empty();
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 增加管道引用计数（fork/dup 复制 fd 时调用，防止子进程退出清空父进程管道）。
@@ -667,7 +667,7 @@ pub fn pipe_add_ref(index: usize, is_write: bool) {
         // 引用计数为普通读-改-写：调用点（fork/dup）处于 IRQ 使能的任务
         // 上下文，被 tick 抢占后另一任务对同一管道并发 add/drop 会丢更新
         // → 槽位泄漏或提前清空。与 pipe_write 同款屏蔽。
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
         unsafe {
             if PIPES[index].used {
                 PIPES[index].refs = PIPES[index].refs.saturating_add(1);
@@ -678,7 +678,7 @@ pub fn pipe_add_ref(index: usize, is_write: bool) {
                 }
             }
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
     }
 }
 
@@ -697,11 +697,11 @@ pub fn pipe_drop_ref(index: usize, is_write: bool) {
     // 引用计数/端计数为普通读-改-写，且尾部要唤醒等待者：全程屏蔽 IRQ
     // （fork 回滚、reap、close 收尾都在 IRQ 使能上下文，并发 drop 丢一次
     // 递减 → 槽位与其中的等待者永久泄漏）。
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let p = &mut PIPES[index];
         if !p.used {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return;
         }
         if p.refs > 0 {
@@ -728,19 +728,19 @@ pub fn pipe_drop_ref(index: usize, is_write: bool) {
             *p = Pipe::empty();
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 增加消息队列引用计数（fork/dup 复制 fd 时调用）。
 pub fn msgq_add_ref(index: usize) {
     if index < MAX_QUEUES {
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
         unsafe {
             if QUEUES[index].used {
                 QUEUES[index].refs = QUEUES[index].refs.saturating_add(1);
             }
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
     }
 }
 
@@ -749,11 +749,11 @@ pub fn msgq_drop_ref(index: usize) {
     if index >= MAX_QUEUES {
         return;
     }
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let q = &mut QUEUES[index];
         if !q.used {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return;
         }
         if q.refs > 0 {
@@ -768,7 +768,7 @@ pub fn msgq_drop_ref(index: usize) {
             *q = MsgQueue::empty();
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 获取共享内存物理页地址（供内核态直接读写演示）。
@@ -795,11 +795,11 @@ pub fn shm_close(fd: i32) {
     let root = process::current_root();
     // ★ 同 shm_map：refs 读-改-写与并发 map/add_ref 的交错会丢更新 → 提前
     // 归零释放仍被映射的物理页。全程屏蔽 IRQ。
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let s = &mut SHMS[entry.index];
         if !s.used || s.refs == 0 {
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             return;
         }
         // 解除本进程的映射（每次映射 -1）
@@ -820,7 +820,7 @@ pub fn shm_close(fd: i32) {
             *s = Shm::empty();
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 
@@ -975,7 +975,7 @@ pub fn pair_write(fd: i32, data: &[u8]) -> usize {
     let idx = entry.index;
     let side = entry.flags as usize;
     let mut written = 0usize;
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     while written < data.len() {
         // 槽位已清空或对端 fd 全部关闭：停止写入（短写 = EPIPE 语义）
         if !unsafe { PAIRS[idx].used } || pair_peer_count(idx, side) == 0 {
@@ -987,13 +987,13 @@ pub fn pair_write(fd: i32, data: &[u8]) -> usize {
             // 缓冲满：登记写等待并阻塞（屏蔽窗口贯穿登记→阻塞，不丢唤醒）
             if !wait_reg(&mut pair_write_ring(idx, side).write_wait, sched_cfs::current_tid()) {
                 // 等待者表满：让出 CPU 后重试登记
-                unsafe { asm!("msr daifclr, #2") };
+                unsafe { asm!("csrsi sstatus, 2") };
                 sched_cfs::yield_now();
-                unsafe { asm!("msr daifset, #2") };
+                unsafe { asm!("csrci sstatus, 2") };
                 continue;
             }
             sched_cfs::block_current();
-            unsafe { asm!("msr daifset, #2") };
+            unsafe { asm!("csrci sstatus, 2") };
             continue;
         }
         {
@@ -1007,7 +1007,7 @@ pub fn pair_write(fd: i32, data: &[u8]) -> usize {
         written += n;
         wait_wake(&mut pair_read_ring(idx, side).read_wait);
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     written
 }
 
@@ -1025,22 +1025,22 @@ pub fn pair_read(fd: i32, out: &mut [u8]) -> usize {
     }
     let idx = entry.index;
     let side = entry.flags as usize;
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     // 空缓冲且对端仍在：登记读等待并阻塞
     while unsafe { PAIRS[idx].used && pair_peer_count(idx, side) > 0 && pair_read_ring(idx, side).count == 0 } {
         if !wait_reg(&mut pair_read_ring(idx, side).read_wait, sched_cfs::current_tid()) {
             // 等待者表满：让出 CPU 后重试登记
-            unsafe { asm!("msr daifclr, #2") };
+            unsafe { asm!("csrsi sstatus, 2") };
             sched_cfs::yield_now();
-            unsafe { asm!("msr daifset, #2") };
+            unsafe { asm!("csrci sstatus, 2") };
             continue;
         }
         sched_cfs::block_current();
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
     }
     // EOF：槽位已清空或对端 fd 全部关闭且无数据
     if !unsafe { PAIRS[idx].used } {
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return 0;
     }
     let n = {
@@ -1054,7 +1054,7 @@ pub fn pair_read(fd: i32, out: &mut [u8]) -> usize {
         n
     };
     wait_wake(&mut pair_write_ring(idx, side).write_wait);
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     n
 }
 
@@ -1065,7 +1065,7 @@ pub fn pair_add_ref(index: usize, side: u32) {
     if index >= MAX_PAIRS {
         return;
     }
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         if PAIRS[index].used {
             PAIRS[index].refs = PAIRS[index].refs.saturating_add(1);
@@ -1076,7 +1076,7 @@ pub fn pair_add_ref(index: usize, side: u32) {
             }
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 按下标释放一个套接字对引用（close/exit 时调用），引用归零才清空槽位。
@@ -1088,11 +1088,11 @@ pub fn pair_drop_ref(index: usize, side: u32) {
     if index >= MAX_PAIRS {
         return;
     }
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let p = &mut PAIRS[index];
         if !p.used {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return;
         }
         if p.refs > 0 {
@@ -1122,7 +1122,7 @@ pub fn pair_drop_ref(index: usize, side: u32) {
             wait_wake(&mut p.ring_b.write_wait);
         }
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// `socketpair` fd 关闭：引用计数 -1，归零释放槽位。

@@ -77,7 +77,7 @@ KUNXBOOT  := $(TOPDIR)/kunxboot
 RECOVERY  := $(APPS)/recovery
 RECOV_ELF = $(RECOVERY)/target/$(TARGET)/release/recovery
 
-TARGET     := aarch64-unknown-none
+TARGET     := riscv64gc-unknown-none-elf
 KERNEL_BIN := rust-kernel
 KERNEL_ELF := $(KUNXCORE)/target/$(TARGET)/release/$(KERNEL_BIN)
 KERNEL_IMG := $(KUNXCORE)/kernel.img
@@ -162,11 +162,14 @@ ROOTFS_FILES := \
 
 CARGO   ?= cargo
 OBJCOPY ?= llvm-objcopy
-QEMU    ?= qemu-system-aarch64
-# 加速后端：默认尝试 KVM（ARM 宿主有 /dev/kvm 时大幅提速），失败自动回退 TCG
-# （纯软件模拟）。作为 -M 的 accel 属性传入（`kvm:tcg` 冒号列表）。
-# 覆盖：make run-gui QEMU_ACCEL=tcg
-QEMU_ACCEL ?= kvm:tcg
+# QEMU riscv64：宿主未安装系统包（无 root），使用用户目录解包版
+# （qemu-system-riscv + opensbi 固件，来自 Arch 官方仓库包）。
+QEMU_SYSROOT := $(HOME)/qemu-riscv-pkgs/root/usr
+QEMU    ?= $(QEMU_SYSROOT)/bin/qemu-system-riscv64
+# OpenSBI fw_dynamic（qemu -bios）：内核经其以 S 模式在 0x80200000 启动
+OPENBI  := $(QEMU_SYSROOT)/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+# 加速后端：x86 宿主无 riscv KVM，恒为 TCG（纯软件模拟）。
+QEMU_ACCEL ?= tcg
 # 内核启动参数（QEMU -append）：如 QEMU_APPEND="verbose" 开启完整启动日志。
 QEMU_APPEND ?=
 
@@ -241,6 +244,10 @@ $(TERMINAL_ELF): $(shell find $(TERMINAL)/src -name '*.rs') $(TERMINAL)/Cargo.to
 $(CALC_ELF): $(shell find $(CALC)/src -name '*.rs') $(CALC)/Cargo.toml $(CALC)/build.rs $(CALC)/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(CALC)/Cargo.toml
 
+CRASHME := $(APPS)/crashme
+$(CRASHME_ELF): $(shell find $(CRASHME)/src -name '*.rs') $(CRASHME)/Cargo.toml $(CRASHME)/build.rs $(CRASHME)/linker.ld $(SHARED_SRC)
+	$(CARGO) build --release --target $(TARGET) --manifest-path $(CRASHME)/Cargo.toml
+
 $(OOBE_ELF): $(shell find $(OOBE)/src -name '*.rs') $(OOBE)/Cargo.toml $(OOBE)/build.rs $(OOBE)/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(OOBE)/Cargo.toml
 
@@ -280,8 +287,8 @@ $(PKG_ELF): $(shell find $(KUNXPKG)/src -name '*.rs') $(KUNXPKG)/Cargo.toml $(KU
 # busybox-lite：手写 C，交叉编译为独立 ELF（内核 ELF 加载器直接加载）。
 BUSYBOX_LD := $(KUNXCORE)/apps/hello.ld
 $(BUSYBOX): $(KUNXCORE)/apps/busybox.c $(BUSYBOX_LD)
-	aarch64-linux-gnu-gcc -nostdlib -ffreestanding -fno-stack-protector -O2 -static \
-		-Wl,-T,$(BUSYBOX_LD),-z,max-page-size=4096 -o $@ $<
+	clang --target=riscv64 -march=rv64gc -mabi=lp64d -mcmodel=medany -nostdlib -ffreestanding -fno-stack-protector -O2 -static \
+		-Wl,-T,$(BUSYBOX_LD),-z,max-page-size=4096 -fuse-ld=lld -o $@ $<
 
 init: $(INIT_ELF)
 networkd: $(NET_ELF)
@@ -477,63 +484,63 @@ pi4: $(RAMDISK)
 
 # ---- 运行 ----
 run: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -nographic -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -nographic -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
-		-device virtio-rng-device -device AC97,audiodev=aud0 \
+		-device virtio-rng-device \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 run-gui: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -serial stdio -device ramfb -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -serial stdio -device ramfb -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
-		-device virtio-rng-device -device AC97,audiodev=aud0 \
+		-device virtio-rng-device \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 # 调试模式：串口挂到 127.0.0.1:1234（宿主 gdb `target remote localhost:1234`，
 # 先在内核 shell 执行 `gdb` 挂起内核，或直接在断点/崩溃处自动进入调试桩）。
 run-debug: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -no-reboot \
 		-serial tcp:127.0.0.1:1234,server,nowait -monitor none -display none \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
-		-device virtio-rng-device -audiodev none,id=aud0 -device AC97,audiodev=aud0
+		-device virtio-rng-device -audiodev none,id=aud0
 
 # 输入注入模式：串口挂到 127.0.0.1:1234（配合 tools/input_inject.py 注入触摸事件）。
 # 观察内核日志可另开终端运行 `python3 tools/input_inject.py console`。
 run-input: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -no-reboot \
 		-serial tcp:127.0.0.1:1234,server,nowait -monitor none -display none \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
-		-device virtio-rng-device -device AC97,audiodev=aud0 \
+		-device virtio-rng-device \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 # 音频验证模式（virtio-sound 首选）：输出到宿主 WAV 文件，供波形分析。
 # 内核音频栈（/dev/audio + IRQ 环形缓冲）走 virtio-sound 低延迟路径。
 run-audio: kernel
 	rm -f /tmp/kunxos-audio.wav
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-audiodev wav,id=aud0,path=/tmp/kunxos-audio.wav \
 		-device virtio-sound-device,audiodev=aud0 -device virtio-rng-device
 
 # 电话/短信演示模式：GUI + virtio-sound（铃声/提示音）+ 虚拟调制解调器。
 # 来电/短信经 /dev/modemctl 注入（shell: echo "CALL_IN:13800000001" > /dev/modemctl）。
 run-phone: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -serial stdio -device ramfb -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -serial stdio -device ramfb -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
-		-device virtio-rng-device -device AC97,audiodev=aud0 \
+		-device virtio-rng-device \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 # 音频验证模式（AC97 遗留回退）：内核回退到 AC97 启动提示音路径。
 run-audio-ac97: kernel
 	rm -f /tmp/kunxos-audio.wav
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-audiodev wav,id=aud0,path=/tmp/kunxos-audio.wav \
-		-device AC97,audiodev=aud0 -device virtio-rng-device
+		-device virtio-rng-device
 
 # 音频验证模式（静音后端）：任意 run 目标 + virtio-sound 的便捷组合，
 # 用 none 后端丢弃音频（QEMU 仍按模拟时钟消费，测量路径完整）。
 run-audio-none: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-audiodev none,id=aud0 \
 		-device virtio-sound-device,audiodev=aud0 -device virtio-rng-device
 
@@ -548,7 +555,7 @@ test-modem: $(RILD_ELF) $(MODEMTEST_ELF)
 	@$(MAKE) kernel
 	@rm -f $(TEST_MODEM_LOG)
 	@echo "== running modemtest in QEMU (headless) =="
-	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-device virtio-rng-device | tee $(TEST_MODEM_LOG)
 	@rm -f $(ROOTFS)/data/modemtest.flag
 	@grep -q "\[MODEMTEST\] PASS" $(TEST_MODEM_LOG) && echo "MODEM TEST: PASS" \
@@ -569,7 +576,7 @@ test-sfsrace: $(SFSRACE_ELF)
 	@$(MAKE) kernel
 	@rm -f $(TEST_SFSRACE_LOG)
 	@echo "== running sfsrace in QEMU (headless) =="
-	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-device virtio-rng-device | tee $(TEST_SFSRACE_LOG)
 	# 无论 QEMU 退出码（测试失败时内核自动关机使 QEMU 非零退出），都必须移除标记，
 	# 否则 rootfs 遗留 /sfsrace-test → 下次 make run-gui 一启动就进测试模式并关机。
@@ -590,7 +597,7 @@ test-mailbox: $(SFSRACE_ELF)
 	@$(MAKE) kernel
 	@rm -f $(TEST_MAILBOX_LOG)
 	@echo "== running mailbox stress in QEMU (headless) =="
-	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-device virtio-rng-device | tee $(TEST_MAILBOX_LOG)
 	@rm -f $(ROOTFS)/sfsrace-test
 	@grep -q "SFS-RACE PASS" $(TEST_MAILBOX_LOG) && grep -q "MAILBOX PASS" $(TEST_MAILBOX_LOG) \
@@ -609,7 +616,7 @@ test-audio: $(AUDIOMIX_ELF) $(AUDIOLAT_ELF)
 	@$(MAKE) kernel
 	@rm -f $(TEST_AUDIO_LOG)
 	@echo "== running audio test in QEMU (headless) =="
-	-timeout 360 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	-timeout 360 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0 \
 		-device virtio-rng-device | tee $(TEST_AUDIO_LOG)
 	@rm -f $(ROOTFS)/etc/audio-test
@@ -630,7 +637,7 @@ $(BOOT_IMG): $(shell find $(KUNXBOOT)/src -name '*.rs') $(KUNXBOOT)/Cargo.toml $
 
 # QEMU 转储机器 DTB（内核设备树来源）。
 $(DTB):
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL),dumpdtb=$@ -cpu cortex-a72 -m 512M -nographic >/dev/null 2>&1 || true
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL),dumpdtb=$@ -cpu rv64 -m 512M -nographic >/dev/null 2>&1 || true
 
 $(DISK_IMG): $(KERNEL_IMG) $(DTB) $(RAMDISK) $(RECOV_RAMDISK) $(TOOLS)/mkdisk.py $(TOOLS)/mkfs_sfs.py
 	python3 $(TOOLS)/mkdisk.py $(KERNEL_IMG) $(DTB) $(RAMDISK) $(RECOV_RAMDISK) $(ROOTFS) $(DISK_IMG) --boot-key $(TOOLS)/kunxsec/keys/boot.sk --build 42
@@ -639,33 +646,29 @@ $(DISK_IMG): $(KERNEL_IMG) $(DTB) $(RAMDISK) $(RECOV_RAMDISK) $(TOOLS)/mkdisk.py
 disk: $(DISK_IMG)
 
 boot: kernel $(BOOT_IMG) $(RECOV_RAMDISK) $(DISK_IMG)
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M \
 		-device loader,file=$(BOOT_IMG),addr=0x46000000,cpu-num=0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device virtio-blk-device,drive=disk0 \
 		-device ramfb \
-		-device virtio-rng-device -device AC97,audiodev=aud0 \
+		-device virtio-rng-device \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0 \
 		-nographic -no-reboot
 
 # 以当前方式（-kernel）直接加载内核，并挂载磁盘镜像验证 /data 持久化。
 run-disk: kernel $(DISK_IMG)
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device virtio-blk-device,drive=disk0 \
-		-device virtio-rng-device -audiodev none,id=aud0 -device AC97,audiodev=aud0 \
+		-device virtio-rng-device -audiodev none,id=aud0 \
 		-nographic -no-reboot
 
-# SMP 多核（-smp 2）：已真实打通——PSCI CPU_ON 经 DTB /psci 检测的 HVC
-# conduit 唤醒副核（QEMU virt 默认 secure=off 时 method="hvc"，QEMU 自身
-# 拦截 hvc 分派 PSCI，无需 EL3 固件；此前实测失败是误用 smc conduit）。
+# SMP 多核（-smp 2）：RISC-V 上所有 hart 经 OpenSBI 直接进入内核 _start，
+# 非 boot hart 在停车场等待 SCHED_READY（无需 PSCI / loader 唤醒）。
 # 副核每核 idle/tick + 全局就绪队列负载均衡，verbose 启动可见：
-#   [smp] PSCI version=0x10001 在线核数=2 / [smp] cpu1 已上线
-# ★ 实验性：sfsrace 全量并发压测在 -smp 2 下仍偶发任务表踩踏（已列
-# SMP 债务之外的深层竞态，见 BUG_REPORT SMP 专项），默认回归与发布
-# 仍以单核为准；此目标用于 SMP 开发与观察（-append verbose 看完整日志）。
+#   [smp] cpus=2（secondary 停车场等待调度就绪） / [smp] cpu1 已上线
 run-smp: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -smp 2 -m 512M -kernel $(KERNEL_IMG) \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -smp 2 -m 512M -kernel $(KERNEL_IMG) \
 		-append "verbose" -nographic -no-reboot
 
 # Pi 4 bootloader 骨架编译检查。
@@ -680,7 +683,7 @@ TEST_WIFI_LOG := /tmp/kunxos-wifi.log
 test-wifi: kernel
 	@echo "== wifi selftest in QEMU (headless) =="
 	@rm -f $(TEST_WIFI_LOG)
-	@-timeout 120 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu cortex-a72 -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+	@-timeout 120 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-append "wifitest" -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-rng-device | tee $(TEST_WIFI_LOG)
 	@grep -q "\[wifi-selftest\] PASS" $(TEST_WIFI_LOG) && echo "WIFI SELFTEST: PASS" \

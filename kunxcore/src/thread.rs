@@ -41,22 +41,15 @@ pub fn yield_now() {
     sched_cfs::yield_now();
 }
 
-/// 写入线程本地存储基址到 `TPIDR_EL0`。
+/// 写入线程本地存储基址。
 ///
-/// # 安全
-/// 需要 EL1 权限；调用者自行保证地址有效性。
-pub unsafe fn set_tp(value: u64) {
-    asm!("msr tpidr_el0, {}", in(reg) value);
-}
+/// RISC-V S 模式无用户 TLS 专用 CSR（tp 为内核 hartid），本内核用户态也
+/// 不使用 TLS —— 桩化为空操作，保留调用点兼容。
+pub unsafe fn set_tp(_value: u64) {}
 
-/// 读取当前线程本地存储基址 `TPIDR_EL0`。
-///
-/// # 安全
-/// 需要 EL1 权限。
+/// 读取线程本地存储基址：恒 0（无 TLS 寄存器，见 `set_tp`）。
 pub unsafe fn get_tp() -> u64 {
-    let v: u64;
-    asm!("mrs {}, tpidr_el0", out(reg) v);
-    v
+    0
 }
 
 /// 设置当前线程本地存储基址（安全封装）。

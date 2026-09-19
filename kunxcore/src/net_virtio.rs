@@ -15,7 +15,7 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::allocator;
-use crate::gic;
+use crate::plic;
 use crate::heap;
 use crate::interrupt;
 
@@ -167,13 +167,13 @@ fn r8(off: usize) -> u8 {
 /// 全内存屏障（普通内存写对设备可见前使用）。
 #[inline]
 fn mb() {
-    unsafe { asm!("dmb sy") }
+    unsafe { asm!("fence rw, rw") }
 }
 
 /// 数据同步屏障（写 MMIO 通知寄存器前使用）。
 #[inline]
 fn dsb() {
-    unsafe { asm!("dsb sy") }
+    unsafe { asm!("fence iorw, iorw") }
 }
 
 /// 按缓存行（64B）清洗数据缓存到内存，使设备 DMA 可读到。
@@ -184,10 +184,10 @@ unsafe fn dcache_clean(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc cvac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 /// 按缓存行作废数据缓存，使后续读取直接取内存（设备写入的数据可见）。
@@ -196,10 +196,10 @@ unsafe fn dcache_invalidate(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc ivac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 // ==================== 环访问辅助 ====================
@@ -371,9 +371,9 @@ unsafe fn drain_impl() {
 
 /// 进程上下文调用的回收入口（屏蔽 IRQ 保护共享状态）。
 pub fn drain() {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe { drain_impl() };
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 中断处理入口（此时 IRQ 已被硬件屏蔽）。
@@ -477,9 +477,9 @@ pub fn init(devs: &[MmioDev]) -> bool {
 
     // 9. 注册中断并启用 GIC
     interrupt::register_handler(unsafe { IRQ }, irq_handler);
-    gic::gic_enable_irq(unsafe { IRQ });
-    gic::gic_set_priority(unsafe { IRQ }, 0x80);
-    gic::gic_set_target(unsafe { IRQ }, 0x01);
+    plic::plic_enable_irq(unsafe { IRQ });
+    plic::plic_set_priority(unsafe { IRQ }, 0x80);
+    plic::plic_set_target(unsafe { IRQ }, 0x01);
 
     true
 }
@@ -577,10 +577,10 @@ pub fn send(pkt: &[u8]) -> i32 {
     unsafe {
         // 屏蔽 IRQ：与中断内 drain_impl 的 TX 回收（kfree/tx_free_desc）互斥，
         // 避免 slab 空闲链表与 TX_FREE_HEAD 被并发改写。
-        asm!("msr daifset, #2");
+        asm!("csrci sstatus, 2");
         let idx = tx_alloc_desc();
         if idx == 0xFFFF {
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         // legacy virtio-net 在每个报文前需 10 字节 virtio_net_hdr（全零）
@@ -589,7 +589,7 @@ pub fn send(pkt: &[u8]) -> i32 {
         if buf.is_null() {
             // 分配失败：归还描述符后返回（不发送）
             tx_free_desc(idx);
-            asm!("msr daifclr, #2");
+            asm!("csrsi sstatus, 2");
             return -1;
         }
         let buf = buf as usize;
@@ -614,7 +614,7 @@ pub fn send(pkt: &[u8]) -> i32 {
 
         dsb();
         w32(REG_QUEUE_NOTIFY, 1); // kick TX 队列
-        asm!("msr daifclr, #2");
+        asm!("csrsi sstatus, 2");
         0
     }
 }
@@ -622,7 +622,7 @@ pub fn send(pkt: &[u8]) -> i32 {
 /// 从软件接收队列取一帧到 `buf`，返回帧长；队列空返回 `None`。
 pub fn recv_into(buf: &mut [u8]) -> Option<usize> {
     unsafe {
-        asm!("msr daifset, #2");
+        asm!("csrci sstatus, 2");
         let r = if RX_POOL_COUNT > 0 {
             let slot = RX_POOL_HEAD;
             let n = RX_POOL_LEN[slot].min(buf.len());
@@ -633,7 +633,7 @@ pub fn recv_into(buf: &mut [u8]) -> Option<usize> {
         } else {
             None
         };
-        asm!("msr daifclr, #2");
+        asm!("csrsi sstatus, 2");
         r
     }
 }
@@ -692,8 +692,8 @@ pub fn cache_line_diag() -> CacheLineDiag {
     }
     unsafe {
         let saved: u64;
-        asm!("mrs {}, daif", out(reg) saved);
-        asm!("msr daifset, #2");
+        asm!("csrr {}, sstatus", out(reg) saved);
+        asm!("csrci sstatus, 2");
         d.rx_ring = RX_RING;
         d.tx_ring = TX_RING;
         // avail 占 [AVAIL_OFF, AVAIL_OFF+6+2*Q)，used 从 USED_OFF 起；
@@ -718,7 +718,7 @@ pub fn cache_line_diag() -> CacheLineDiag {
                 }
             }
         }
-        asm!("msr daif, {}", in(reg) saved);
+        asm!("csrw sstatus, {}", in(reg) saved);
     }
     d
 }

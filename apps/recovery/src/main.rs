@@ -38,17 +38,17 @@ const O_RDWR: usize = 2;
 
 unsafe fn sc1(n: usize, a1: usize) -> usize {
     let r: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => r, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, options(nostack));
     r
 }
 unsafe fn sc2(n: usize, a1: usize, a2: usize) -> usize {
     let r: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => r, in("x1") a2, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, options(nostack));
     r
 }
 unsafe fn sc3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let r: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => r, in("x1") a2, in("x2") a3, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, in("a2") a3, options(nostack));
     r
 }
 

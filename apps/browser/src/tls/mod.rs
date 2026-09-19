@@ -53,11 +53,11 @@ pub fn tls_log(s: &str) {
     unsafe {
         let mut write = |buf: &[u8]| {
             core::arch::asm!(
-                "svc #0",
-                in("x8") 64usize, // SYS_WRITE
-                in("x0") 2usize,  // stderr
-                in("x1") buf.as_ptr() as usize,
-                in("x2") buf.len(),
+                "ecall",
+                in("a7") 64usize, // SYS_WRITE
+                in("a0") 2usize,  // stderr
+                in("a1") buf.as_ptr() as usize,
+                in("a2") buf.len(),
                 options(nostack)
             );
         };

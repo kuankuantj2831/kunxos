@@ -203,12 +203,12 @@ fn mk_cmd_path(out: &mut [u8; 80]) -> usize {
 unsafe fn lc_rename(old: &[u8], new: &[u8]) -> isize {
     let ret: usize;
     core::arch::asm!(
-        "svc #0",
-        in("x8") 38usize,
-        inlateout("x0") 0xFFFF_FFFF_FFFF_FF9Cusize => ret, // AT_FDCWD
-        in("x1") old.as_ptr(),
-        in("x2") 0xFFFF_FFFF_FFFF_FF9Cusize,
-        in("x3") new.as_ptr(),
+        "ecall",
+        in("a7") 38usize,
+        inlateout("a0") 0xFFFF_FFFF_FFFF_FF9Cusize => ret, // AT_FDCWD
+        in("a1") old.as_ptr(),
+        in("a2") 0xFFFF_FFFF_FFFF_FF9Cusize,
+        in("a3") new.as_ptr(),
         options(nostack)
     );
     ret as isize

@@ -48,7 +48,7 @@ const EXEC_MAX_CAP: usize = 4 * 1024 * 1024;
 const ELF_MAGIC: u32 = 0x464C_457F;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
-const EM_AARCH64: u16 = 183;
+const EM_RISCV: u16 = 243;
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -156,17 +156,15 @@ pub fn fork_runtime_info(parent_pid: u32, child_pid: u32) {
 // ==================== 段权限 ====================
 
 fn seg_flags(pf: u32) -> vm::MapFlags {
-    let mut f = vm::AF | vm::SH_INNER | vm::ATTR_NORMAL;
+    let mut f = vm::AF;
     if pf & PF_W != 0 {
         f |= vm::AP_USER_RW;
     } else {
         f |= vm::AP_USER_RO;
     }
     if pf & PF_X != 0 {
-        // 可执行：EL0 可执行（UXN 清 0）、EL1 不可执行（PXN 置 1）
-        f |= vm::PXN;
-    } else {
-        f |= vm::UXN | vm::PXN;
+        // RISC-V：可执行 = 置 X 位（aarch64 语义是「清 UXN」，此处为正逻辑）
+        f |= vm::EXEC;
     }
     f
 }
@@ -203,7 +201,7 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
         return Err(-1);
     }
     let e_machine = rd_u16(data, 18);
-    if e_machine != EM_AARCH64 {
+    if e_machine != EM_RISCV {
         return Err(-1);
     }
     let entry = rd_u64(data, 24) as usize;
@@ -711,15 +709,18 @@ fn setup_stdio(pid: u32) {
     }
 }
 
-// ==================== 下陷到 EL0 ====================
+// ==================== 下陷到 U 模式 ====================
 
-/// EL0 模式、DAIF 全开（用户态可被定时器抢占）。
-const SPSR_EL0T: u64 = 0;
+/// 陷阱帧缓冲（832 字节 = trap_entry 布局，16 对齐）。
+#[repr(align(16))]
+struct UserEntryFrame([u8; 832]);
 
-/// 用户线程入口：首次调度时运行，设置 EL0 栈/入口并 `eret` 到 EL0。
+/// 用户线程入口：首次调度时运行，合成陷阱帧并经 `trap_return` 下陷到
+/// U 模式。
 ///
-/// `pid` 由 `thread_trampoline` 经 x0 传入。TTBR0_EL1 已由调度器在
-/// 上下文切换时设置为本进程页表根，此处无需再动页表。
+/// `pid` 由 `thread_trampoline` 经 a0 传入。satp 已由调度器在上下文切换时
+/// 设置为本进程页表根，此处无需再动页表。sstatus 只需 FS（trap_return 白
+/// 清洗会强制 SUM/MXR/SPIE），SPP=0 → 走用户出口分支。
 fn user_trampoline(pid: usize) -> ! {
     let (entry, stack_top) = unsafe {
         if pid < MAX_ELF_PROCS {
@@ -729,15 +730,20 @@ fn user_trampoline(pid: usize) -> ! {
             (0, 0)
         }
     };
+    let mut frame = UserEntryFrame([0u8; 832]);
     unsafe {
+        let p = frame.0.as_mut_ptr();
+        // x2 槽 @0x10 与 sp_el0 槽 @0x100 = 用户栈顶
+        *(p.add(0x10) as *mut u64) = stack_top as u64;
+        *(p.add(0x100) as *mut u64) = stack_top as u64;
+        // elr(sepc) @0x108 = 入口
+        *(p.add(0x108) as *mut u64) = entry as u64;
+        // sstatus @0x110：FS=Dirty（浮点可用）
+        *(p.add(0x110) as *mut u64) = 0x6000;
         asm!(
-            "msr sp_el0, {sp}",
-            "msr elr_el1, {pc}",
-            "msr spsr_el1, {spsr}",
-            "eret",
-            sp = in(reg) stack_top,
-            pc = in(reg) entry,
-            spsr = in(reg) SPSR_EL0T,
+            "mv sp, {f}",
+            "tail trap_return",
+            f = in(reg) p as usize,
             options(noreturn),
         );
     }
@@ -961,16 +967,18 @@ pub fn execve(path: &str, argv: &[&str], envp: &[&str], f: &mut TrapFrame) -> i3
         }
     }
 
-    // 5. 改写陷阱帧：返回时 eret 到新入口
+    // 5. 改写陷阱帧：返回时 sret 到新入口
     f.sp_el0 = initial_sp as u64;
+    f.x[2] = initial_sp as u64;
     f.elr = entry as u64;
-    f.spsr = SPSR_EL0T;
-    f.x[0] = 0;
-    // 清零陷阱帧的 FP/SIMD 区（v0-v31 + fpsr/fpcr，@0x110..0x320）：execve 后
-    // 新进程无浮点状态，避免内核栈残留的浮点常量（0.01 等）污染用户 v 寄存器
+    // sstatus：FS=Dirty（浮点可用）；trap_return 白清洗会补 SUM/MXR/SPIE
+    f.spsr = 0x6000;
+    f.x[10] = 0; // a0 = 0（新进程入口参数语义）
+    // 清零陷阱帧的 FP 区（f0-f31 + fcsr，@0x120..0x328）：execve 后新进程无
+    // 浮点状态，避免内核栈残留的浮点常量（0.01 等）污染用户 f 寄存器
     // （残留值会被 syscall 返回路径恢复进用户态 → 浮点计算错乱 → 跳垃圾地址）。
     let fb = (f as *mut TrapFrame) as *mut u8;
-    unsafe { core::ptr::write_bytes(fb.add(0x110), 0, 0x320 - 0x110) };
+    unsafe { core::ptr::write_bytes(fb.add(0x120), 0, 0x328 - 0x120) };
     // [诊断] 记录 execve 设置的初始栈顶与入口（核对 PC=0 故障中 sp 是否错位）
     crate::kinfo! {
         crate::uart_send_str("[execve-diag] entry=");

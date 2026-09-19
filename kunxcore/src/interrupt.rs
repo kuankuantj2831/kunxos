@@ -1,47 +1,58 @@
-//! 中断处理：中断处理函数表与 IRQ 分发入口。
+//! 陷入与中断处理：统一陷入分发入口 + PLIC 外部中断分发。
 //!
-//! 维护一个 irq -> 处理函数 的映射表，`irq_handler` 由汇编异常向量表调用，
-//! 负责应答中断（IAR）、写 EOI 并查表分发。
+//! RISC-V 无 aarch64 的 16 槽异常向量表：所有陷入经单一 `stvec` 进入
+//! `trap_entry` 汇编（main.rs，保存完整 832 字节陷阱帧后调用本模块的
+//! [`trap_dispatch`]），由 `scause` 分派：
+//!   - 中断（scause 最高位 1）：5 = 监督定时器（SBI，双通道复用）、
+//!     9 = 外部中断（PLIC claim/complete）、1 = 软件中断（IPI，清挂起位）
+//!   - 异常：8 = U 模式 ecall（系统调用，sepc+4）、12/13/15 = U 模式缺页
+//!     （按需分页/COW）、3 = 断点（GDB 桩）、其余 U 模式异常 → el0_fault；
+//!     S 模式异常 → sync_exception_handler（内核诊断，不返回）
+//!
+//! 中断处理函数表沿用 aarch64 版结构：`irq -> 处理函数` 映射 + per-IRQ
+//! 分发计数（`irqstat` 观测点）+ 风暴 episode 环形日志（PLIC 无 IAR/CPUID
+//! 位，快照改为使能位图）。
 
-use crate::gic;
+use core::arch::asm;
+
+use crate::plic;
+use crate::syscall_table::TrapFrame;
 
 /// 中断处理函数类型。
 pub type IrqHandler = fn();
 
-/// 最大有效中断号（GICv2 IAR 中断号字段为 10 位，0..1019 有效）。
-const MAX_IRQ: usize = 1020;
+/// 最大有效中断号（QEMU virt PLIC ndev=95）。
+const MAX_IRQ: usize = 96;
 
 /// 中断处理函数表：irq -> 处理函数。
 static mut HANDLERS: [Option<IrqHandler>; MAX_IRQ] = [None; MAX_IRQ];
 
 // ==================== 中断观测点（irqstat：风暴源定位） ====================
 //
-// 中断风暴（尤其 iar=0/SGI 锁存与 dist 寄存器视图自相矛盾的 act0 待复现
-// 案例，见 BUG_REPORT「中断风暴 iar=0」）此前只有风暴时刻的一次性转储，
-// 缺少「episode 前后分布」与「常态每源分发频率」两类数据。观测点：
+// 中断风暴只有风暴时刻的一次性转储，缺少「episode 前后分布」与「常态每源
+// 分发频率」两类数据。观测点：
 //   1. 每 IRQ 分发计数（IRQ_COUNTS）：irqstat 输出，定位高频源/风暴贡献者；
-//   2. 风暴 episode 环形日志（STORM_LOG）：转储阈值时刻的 GIC 状态快照
-//      （含 act0），事后可回溯，不必盯着串口抓现场。
+//   2. 风暴 episode 环形日志（STORM_LOG）：转储阈值时刻的 PLIC 状态快照，
+//      事后可回溯，不必盯着串口抓现场。
 
-/// 每 IRQ 分发计数（含定时器；1020+ 伪中断不计）。
+/// 每 IRQ 分发计数（不含定时器——监督定时器不走 PLIC）。
 static mut IRQ_COUNTS: [u64; MAX_IRQ] = [0; MAX_IRQ];
 
-/// 一次风暴 episode 在转储阈值时刻的 GIC 状态快照。
+/// 一次风暴 episode 在转储阈值时刻的状态快照。
 #[derive(Clone, Copy)]
 pub struct StormEp {
-    /// 风暴中断号（IAR 低 10 位）。
+    /// 风暴中断号（PLIC claim 值）。
     pub irq: u32,
     /// 连续重入次数（阈值 2000/20000/200000 各记一条）。
     pub n: u64,
     /// 快照时刻（µs，timer::now_us）。
     pub t_us: u64,
-    /// GICD_ISPENDR0/1（挂起）。
+    /// 使能位图字 0/1/2（PLIC enable[ctx]）。
     pub pend0: u32,
     pub pend1: u32,
-    /// GICD_ICACTIVER0（SGI/PPI 活动）/1（SPI 活动）。
     pub act0: u32,
     pub act1: u32,
-    /// GICC_RPR（运行优先级）。
+    /// 保留（GICC_RPR 的 RISC-V 无对应物，恒 0）。
     pub rpr: u32,
     /// 快照时刻当前 pid。
     pub pid: u32,
@@ -65,16 +76,16 @@ static mut STORM_LOG: [StormEp; 8] = [EMPTY_EP; 8];
 static mut STORM_LOG_N: usize = 0;
 
 /// 记录一条风暴 episode（转储阈值时刻调用，IRQ 已关闭）。
-unsafe fn storm_ep_record(irq: u32, n: u64, pend0: u32, pend1: u32, act0: u32, act1: u32, rpr: u32) {
+unsafe fn storm_ep_record(irq: u32, n: u64) {
     let ep = StormEp {
         irq,
         n,
         t_us: crate::timer::now_us(),
-        pend0,
-        pend1,
-        act0,
-        act1,
-        rpr,
+        pend0: plic::plic_enable_read(0),
+        pend1: plic::plic_enable_read(1),
+        act0: plic::plic_enable_read(2),
+        act1: 0,
+        rpr: 0,
         pid: crate::process::current_pid(),
     };
     STORM_LOG[STORM_LOG_N % 8] = ep;
@@ -119,120 +130,163 @@ pub fn unregister_handler(irq: u32) {
     }
 }
 
-/// IRQ 处理入口，由汇编异常向量表调用。
-///
-/// 流程：读 IAR 应答中断 → 立即写 EOI（释放中断线、降低优先级）→ 查表分发。
-/// 在分发前完成 EOI，是因为定时器等处理函数会触发上下文切换而不返回，
-/// 若 EOI 推迟到返回之后，GIC 会一直认为该中断仍处于 active 状态，导致
-/// 后续同优先级中断无法投递。
-#[no_mangle]
-pub extern "C" fn irq_handler() {
-    let iar = gic::gic_read_iar();
-    let irq = iar & 0x3FF;
-
-    // 中断风暴探测器：同一中断连续重入超阈值时转储 GIC 状态（冷路径，
-    // 正常运行下 STORM_N 永远到不了阈值；把「静默冻结」变成可诊断现场）。
-    unsafe {
-        static mut STORM_IRQ: u32 = u32::MAX;
-        static mut STORM_N: u64 = 0;
-        if irq == STORM_IRQ {
-            STORM_N += 1;
-            // 风暴期间 CPU 被同号中断持续重入占据（episode 可达数百 ms），
-            // 远超 PL011 RX FIFO 的 ~1.4ms 容量 —— 仅在转储时刻排空 RX 不够。
-            // 每 256 次重入主动排空一次（一次 volatile 读，常态零开销），
-            // 注入的触摸帧/终端输入不再按帧丢失。
-            if STORM_N & 0xFF == 0 {
-                crate::uart_rx_drain();
-            }
-        } else {
-            STORM_IRQ = irq;
-            STORM_N = 0;
-        }
-        if STORM_N == 2000 || STORM_N == 20000 || STORM_N == 200000 {
-            // GICD_ISPENDR0/1（挂起）0x200/0x204、GICD_ICACTIVER0（SGI/PPI 活动）
-            // 0x300、GICD_ICACTIVER1（SPI 活动）0x304、GICC_RPR（运行优先级）0x14。
-            let (pend0, rpr) = gic::gic_diag_read(0x200, 0x14);
-            let (pend1, act1) = gic::gic_diag_read(0x204, 0x304);
-            let (act0, _ctlr) = gic::gic_diag_read(0x300, 0x000);
-            crate::uart_send_str("[storm] irq=");
-            crate::print_dec(irq as u64);
-            crate::uart_send_str(" iar=");
-            crate::print_hex(iar as u64);
-            crate::uart_send_str(" pend0=");
-            crate::print_hex(pend0 as u64);
-            crate::uart_send_str(" pend1=");
-            crate::print_hex(pend1 as u64);
-            crate::uart_send_str(" act0=");
-            crate::print_hex(act0 as u64);
-            crate::uart_send_str(" act1=");
-            crate::print_hex(act1 as u64);
-            crate::uart_send_str(" rpr=");
-            crate::print_hex(rpr as u64);
-            crate::uart_send_str(" pid=");
-            crate::print_dec(crate::process::current_pid() as u64);
-            crate::uart_send_str("\n");
-            // episode 落入环形日志（irqstat 事后回溯，不必盯串口抓现场）
-            storm_ep_record(irq, STORM_N, pend0, pend1, act0, act1, rpr);
-            // 转储全程 IRQ 关闭且逐字节忙等 TX（~13ms）：间隙主动排空
-            // UART RX，避免 16 字节硬件 FIFO 溢出丢输入。
+/// 风暴探测器：同一中断连续重入超阈值时转储状态（正常路径零阈值）。
+unsafe fn storm_probe(irq: u32) {
+    static mut STORM_IRQ: u32 = u32::MAX;
+    static mut STORM_N: u64 = 0;
+    if irq == STORM_IRQ {
+        STORM_N += 1;
+        // 风暴期间 CPU 被同号中断持续重入占据（episode 可达数百 ms），
+        // 远超 16550 RX FIFO 容量——每 256 次重入主动排空一次（常态零开销），
+        // 注入的触摸帧/终端输入不再按帧丢失。
+        if STORM_N & 0xFF == 0 {
             crate::uart_rx_drain();
         }
-        // 风暴护栏（冷路径，每次风暴 episode 只执行一次）：把风暴源中断号从
-        // GICD 层禁用（GICD_ICENABLERn 写 1 清除对应 enable 位，复用
-        // gic::gic_disable_irq）。只清一个 enable 位，其余中断照常投递，
-        // 调度不受影响。
-        //
-        // ★ 仅对 SPI（irq>=32）执行屏蔽写：GICv2 架构上 SGI/PPI 的
-        // ICENABLER 写是 RAO/WI（无效），但 QEMU 的 GIC 实现会照单全收 ——
-        // 此前对 PPI 风暴（iar=0x1b，CNTV 调度器时钟）写屏蔽直接把调度器
-        // tick 关掉，整机冻结（kunx_pkg_test 实测：护栏一触发系统即停摆）。
-        // PPI 风暴 episode 会自行消散（应用回归 33 次探测期间系统全程正常
-        // 推进），这里只把诊断静音，不做屏蔽写。
-        if STORM_N == 200000 {
-            if (32..1020).contains(&irq) {
-                gic::gic_disable_irq(irq);
-                crate::uart_send_str("[storm] 已屏蔽 irq=");
-                crate::print_dec(irq as u64);
-                crate::uart_send_str("（风暴护栏）\n");
-            }
-            // STORM_N 推到永不匹配打印阈值的量级：即使屏蔽写被硬件忽略
-            // （GICv2 架构上 SGI 的 ICENABLER 写是 RAO/WI）导致同一中断号
-            // 继续风暴，也不再打印刷屏；irq 换号时计数自然复位重新探测。
-            STORM_N = u64::MAX / 2;
-        }
+    } else {
+        STORM_IRQ = irq;
+        STORM_N = 0;
     }
-
-    // 1020-1023 为特殊值（spurious / 保留），直接返回
-    if irq >= 1020 {
-        return;
+    if STORM_N == 2000 || STORM_N == 20000 || STORM_N == 200000 {
+        crate::uart_send_str("[storm] irq=");
+        crate::print_dec(irq as u64);
+        crate::uart_send_str(" enable0=");
+        crate::print_hex(plic::plic_enable_read(0) as u64);
+        crate::uart_send_str(" enable1=");
+        crate::print_hex(plic::plic_enable_read(1) as u64);
+        crate::uart_send_str(" pid=");
+        crate::print_dec(crate::process::current_pid() as u64);
+        crate::uart_send_str("\n");
+        storm_ep_record(irq, STORM_N);
+        // 转储全程 IRQ 关闭且逐字节忙等 TX：间隙主动排空 UART RX，
+        // 避免 16 字节硬件 FIFO 溢出丢输入。
+        crate::uart_rx_drain();
     }
+    // 风暴护栏（冷路径，每次 episode 只执行一次）：把风暴源从 PLIC 层禁用。
+    // 只清一个 enable 位，其余中断照常投递，调度不受影响。
+    if STORM_N == 200000 {
+        plic::plic_disable_irq(irq);
+        crate::uart_send_str("[storm] 已屏蔽 irq=");
+        crate::print_dec(irq as u64);
+        crate::uart_send_str("（风暴护栏）\n");
+        // 即使屏蔽写被硬件忽略导致同一中断号继续风暴，也不再打印刷屏；
+        // irq 换号时计数自然复位重新探测。
+        STORM_N = u64::MAX / 2;
+    }
+}
 
-    // 每 IRQ 分发计数（irqstat 观测点；一次数组写，与风暴探测器同级的
-    // 常态开销）
-    unsafe { IRQ_COUNTS[irq as usize] += 1 };
-
-    // 定时器（CNTV 调度 tick / CNTP 动画帧）：先确认（重装清除中断源）再 EOI，
-    // 避免电平触发重触发风暴；之后再分发（调度器 tick 可能切换上下文，
-    // EOI 已在切换前完成）。动画定时器回调不切换上下文，同样安全。
-    if irq == crate::timer::TIMER_IRQ || irq == crate::timer::TIMER2_IRQ {
-        if irq == crate::timer::TIMER_IRQ {
-            crate::timer::timer_ack();
-        } else {
-            crate::timer::timer2_ack();
+/// 外部中断（scause=9）处理：claim → 计数/风暴探测 → 分发 → complete。
+///
+/// claim 后立即 complete 前置在分发前还是后？PLIC 与 GIC 相反：claim 即
+/// 应答（清 pending），complete 释放线；电平触发源（virtio）在 handler
+/// 清源前 complete 会立刻重挂起——因此 **先分发后 complete**，并循环
+/// claim 直到无挂起（多源并发一次陷入全处理，减少异常往返）。
+fn external_irq_dispatch() {
+    loop {
+        let irq = plic::plic_claim();
+        if irq == 0 || irq as usize >= MAX_IRQ {
+            return;
         }
-        gic::gic_write_eoir(iar);
+        unsafe { IRQ_COUNTS[irq as usize] += 1 };
+        unsafe { storm_probe(irq) };
         if let Some(handler) = unsafe { HANDLERS[irq as usize] } {
             handler();
         }
-        crate::sched_cfs::resched_if_needed();
+        plic::plic_complete(irq);
+    }
+}
+
+/// 读取 scause / stval / sstatus（陷入现场 CSR）。
+#[inline]
+fn read_causes() -> (u64, u64, u64) {
+    let cause: u64;
+    let tval: u64;
+    let status: u64;
+    unsafe {
+        asm!("csrr {}, scause", out(reg) cause);
+        asm!("csrr {}, stval", out(reg) tval);
+        asm!("csrr {}, sstatus", out(reg) status);
+    }
+    (cause, tval, status)
+}
+
+/// 统一陷入分发入口，由 main.rs `trap_entry` 汇编调用（a0 = 陷阱帧指针）。
+///
+/// 正常路径（中断/系统调用/已解析缺页/GDB 继续）返回到汇编统一恢复点；
+/// 用户程序故障走 `el0_fault_handler`（不返回）；S 模式未处理异常走
+/// `sync_exception_handler`（不返回）。
+#[no_mangle]
+pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
+    let (cause, tval, status) = read_causes();
+    let is_interrupt = cause >> 63 != 0;
+    let code = cause & 0xFFF_FFFF_FFFF_FFFF;
+
+    if is_interrupt {
+        match code {
+            5 => {
+                // 监督定时器：动画通道先判到期（120Hz 与调度 10ms 复用硬件）
+                if crate::timer::ch2_due() {
+                    crate::timer::timer2_handle_irq();
+                }
+                crate::timer::timer_handle_irq();
+                crate::sched_cfs::resched_if_needed();
+            }
+            9 => {
+                external_irq_dispatch();
+                crate::sched_cfs::resched_if_needed();
+            }
+            1 => {
+                // 软件中断（IPI）：清 SSIP 挂起即可
+                unsafe { asm!("csrc sip, 2") };
+            }
+            _ => {
+                // 未知中断源：诊断后继续（不挂死整机）
+                crate::uart_send_str("[trap] 未知中断 cause=");
+                crate::print_dec(code);
+                crate::uart_send_str("\n");
+            }
+        }
         return;
     }
 
-    // 其余中断：先写 EOI 再分发（必须传入含 CPUID 位的原始 IAR 值）
-    gic::gic_write_eoir(iar);
-
-    if let Some(handler) = unsafe { HANDLERS[irq as usize] } {
-        handler();
+    // ---- 异常：SPP（sstatus bit8）= 0 表示来自用户态 ----
+    let from_user = status & (1 << 8) == 0;
+    match code {
+        8 if from_user => {
+            // ecall from U：系统调用。sepc 指向 ecall 本身，前进 4 字节
+            unsafe {
+                (*frame).elr += 4;
+                // 恢复 IRQ（syscall 处理可被抢占：长调用/阻塞语义）；
+                // trap_return 恢复现场前会重新屏蔽
+                asm!("csrsi sstatus, 2");
+            }
+            crate::syscall_table::syscall_dispatch(frame);
+        }
+        12 | 13 | 15 if from_user => {
+            // 取指/读/写缺页：按需分页（demand paging / COW / LAZY 落地）
+            if crate::el0_page_fault_handler(frame as *mut u8, tval as usize) {
+                return; // 已落地：恢复现场重试故障指令
+            }
+            crate::el0_fault_handler(frame as *mut u8);
+        }
+        3 => {
+            // 断点：GDB 调试桩（用户态与内核态都可命中）
+            // 返回 0 = 恢复现场继续；非 0 = 按来源走终止/内核诊断
+            if crate::gdbstub::gdb_debug_entry(frame as *mut u64) == 0 {
+                return;
+            }
+            if from_user {
+                crate::el0_fault_handler(frame as *mut u8);
+            } else {
+                crate::sync_exception_handler();
+            }
+        }
+        _ if from_user => {
+            // 其余用户态异常（非法指令/访存错/未对齐）：SIGSEGV 语义终止
+            crate::el0_fault_handler(frame as *mut u8);
+        }
+        _ => {
+            // S 模式异常：内核诊断（不返回）
+            crate::sync_exception_handler();
+        }
     }
-    crate::sched_cfs::resched_if_needed();
 }

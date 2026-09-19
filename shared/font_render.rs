@@ -250,7 +250,7 @@ fn lazy_read_font(path: &[u8]) -> alloc::vec::Vec<u8> {
 #[inline(always)]
 unsafe fn syscall1_lazy(n: usize, a1: usize) -> usize {
     let ret: usize;
-    core::arch::asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    core::arch::asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
     ret
 }
 
@@ -258,11 +258,11 @@ unsafe fn syscall1_lazy(n: usize, a1: usize) -> usize {
 unsafe fn syscall3_lazy(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     core::arch::asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret

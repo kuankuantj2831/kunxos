@@ -6,15 +6,15 @@ typedef unsigned long u64;
 typedef long i64;
 
 static inline i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
-    register i64 x8 __asm__("x8") = n;
-    register i64 x0 __asm__("x0") = a;
-    register i64 x1 __asm__("x1") = b;
-    register i64 x2 __asm__("x2") = c;
-    register i64 x3 __asm__("x3") = d;
-    register i64 x4 __asm__("x4") = e;
-    register i64 x5 __asm__("x5") = f;
-    __asm__ __volatile__("svc #0" : "=r"(x0) : "r"(x8), "0"(x0), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory");
-    return x0;
+    register i64 a7 __asm__("a7") = n;
+    register i64 a0 __asm__("a0") = a;
+    register i64 a1 __asm__("a1") = b;
+    register i64 a2 __asm__("a2") = c;
+    register i64 a3 __asm__("a3") = d;
+    register i64 a4 __asm__("a4") = e;
+    register i64 a5 __asm__("a5") = f;
+    __asm__ __volatile__("ecall" : "=r"(a0) : "r"(a7), "0"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5) : "memory");
+    return a0;
 }
 #define sys1(n,a) sys6(n,a,0,0,0,0,0)
 #define sys3(n,a,b,c) sys6(n,a,b,c,0,0,0)
@@ -101,11 +101,11 @@ __asm__(
 ".global _start\n"
 ".type _start, %function\n"
 "_start:\n"
-"    mov x2, sp\n"
-"    ldr x0, [x2], #8\n"
-"    mov x1, x2\n"
-"    bl busybox_main\n"
-"    mov x8, #93\n"
-"    svc #0\n"
-"    b .\n"
+"    mv a1, sp\n"
+"    ld a0, 0(a1)\n"
+"    addi a1, a1, 8\n"
+"    call busybox_main\n"
+"    li a7, 93\n"
+"    ecall\n"
+"    j .\n"
 );

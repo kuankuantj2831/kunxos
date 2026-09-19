@@ -38,6 +38,7 @@ mod plat_pi4;
 // 相机后端窄接口：平台模块保持私有，仅导出相机所需的注入入口。
 #[cfg(feature = "qemu")]
 pub use plat_qemu::sim_camera_set_clock;
+pub use plat_qemu::qemu_power_set_hooks;
 
 pub use display::DisplayInfo;
 pub use fusion::{Euler, Quat, RotationVector, Vec3};

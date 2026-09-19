@@ -1,13 +1,14 @@
-//! PL031 实时时钟（RTC）驱动。
+//! goldfish 实时时钟（RTC）驱动。
 //!
 //! 读取/写入自 Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
-//! QEMU virt 的 PL031 位于 0x09010000；无 RTC 平台（如 Pi4）时 `init`
+//! QEMU virt RISC-V 的 goldfish RTC 位于 0x101000；无 RTC 平台时 `init`
 //! 保持 `EPOCH_OFFSET = 0`，此时 wall 时间退化为单调时钟（与旧行为一致）。
 //!
-//! 寄存器（PL031）：
-//!   RTC_DR  0x000  Data（秒，32 位，只读）
-//!   RTC_LR  0x008  Load（写此值更新当前时间）
-//!   RTC_CR  0x00C  Control（bit0 RTCEN 使能）
+//! 寄存器（goldfish-rtc）：
+//!   TIME_LOW   0x00  秒低 32 位
+//!   TIME_HIGH  0x04  秒高 32 位
+//!   ALARM_LOW/HIGH 0x08/0x0C（未用：IRQ 使能恒关）
+//!   IRQ        0x10（未用）
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +31,7 @@ pub fn init(rtc_base: Option<usize>) {
         if epoch != 0 {
             EPOCH_SECS.store(epoch, Ordering::Relaxed);
             crate::kinfo! {
-                crate::uart_send_str("[rtc] PL031 epoch=");
+                crate::uart_send_str("[rtc] goldfish epoch=");
                 crate::print_dec(epoch);
                 // 自检：打印当前墙钟日历时间（验证 civil_from_epoch）
                 let wall = wall_time_us() / 1_000_000;
@@ -56,7 +57,7 @@ pub fn init(rtc_base: Option<usize>) {
                 crate::uart_send_str("\n");
             }
         } else {
-            crate::kinfo! { crate::uart_send_str("[rtc] 存在 PL031 但 epoch=0，改用单调时钟\n"); }
+            crate::kinfo! { crate::uart_send_str("[rtc] 存在 RTC 但 epoch=0，改用单调时钟\n"); }
         }
     } else {
         crate::kinfo! { crate::uart_send_str("[rtc] 无 RTC 设备，使用单调时钟\n"); }
@@ -65,14 +66,19 @@ pub fn init(rtc_base: Option<usize>) {
 
 /// 读取 PL031 Data 寄存器（秒）。
 fn read_secs(base: usize) -> u64 {
-    unsafe { read_volatile((base + 0x000) as *const u32) as u64 }
+    unsafe {
+        let lo = read_volatile((base + 0x00) as *const u32) as u64;
+        let hi = read_volatile((base + 0x04) as *const u32) as u64;
+        lo | (hi << 32)
+    }
 }
 
 /// 设置当前时间（秒）：写 Load 寄存器并确认。
 pub fn set_epoch_secs(secs: u64) {
     if let Some(base) = rtc_base_of() {
         unsafe {
-            write_volatile((base + 0x008) as *mut u32, (secs & 0xFFFF_FFFF) as u32);
+            write_volatile((base + 0x00) as *mut u32, (secs & 0xFFFF_FFFF) as u32);
+            write_volatile((base + 0x04) as *mut u32, (secs >> 32) as u32);
         }
         EPOCH_SECS.store(secs, Ordering::Relaxed);
     }

@@ -13,16 +13,19 @@ SECTIONS
         KEEP(*(.text._start))
         *(.text .text.*)
         *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
     }
 
     . = ALIGN(0x1000);
 
     .data : {
         *(.data .data.*)
+        *(.sdata .sdata.*)
     }
 
     .bss (NOLOAD) : {
         *(.bss .bss.*)
+        *(.sbss .sbss.*)
         *(COMMON)
     }
 

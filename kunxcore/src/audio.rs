@@ -225,10 +225,10 @@ fn stats_avg(sum: u64, n: u64) -> u64 {
 
 /// 屏蔽 IRQ（保护环形缓冲与补充路径的共享状态）。
 fn irq_mask() {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
 }
 fn irq_unmask() {
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
 }
 
 /// 补充：把软件环形缓冲的数据推给硬件；不足一块时以静音填充保持连续。

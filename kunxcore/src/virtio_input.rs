@@ -10,7 +10,7 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::allocator;
-use crate::gic;
+use crate::plic;
 use crate::input::{self, InputEvent};
 use crate::interrupt;
 use crate::net_virtio::MmioDev;
@@ -92,32 +92,32 @@ unsafe fn w32(idx: usize, off: usize, value: u32) {
 
 #[inline]
 fn mb() {
-    unsafe { asm!("dmb sy") }
+    unsafe { asm!("fence rw, rw") }
 }
 
 #[inline]
 fn dsb() {
-    unsafe { asm!("dsb sy") }
+    unsafe { asm!("fence iorw, iorw") }
 }
 
 unsafe fn dcache_clean(va: usize, len: usize) {
     let mut addr = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while addr < end {
-        asm!("dc cvac, {}", in(reg) addr);
+        asm!("fence iorw, iorw");
         addr += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 unsafe fn dcache_invalidate(va: usize, len: usize) {
     let mut addr = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while addr < end {
-        asm!("dc ivac, {}", in(reg) addr);
+        asm!("fence iorw, iorw");
         addr += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 #[inline]
@@ -335,9 +335,9 @@ pub fn init(devs: &[MmioDev]) -> bool {
             1 => interrupt::register_handler(irq, irq_handler_1),
             _ => {}
         }
-        gic::gic_enable_irq(irq);
-        gic::gic_set_priority(irq, 0x90);
-        gic::gic_set_target(irq, 0x01);
+        plic::plic_enable_irq(irq);
+        plic::plic_set_priority(irq, 0x90);
+        plic::plic_set_target(irq, 0x01);
     }
     true
 }

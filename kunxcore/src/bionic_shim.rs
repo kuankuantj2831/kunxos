@@ -97,7 +97,7 @@ pub fn futex_wait(addr: usize, val: u32, deadline: Option<u64>) -> i32 {
     let tid = sched_cfs::current_tid();
     let pid = sched_cfs::current_pid();
     let saved = unsafe { sched_cfs::read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     // 登记等待项（IRQ 屏蔽下进行）
     let mut slot = None;
     unsafe {
@@ -156,7 +156,7 @@ pub fn futex_wake(addr: usize, n: u32) -> i32 {
     // 表操作全程屏蔽 IRQ：futex_wait 在屏蔽窗口内写表，此处（及 requeue/
     // cleanup）若在 IRQ 使能下读写，tick 抢占会撕裂「查表 → 清槽 → 唤醒」
     let saved = unsafe { sched_cfs::read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         for i in 0..MAX_FUTEX_WAITERS {
             if woken >= n {
@@ -182,7 +182,7 @@ pub fn futex_wake(addr: usize, n: u32) -> i32 {
 /// 由 `sched_cfs::kill_pid`（进程退出/终止统一清理路径）调用。
 pub fn futex_cleanup_tid(tid: u32) {
     let saved = unsafe { sched_cfs::read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         for w in FUTEX_WAITERS.iter_mut() {
             if w.used && w.tid == tid {
@@ -199,7 +199,7 @@ pub fn futex_requeue(addr: usize, n: u32, addr2: usize) -> i32 {
     let mut woken = 0u32;
     let cur_pid = sched_cfs::current_pid();
     let saved = unsafe { sched_cfs::read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         for i in 0..MAX_FUTEX_WAITERS {
             let w = FUTEX_WAITERS[i];
@@ -238,43 +238,57 @@ extern "C" {
 global_asm!(
     r#"
     // clone(CLONE_THREAD) 内核主体。
-    // 入参：x0 = trap_frame, x1 = child_stack, x2 = tls, x3 = parent_tidptr, x4 = child_tidptr
+    // 入参：a0 = trap_frame, a1 = child_stack, a2 = tls, a3 = parent_tidptr, a4 = child_tidptr
     .section .text.do_clone, "ax"
     .global do_clone
     .type do_clone, %function
 do_clone:
-    // 保存 callee-saved 寄存器（x19-x30）作为子线程上下文
-    sub sp, sp, #96
-    stp x19, x20, [sp, #0x00]
-    stp x21, x22, [sp, #0x10]
-    stp x23, x24, [sp, #0x20]
-    stp x25, x26, [sp, #0x30]
-    stp x27, x28, [sp, #0x40]
-    stp x29, x30, [sp, #0x50]
-    // 暂存入参到调用者保存寄存器
-    mov x6, x0
-    mov x7, x1
-    mov x8, x2
-    mov x9, x3
-    mov x10, x4
+    // 保存 callee-saved 寄存器（ra + s0-s11）作为现场锚点
+    addi sp, sp, -112
+    sd ra, 0x00(sp)
+    sd s0, 0x08(sp)
+    sd s1, 0x10(sp)
+    sd s2, 0x18(sp)
+    sd s3, 0x20(sp)
+    sd s4, 0x28(sp)
+    sd s5, 0x30(sp)
+    sd s6, 0x38(sp)
+    sd s7, 0x40(sp)
+    sd s8, 0x48(sp)
+    sd s9, 0x50(sp)
+    sd s10, 0x58(sp)
+    sd s11, 0x60(sp)
+    // 暂存入参：t3-t6 + 帧尾空槽 0x68（13 个 callee-saved 只占 0x00..0x67）
+    mv t3, a0        # trap_frame
+    mv t4, a1        # child_stack
+    mv t5, a2        # tls
+    mv t6, a3        # parent_tidptr
+    sd a4, 0x68(sp)  # child_tidptr
     // clone_parent(saved_sp, trap_frame, child_stack, tls, parent_tidptr, child_tidptr)
-    mov x0, sp
-    mov x1, x6
-    mov x2, x7
-    mov x3, x8
-    mov x4, x9
-    mov x5, x10
-    bl clone_parent
+    mv a0, sp
+    mv a1, t3
+    mv a2, t4
+    mv a3, t5
+    mv a4, t6
+    ld a5, 0x68(sp)
+    call clone_parent
     // 父线程路径：恢复现场并返回子 tid
-    mov x9, x0
-    ldp x19, x20, [sp, #0x00]
-    ldp x21, x22, [sp, #0x10]
-    ldp x23, x24, [sp, #0x20]
-    ldp x25, x26, [sp, #0x30]
-    ldp x27, x28, [sp, #0x40]
-    ldp x29, x30, [sp, #0x50]
-    add sp, sp, #96
-    mov x0, x9
+    mv t3, a0
+    ld ra, 0x00(sp)
+    ld s0, 0x08(sp)
+    ld s1, 0x10(sp)
+    ld s2, 0x18(sp)
+    ld s3, 0x20(sp)
+    ld s4, 0x28(sp)
+    ld s5, 0x30(sp)
+    ld s6, 0x38(sp)
+    ld s7, 0x40(sp)
+    ld s8, 0x48(sp)
+    ld s9, 0x50(sp)
+    ld s10, 0x58(sp)
+    ld s11, 0x60(sp)
+    addi sp, sp, 112
+    mv a0, t3
     ret
 "#
 );
@@ -293,7 +307,7 @@ extern "C" fn clone_parent(
     child_tidptr: usize,
 ) -> u32 {
     // 屏蔽 IRQ，保护栈拷贝与任务表写入的临界区
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
 
     let (stack_base, stack_top) = sched_cfs::current_stack();
     let stack_size = stack_top - stack_base;
@@ -302,7 +316,7 @@ extern "C" fn clone_parent(
     // 子线程内核栈布局与父线程完全一致，拷贝区之下仍有 ~256KB 可用栈。
     // 子栈分配失败（OOM）：clone 明确失败（此前 panic，clone 风暴可打挂内核）。
     let Some(child_stack_top) = sched_cfs::alloc_stack() else {
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         crate::uart_send_str("[clone] 子线程栈分配失败 (OOM)\n");
         return u32::MAX;
     };
@@ -313,11 +327,11 @@ extern "C" fn clone_parent(
         core::ptr::copy_nonoverlapping(saved_sp as *const u8, child_sp as *mut u8, copy_len);
     }
 
-    // 子线程陷阱帧放在**子栈顶部**（child_stack_top - 272，同 fork）：
-    // 首次 eret 后内核 sp = child_stack_top，后续系统调用帧从栈顶向下分配，
-    // 与拷贝区（exec 残留）隔离。修改：新用户栈（sp_el0 字段 @0xF8）与
-    // 返回值 x[0]=0。
-    const TRAP_FRAME_SIZE: usize = 800;
+    // 子线程陷阱帧放在**子栈顶部**（child_stack_top - 832，同 fork）：
+    // 首次 sret 后内核 sp = child_stack_top，后续系统调用帧从栈顶向下分配，
+    // 与拷贝区（exec 残留）隔离。修改：新用户栈（x2 与 sp_el0 槽 @0x100）与
+    // 返回值 a0（x[10] @0x50）=0。
+    const TRAP_FRAME_SIZE: usize = 832;
     let child_frame = child_stack_top - TRAP_FRAME_SIZE;
     if trap_frame >= saved_sp && trap_frame + TRAP_FRAME_SIZE <= stack_top {
         unsafe {
@@ -326,8 +340,9 @@ extern "C" fn clone_parent(
                 child_frame as *mut u8,
                 TRAP_FRAME_SIZE,
             );
-            *((child_frame + 0xF8) as *mut u64) = child_stack as u64;
-            *(child_frame as *mut u64) = 0;
+            *((child_frame + 0x10) as *mut u64) = child_stack as u64; // x2 槽
+            *((child_frame + 0x100) as *mut u64) = child_stack as u64; // sp_el0 槽
+            *((child_frame + 0x50) as *mut u64) = 0; // a0 槽：子线程返回 0
         }
     } else {
         // 陷阱帧不在父栈活动区：归还已分配的子栈（此前该路径漏释放，
@@ -338,23 +353,21 @@ extern "C" fn clone_parent(
                 crate::allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
             }
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return u32::MAX;
     }
 
-    // 子线程上下文：首次调度直接进入 syscall_return_restore，sp 指向子线程
-    // **拷贝的陷阱帧**（x0 已置 0、sp_el0 已改为新用户栈，elr/spsr 均为
-    // 子线程自身副本值）。不经过 syscall_dispatch（无跨栈写、不回卷），
-    // eret 直接回到用户态 clone() 调用点，x0 = 0（子线程语义）。
+    // 子线程上下文：首次调度直接进入 trap_return，sp 指向子线程**拷贝的
+    // 陷阱帧**（a0 已置 0、sp_el0 已改为新用户栈，elr/sstatus 均为子线程
+    // 自身副本值）。不经过 syscall_dispatch（无跨栈写、不回卷），sret 直接
+    // 回到用户态 clone() 调用点，a0 = 0（子线程语义）。
+    // RISC-V 无用户 TLS 寄存器编程（tp 为内核 hartid），tls 参数仅存档。
+    let _ = tls;
     let mut ctx = sched_cfs::TaskContext::empty();
-    ctx.x30 = el0_resume_entry as *const () as usize as u64;
+    ctx.ra = el0_resume_entry as *const () as usize as u64;
     ctx.sp = child_frame as u64;
-    ctx.spsr = 0x5;
-    // 初始 ELR 取陷阱帧副本中的 EL0 返回地址（防「ELR=0 在飞」窗口）
-    ctx.elr = unsafe { *((child_frame + 0x100) as *const u64) };
-    ctx.tpidr = tls as u64;
-    // CLONE_THREAD：共享地址空间，TTBR0 与父线程一致
-    ctx.ttbr0_el1 = process::current_root() as u64;
+    // CLONE_THREAD：共享地址空间，satp_root 与父线程一致
+    ctx.satp_root = process::current_root() as u64;
 
     let class = sched_cfs::current_class();
     let nice = sched_cfs::current_nice();
@@ -366,7 +379,7 @@ extern "C" fn clone_parent(
         for p in 0..pages {
             crate::allocator::free_page(child_stack_base + p * crate::allocator::PAGE_SIZE);
         }
-        unsafe { asm!("msr daifclr, #2") };
+        unsafe { asm!("csrsi sstatus, 2") };
         return u32::MAX;
     }
 
@@ -392,7 +405,7 @@ extern "C" fn clone_parent(
         crate::mmu::uaccess_end();
     }
 
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     tid
 }
 

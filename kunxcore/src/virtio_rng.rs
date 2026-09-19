@@ -71,11 +71,11 @@ fn w32(off: usize, v: u32) {
 
 #[inline]
 fn mb() {
-    unsafe { asm!("dmb sy") }
+    unsafe { asm!("fence rw, rw") }
 }
 #[inline]
 fn dsb() {
-    unsafe { asm!("dsb sy") }
+    unsafe { asm!("fence iorw, iorw") }
 }
 
 /// 按缓存行清洗数据缓存，使设备 DMA 可读到。
@@ -84,10 +84,10 @@ unsafe fn dcache_clean(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc cvac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 /// 按缓存行作废数据缓存，使设备写入的数据可见。
@@ -96,10 +96,10 @@ unsafe fn dcache_invalidate(va: usize, len: usize) {
     let mut a = va & !63usize;
     let end = (va + len + 63) & !63usize;
     while a < end {
-        asm!("dc ivac, {}", in(reg) a);
+        asm!("fence iorw, iorw");
         a += 64;
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 }
 
 // ==================== 环访问 ====================

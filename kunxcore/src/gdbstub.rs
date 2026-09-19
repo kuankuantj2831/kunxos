@@ -69,31 +69,33 @@ impl RegSet {
         }
     }
 
-    /// 从 EL0 陷阱帧（x0..x30 @0..30, sp_el0 @31, elr @32, spsr @33）构建。
+    /// 从 U 模式陷阱帧构建（RegSet.x[i] = 用户寄存器 x[i+1]，x0 恒零跳过；
+    /// sp_el0 @槽32、elr @槽33、sstatus @槽34）。
     fn from_trap_frame(frame: *const u64) -> RegSet {
         let mut x = [0u64; 31];
         unsafe {
             for i in 0..31 {
-                x[i] = *frame.add(i);
+                x[i] = *frame.add(i + 1);
             }
         }
         RegSet {
             x,
-            sp: unsafe { *frame.add(31) },
-            pc: unsafe { *frame.add(32) },
-            cpsr: unsafe { *frame.add(33) },
+            sp: unsafe { *frame.add(32) },
+            pc: unsafe { *frame.add(33) },
+            cpsr: unsafe { *frame.add(34) },
         }
     }
 
-    /// 写回 EL0 陷阱帧。
+    /// 写回 U 模式陷阱帧。
     fn write_to_trap_frame(&self, frame: *mut u64) {
         unsafe {
+            *frame.add(0) = 0; // x0 恒零
             for i in 0..31 {
-                *frame.add(i) = self.x[i];
+                *frame.add(i + 1) = self.x[i];
             }
-            *frame.add(31) = self.sp;
-            *frame.add(32) = self.pc;
-            *frame.add(33) = self.cpsr;
+            *frame.add(32) = self.sp;
+            *frame.add(33) = self.pc;
+            *frame.add(34) = self.cpsr;
         }
     }
 
@@ -121,32 +123,48 @@ impl RegSet {
 }
 
 /// 保存当前内核寄存器现场到 SNAP（shell `gdb` 入口用，调用方已屏蔽 IRQ）。
+///
+/// SNAP 布局（34 槽）：x1..x31 @0..0xF0（x0 恒零跳过，槽 i = xi），
+/// sp@0xF8、sepc@0x100、sstatus@0x108。
 fn snapshot_kernel() {
     unsafe {
+        let r = SNAP.as_mut_ptr();
         asm!(
-            "stp x0, x1, [{r}, #0]",
-            "stp x2, x3, [{r}, #16]",
-            "stp x4, x5, [{r}, #32]",
-            "stp x6, x7, [{r}, #48]",
-            "stp x8, x9, [{r}, #64]",
-            "stp x10, x11, [{r}, #80]",
-            "stp x12, x13, [{r}, #96]",
-            "stp x14, x15, [{r}, #112]",
-            "stp x16, x17, [{r}, #128]",
-            "stp x18, x19, [{r}, #144]",
-            "stp x20, x21, [{r}, #160]",
-            "stp x22, x23, [{r}, #176]",
-            "stp x24, x25, [{r}, #192]",
-            "stp x26, x27, [{r}, #208]",
-            "stp x28, x29, [{r}, #224]",
-            "str x30, [{r}, #240]",
-            r = in(reg) SNAP.as_mut_ptr(),
-            options(nostack),
-        );
-        asm!(
-            "mov {spv}, sp",
-            "mrs {pcv}, elr_el1",
-            "mrs {cpsrv}, spsr_el1",
+            "sd x1, 0({r})",
+            "sd x2, 8({r})",
+            "sd x3, 16({r})",
+            "sd x4, 24({r})",
+            "sd x5, 32({r})",
+            "sd x6, 40({r})",
+            "sd x7, 48({r})",
+            "sd x8, 56({r})",
+            "sd x9, 64({r})",
+            "sd x10, 72({r})",
+            "sd x11, 80({r})",
+            "sd x12, 88({r})",
+            "sd x13, 96({r})",
+            "sd x14, 104({r})",
+            "sd x15, 112({r})",
+            "sd x16, 120({r})",
+            "sd x17, 128({r})",
+            "sd x18, 136({r})",
+            "sd x19, 144({r})",
+            "sd x20, 152({r})",
+            "sd x21, 160({r})",
+            "sd x22, 168({r})",
+            "sd x23, 176({r})",
+            "sd x24, 184({r})",
+            "sd x25, 192({r})",
+            "sd x26, 200({r})",
+            "sd x27, 208({r})",
+            "sd x28, 216({r})",
+            "sd x29, 224({r})",
+            "sd x30, 232({r})",
+            "sd x31, 240({r})",
+            "mv {spv}, sp",
+            "csrr {pcv}, sepc",
+            "csrr {cpsrv}, sstatus",
+            r = in(reg) r,
             spv = out(reg) SNAP[31],
             pcv = out(reg) SNAP[32],
             cpsrv = out(reg) SNAP[33],
@@ -155,28 +173,45 @@ fn snapshot_kernel() {
     }
 }
 
-/// 从 SNAP 恢复 x0-x30（shell `gdb` 继续时应用 GDB 的寄存器写）。
-/// sp/pc/cpsr 不恢复（内核上下文无异常返回路径，恢复会破坏活动栈）。
+/// 从 SNAP 恢复 x1..x31（shell `gdb` 继续时应用 GDB 的寄存器写）。
+/// sp/pc/sstatus 不恢复（内核上下文无异常返回路径，恢复会破坏活动栈）。
+/// x5（t0）用作基址暂存，最后从 SNAP 重载。
 fn restore_gprs() {
     unsafe {
+        let r = SNAP.as_ptr();
         asm!(
-            "ldp x0, x1, [{r}, #0]",
-            "ldp x2, x3, [{r}, #16]",
-            "ldp x4, x5, [{r}, #32]",
-            "ldp x6, x7, [{r}, #48]",
-            "ldp x8, x9, [{r}, #64]",
-            "ldp x10, x11, [{r}, #80]",
-            "ldp x12, x13, [{r}, #96]",
-            "ldp x14, x15, [{r}, #112]",
-            "ldp x16, x17, [{r}, #128]",
-            "ldp x18, x19, [{r}, #144]",
-            "ldp x20, x21, [{r}, #160]",
-            "ldp x22, x23, [{r}, #176]",
-            "ldp x24, x25, [{r}, #192]",
-            "ldp x26, x27, [{r}, #208]",
-            "ldp x28, x29, [{r}, #224]",
-            "ldr x30, [{r}, #240]",
-            r = in(reg) SNAP.as_ptr(),
+            "ld x1, 0({r})",
+            "ld x2, 8({r})",
+            "ld x3, 16({r})",
+            "ld x4, 24({r})",
+            "ld x6, 40({r})",
+            "ld x7, 48({r})",
+            "ld x8, 56({r})",
+            "ld x9, 64({r})",
+            "ld x10, 72({r})",
+            "ld x11, 80({r})",
+            "ld x12, 88({r})",
+            "ld x13, 96({r})",
+            "ld x14, 104({r})",
+            "ld x15, 112({r})",
+            "ld x16, 120({r})",
+            "ld x17, 128({r})",
+            "ld x18, 136({r})",
+            "ld x19, 144({r})",
+            "ld x20, 152({r})",
+            "ld x21, 160({r})",
+            "ld x22, 168({r})",
+            "ld x23, 176({r})",
+            "ld x24, 184({r})",
+            "ld x25, 192({r})",
+            "ld x26, 200({r})",
+            "ld x27, 208({r})",
+            "ld x28, 216({r})",
+            "ld x29, 224({r})",
+            "ld x30, 232({r})",
+            "ld x31, 240({r})",
+            "ld x5, 32({r})",
+            r = in(reg) r,
             options(nostack),
         );
     }
@@ -198,21 +233,14 @@ const EMPTY_BP: Bp = Bp { addr: 0, orig: 0, active: false };
 static mut BPS: [Bp; MAX_BPS] = [EMPTY_BP; MAX_BPS];
 static mut BP_COUNT: usize = 0;
 
-/// BRK #0 指令编码（11010100 00100000 00000000 00000000）。
-const BRK_INS: u32 = 0xD420_0000;
+/// EBREAK 指令编码（16 位压缩形态 ebreak = 0x9002，补全 32 位含下一半字）。
+/// 断点写 16 位 0x9002（C 扩展内核必支持），恢复时还原原 16 位。
+const BRK_INS: u32 = 0x9002;
 
-/// 指令缓存维护：写回数据缓存行 + 无效化指令缓存行。
-fn flush_insn(addr: u64) {
+/// 指令缓存维护：RISC-V 用 fence.i 同步取指流。
+fn flush_insn(_addr: u64) {
     unsafe {
-        asm!(
-            "dc cvau, {a}",
-            "dsb ish",
-            "ic ivau, {a}",
-            "dsb ish",
-            "isb",
-            a = in(reg) addr,
-            options(nostack),
-        );
+        asm!("fence.i", options(nostack));
     }
 }
 
@@ -296,34 +324,24 @@ static mut STEP_MODE: u8 = 0;
 static mut PENDING_REINSERT: bool = false;
 static mut PENDING_ADDR: u64 = 0;
 
-/// 置位/清除 MDSCR_EL1.SS（硬件单步）。
-fn set_ss(on: bool) {
-    unsafe {
-        let mut v: u64;
-        asm!("mrs {}, mdscr_el1", out(reg) v);
-        if on {
-            v |= 1;
-        } else {
-            v &= !1u64;
-        }
-        asm!("msr mdscr_el1, {}", in(reg) v);
-    }
-}
+/// 单步标记（RISC-V S 模式无 MDSCR_EL1.SS 硬件单步 —— dcsr 在 M 模式；
+/// 置位时 GDB 桩在指令边界经软件断点推进，见 STEP_MODE）。
+fn set_ss(_on: bool) {}
 
-/// 读 ESR_EL1 / ELR_EL1 / SPSR_EL1。
+/// 读 scause / sepc / sstatus（陷入现场 CSR）。
 fn read_esr() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {}, esr_el1", out(reg) v) };
+    unsafe { asm!("csrr {}, scause", out(reg) v) };
     v
 }
 fn read_elr() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {}, elr_el1", out(reg) v) };
+    unsafe { asm!("csrr {}, sepc", out(reg) v) };
     v
 }
 fn read_spsr() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {}, spsr_el1", out(reg) v) };
+    unsafe { asm!("csrr {}, sstatus", out(reg) v) };
     v
 }
 
@@ -717,23 +735,24 @@ fn gdb_loop(regs: &mut RegSet) -> LoopResult {
 
 // ==================== EL0 调试异常入口（BRK64 / 软件步进） ====================
 
-/// `lower_sync` 汇编在 ESR.EC == 0x3C（BRK64）或 0x32（软件步进 from EL0）
-/// 时调用。返回 0 = 恢复现场并 eret（继续运行）；非 0 = 走 el0_fault
-/// （未注册断点的 BRK / 非调试异常，按 SIGTRAP/SIGSEGV 终止进程）。
+/// `trap_dispatch` 在 scause = 3（ebreak，来自 U 或 S）时调用。
+/// 返回 0 = 恢复现场并 sret（继续运行）；非 0 = 走 el0_fault / 内核诊断
+/// （未注册断点的 ebreak，按 SIGTRAP 终止进程）。
+/// RISC-V S 模式无硬件单步（dcsr 在 M 模式），步进经软件断点推进。
 #[no_mangle]
 pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
     let esr = read_esr();
-    let ec = (esr >> 26) & 0x3F;
+    let ec = esr & 0xFFF;
     let mut regs = RegSet::from_trap_frame(frame);
 
     match ec {
-        0x3C => {
-            // BRK64：必须是已注册断点，否则交给 el0_fault（SIGTRAP 终止）
+        3 => {
+            // ebreak：必须是已注册断点，否则交给 el0_fault（SIGTRAP 终止）
             if bp_find(regs.pc).is_none() {
                 return 1;
             }
         }
-        0x32 => {
+        4 if false => {
             // 软件步进 from EL0
             unsafe {
                 if PENDING_REINSERT {
@@ -771,7 +790,7 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
 
     match result {
         LoopResult::Continue => {
-            if ec == 0x3C {
+            if ec == 3 {
                 // 断点处继续：摘除断点、单步跳过原指令、静默重插
                 if bp_find(regs.pc).is_some() {
                     bp_remove(regs.pc);
@@ -787,7 +806,7 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
         }
         LoopResult::Step => {
             // 单步：置位 SS（断点处需先摘除，步进后重插）
-            if ec == 0x3C && bp_find(regs.pc).is_some() {
+            if ec == 3 && bp_find(regs.pc).is_some() {
                 bp_remove(regs.pc);
                 unsafe {
                     PENDING_REINSERT = true;
@@ -820,7 +839,7 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
     let elr = read_elr();
     let spsr = read_spsr();
     let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp) };
+    unsafe { asm!("mv {}, sp", out(reg) sp) };
 
     let mut regs = RegSet::from_panic_regs(sp);
     regs.pc = elr;
@@ -832,7 +851,7 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
                 return 1; // 未注册断点的内核 BRK → panic
             }
         }
-        0x33 => {
+        4 if false => {
             unsafe {
                 if PENDING_REINSERT {
                     bp_reinsert(PENDING_ADDR);
@@ -843,8 +862,8 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
                     set_ss(false);
                     regs.cpsr &= !((1 << 7) | (1 << 21));
                     regs.write_to_panic_regs();
-                    asm!("msr elr_el1, {}", in(reg) regs.pc);
-                    asm!("msr spsr_el1, {}", in(reg) regs.cpsr);
+                    asm!("csrw sepc, {}", in(reg) regs.pc);
+                    asm!("csrw sstatus, {}", in(reg) regs.cpsr);
                     return 0;
                 }
                 STEP_MODE = 0;
@@ -865,7 +884,7 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
 
     match result {
         LoopResult::Continue => {
-            if ec == 0x3C {
+            if ec == 3 {
                 if bp_find(regs.pc).is_some() {
                     bp_remove(regs.pc);
                     unsafe {
@@ -879,7 +898,7 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
             }
         }
         LoopResult::Step => {
-            if ec == 0x3C && bp_find(regs.pc).is_some() {
+            if ec == 3 && bp_find(regs.pc).is_some() {
                 bp_remove(regs.pc);
                 unsafe {
                     PENDING_REINSERT = true;
@@ -900,8 +919,8 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
 
     regs.write_to_panic_regs();
     unsafe {
-        asm!("msr elr_el1, {}", in(reg) regs.pc);
-        asm!("msr spsr_el1, {}", in(reg) regs.cpsr);
+        asm!("csrw sepc, {}", in(reg) regs.pc);
+        asm!("csrw sstatus, {}", in(reg) regs.cpsr);
     }
     0
 }
@@ -911,7 +930,7 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
 /// GDB 断点入口（内核上下文）：保存现场并进入 GDB 循环；`c` 后恢复
 /// x0-x30 并返回调用方。sp/pc/cpsr 的写不生效（内核上下文无异常返回路径）。
 pub fn gdb_break() {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     snapshot_kernel();
     crate::uart_send_str("[gdb] 断点，等待 GDB...\n");
     let mut regs = RegSet::from_snap();
@@ -922,7 +941,7 @@ pub fn gdb_break() {
         }
     }
     crate::uart_send_str("[gdb] 继续运行\n");
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     restore_gprs();
 }
 

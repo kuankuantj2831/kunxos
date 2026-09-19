@@ -108,8 +108,8 @@ static mut NEXT_FREE: [u32; MAX_VOLUMES] = [2; MAX_VOLUMES];
     /// DAIF，调用方须以同一值调用 [`fat_unlock`]。
     fn fat_lock() -> u64 {
         let saved: u64;
-        unsafe { asm!("mrs {}, daif", out(reg) saved) };
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrr {}, sstatus", out(reg) saved) };
+        unsafe { asm!("csrci sstatus, 2") };
         let cpu = crate::smp::cpu_id();
         loop {
             let w = FAT_LOCKED.load(Ordering::Acquire);
@@ -146,7 +146,7 @@ static mut NEXT_FREE: [u32; MAX_VOLUMES] = [2; MAX_VOLUMES];
                 break;
             }
         }
-        unsafe { asm!("msr daif, {}", in(reg) saved) };
+        unsafe { asm!("csrw sstatus, {}", in(reg) saved) };
     }
 
 // ==================== 小端辅助 ====================

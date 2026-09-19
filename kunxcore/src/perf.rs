@@ -172,7 +172,7 @@ pub fn poll_report() {
         // 混算。UART 打印（毫秒级忙等）留在可中断上下文 —— 帧统计冲刷
         // 此前刚因 IRQ 内忙等打满帧预算而从 CNTP 挪出来，不能倒退。
         let saved = crate::sched_cfs::read_daif();
-        core::arch::asm!("msr daifset, #2");
+        core::arch::asm!("csrci sstatus, 2");
         let n = FS_N;
         if n == 0 {
             // 报告标记跨窗口竞态（同 anim::report_frame_stats 的 n==0 防御）

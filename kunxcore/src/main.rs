@@ -17,38 +17,21 @@ extern crate alloc;
 ///
 /// 性能：帧缓冲脏区行拷贝 / ELF 段加载等大块拷贝经此符号，纯字节循环在
 /// QEMU 软件渲染与慢速核心上不足以喂满 120Hz 帧预算（540×960 整屏 = 2MB
-/// 拷贝）。这里在两端 16 字节对齐时用 AArch64 `ldp/stp` 16 字节宽通道，
-/// 仅 8 字节对齐时用 `ldr/str x`，尾部与未对齐场景回退字节循环 ——
-/// 任意对齐都正确，同时把大块拷贝降到接近 NEON 前的理论上限。
+/// 拷贝）。这里在两端 8 字节对齐时用 RISC-V `ld/sd` 8 字节宽通道，尾部与
+/// 未对齐场景回退字节循环 —— 任意对齐都正确。
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     let mut d = dest as usize;
     let mut s = src as usize;
     let end = d.saturating_add(n);
-    // 两端 16 字节对齐：ldp/stp 对（每迭代 16B）
-    if (d & 15) == 0 && (s & 15) == 0 {
-        while end.saturating_sub(d) >= 16 {
-            asm!(
-                "ldp {v0}, {v1}, [{s}]",
-                "add {s}, {s}, #16",
-                "stp {v0}, {v1}, [{d}]",
-                "add {d}, {d}, #16",
-                v0 = out(reg) _,
-                v1 = out(reg) _,
-                s = inout(reg) s,
-                d = inout(reg) d,
-                options(nostack),
-            );
-        }
-    }
-    // 仅 8 字节对齐：ldr/str x（每迭代 8B）
+    // 两端 8 字节对齐：ld/sd 对（每迭代 8B）
     if (d & 7) == 0 && (s & 7) == 0 {
         while end.saturating_sub(d) >= 8 {
             asm!(
-                "ldr {v}, [{s}]",
-                "add {s}, {s}, #8",
-                "str {v}, [{d}]",
-                "add {d}, {d}, #8",
+                "ld {v}, 0({s})",
+                "sd {v}, 0({d})",
+                "addi {s}, {s}, 8",
+                "addi {d}, {d}, 8",
                 v = out(reg) _,
                 s = inout(reg) s,
                 d = inout(reg) d,
@@ -83,7 +66,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
     dest
 }
 
-/// 字节填充：8B `str` 宽通道（页清零 / 画布填充走此路径）。
+/// 字节填充：8B `sd` 宽通道（页清零 / 画布填充走此路径）。
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     let mut p = s as usize;
@@ -94,21 +77,10 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
         (p as *mut u8).write_volatile(v as u8);
         p += 1;
     }
-    if p & 15 == 0 {
-        while end.saturating_sub(p) >= 16 {
-            asm!(
-                "stp {w}, {w}, [{p}]",
-                "add {p}, {p}, #16",
-                w = in(reg) word,
-                p = inout(reg) p,
-                options(nostack),
-            );
-        }
-    }
     while end.saturating_sub(p) >= 8 {
         asm!(
-            "str {w}, [{p}]",
-            "add {p}, {p}, #8",
+            "sd {w}, 0({p})",
+            "addi {p}, {p}, 8",
             w = in(reg) word,
             p = inout(reg) p,
             options(nostack),
@@ -139,7 +111,8 @@ mod fdt;
 mod fat32;
 mod fs_simple;
 mod fsops;
-mod gic;
+mod plic;
+mod sbi;
 mod gpu_simple;
 mod gesture;
 mod heap;
@@ -207,49 +180,90 @@ pub fn kernel_end() -> usize {
     addr_of!(_kernel_end) as usize
 }
 
-// ==================== PL011 UART 寄存器 ====================
+// ==================== NS16550 UART 寄存器 ====================
 
-/// PL011 寄存器布局（偏移以 32 位字为单位）
-#[repr(C)]
-struct Pl011 {
-    dr: u32,               // 0x000 数据寄存器（读=接收，写=发送）
-    _ecr: u32,             // 0x004 错误清除 / 接收状态
-    _reserved0: [u32; 4],  // 0x008 .. 0x014 保留
-    fr: u32,               // 0x018 标志寄存器（TXFF / RXFE 等）
-    _reserved1: u32,       // 0x01C 保留
-    _ilpr: u32,            // 0x020 IrDA 低功耗寄存器
-    ibrd: u32,             // 0x024 整数波特率除数
-    fbrd: u32,             // 0x028 小数波特率除数
-    lcr_h: u32,            // 0x02C 行控制寄存器
-    cr: u32,               // 0x030 控制寄存器（使能 UART / TX / RX）
-    ifls: u32,             // 0x034 FIFO 中断触发深度
-    imsc: u32,             // 0x038 中断屏蔽置位 / 清除
-    ris: u32,              // 0x03C 原始中断状态
-    _mis: u32,             // 0x040 屏蔽后中断状态
-    icr: u32,              // 0x044 中断清除
-    _dmacr: u32,           // 0x048 DMA 控制
+/// NS16550 寄存器布局（偏移以字节为单位；DLAB=0 视图）。
+///
+/// QEMU virt RISC-V 的串口是 ns16550a（DTB /soc/serial@10000000，IRQ 10），
+/// 寄存器宽度 1 字节（reg-space 0x100，按字节访问）。
+#[repr(C, align(4))]
+struct Ns16550 {
+    thr_rbr: u8,    // 0x00 发送保持（写）/ 接收缓冲（读）
+    ier: u8,        // 0x01 中断使能（DLAB=0）
+    iir_fcr: u8,    // 0x02 中断识别（读）/ FIFO 控制（写）
+    lcr: u8,        // 0x03 行控制（含 DLAB）
+    mcr: u8,        // 0x04 Modem 控制
+    lsr: u8,        // 0x05 线状态（THRE / DR）
+    _msr: u8,       // 0x06 Modem 状态
+    _scr: u8,       // 0x07 暂存
+    _reserved: [u8; 0x100 - 8],
 }
 
-/// UART MMIO 基地址（由设备树解析得到，默认 QEMU virt 值）
-static mut UART_BASE: usize = 0x0900_0000;
+/// UART MMIO 基地址（由设备树解析得到，默认 QEMU virt RISC-V 值）
+static mut UART_BASE: usize = 0x1000_0000;
 
 /// 获取 UART 设备引用
 ///
 /// # 安全
-/// `UART_BASE` 指向的 MMIO 地址处始终存在一个 PL011 设备。
-fn uart() -> &'static mut Pl011 {
-    unsafe { &mut *(UART_BASE as *mut Pl011) }
+/// `UART_BASE` 指向的 MMIO 地址处始终存在一个 ns16550a 设备。
+fn uart() -> &'static mut Ns16550 {
+    unsafe { &mut *(UART_BASE as *mut Ns16550) }
 }
 
-/// UART 标志寄存器位定义
-const FR_TXFF: u32 = 1 << 5; // 发送 FIFO 满
-const FR_RXFE: u32 = 1 << 4; // 接收 FIFO 空
+/// 线状态寄存器位定义
+const LSR_THRE: u8 = 1 << 5; // 发送保持寄存器空（可写下一字节）
+const LSR_DR: u8 = 1 << 0; // 接收数据就绪（可读）
 
-/// UART 中断相关位定义
-const IMSC_RXIM: u32 = 1 << 4; // 接收中断屏蔽位
-const IMSC_RTIM: u32 = 1 << 6; // 接收超时中断屏蔽位
-const ICR_RXIC: u32 = 1 << 4;  // 清除接收中断
-const ICR_RTIC: u32 = 1 << 6;  // 清除接收超时中断
+/// 行控制：8N1 + DLAB（访问除数锁存）
+const LCR_8N1: u8 = 0b0000_0011;
+const LCR_DLAB: u8 = 1 << 7;
+
+/// FIFO 控制：FIFO 使能 + 清空 RX/TX + RX 触发深度 14 字节（0xC7）
+const FCR_ENABLE: u8 = 0xC7;
+
+/// 中断使能：接收数据可用（IER bit0）；16550 的接收超时随 FIFO 使能生效
+const IER_RX: u8 = 0b0000_0001;
+
+/// 初始化 ns16550：`base` 为 MMIO 基地址，`clock` 为 UART 时钟（Hz）。
+/// 波特率 115200 8N1，使能 FIFO，使能接收中断。
+fn uart_init(base: usize, clock: u32) {
+    unsafe {
+        UART_BASE = base;
+    }
+    let uart = uart();
+    unsafe {
+        // 关中断，才能安全修改寄存器
+        write_volatile(&mut uart.ier, 0);
+        // DLAB=1 设置除数（divisor = clock / (16*115200)，至少 1）
+        write_volatile(&mut uart.lcr, LCR_DLAB);
+        let div = (clock / (16 * 115200)).clamp(1, 255) as u8;
+        write_volatile(&mut uart.thr_rbr, div); // DLL（除数低字节）
+        write_volatile(&mut uart.ier, 0); // DLM（除数高字节，时钟 < 470MHz 时恒 0）
+        // 8N1（DLAB=0）
+        write_volatile(&mut uart.lcr, LCR_8N1);
+        // 使能并复位 FIFO（QEMU 16550 忽略触发深度差异，行为兼容）
+        write_volatile(&mut uart.iir_fcr, FCR_ENABLE);
+        // 使能接收中断（RX 数据可用 + FIFO 模式接收超时）
+        write_volatile(&mut uart.ier, IER_RX);
+    }
+}
+
+/// 阻塞发送单个字符
+pub(crate) fn uart_send_char(c: u8) {
+    kmsg_put(c);
+    let uart = uart();
+    // 等待发送保持寄存器空（THRE 置位）
+    while unsafe { read_volatile(&uart.lsr) } & LSR_THRE == 0 {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        write_volatile(&mut uart.thr_rbr, c);
+    }
+    // TTY/PTY 屏幕镜像：把串口输出同步到活动会话的 out_q（图形终端主侧读取）。
+    // 未附接时是零开销布尔判断；附接后 GUI 终端因此能看到 Shell 提示符、回显
+    // 与所有命令输出（包含 ANSI 光标/颜色序列）。
+    crate::tty::echo_mirror(c);
+}
 
 /// UART 接收环形缓冲（中断处理例程写入，shell / /dev/tty 读出）。
 /// 4096 字节：足以容纳一次粘贴的大段命令而不会在 shell 忙于执行时溢出丢弃。
@@ -362,8 +376,8 @@ static mut KMSG_LEN: usize = 0;
 pub fn kmsg_put(c: u8) {
     // 保存/恢复 DAIF：可从 IRQ 处理、系统调用、panic 等任意上下文调用
     let saved: u64;
-    unsafe { asm!("mrs {}, daif", out(reg) saved) };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrr {}, sstatus", out(reg) saved) };
+    unsafe { asm!("csrci sstatus, 2") };
     unsafe {
         let i = (KMSG_HEAD + KMSG_LEN) % KMSG_BUF_SIZE;
         KMSG_BUF[i] = c;
@@ -375,7 +389,7 @@ pub fn kmsg_put(c: u8) {
     }
     unsafe {
         asm!(
-            "msr daif, {}",
+            "csrw sstatus, {}",
             in(reg) saved,
         );
     }
@@ -392,53 +406,7 @@ pub fn kmsg_snapshot(out: &mut [u8]) -> usize {
     }
 }
 
-// ==================== UART 驱动 ====================
-
-/// 初始化 PL011：`base` 为 MMIO 基地址，`clock` 为 UART 时钟（Hz）。
-/// 波特率 115200 8N1，使能 FIFO，使能接收中断。
-fn uart_init(base: usize, clock: u32) {
-    unsafe {
-        UART_BASE = base;
-    }
-    let uart = uart();
-    unsafe {
-        // 先关闭 UART，才能安全修改寄存器
-        write_volatile(&mut uart.cr, 0);
-
-        // 波特率除数 = clock / (16 * baud)，小数部分 6 位
-        let divisor = clock / (16 * 115200);
-        let remainder = clock % (16 * 115200);
-        let frac = (remainder * 64 + (16 * 115200) / 2) / (16 * 115200);
-        write_volatile(&mut uart.ibrd, divisor);
-        write_volatile(&mut uart.fbrd, frac);
-
-        // 8N1：字长 8 位（WLEN=0b11），使能 FIFO（FEN）
-        write_volatile(&mut uart.lcr_h, (0b11 << 5) | (1 << 4));
-
-        // 使能接收中断（RXIM）与接收超时中断（RTIM）
-        write_volatile(&mut uart.imsc, IMSC_RXIM | IMSC_RTIM);
-
-        // 使能 UART（UARTEN=bit0）、发送（TXE=bit8）、接收（RXE=bit9）
-        write_volatile(&mut uart.cr, (1 << 0) | (1 << 8) | (1 << 9));
-    }
-}
-
-/// 阻塞发送单个字符
-pub(crate) fn uart_send_char(c: u8) {
-    kmsg_put(c);
-    let uart = uart();
-    // 等待发送 FIFO 非满（TXFF 位清零）
-    while unsafe { read_volatile(&uart.fr) } & FR_TXFF != 0 {
-        core::hint::spin_loop();
-    }
-    unsafe {
-        write_volatile(&mut uart.dr, c as u32);
-    }
-    // TTY/PTY 屏幕镜像：把串口输出同步到活动会话的 out_q（图形终端主侧读取）。
-    // 未附接时是零开销布尔判断；附接后 GUI 终端因此能看到 Shell 提示符、回显
-    // 与所有命令输出（包含 ANSI 光标/颜色序列）。
-    crate::tty::echo_mirror(c);
-}
+// ==================== UART 驱动（初始化/发送见上方 Ns16550 节） ====================
 
 /// 诊断打印（冷路径）：输出标记 + 两个十六进制值。
 pub(crate) fn log_dbg(tag: &str, a: u64, b: u64) {
@@ -468,23 +436,23 @@ pub(crate) fn uart_send_str(s: &str) {
     }
 }
 
-/// 直接从 PL011 硬件接收 FIFO 读一个字节（绕过 IRQ/软件缓冲）。
+/// 直接从 ns16550 硬件接收 FIFO 读一个字节（绕过 IRQ/软件缓冲）。
 /// 供 GDB 调试桩在屏蔽 IRQ 期间使用（此时 RX 中断不触发，软件缓冲不再增长）。
 pub(crate) fn uart_read_hw() -> Option<u8> {
     let uart = uart();
-    if unsafe { read_volatile(&uart.fr) } & FR_RXFE != 0 {
+    if unsafe { read_volatile(&uart.lsr) } & LSR_DR == 0 {
         return None; // FIFO 空
     }
-    Some(unsafe { read_volatile(&uart.dr) } as u8)
+    Some(unsafe { read_volatile(&uart.thr_rbr) })
 }
 
-/// 把 PL011 硬件接收 FIFO 全部排空到软件缓冲（供 GDB 调试桩使用：
+/// 把 ns16550 硬件接收 FIFO 全部排空到软件缓冲（供 GDB 调试桩使用：
 /// 断点期间 IRQ 被屏蔽，RX 中断不触发，必须主动轮询排空 16 字节硬件
 /// FIFO，否则长报文在 FIFO 溢出时丢字节 → 校验和错误）。
 pub(crate) fn uart_drain_hw() {
     let uart = uart();
-    while unsafe { read_volatile(&uart.fr) } & FR_RXFE == 0 {
-        let c = unsafe { read_volatile(&uart.dr) } as u8;
+    while unsafe { read_volatile(&uart.lsr) } & LSR_DR != 0 {
+        let c = unsafe { read_volatile(&uart.thr_rbr) };
         unsafe {
             if UART_RX_COUNT < UART_RX_BUF_SIZE {
                 UART_RX_BUF[UART_RX_TAIL] = c;
@@ -522,7 +490,7 @@ pub(crate) fn uart_rx_pending() -> bool {
 ///
 /// 返回 `None` 表示当前无待读字节。
 pub(crate) fn uart_try_read_char() -> Option<u8> {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let c = unsafe {
         if UART_RX_COUNT == 0 {
             None
@@ -533,18 +501,18 @@ pub(crate) fn uart_try_read_char() -> Option<u8> {
             Some(b)
         }
     };
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     c
 }
 
 /// 读取并清零 UART 溢出丢弃计数（供 shell 提示用户输入被丢弃）。
 pub(crate) fn uart_take_dropped() -> usize {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let d = unsafe { UART_RX_DROPPED };
     unsafe {
         UART_RX_DROPPED = 0;
     }
-    unsafe { asm!("msr daifclr, #2") };
+    unsafe { asm!("csrsi sstatus, 2") };
     d
 }
 
@@ -584,12 +552,12 @@ pub(crate) fn print_dec(mut v: u64) {
 
 // ==================== 系统寄存器访问 ====================
 
-/// 清除 PSTATE 的 I 位，开启 IRQ
+/// 置 sstatus.SIE，开启 IRQ
 ///
 /// # 安全
-/// 调用者必须已正确初始化异常向量表与 GIC，否则开启 IRQ 会导致未定义行为。
+/// 调用者必须已正确初始化 stvec 与 PLIC，否则开启 IRQ 会导致未定义行为。
 pub(crate) unsafe fn enable_irq() {
-    asm!("msr daifclr, #2");
+    asm!("csrsi sstatus, 2");
 }
 
 /// 等待中断
@@ -600,23 +568,33 @@ pub(crate) unsafe fn wfi() {
     asm!("wfi");
 }
 
-/// 读取 ESR_EL1（异常综合寄存器）
+/// 读取 scause（异常原因寄存器）
 ///
 /// # 安全
-/// 需要 EL1 权限。
-unsafe fn read_esr_el1() -> u64 {
+/// 需要 S 模式权限。
+unsafe fn read_scause() -> u64 {
     let v: u64;
-    asm!("mrs {}, esr_el1", out(reg) v);
+    asm!("csrr {}, scause", out(reg) v);
     v
 }
 
-/// 读取 ELR_EL1（异常链接寄存器，保存故障指令地址）
+/// 读取 stval（异常有效值寄存器：故障地址 / 指令编码）
 ///
 /// # 安全
-/// 需要 EL1 权限。
-unsafe fn read_elr_el1() -> u64 {
+/// 需要 S 模式权限。
+unsafe fn read_stval() -> u64 {
     let v: u64;
-    asm!("mrs {}, elr_el1", out(reg) v);
+    asm!("csrr {}, stval", out(reg) v);
+    v
+}
+
+/// 读取 sepc（异常程序计数器，保存故障指令地址）
+///
+/// # 安全
+/// 需要 S 模式权限。
+unsafe fn read_sepc() -> u64 {
+    let v: u64;
+    asm!("csrr {}, sepc", out(reg) v);
     v
 }
 
@@ -625,12 +603,8 @@ unsafe fn read_elr_el1() -> u64 {
 /// UART 接收中断：读取所有可用字符并送入接收环形缓冲（不在此回显，
 /// 回显由消费方如 shell 的行编辑完成）。
 fn uart_handle_rx() {
+    // 16550：读 RBR 即清接收数据中断；FIFO 模式下排空后接收超时中断自清
     unsafe { uart_rx_drain() };
-    let uart = uart();
-    // 清除接收中断与接收超时中断
-    unsafe {
-        write_volatile(&mut uart.icr, ICR_RXIC | ICR_RTIC);
-    }
 }
 
 /// 排空 UART 接收 FIFO 并按正常路径分发（输入子系统优先，其余入 tty 环形缓冲）。
@@ -640,9 +614,9 @@ fn uart_handle_rx() {
 /// 忙等超过该窗口会静默丢输入字节（终端粘贴/自动化测试注入被截断）。
 pub(crate) unsafe fn uart_rx_drain() {
     let uart = uart();
-    // 只要接收 FIFO 非空（RXFE=0）就读取
-    while read_volatile(&uart.fr) & FR_RXFE == 0 {
-        let c = read_volatile(&uart.dr) as u8;
+    // 只要接收 FIFO 有数据（DR=1）就读取
+    while read_volatile(&uart.lsr) & LSR_DR != 0 {
+        let c = read_volatile(&uart.thr_rbr);
         // 触摸协议帧优先：被输入子系统消费的字节不再进入 tty/shell 缓冲
         if input::feed_uart_byte(c) {
             continue;
@@ -672,12 +646,11 @@ pub extern "C" fn rust_main() -> ! {
     let mut uart_base = platform.uart_base();
     let mut uart_irq = platform.uart_irq();
     let mut uart_clk = platform.uart_clock();
-    let mut gicd_base = platform.gicd_base();
-    let mut gicc_base = platform.gicc_base();
+    let mut plic_base = platform.gicd_base(); // HAL 语义复用：gicd_base 返回中断控制器基址（RISC-V = PLIC）
     let mut mem_base = platform.ram_base();
     let mut mem_size = platform.ram_size();
     // fw_cfg 为 QEMU 特有设备（Pi 4 无此设备），保留默认值，由设备树覆盖
-    let mut fwcfg_base: usize = 0x0902_0000;
+    let mut fwcfg_base: usize = 0x1010_0000;
     let mut stdout_path: Option<&str> = None;
     let mut boot_shell = false; // bootargs 含 "shell"：GUI 启动同时拉起内置 shell（QEMU 测试用）
     let mut boot_wifitest = false; // bootargs 含 "wifitest"：无头 Wi-Fi 自检
@@ -740,14 +713,12 @@ pub extern "C" fn rust_main() -> ! {
                 mem_size = size as usize;
             }
         }
-        // UART：优先 stdout-path 指定的节点（secure=on 时 DTB 有 secure-chosen
-        // →0x9040000 与普通 chosen →0x9000000 两个 pl011，控制台接普通串口，
-        // 必须按 stdout-path 选择而非 find_compatible 的首个匹配），
-        // 失败按 /soc/pl011 或 compatible 查找
+        // UART：优先 stdout-path 指定的节点（QEMU virt RISC-V 为
+        // /soc/serial@10000000，ns16550a），失败按 compatible 查找
         let uart = if let Some(sp) = stdout_path {
-            fdt.node(sp).or_else(|| fdt.node("/soc/pl011").or_else(|| fdt.find_compatible("arm,pl011")))
+            fdt.node(sp).or_else(|| fdt.find_compatible("ns16550a"))
         } else {
-            fdt.node("/soc/pl011").or_else(|| fdt.find_compatible("arm,pl011"))
+            fdt.node("/soc/serial").or_else(|| fdt.find_compatible("ns16550a"))
         };
         if let Some(uart) = uart {
             if let Some((base, _)) = uart.reg(&fdt, 0) {
@@ -757,19 +728,28 @@ pub extern "C" fn rust_main() -> ! {
                 uart_irq = fdt::gic_irq(t, n);
             }
         }
-        // UART 时钟：fixed-clock 节点（QEMU virt 为 24MHz）
+        // UART 时钟：fixed-clock 节点；缺失时保持平台默认（QEMU 16550
+        // 不校验波特率分频，时钟精度不影响可用性）
         if let Some(clk) = fdt.find_compatible("fixed-clock") {
             if let Some(freq) = clk.prop_u32(&fdt, "clock-frequency", 0) {
                 uart_clk = freq;
             }
         }
-        // GIC：优先 /soc/gic 路径，失败按 compatible 查找
-        if let Some(gic) = fdt.node("/soc/gic").or_else(|| fdt.find_compatible("arm,cortex-a15-gic")) {
-            if let Some((base, _)) = gic.reg(&fdt, 0) {
-                gicd_base = base as usize;
+        // PLIC：按 compatible 查找（RISC-V DTB 无 GIC 式多 reg 语义，单基址）
+        if let Some(plic) = fdt
+            .find_compatible("riscv,plic0")
+            .or_else(|| fdt.find_compatible("sifive,plic-1.0.0"))
+        {
+            if let Some((base, _)) = plic.reg(&fdt, 0) {
+                plic_base = base as usize;
             }
-            if let Some((base, _)) = gic.reg(&fdt, 1) {
-                gicc_base = base as usize;
+        }
+        // timebase：/cpus/timebase-frequency（QEMU virt RISC-V = 10MHz）
+        if let Some(cpus) = fdt.node("/cpus") {
+            if let Some(hz) = cpus.prop_u32(&fdt, "timebase-frequency", 0) {
+                if hz > 0 {
+                    timer::set_timebase(hz as u64);
+                }
             }
         }
         // fw_cfg（ramfb 帧缓冲配置通道）
@@ -797,6 +777,8 @@ pub extern "C" fn rust_main() -> ! {
 
     // ===== 2. 用设备树信息初始化串口 =====
     uart_init(uart_base, uart_clk);
+    // 电源控制钩子：HAL 平台后端经此取得 SBI 关机/重启实现（PSCI 的 RISC-V 等价物）
+    kunxhal::qemu_power_set_hooks(sbi::shutdown, sbi::system_reset);
     uart_send_str("Hello from Rust kernel!\n");
 
     // ===== 2.05 SMP 多核：唤醒其余核心（QEMU PSCI） =====
@@ -880,10 +862,8 @@ pub extern "C" fn rust_main() -> ! {
         uart_send_str(" clk=");
         print_dec(uart_clk as u64);
         uart_send_str("\n");
-        uart_send_str("[FDT] gic gicd=");
-        print_hex(gicd_base as u64);
-        uart_send_str(" gicc=");
-        print_hex(gicc_base as u64);
+        uart_send_str("[FDT] plic base=");
+        print_hex(plic_base as u64);
         uart_send_str("\n");
     }
 
@@ -975,7 +955,7 @@ pub extern "C" fn rust_main() -> ! {
     gfx_boot(fwcfg_base);
 
     // ===== 6. 初始化中断控制器与定时器 =====
-    gic::gic_init(gicd_base, gicc_base);
+    plic::plic_init(plic_base);
     let virtio_kbd = virtio_input::init(&virtio_devs[..virtio_count]);
     kinfo! {
         if virtio_kbd {
@@ -1002,14 +982,12 @@ pub extern "C" fn rust_main() -> ! {
     interrupt::register_handler(timer::TIMER2_IRQ, timer::timer2_handle_irq);
     interrupt::register_handler(uart_irq, uart_handle_rx);
 
-    // ===== 8. 配置并使能 GIC 中断 =====
-    gic::gic_enable_irq(timer::TIMER_IRQ);
-    gic::gic_set_priority(timer::TIMER_IRQ, 0x80);
-    gic::gic_enable_irq(timer::TIMER2_IRQ); // 动画帧 tick（手势动画渲染管线）
-    gic::gic_set_priority(timer::TIMER2_IRQ, 0x80);
-    gic::gic_enable_irq(uart_irq);
-    gic::gic_set_priority(uart_irq, 0xA0);
-    gic::gic_set_target(uart_irq, 0x01); // 目标 CPU0
+    // ===== 8. 配置并使能 PLIC 中断 =====
+    // 监督定时器（调度 tick + 动画帧）不走 PLIC（scause=5），由 SBI 编程；
+    // 此处只使能外部设备中断（UART 等）。virtio 各设备 IRQ 由各自驱动
+    // 探测时使能。
+    plic::plic_enable_irq(uart_irq);
+    plic::plic_set_priority(uart_irq, 0xA0);
 
     // ===== 8.5 启动期动画管线性能测试（仅 bootargs 含 "perftest" 时执行） =====
     // 默认跳过：该测试固定消耗约 1.5s 来宾时间（1s 120Hz 看门狗 + A/B/C 约 300 帧
@@ -1727,6 +1705,14 @@ const BOOT_SPLASH_HOLD_US: u64 = 1_200_000;
 // ==================== bootloader 启动画面交接 ====================
 
 /// bootloader 写入交接信息的物理地址（与 kunxboot/src/splash.rs 一致）。
+///
+/// RISC-V：kunxboot（ARM bootloader）不参与启动，此地址只需**可安全读取**
+/// 的清零内存（magic 校验不过 → 无交接，走正常 fb_init 路径）。选 0x8010_0000
+/// （OpenSBI 区之上、内核 0x80200000 之下的空闲 RAM，恒等映射 2MB 块覆盖）。
+/// aarch64 保持 kunxboot 协议地址 0x46F0_0000。
+#[cfg(target_arch = "riscv64")]
+const SPLASH_HANDOFF_ADDR: usize = 0x8010_0000;
+#[cfg(not(target_arch = "riscv64"))]
 const SPLASH_HANDOFF_ADDR: usize = 0x46F0_0000;
 /// 交接信息魔数（"KNXS"）。
 const SPLASH_MAGIC: u32 = 0x4B4E_5853;
@@ -2027,7 +2013,7 @@ impl Write for UartWriter {
 /// 栈回溯前 64 字 + 返回地址扫描，便于定位 kmalloc OOM 等 panic 的调用链。
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     uart_send_str("PANIC: ");
     let mut writer = UartWriter;
     // 格式化 panic 信息（含位置与消息）
@@ -2040,7 +2026,7 @@ fn panic(info: &PanicInfo) -> ! {
     uart_send_str(crate::sched_cfs::current_task_name());
     uart_send_str(" sp=");
     let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp) };
+    unsafe { asm!("mv {}, sp", out(reg) sp) };
     crate::print_hex(sp);
     // 栈回溯（前 64 个 8 字节）与返回地址扫描（.text 区内的字）
     uart_send_str("\n[stack] ");
@@ -2052,7 +2038,7 @@ fn panic(info: &PanicInfo) -> ! {
     uart_send_str("\n[ret-scan] ");
     for i in 0..256usize {
         let v = unsafe { *((sp as *const u64).add(i)) };
-        if (0x4008_0000..0x400c_3000).contains(&v) {
+        if (0x8020_0000usize..crate::kernel_end()).contains(&(v as usize)) {
             uart_send_str("ret?=");
             crate::print_hex(v);
             uart_send_str(" ");
@@ -2084,11 +2070,11 @@ fn panic(info: &PanicInfo) -> ! {
 extern "C" fn sync_exception_handler() -> ! {
     // 防递归：入口屏蔽 IRQ 并记录首次故障，避免 panic 处理自身再次
     // 触发异常（用户栈区 sp 等损坏状态会无限递归刷屏）
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     static mut FIRST: bool = true;
     if unsafe { !FIRST } {
-        let esr = unsafe { read_esr_el1() };
-        uart_send_str("PANIC（重入）ESR=");
+        let esr = unsafe { read_scause() };
+        uart_send_str("PANIC（重入）scause=");
         print_hex(esr);
         uart_send_str("\n");
         loop {
@@ -2096,25 +2082,16 @@ extern "C" fn sync_exception_handler() -> ! {
         }
     }
     unsafe { FIRST = false };
-    // 读取异常综合寄存器（异常原因）与异常链接寄存器（故障地址）
-    let esr = unsafe { read_esr_el1() };
-    let elr = unsafe { read_elr_el1() };
-    let far: u64;
-    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
-    uart_send_str("PANIC: 同步异常 ESR=");
+    // 读取异常原因与故障地址（Sv39：scause/stval/sepc）
+    let esr = unsafe { read_scause() };
+    let elr = unsafe { read_sepc() };
+    let far = unsafe { read_stval() };
+    uart_send_str("PANIC: 同步异常 scause=");
     print_hex(esr);
-    uart_send_str(" ELR=");
+    uart_send_str(" sepc=");
     print_hex(elr);
-    uart_send_str(" FAR=");
+    uart_send_str(" stval=");
     print_hex(far);
-    // PAN 故障诊断：DFSC=permission fault（0b001001/0b001011/0b001101/0b001111）
-    // 且 FAR 落在用户地址范围、SCTLR_EL1.PAN 已置位 → 内核漏了 uaccess 包装
-    let dfsc = (esr & 0x3F) as u32;
-    let is_perm_fault = matches!(dfsc & 0b111001, 0b001001 | 0b010001);
-    if is_perm_fault && far < crate::vm::USER_VA_TOP as u64 && mmu::pan_supported() {
-        uart_send_str("\n[PAN] EL1 访问用户内存被 PAN 拦截（漏了 uaccess_begin/end 包装？）"
-            );
-    }
     uart_send_str(" pid=");
     crate::print_dec(crate::sched_cfs::current_pid() as u64);
     uart_send_str(" tid=");
@@ -2123,7 +2100,7 @@ extern "C" fn sync_exception_handler() -> ! {
     uart_send_str(crate::sched_cfs::current_task_name());
     uart_send_str(" sp=");
     let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp) };
+    unsafe { asm!("mv {}, sp", out(reg) sp) };
     print_hex(sp);
     // 故障点通用寄存器（sync_entry 汇编入口保存，未被 print 污染）
     uart_send_str("\n[regs] ");
@@ -2145,7 +2122,7 @@ extern "C" fn sync_exception_handler() -> ! {
     uart_send_str("\n[ret-scan] ");
     for i in 0..256usize {
         let v = unsafe { *((sp as *const u64).add(i)) };
-        if (0x4008_0000..0x400c_3000).contains(&v) {
+        if (0x8020_0000usize..crate::kernel_end()).contains(&(v as usize)) {
             uart_send_str("ret?=");
             print_hex(v);
             uart_send_str(" ");
@@ -2176,11 +2153,10 @@ extern "C" fn sync_exception_handler() -> ! {
 /// 由汇编 `unknown_fault_entry` 调用（无保存寄存器，仅读系统寄存器）。
 #[no_mangle]
 extern "C" fn unknown_exception_handler() -> ! {
-    let esr = unsafe { read_esr_el1() };
-    let elr = unsafe { read_elr_el1() };
-    let far: u64;
-    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
-    uart_send_str("PANIC: 未处理异常（FIQ/SError/SP0）ESR=");
+    let esr = unsafe { read_scause() };
+    let elr = unsafe { read_sepc() };
+    let far = unsafe { read_stval() };
+    uart_send_str("PANIC: 未处理异常 scause=");
     crate::print_hex(esr);
     uart_send_str(" ELR=");
     crate::print_hex(elr);
@@ -2200,14 +2176,13 @@ extern "C" fn unknown_exception_handler() -> ! {
 /// 由汇编 `el0_fault` 入口调用（陷阱帧已保存在内核栈上，sp 传入）。
 #[no_mangle]
 extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
-    let esr = unsafe { read_esr_el1() };
-    let elr = unsafe { read_elr_el1() };
+    let esr = unsafe { read_scause() };
+    let elr = unsafe { read_sepc() };
     let pid = crate::sched_cfs::current_pid();
     // [crash] 生成并落盘 tombstone（SIGSEGV/SIGILL/SIGTRAP 语义，
     // 含寄存器/内存映射/栈回溯/日志快照），随后继续打印详细诊断。
     {
-        let far: u64;
-        unsafe { asm!("mrs {}, far_el1", out(reg) far) };
+        let far = unsafe { read_stval() };
         let sig = crate::crash::esr_describe(esr).0;
         let fi = crate::crash::FaultInfo {
             kind: crate::crash::signal_name(sig),
@@ -2248,49 +2223,48 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     // 转储陷阱帧中的 sp_el0/elr/spsr（frame 指向栈上的 TrapFrame）
     let (f_sp, f_elr, f_spsr) = unsafe {
         let p = frame as *const u64;
-        (*p.add(31), *p.add(32), *p.add(33)) // sp_el0@0xf8/32, elr@0x100/33, spsr@0x108/34
+        // x[2](用户 sp)@2, elr@33, spsr@34（新布局：x[0..32] + 兼容位 + elr + spsr）
+        (*p.add(2), *p.add(33), *p.add(34))
     };
-    uart_send_str("\n[el0-fault frame] sp_el0=");
+    uart_send_str("\n[el0-fault frame] sp(x2)=");
     print_hex(f_sp);
     uart_send_str(" elr=");
     print_hex(f_elr);
-    uart_send_str(" spsr=");
+    uart_send_str(" sstatus=");
     print_hex(f_spsr);
 
-    // 关键调用寄存器：x29(fp)/x30(lr)/x0/x1/x8（定位跳转 0 的调用点）
+    // 关键调用寄存器：s0(x8,fp)/ra(x1)/a0(x10)/a1(x11)/a7(x17)（定位跳转 0
+    // 的调用点；riscv 帧指针为 s0，返回地址为 ra）
     let (x29, x30, x0, x1, x8) = unsafe {
         let p = frame as *const u64;
-        (*p.add(29), *p.add(30), *p.add(0), *p.add(1), *p.add(8))
+        (*p.add(8), *p.add(1), *p.add(10), *p.add(11), *p.add(8))
     };
-    uart_send_str(" x29=");
+    uart_send_str(" fp(x8)=");
     print_hex(x29);
-    uart_send_str(" x30=");
+    uart_send_str(" ra(x1)=");
     print_hex(x30);
-    uart_send_str(" x0=");
+    uart_send_str(" a0(x10)=");
     print_hex(x0);
-    uart_send_str(" x1=");
+    uart_send_str(" a1(x11)=");
     print_hex(x1);
-    uart_send_str(" x8=");
-    print_hex(x8);
     let (x19, x20, x21, x22, x23) = unsafe {
         let p = frame as *const u64;
-        (*p.add(19), *p.add(20), *p.add(21), *p.add(22), *p.add(23))
+        (*p.add(17), *p.add(5), *p.add(6), *p.add(2), *p.add(3))
     };
-    uart_send_str(" x19=");
+    uart_send_str(" a7(x17)=");
     print_hex(x19);
-    uart_send_str(" x20=");
+    uart_send_str(" t0(x5)=");
     print_hex(x20);
-    uart_send_str(" x21=");
+    uart_send_str(" t1(x6)=");
     print_hex(x21);
-    uart_send_str(" x22=");
+    uart_send_str(" sp(x2)=");
     print_hex(x22);
-    uart_send_str(" x23=");
+    uart_send_str(" gp(x3)=");
     print_hex(x23);
 
-    // FAR_EL1：data abort 时是故障访问地址（定位越界写目标）
-    let far: u64;
-    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
-    uart_send_str(" far=");
+    // stval：data abort 时是故障访问地址（定位越界写目标）
+    let far = unsafe { read_stval() };
+    uart_send_str(" stval=");
     print_hex(far);
 
     // 诊断：用户栈 VA 与帧缓冲映射 VA 的物理页（核对栈/显存物理页是否重叠）
@@ -2343,8 +2317,8 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
     unsafe { crate::mmu::uaccess_end() };
     uart_send_str("\n");
 
-    // 用户回溯：沿 x29 帧指针链（每帧 [fp]=prev_fp, [fp+8]=lr）打印调用栈，
-    // 定位「ret 到 0 / 垃圾地址」时崩溃函数的调用者。
+    // 用户回溯：沿 s0 帧指针链（每帧 [fp]=prev_fp, [fp-8]=ra，riscv 布局）
+    // 打印调用栈，定位「ret 到 0 / 垃圾地址」时崩溃函数的调用者。
     uart_send_str(" [user-bt]");
     let mut fp = x29;
     let mut steps = 0;
@@ -2358,7 +2332,7 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
             break;
         }
         let prev_fp = unsafe { *(fp as *const u64) };
-        let lr = unsafe { *((fp + 8) as *const u64) };
+        let lr = unsafe { *((fp - 8) as *const u64) };
         uart_send_str(" [fp=");
         print_hex(fp);
         uart_send_str(" lr=");
@@ -2375,7 +2349,7 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
 
     // 内核栈溢出检测：栈底 16 字节应为 0xA5 填充模式
     let (sb, st) = crate::sched_cfs::current_stack();
-    if sb >= 0x4000_0000 && st > sb {
+    if sb >= 0x8000_0000 && st > sb {
         let mut clobbered = 0usize;
         for off in (0..64usize).step_by(8) {
             let v = unsafe { *((sb + off) as *const u64) };
@@ -2435,607 +2409,427 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
 /// 本函数在 IRQ 屏蔽态下运行（lower_sync 入口已 `daifset`），期间不允许被
 /// 抢占，因此读 ESR/FAR 与落地是原子的。
 #[no_mangle]
-extern "C" fn el0_page_fault_handler(_frame: *mut u8) -> bool {
-    // ESR_EL1：DFSC 位于 bits[5:0]
-    let esr: u64;
-    unsafe { asm!("mrs {}, esr_el1", out(reg) esr) };
-    let dfsc = (esr & 0x3F) as u32;
-    // FAR_EL1：data abort 的故障访问地址
-    let far: u64;
-    unsafe { asm!("mrs {}, far_el1", out(reg) far) };
-    let va = far as usize;
+extern "C" fn el0_page_fault_handler(_frame: *mut u8, stval: usize) -> bool {
+    // stval：缺页故障访问地址（interrupt.rs 从 stval 寄存器传入）
+    let va = stval;
     if !crate::vm::user_va_range_ok(va, 1) {
         return false;
     }
-    // 掩掉 level 位（bit1、bit2、bit3）与 TTL 位（bit4），只保留故障类型：
-    //   translation（任意 level）→ 0b000001
-    //   permission L0/L1（无 TTL）→ 0b001001；permission L2/L3（TTL）→ 0b010001
-    const DFSC_TRANSLATION: u32 = 0b000001;
-    const DFSC_PERMISSION_L01: u32 = 0b001001;
-    const DFSC_PERMISSION_L23: u32 = 0b010001;
-    // 各级 translation/permission/AF 编码经掩码归一：全部先试 LAZY 预留页
-    // 落地（mmap 匿名区被继承的内核恒等映射 2MB 块遮盖时报 L2 权限错误而非
-    // translation），再试 COW，均失败才 SIGSEGV。wild 指针因无记录自然落到
-    // SIGSEGV 分支，语义不变。
-    let _ = dfsc;
+    // Sv39 缺页成因（scause 12/13/15：取指/读/写缺页）不区分 translation 与
+    // permission（后者以 access-fault 编码）：全部先试 LAZY 预留页落地
+    // （mmap 匿名区按需分页），再试 COW，均失败才 SIGSEGV。wild 指针因无
+    // 记录自然落到 SIGSEGV 分支，语义不变。
     if crate::process::page_fault_resolve(va) {
         true
     } else {
         crate::process::cow_break(va)
     }
 }
-// ==================== 启动汇编 ====================
+
+// ==================== FP 现场保存/恢复（inline asm! 辅助） ====================
+//
+// global_asm! 在 opt-level>0 时不接受 FP 指令（rustc 内建汇编器不随
+// -Ctarget-feature 开 D 扩展，LTO/优化路径一致拒绝 fsd/fld），而 inline
+// asm! 经 LLVM 代码生成、继承 riscv64gc 全部扩展。陷阱帧 FP 区布局：
+// f0-f31 @0x120..0x320，fcsr @0x320。
+
+/// 保存 f0-f31 + fcsr 到陷阱帧 FP 区（`p` = 帧基址）。
+#[no_mangle]
+pub unsafe extern "C" fn trap_save_fp(p: *mut u8) {
+    asm!(
+        "fsd f0, 0x120({p})",
+        "fsd f1, 0x128({p})",
+        "fsd f2, 0x130({p})",
+        "fsd f3, 0x138({p})",
+        "fsd f4, 0x140({p})",
+        "fsd f5, 0x148({p})",
+        "fsd f6, 0x150({p})",
+        "fsd f7, 0x158({p})",
+        "fsd f8, 0x160({p})",
+        "fsd f9, 0x168({p})",
+        "fsd f10, 0x170({p})",
+        "fsd f11, 0x178({p})",
+        "fsd f12, 0x180({p})",
+        "fsd f13, 0x188({p})",
+        "fsd f14, 0x190({p})",
+        "fsd f15, 0x198({p})",
+        "fsd f16, 0x1A0({p})",
+        "fsd f17, 0x1A8({p})",
+        "fsd f18, 0x1B0({p})",
+        "fsd f19, 0x1B8({p})",
+        "fsd f20, 0x1C0({p})",
+        "fsd f21, 0x1C8({p})",
+        "fsd f22, 0x1D0({p})",
+        "fsd f23, 0x1D8({p})",
+        "fsd f24, 0x1E0({p})",
+        "fsd f25, 0x1E8({p})",
+        "fsd f26, 0x1F0({p})",
+        "fsd f27, 0x1F8({p})",
+        "fsd f28, 0x200({p})",
+        "fsd f29, 0x208({p})",
+        "fsd f30, 0x210({p})",
+        "fsd f31, 0x218({p})",
+        "csrr {t}, fcsr",
+        "sd {t}, 0x320({p})",
+        p = in(reg) p,
+        t = out(reg) _,
+        options(nostack),
+    );
+}
+
+/// 从陷阱帧 FP 区恢复 f0-f31 + fcsr（`p` = 帧基址）。
+#[no_mangle]
+pub unsafe extern "C" fn trap_restore_fp(p: *mut u8) {
+    asm!(
+        "ld {t}, 0x320({p})",
+        "csrw fcsr, {t}",
+        "fld f0, 0x120({p})",
+        "fld f1, 0x128({p})",
+        "fld f2, 0x130({p})",
+        "fld f3, 0x138({p})",
+        "fld f4, 0x140({p})",
+        "fld f5, 0x148({p})",
+        "fld f6, 0x150({p})",
+        "fld f7, 0x158({p})",
+        "fld f8, 0x160({p})",
+        "fld f9, 0x168({p})",
+        "fld f10, 0x170({p})",
+        "fld f11, 0x178({p})",
+        "fld f12, 0x180({p})",
+        "fld f13, 0x188({p})",
+        "fld f14, 0x190({p})",
+        "fld f15, 0x198({p})",
+        "fld f16, 0x1A0({p})",
+        "fld f17, 0x1A8({p})",
+        "fld f18, 0x1B0({p})",
+        "fld f19, 0x1B8({p})",
+        "fld f20, 0x1C0({p})",
+        "fld f21, 0x1C8({p})",
+        "fld f22, 0x1D0({p})",
+        "fld f23, 0x1D8({p})",
+        "fld f24, 0x1E0({p})",
+        "fld f25, 0x1E8({p})",
+        "fld f26, 0x1F0({p})",
+        "fld f27, 0x1F8({p})",
+        "fld f28, 0x200({p})",
+        "fld f29, 0x208({p})",
+        "fld f30, 0x210({p})",
+        "fld f31, 0x218({p})",
+        p = in(reg) p,
+        t = out(reg) _,
+        options(nostack),
+    );
+}
+
+// ==================== 启动/陷入汇编（RISC-V Sv39 + S 模式） ====================
 
 global_asm!(
     r#"
-    // ===== 启动代码：从复位向量开始 =====
+    // ============================================================
+    // 启动代码：OpenSBI fw_dynamic 以 S 模式进入
+    //   a0 = hartid，a1 = DTB 物理地址，MMU 关（satp=0）
+    // ============================================================
     .section .text._start, "ax"
     .global _start
     .type _start, %function
 _start:
-    // 保存 QEMU 通过 x0 传入的设备树地址到 x19（启动代码不使用 x19，后续会写入 DTB_ADDR）
-    mov x19, x0
-
-    // ===== 若当前在 EL2（secure=on：EL3 固件把内核带到 EL2），先降到 EL1 =====
-    bl drop_to_el1
-
-    // 关闭 MMU：清除 SCTLR_EL1 的 M 位（bit0）
-    mrs x0, sctlr_el1
-    bic x0, x0, #1
-    msr sctlr_el1, x0
-    isb
-
-    // 切换当前栈指针为 SP_EL1（SPSel=1）
-    msr spsel, #1
-    isb
-    // 设置 EL1 栈指针为 0x40080000（mov sp 写入当前选中的 SP_EL1）
-    ldr x0, =_stack_top
-    mov sp, x0
-
-    // 设置异常向量表基地址
-    ldr x0, =vector_table
-    msr vbar_el1, x0
-    isb
-
-    // 清零 BSS 段
-    ldr x0, =_bss_start
-    ldr x1, =_bss_end
+    // sscratch 停泊约定：用户态运行时 = 下次用户陷入用的内核栈指针；
+    // 内核态运行时 = 0（陷入入口据此区分来源，见 trap_entry）
+    csrw sscratch, zero
+    // 非 boot hart（OpenSBI 把所有 hart 都带到这）→ 停车场等待调度就绪
+    bnez a0, park
+    mv tp, a0                    // tp = hartid（cpu_id 读此寄存器）
+    // 保存 DTB 地址到全局（在 BSS 清零之后写入才有效——先清 BSS 再写）
+    // 关 MMU（防御 OpenSBI 遗留 satp；清 satp 后必须 sfence）
+    csrw satp, zero
+    sfence.vma
+    // 引导栈：链接脚本 .bootstack 段尾（栈向下生长）
+    la sp, _stack_top
+    // 清零 BSS（sd 对齐推进；_bss_start/_bss_end 均 8 字节对齐由链接脚本保证）
+    la t0, _bss_start
+    la t1, _bss_end
 1:
-    cmp x0, x1
-    b.ge 2f
-    str xzr, [x0], #8
-    b 1b
+    bgeu t0, t1, 2f
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    j 1b
 2:
+    // 写入 DTB 地址（BSS 已清零）
+    la t0, DTB_ADDR
+    sd a1, 0(t0)
+    // FPU 使能（sstatus.FS=Dirty）：复位后 FS=Off，任何浮点指令触发
+    // illegal instruction；Rust 编译器可能生成浮点/向量访问
+    li t0, 0x6000
+    csrs sstatus, t0
+    // SUM|MXR：S 模式可访问 U 页 / 读仅执行页（内核直读用户内存）
+    li t0, 0xC0000
+    csrs sstatus, t0
+    // 统一陷入入口
+    la t0, trap_entry
+    csrw stvec, t0
+    // 屏蔽中断，进入 Rust 主体
+    csrci sstatus, 2
+    call rust_main
+    // rust_main 不应返回
+3:  wfi
+    j 3b
 
-    // 使能 FP/SIMD：CPACR_EL1.FPEN = 0b11（bits[21:20]）。
-    // 复位时 FP/SIMD 被禁用，Rust 编译器可能生成 NEON 指令（如向量化初始化），
-    // 若不使能会在执行 SIMD 指令时触发 synchronous trap。
-    mov x0, #0x300000
-    msr cpacr_el1, x0
-    isb
-
-    // 把保存的设备树地址写入全局变量（必须在 BSS 清零之后）
-    ldr x1, =DTB_ADDR
-    str x19, [x1]
-
-    // 跳转到 Rust 主函数
-    bl rust_main
-
-    // rust_main 不应返回，若返回则死循环
-    b .
-
-    // ===== secondary 核入口（SMP，PSCI CPU_ON 引导至此） =====
-    .section .text.secondary, "ax"
-    .global secondary_entry
-    .type secondary_entry, %function
-secondary_entry:
-    // x0 = cpu id（从 MPIDR 读取，不依赖 PSCI context_id）
-    mrs x19, mpidr_el1
-    and x19, x19, #0xFF
-    // 设置 per-cpu 栈：SECONDARY_STACKS + cpu*STACK_SIZE + STACK_SIZE。
-    // SP 防御性 16 字节向下对齐（AAPCS64）：SECONDARY_STACKS 声明已带
-    // #[repr(align(16))]，此处兜底任何链接布局（对齐丢失 ≤15 字节）。
-    ldr x0, =SECONDARY_STACKS
-    mov x1, #16384
-    madd x0, x19, x1, x0
-    add x0, x0, x1
-    bic x0, x0, #0xF
-    mov sp, x0
-    // 若 PSCI 以 EL2 唤醒（secure=on），降到 EL1
-    bl drop_to_el1
-    // 使能 FP/SIMD（与 _start 一致）
-    mov x0, #0x300000
-    msr cpacr_el1, x0
-    isb
-    // 设置异常向量表
-    ldr x0, =vector_table
-    msr vbar_el1, x0
-    isb
-    mov x0, x19
-    bl smp_secondary_main
-    b .
-
-    // ===== 子程序：当前在 EL2 时降到 EL1（调用者处于 EL2 或 EL1 均可） =====
-    // 返回后处于 EL1，继续执行调用点之后的代码。
-    // 仅供 secure=on（EL3 固件把内核/唤醒核带到 EL2）的启动路径使用。
-    .section .text.drop_to_el1, "ax"
-    .global drop_to_el1
-    .type drop_to_el1, %function
-drop_to_el1:
-    mrs x9, currentel
-    and x9, x9, #0xC
-    cmp x9, #0x8
-    b.ne 9f
-    // 配置 HCR_EL2.RW=1（EL1 以 AArch64 运行）
-    mrs x9, hcr_el2
-    orr x9, x9, #(1 << 31)
-    msr hcr_el2, x9
-    isb
-    // 清零 SCTLR_EL1（关闭 EL1 MMU/缓存，恢复复位语义）
-    msr sctlr_el1, xzr
-    // 降到 EL1：SPSR_EL2 = EL1h + DAIF 屏蔽，ELR_EL2 = 继续执行的地址
-    mov x9, #0x3C5
-    msr spsr_el2, x9
-    adr x9, 9f
-    msr elr_el2, x9
-    eret
-9:
-    ret
-
-    // ===== 异常向量表：必须 2KB 对齐，每个表项必须位于 0x80 偏移处 =====
-    .section .text.vector, "ax"
-    .balign 2048
-    .global vector_table
-vector_table:
-    // 当前 EL + SP_EL0（内核不运行于 SP0，若触发说明配置错误：打印诊断）
-    b unknown_fault_entry  // 0x000 同步异常
-    .balign 0x80
-    b unknown_fault_entry  // 0x080 IRQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x100 FIQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x180 SError
-    .balign 0x80
-    // 当前 EL + SP_ELx
-    b sync_entry        // 0x200 同步异常
-    .balign 0x80
-    b irq_entry         // 0x280 IRQ（使用 SP_EL1 时的 IRQ 入口）
-    .balign 0x80
-    b unknown_fault_entry  // 0x300 FIQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x380 SError
-    .balign 0x80
-    // 低特权级 AArch64
-    b lower_sync         // 0x400 同步异常（svc #0）
-    .balign 0x80
-    b irq_entry          // 0x480 IRQ（EL0 被定时器抢占时，复用 EL1 的 IRQ 处理入口）
-    .balign 0x80
-    b unknown_fault_entry  // 0x500 FIQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x580 SError
-    .balign 0x80
-    // 低特权级 AArch32（本系统不运行 AArch32：打印诊断后停机）
-    b unknown_fault_entry  // 0x600 同步异常
-    .balign 0x80
-    b unknown_fault_entry  // 0x680 IRQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x700 FIQ
-    .balign 0x80
-    b unknown_fault_entry  // 0x780 SError
-    .balign 0x80
-
-    // ===== 未接线异常入口：屏蔽 IRQ 后调用 Rust 诊断处理器 =====
-    .type unknown_fault_entry, %function
-unknown_fault_entry:
-    msr daifset, #2
-    bl unknown_exception_handler
-    b .
-
-    // ===== IRQ 处理入口：保存现场 -> 调用 Rust handler -> 恢复现场 -> eret =====
-    .type irq_entry, %function
-irq_entry:
-    // 立即屏蔽 IRQ（硬件入口已置 I=1，此处显式化）：保证后续寄存器保存与
-    // elr_el1/spsr_el1 的读取在屏蔽态下原子完成，杜绝嵌套抢占污染。
-    msr daifset, #2
-    // 保存通用寄存器 x0-x30（32*8=256 字节）+ FP/SIMD 上下文
-    // （v0-v31 + fpsr/fpcr @0x108 起，共 520 字节）；帧总 784 字节、16 对齐。
-    sub sp, sp, #784
-    stp x0, x1, [sp, #(16 * 0)]
-    stp x2, x3, [sp, #(16 * 1)]
-    stp x4, x5, [sp, #(16 * 2)]
-    stp x6, x7, [sp, #(16 * 3)]
-    stp x8, x9, [sp, #(16 * 4)]
-    stp x10, x11, [sp, #(16 * 5)]
-    stp x12, x13, [sp, #(16 * 6)]
-    stp x14, x15, [sp, #(16 * 7)]
-    stp x16, x17, [sp, #(16 * 8)]
-    stp x18, x19, [sp, #(16 * 9)]
-    stp x20, x21, [sp, #(16 * 10)]
-    stp x22, x23, [sp, #(16 * 11)]
-    stp x24, x25, [sp, #(16 * 12)]
-    stp x26, x27, [sp, #(16 * 13)]
-    stp x28, x29, [sp, #(16 * 14)]
-    str x30, [sp, #(16 * 15)]
-    // FP/SIMD 保存 @0x100（q 寄存器对，16 对齐）
-    stp q0, q1, [sp, #0x100]
-    stp q2, q3, [sp, #0x120]
-    stp q4, q5, [sp, #0x140]
-    stp q6, q7, [sp, #0x160]
-    stp q8, q9, [sp, #0x180]
-    stp q10, q11, [sp, #0x1A0]
-    stp q12, q13, [sp, #0x1C0]
-    stp q14, q15, [sp, #0x1E0]
-    stp q16, q17, [sp, #0x200]
-    stp q18, q19, [sp, #0x220]
-    stp q20, q21, [sp, #0x240]
-    stp q22, q23, [sp, #0x260]
-    stp q24, q25, [sp, #0x280]
-    stp q26, q27, [sp, #0x2A0]
-    stp q28, q29, [sp, #0x2C0]
-    stp q30, q31, [sp, #0x2E0]
-    mrs x9, fpsr
-    str x9, [sp, #0x300]
-    mrs x9, fpcr
-    str x9, [sp, #0x308]
-
-    // 调用 Rust IRQ 处理器
-    bl irq_handler
-
-    // 防御护栏：返回 EL0 前校验 eret 目标。用户态 IRQ 的中断点（elr_el1）在
-    // 被抢占/恢复期间若被损坏为 0 或内核地址（>1GB），eret 会让用户态从 PC=0
-    // 或内核地址取指（表现为偶发「EL0 取指 PC=0 / 执行内核代码」故障）。
-    // 校验放在**弹出用户寄存器之前**（x9/x10 随后被 pop 恢复，不污染用户现场）；
-    // EL1 返回（M≠0，syscall/内核上下文里的 IRQ）跳过校验。
-    mrs x9, spsr_el1
-    and w10, w9, #0xf
-    cbnz w10, 1f
-    mrs x9, elr_el1
-    cbz x9, 2f
-    movz x10, #0x4000, lsl #16
-    cmp x9, x10
-    b.hs 2f
+    // ============================================================
+    // secondary hart 停车场：等待主核置 SCHED_READY 后进调度器
+    // ============================================================
+    .section .text._start
+    .type park, %function
+park:
+    mv tp, a0                    // tp = hartid
+    la t0, trap_entry
+    csrw stvec, t0
+    // FPU + SUM/MXR（与 _start 一致；satp 由 smp_secondary_main→mmu::init_secondary 配置）
+    li t0, 0x6000
+    csrs sstatus, t0
+    li t0, 0xC0000
+    csrs sstatus, t0
+    csrci sstatus, 2
 1:
-    // 恢复 FP/SIMD 上下文（x9 随后从帧中恢复）
-    ldp q0, q1, [sp, #0x100]
-    ldp q2, q3, [sp, #0x120]
-    ldp q4, q5, [sp, #0x140]
-    ldp q6, q7, [sp, #0x160]
-    ldp q8, q9, [sp, #0x180]
-    ldp q10, q11, [sp, #0x1A0]
-    ldp q12, q13, [sp, #0x1C0]
-    ldp q14, q15, [sp, #0x1E0]
-    ldp q16, q17, [sp, #0x200]
-    ldp q18, q19, [sp, #0x220]
-    ldp q20, q21, [sp, #0x240]
-    ldp q22, q23, [sp, #0x260]
-    ldp q24, q25, [sp, #0x280]
-    ldp q26, q27, [sp, #0x2A0]
-    ldp q28, q29, [sp, #0x2C0]
-    ldp q30, q31, [sp, #0x2E0]
-    ldr x9, [sp, #0x300]
-    msr fpsr, x9
-    ldr x9, [sp, #0x308]
-    msr fpcr, x9
-    // 恢复通用寄存器
-    ldp x0, x1, [sp, #(16 * 0)]
-    ldp x2, x3, [sp, #(16 * 1)]
-    ldp x4, x5, [sp, #(16 * 2)]
-    ldp x6, x7, [sp, #(16 * 3)]
-    ldp x8, x9, [sp, #(16 * 4)]
-    ldp x10, x11, [sp, #(16 * 5)]
-    ldp x12, x13, [sp, #(16 * 6)]
-    ldp x14, x15, [sp, #(16 * 7)]
-    ldp x16, x17, [sp, #(16 * 8)]
-    ldp x18, x19, [sp, #(16 * 9)]
-    ldp x20, x21, [sp, #(16 * 10)]
-    ldp x22, x23, [sp, #(16 * 11)]
-    ldp x24, x25, [sp, #(16 * 12)]
-    ldp x26, x27, [sp, #(16 * 13)]
-    ldp x28, x29, [sp, #(16 * 14)]
-    ldr x30, [sp, #(16 * 15)]
-    add sp, sp, #784
-    // 异常返回
-    eret
-2:
-    // 校验失败：把 IRQ 帧转成 272 字节陷阱帧（基址下移 16 字节 + 补 sp_el0/elr/spsr），
-    // 走 el0_fault 干净终止进程（罕见路径，长度无所谓）。
-    sub sp, sp, #16
-    ldr x0, [sp, #0x10]; str x0, [sp, #0x00]
-    ldr x1, [sp, #0x18]; str x1, [sp, #0x08]
-    ldr x2, [sp, #0x20]; str x2, [sp, #0x10]
-    ldr x3, [sp, #0x28]; str x3, [sp, #0x18]
-    ldr x4, [sp, #0x30]; str x4, [sp, #0x20]
-    ldr x5, [sp, #0x38]; str x5, [sp, #0x28]
-    ldr x6, [sp, #0x40]; str x6, [sp, #0x30]
-    ldr x7, [sp, #0x48]; str x7, [sp, #0x38]
-    ldr x8, [sp, #0x50]; str x8, [sp, #0x40]
-    ldr x9, [sp, #0x58]; str x9, [sp, #0x48]
-    ldr x10, [sp, #0x60]; str x10, [sp, #0x50]
-    ldr x11, [sp, #0x68]; str x11, [sp, #0x58]
-    ldr x12, [sp, #0x70]; str x12, [sp, #0x60]
-    ldr x13, [sp, #0x78]; str x13, [sp, #0x68]
-    ldr x14, [sp, #0x80]; str x14, [sp, #0x70]
-    ldr x15, [sp, #0x88]; str x15, [sp, #0x78]
-    ldr x16, [sp, #0x90]; str x16, [sp, #0x80]
-    ldr x17, [sp, #0x98]; str x17, [sp, #0x88]
-    ldr x18, [sp, #0xa0]; str x18, [sp, #0x90]
-    ldr x19, [sp, #0xa8]; str x19, [sp, #0x98]
-    ldr x20, [sp, #0xb0]; str x20, [sp, #0xa0]
-    ldr x21, [sp, #0xb8]; str x21, [sp, #0xa8]
-    ldr x22, [sp, #0xc0]; str x22, [sp, #0xb0]
-    ldr x23, [sp, #0xc8]; str x23, [sp, #0xb8]
-    ldr x24, [sp, #0xd0]; str x24, [sp, #0xc0]
-    ldr x25, [sp, #0xd8]; str x25, [sp, #0xc8]
-    ldr x26, [sp, #0xe0]; str x26, [sp, #0xd0]
-    ldr x27, [sp, #0xe8]; str x27, [sp, #0xd8]
-    ldr x28, [sp, #0xf0]; str x28, [sp, #0xe0]
-    ldr x29, [sp, #0xf8]; str x29, [sp, #0xe8]
-    ldr x30, [sp, #0x100]; str x30, [sp, #0xf0]
-    mrs x0, sp_el0
-    str x0, [sp, #0xf8]
-    mrs x0, elr_el1
-    str x0, [sp, #0x100]
-    mrs x0, spsr_el1
-    str x0, [sp, #0x108]
-    b el0_fault
+    la t0, SCHED_READY           // AtomicBool（1 字节）
+    lbu t1, 0(t0)
+    beqz t1, 2f
+    // 就绪：per-cpu 栈（SECONDARY_STACKS + hartid*16KB，栈顶 = 区段尾）
+    la t0, SECONDARY_STACKS
+    slli t1, a0, 14              // t1 = hartid * 16384
+    add t0, t0, t1
+    li t1, 16384                 // addi 立即数限 12 位，16384 经 li 中转
+    add t0, t0, t1               // SECONDARY_STACKS + hartid*16KB + 16KB（栈顶）
+    andi t0, t0, -16             // SP 16 字节向下对齐（riscv ABI）
+    mv sp, t0
+    csrw sscratch, zero
+    mv a0, tp
+    call smp_secondary_main
+3:  wfi
+    j 3b
+2:  wfi
+    j 1b
 
-    // ===== 同步异常处理入口：调用 Rust 处理器（不返回） =====
-    .type sync_entry, %function
-sync_entry:
-    // 立即屏蔽 IRQ：同步异常入口到 handler 的 daifset 之间若被定时器抢占，
-    // IRQ 入口会覆盖 elr_el1/spsr_el1，panic 诊断读到 IRQ 残留（PC/寄存器错乱）。
-    msr daifset, #2
-    // [诊断] 在调用 Rust 处理器前保存故障点通用寄存器（print 会污染 x0-x30）。
-    // 基址用 x11（故障 x11 丢失，槽位 11 存基址地址作标记）；memcpy 循环的
-    // dst=x9 / src=x13 / data=x14 均完整保留。
-    adrp x11, PANIC_REGS
-    add x11, x11, :lo12:PANIC_REGS
-    stp x0, x1, [x11, #0x00]
-    stp x2, x3, [x11, #0x10]
-    stp x4, x5, [x11, #0x20]
-    stp x6, x7, [x11, #0x30]
-    stp x8, x9, [x11, #0x40]
-    stp x10, x11, [x11, #0x50]
-    stp x12, x13, [x11, #0x60]
-    stp x14, x15, [x11, #0x70]
-    stp x16, x17, [x11, #0x80]
-    stp x18, x19, [x11, #0x90]
-    stp x20, x21, [x11, #0xa0]
-    stp x22, x23, [x11, #0xb0]
-    stp x24, x25, [x11, #0xc0]
-    stp x26, x27, [x11, #0xd0]
-    stp x28, x29, [x11, #0xe0]
-    str x30, [x11, #0xf0]
-    // GDB 内核断点：BRK64（0x3C）与软件步进（0x33）from EL1 → 调试桩；
-    // 返回 0 = 恢复寄存器并 eret（继续内核执行），非 0 = 走 panic
-    mrs x9, esr_el1
-    lsr x10, x9, #26
-    cmp x10, #0x3c
-    b.eq 1f
-    cmp x10, #0x33
-    b.ne 2f
+    // ============================================================
+    // 统一陷入入口（stvec 指向此处，4 字节对齐）
+    //
+    // 陷阱帧（832 字节 = 0x340，16 对齐，位于当前任务内核栈）：
+    //   x[0..32]   @0x000..0x100（x0 恒 0 占位；x2 = 陷阱前 sp）
+    //   sp_el0     @0x100（兼容占位，恒 0）
+    //   elr(sepc)  @0x108
+    //   spsr(sstatus) @0x110
+    //   f[0..32]   @0x120..0x320（f0-f31）
+    //   fcsr       @0x320
+    // FP 在陷入入口保存、返回前恢复（内核可能用浮点，防止污染用户现场）。
+    // ============================================================
+    .section .text.trap_entry, "ax"
+    .balign 4
+    .global trap_entry
+    .type trap_entry, %function
+trap_entry:
+    // sp ↔ sscratch 交换：来自用户 → sp=停泊内核栈、sscratch=用户 sp；
+    // 来自内核（嵌套 IRQ 等）→ sscratch=0，交换后 sp=0
+    csrrw sp, sscratch, sp
+    bnez sp, 1f
+    csrr sp, sscratch            // 内核来源：恢复陷阱前内核 sp
 1:
-    bl sync_gdb_entry
-    cbz x0, 3f
-2:
-    // 直接调用 Rust 同步异常处理器（它读取 ESR/ELR 并死循环，不返回）
-    bl sync_exception_handler
-    b .
-3:
-    // GDB 继续：从 PANIC_REGS 恢复 x0-x30（x11 槽为基址标记，恢复后 x11
-    // 为基址地址——内核断点场景下 x11 原始值丢失，属已知限制）并 eret。
-    // elr_el1/spsr_el1 已由 sync_gdb_entry 写入。
-    adrp x11, PANIC_REGS
-    add x11, x11, :lo12:PANIC_REGS
-    ldp x0, x1, [x11, #0x00]
-    ldp x2, x3, [x11, #0x10]
-    ldp x4, x5, [x11, #0x20]
-    ldp x6, x7, [x11, #0x30]
-    ldp x8, x9, [x11, #0x40]
-    ldp x10, x11, [x11, #0x50]
-    ldp x12, x13, [x11, #0x60]
-    ldp x14, x15, [x11, #0x70]
-    ldp x16, x17, [x11, #0x80]
-    ldp x18, x19, [x11, #0x90]
-    ldp x20, x21, [x11, #0xa0]
-    ldp x22, x23, [x11, #0xb0]
-    ldp x24, x25, [x11, #0xc0]
-    ldp x26, x27, [x11, #0xd0]
-    ldp x28, x29, [x11, #0xe0]
-    ldr x30, [x11, #0xf0]
-    eret
+    addi sp, sp, -832
+    // 保存通用寄存器 x1..x31（x2 槽稍后由 sscratch 补）
+    sd x1, 8(sp)
+    sd x3, 24(sp)
+    sd x4, 32(sp)
+    sd x5, 40(sp)
+    sd x6, 48(sp)
+    sd x7, 56(sp)
+    sd x8, 64(sp)
+    sd x9, 72(sp)
+    sd x10, 80(sp)
+    sd x11, 88(sp)
+    sd x12, 96(sp)
+    sd x13, 104(sp)
+    sd x14, 112(sp)
+    sd x15, 120(sp)
+    sd x16, 128(sp)
+    sd x17, 136(sp)
+    sd x18, 144(sp)
+    sd x19, 152(sp)
+    sd x20, 160(sp)
+    sd x21, 168(sp)
+    sd x22, 176(sp)
+    sd x23, 184(sp)
+    sd x24, 192(sp)
+    sd x25, 200(sp)
+    sd x26, 208(sp)
+    sd x27, 216(sp)
+    sd x28, 224(sp)
+    sd x29, 232(sp)
+    sd x30, 240(sp)
+    sd x31, 248(sp)
+    sd zero, 0(sp)               // x0 = 0
+    // x2 = 陷阱前 sp（csrrw 后保存在 sscratch）；sp_el0 槽同步镜像
+    // （信号投递/rt_sigreturn 以 sp_el0 槽为用户 sp 的权威槽位）
+    csrr t0, sscratch
+    sd t0, 16(sp)
+    sd t0, 0x100(sp)
+    // 保存 FP 现场（f0-f31 + fcsr @0x120..0x328）：经 Rust 辅助函数
+    // trap_save_fp（inline asm!）—— global_asm 在 opt>0 下不接受 FP 指令
+    // （rustc 汇编器不随 -Ctarget-feature 打开 D 扩展），inline asm! 走
+    // LLVM 代码生成不受此限。此时全部 GPR 已入帧，caller-saved 随便压。
+    mv a0, sp
+    call trap_save_fp
+    // 保存 CSR 现场
+    csrr t0, sepc
+    sd t0, 0x108(sp)
+    csrr t0, sstatus
+    sd t0, 0x110(sp)
+    // 标记内核态（嵌套陷阱走「来自内核」路径）
+    csrw sscratch, zero
+    // 进入 Rust 分发（正常路径返回后落到 trap_return）
+    mv a0, sp
+    call trap_dispatch
 
-    // ===== EL0 同步异常（svc）入口：保存完整寄存器现场，调用 Rust 分发后 eret =====
-    .type lower_sync, %function
-    lower_sync:
-    // 立即屏蔽 IRQ：svc 入口的 ESR 检查（下方 mrs esr_el1）必须读到**本次**
-    // 异常的 ESR。若在检查前被定时器抢占，irq_entry 的 eret 不恢复 ESR_EL1，
-    // 检查会读到 IRQ 残留值（EC≠0x15）→ 把正常 svc 误判为 EL0 fault。
-    msr daifset, #2
-    // 在 SP_EL1（当前任务内核栈）上分配 800 字节陷阱帧：272 字节头（布局与
-    // syscall_table::TrapFrame 一致）+ 8 字节填充 + 520 字节 FP/SIMD 上下文
-    // （v0-v31 + fpsr/fpcr @0x118 起）。FP 在异常入口保存、返回前恢复，
-    // 防止 IRQ/内核 memcpy（NEON）静默破坏用户态浮点状态。
-    sub sp, sp, #800
-    stp x0, x1, [sp, #0x00]
-    stp x2, x3, [sp, #0x10]
-    stp x4, x5, [sp, #0x20]
-    stp x6, x7, [sp, #0x30]
-    stp x8, x9, [sp, #0x40]
-    stp x10, x11, [sp, #0x50]
-    stp x12, x13, [sp, #0x60]
-    stp x14, x15, [sp, #0x70]
-    stp x16, x17, [sp, #0x80]
-    stp x18, x19, [sp, #0x90]
-    stp x20, x21, [sp, #0xa0]
-    stp x22, x23, [sp, #0xb0]
-    stp x24, x25, [sp, #0xc0]
-    stp x26, x27, [sp, #0xd0]
-    stp x28, x29, [sp, #0xe0]
-    str x30, [sp, #0xf0]
-    mrs x21, sp_el0
-    mrs x22, elr_el1
-    mrs x23, spsr_el1
-    str x21, [sp, #0xf8]
-    str x22, [sp, #0x100]
-    str x23, [sp, #0x108]
-    // 保存 FP/SIMD 上下文（v0-v31 + fpsr/fpcr）@0x110 起（q 寄存器对，16 对齐）
-    stp q0, q1, [sp, #0x110]
-    stp q2, q3, [sp, #0x130]
-    stp q4, q5, [sp, #0x150]
-    stp q6, q7, [sp, #0x170]
-    stp q8, q9, [sp, #0x190]
-    stp q10, q11, [sp, #0x1B0]
-    stp q12, q13, [sp, #0x1D0]
-    stp q14, q15, [sp, #0x1F0]
-    stp q16, q17, [sp, #0x210]
-    stp q18, q19, [sp, #0x230]
-    stp q20, q21, [sp, #0x250]
-    stp q22, q23, [sp, #0x270]
-    stp q24, q25, [sp, #0x290]
-    stp q26, q27, [sp, #0x2B0]
-    stp q28, q29, [sp, #0x2D0]
-    stp q30, q31, [sp, #0x2F0]
-    mrs x9, fpsr
-    str x9, [sp, #0x310]
-    mrs x9, fpcr
-    str x9, [sp, #0x318]
-
-    // 检查 ESR：仅 EC == 0x15（SVC from EL0）按系统调用处理；
-    // EC == 0x24（data abort from EL0）先尝试按需分页解析（demand paging），
-    // 解析成功则恢复现场并 eret 重试故障指令，失败再终止进程；
-    // 其余（指令 abort / PC 未对齐等）直接走 el0_fault_handler 终止当前进程，
-    // 而不是被当成 svc 或挂死整个内核。
-    mrs x9, esr_el1
-    lsr x10, x9, #26
-    cmp x10, #0x15
-    b.eq 1f
-    // 非 SVC：是否为 EL0 data abort（按需分页候选）
-    cmp x10, #0x24
-    b.eq 2f
-    // GDB 调试异常：BRK64（0x3C，软件断点）与软件步进（0x32）→ 调试桩
-    cmp x10, #0x3c
-    b.eq 3f
-    cmp x10, #0x32
-    b.eq 3f
-    b el0_fault
-2:
-    // 尝试按需分页：x0 = 陷阱帧指针（保留，未处理时复用）
-    mov x0, sp
-    bl el0_page_fault_handler
-    // 返回 x0 != 0 表示已落地：恢复现场并 eret 重试故障指令
-    cbnz x0, syscall_return_restore
-    // 未处理（非预留页等）：走 el0_fault_handler 终止进程
-    mov x0, sp
-    b el0_fault
-3:
-    // GDB 调试桩：x0 = 陷阱帧指针；返回 0 = 恢复现场继续（eret），
-    // 非 0（未注册断点的 BRK 等）= 走 el0_fault 终止进程
-    mov x0, sp
-    bl gdb_debug_entry
-    cbz x0, syscall_return_restore
-    b el0_fault
-1:
-    // 确认是 svc：恢复 IRQ（syscall 处理可被抢占）
-    msr daifclr, #2
-    // 调用 Rust 系统调用分发：x0 = 陷阱帧指针
-    mov x0, sp
-    bl syscall_dispatch
-    // 恢复现场（帧中的 x0 已被更新为返回值）。
-    // 该标签同时作为 fork/clone 子进程/子线程的首次调度入口：子进程的
-    // TaskContext 直接把 sp 指向其**拷贝的陷阱帧**、x30 指向此处，从而绕过
-    // syscall_dispatch —— 既避免子进程把返回值写回父进程陷阱帧（跨栈写），
-    // 也避免子进程沿父调用链回卷（子帧 x0 已被 fork/clone 置 0，elr/spsr/
-    // sp_el0 均为其自身的副本值），eret 直接回到用户态 fork()/clone() 调用点。
+    // ===== 统一恢复点 =====
+    // 该标签同时作为 fork/clone 子任务/子线程的首次调度入口：子任务的
+    // TaskContext 把 sp 指向其**拷贝的陷阱帧**、ra 指向此处，从而绕过
+    // trap_dispatch —— 子帧 a0 已被 fork/clone 置 0，elr/sstatus/x2 均
+    // 为其自身的副本值，sret 直接回到用户态 fork()/clone() 调用点。
     .global syscall_return_restore
+    .global trap_return
+    .type trap_return, %function
+trap_return:
+syscall_return_restore:
+    // ★ 恢复/sret 全程屏蔽中断：syscall 体（dispatch 前）已放开抢占，若
+    // 定时器恰在「写 sepc → sret」窗口抢占本任务，switch_to 会把恢复点
+    // 存进任务上下文；恢复时 sret 跳回该内核地址 → U 模式执行内核代码。
+    // sret 按 SPIE 恢复 IE（用户态自动开中断），此处屏蔽不吞用户中断。
+    csrci sstatus, 2
+    // ---- PC 护栏（仅用户来源）：elr 非 0 且低于内核恒等映射起点 ----
+    ld t0, 0x110(sp)             // sstatus
+    andi t1, t0, 1               // SPP：1 = 来自内核
+    bnez t1, 2f
+    ld t0, 0x108(sp)             // elr
+    beqz t0, 3f
+    li t1, 0x80000000
+    bgeu t0, t1, 3f
+    // ---- sstatus 白名单清洗（用户来源）----
+    // rt_sigreturn 等路径的帧内容用户可控：只保留 FS（浮点状态），强制
+    // SPP=0（回 U 模式）、SPIE=1（sret 后开中断）、SUM|MXR=1（内核语义），
+    // 其余位（XS/UBE 等伪装特权位）清零。
+    ld t0, 0x110(sp)
+    li t1, 0x6000                // FS 掩码
+    and t0, t0, t1
+    li t1, 0xC0020               // SUM|MXR|SPIE
+    or t0, t0, t1
+    csrw sstatus, t0
+    j 4f
+2:  // 内核来源：帧内 sstatus 原样回写（SPP=1 → sret 回 S 模式，SPIE 保留
+    // 陷阱前的关中断状态）
+    ld t0, 0x110(sp)
+    csrw sstatus, t0
+    j 4f
+3:  // 护栏失败：elr 为 0 / 内核地址 → 干净终止当前进程（不 eret 到垃圾 PC）
+    mv a0, sp
+    call el0_fault_handler
+    j .
+4:
+    // sepc
+    ld t0, 0x108(sp)
+    csrw sepc, t0
+    // FP 恢复：经 Rust 辅助函数 trap_restore_fp（inline asm!，理由同保存侧；
+    // 此时尚未从帧恢复 GPR，caller-saved 压掉无妨）
+    mv a0, sp
+    call trap_restore_fp
+    // ---- 分流出口 ----
+    ld t0, 0x110(sp)
+    andi t0, t0, 1
+    bnez t0, kexit               // 内核来源出口
+    // 用户出口：先恢复全部通用寄存器（x2 除外），再经 sscratch 中转装回
+    // 用户 sp —— RISC-V 的 x2 就是 sp：若直接 `ld x2, 0x100(sp)` 后弹帧，
+    // addi 会加到刚装载的用户 sp 上（用户 sp 恒 +832 的根因）。
+    ld x1, 8(sp)
+    ld x3, 24(sp)
+    ld x4, 32(sp)
+    ld x5, 40(sp)
+    ld x6, 48(sp)
+    ld x7, 56(sp)
+    ld x8, 64(sp)
+    ld x9, 72(sp)
+    ld x10, 80(sp)
+    ld x11, 88(sp)
+    ld x12, 96(sp)
+    ld x13, 104(sp)
+    ld x14, 112(sp)
+    ld x15, 120(sp)
+    ld x16, 128(sp)
+    ld x17, 136(sp)
+    ld x18, 144(sp)
+    ld x19, 152(sp)
+    ld x20, 160(sp)
+    ld x21, 168(sp)
+    ld x22, 176(sp)
+    ld x23, 184(sp)
+    ld x24, 192(sp)
+    ld x25, 200(sp)
+    ld x26, 208(sp)
+    ld x27, 216(sp)
+    ld x28, 224(sp)
+    ld x29, 232(sp)
+    ld x30, 240(sp)
+    ld x31, 248(sp)
+    // ★ 用户 sp 装回序列（x2 == sp，禁止常规 ld+addi 组合）：
+    //   1) t0 = 帧内用户 sp，暂存 sscratch；
+    //   2) 弹帧（sp = 下一轮用户陷阱的停泊值）；
+    //   3) 从帧残留内存补恢复 t0 的用户值（偏移 48-832 = -784）；
+    //   4) csrrw 交换：sp ← 用户 sp，sscratch ← 停泊内核 sp（一次完成）。
+    ld t0, 0x100(sp)
+    csrw sscratch, t0
+    addi sp, sp, 832
+    ld t0, -784(sp)
+    csrrw sp, sscratch, sp
+    sret
+kexit:
+    // 内核出口：sscratch 回 0（内核标记），sp 不动（x2 槽是陷阱前内核 sp）
+    csrw sscratch, zero
+    ld x1, 8(sp)
+    ld x3, 24(sp)
+    ld x4, 32(sp)
+    ld x5, 40(sp)
+    ld x6, 48(sp)
+    ld x7, 56(sp)
+    ld x8, 64(sp)
+    ld x9, 72(sp)
+    ld x10, 80(sp)
+    ld x11, 88(sp)
+    ld x12, 96(sp)
+    ld x13, 104(sp)
+    ld x14, 112(sp)
+    ld x15, 120(sp)
+    ld x16, 128(sp)
+    ld x17, 136(sp)
+    ld x18, 144(sp)
+    ld x19, 152(sp)
+    ld x20, 160(sp)
+    ld x21, 168(sp)
+    ld x22, 176(sp)
+    ld x23, 184(sp)
+    ld x24, 192(sp)
+    ld x25, 200(sp)
+    ld x26, 208(sp)
+    ld x27, 216(sp)
+    ld x28, 224(sp)
+    ld x29, 232(sp)
+    ld x30, 240(sp)
+    ld x31, 248(sp)
+    addi sp, sp, 832
+    sret
+
     // ===== fork/clone 子任务首次调度入口 =====
     // 子任务的恢复点不是任何 switch 路径（thread_trampoline 只用于 spawn），
     // 须先释放调度锁（切换路径在 switch 前获取、由被切到任务的恢复点释放，
-    // 见 sched_cfs::sched_unlock_from_asm），再进入 syscall_return_restore。
+    // 见 sched_cfs::sched_unlock_from_asm），再进入 trap_return。
     .global el0_resume_entry
     .type el0_resume_entry, %function
 el0_resume_entry:
-    bl sched_unlock_from_asm
-    b syscall_return_restore
-syscall_return_restore:
-    // ★ 关键修复：恢复/eret 全程屏蔽 IRQ。syscall 体（dispatch 前）已被
-    // `daifclr` 放开抢占，若定时器 IRQ 恰在「msr elr_el1（0x38）→ eret」窗口
-    // 抢占本任务，switch_to 会把 elr_el1 = 本段代码地址（如 0x4008113c）存进
-    // 任务上下文；恢复时 eret 跳回该内核地址 → EL0 执行内核代码 → 故障
-    // （表现为 fork 子进程偶发 PC=0 / 内核地址）。此处重新屏蔽 IRQ，保证
-    // 恢复+eret 原子完成（eret 到 EL0 时硬件自动开中断）。
-    msr daifset, #2
-    ldr x21, [sp, #0xf8]
-    ldr x22, [sp, #0x100]
-    ldr x23, [sp, #0x108]
-    // 防御护栏：EL0 返回地址必须非 0 且低于内核恒等映射起点（0x40000000）。
-    // 陷阱帧 elr 损坏（被并发覆写/栈越界踩坏）时直接走 el0_fault 干净终止
-    // 当前进程，而不是 eret 到地址 0（此前偶发「EL0 取指 PC=0」故障）。
-    cmp x22, #0
-    b.eq el0_fault
-    movz x24, #0x4000, lsl #16
-    cmp x22, x24
-    b.hs el0_fault
-    // ★ SPSR 白名单清洗：eret 把 SPSR 中的 M/DAIF/SS/IL 原样写入 PSTATE。
-    // AArch64 的 EL0 可直接 `msr daifset`，且 rt_sigreturn 等路径的帧内容
-    // 用户可控 —— 若不清洗，EL0 能以关中断状态运行（吞掉全部定时器 tick，
-    // 单核整机冻结）甚至伪造 EL1 特权位。此处强制：EL0t（M[3:0]=0）、
-    // 中断全开（DAIF bit9:6 清零）、SS/IL（bit21/20）清零；NZCV 等其余
-    // 标志保留。
-    bic x23, x23, #0xf
-    bic x23, x23, #0x3c0
-    bic x23, x23, #0x300000
-    msr sp_el0, x21
-    msr elr_el1, x22
-    msr spsr_el1, x23
-    // 恢复 FP/SIMD 上下文（v0-v31 + fpsr/fpcr）；x9 随后从帧中恢复
-    ldp q0, q1, [sp, #0x110]
-    ldp q2, q3, [sp, #0x130]
-    ldp q4, q5, [sp, #0x150]
-    ldp q6, q7, [sp, #0x170]
-    ldp q8, q9, [sp, #0x190]
-    ldp q10, q11, [sp, #0x1B0]
-    ldp q12, q13, [sp, #0x1D0]
-    ldp q14, q15, [sp, #0x1F0]
-    ldp q16, q17, [sp, #0x210]
-    ldp q18, q19, [sp, #0x230]
-    ldp q20, q21, [sp, #0x250]
-    ldp q22, q23, [sp, #0x270]
-    ldp q24, q25, [sp, #0x290]
-    ldp q26, q27, [sp, #0x2B0]
-    ldp q28, q29, [sp, #0x2D0]
-    ldp q30, q31, [sp, #0x2F0]
-    ldr x9, [sp, #0x310]
-    msr fpsr, x9
-    ldr x9, [sp, #0x318]
-    msr fpcr, x9
-
-    ldp x0, x1, [sp, #0x00]
-    ldp x2, x3, [sp, #0x10]
-    ldp x4, x5, [sp, #0x20]
-    ldp x6, x7, [sp, #0x30]
-    ldp x8, x9, [sp, #0x40]
-    ldp x10, x11, [sp, #0x50]
-    ldp x12, x13, [sp, #0x60]
-    ldp x14, x15, [sp, #0x70]
-    ldp x16, x17, [sp, #0x80]
-    ldp x18, x19, [sp, #0x90]
-    ldp x20, x21, [sp, #0xa0]
-    ldp x22, x23, [sp, #0xb0]
-    ldp x24, x25, [sp, #0xc0]
-    ldp x26, x27, [sp, #0xd0]
-    ldp x28, x29, [sp, #0xe0]
-    ldr x30, [sp, #0xf0]
-    add sp, sp, #800
-    eret
-
-    // ===== EL0 用户程序故障（非 svc 同步异常）入口 =====
-    // 陷阱帧已保存在 sp 处（与 syscall 布局一致），调用 Rust 处理器终止
-    // 当前进程（SIGSEGV 语义），不返回——避免用户程序崩溃挂死整个内核。
-    .type el0_fault, %function
-el0_fault:
-    mov x0, sp
-    bl el0_fault_handler
-    b .
+    call sched_unlock_from_asm
+    j trap_return
 "#
 );

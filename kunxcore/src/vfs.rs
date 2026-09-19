@@ -13,13 +13,13 @@ use crate::process::{self, FdKind};
 /// 供打开文件表引用计数/偏移等共享状态的短临界区使用。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    core::arch::asm!("mrs {}, daif", out(reg) d);
-    core::arch::asm!("msr daifset, #2");
+    core::arch::asm!("csrr {}, sstatus", out(reg) d);
+    core::arch::asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(saved: u64) {
-    core::arch::asm!("msr daif, {}", in(reg) saved);
+    core::arch::asm!("csrw sstatus, {}", in(reg) saved);
 }
 
 // ==================== 打开标志 ====================

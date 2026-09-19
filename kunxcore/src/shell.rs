@@ -2869,24 +2869,17 @@ fn factor(s: &[u8], pos: &mut usize) -> Option<i32> {
     }
 }
 
-/// `poweroff`：经 PSCI SYSTEM_OFF 关机（QEMU virt 下优雅退出模拟器）。
+/// `poweroff`：经 SBI 关机（QEMU virt 下优雅退出模拟器）。
 fn cmd_poweroff(_cmd: &Command, _sink: &mut Sink) {
     crate::uart_send_str("poweroff: 正在关机\n");
-    // PSCI 0x84000008 = SYSTEM_OFF。QEMU virt 的 PSCI conduit 是 hvc
-    //（DTB psci 节点 method="hvc"）：HVC 交给 EL2/固件后 QEMU 退出（-no-reboot）。
-    unsafe {
-        let func: u64 = 0x8400_0008;
-        core::arch::asm!("hvc #0", in("x0") func, options(noreturn));
-    }
+    // SBI SRST（shutdown）→ 旧式 shutdown → sifive test 器件（0x5555）兜底
+    crate::sbi::shutdown();
 }
 
-/// `reboot`：经 PSCI SYSTEM_RESET 重启（QEMU `-no-reboot` 下等价退出）。
+/// `reboot`：经 SBI 重启（QEMU `-no-reboot` 下等价退出）。
 fn cmd_reboot(_cmd: &Command, _sink: &mut Sink) {
     crate::uart_send_str("reboot: 系统重置\n");
-    unsafe {
-        let func: u64 = 0x8400_0009; // PSCI SYSTEM_RESET
-        core::arch::asm!("hvc #0", in("x0") func, options(noreturn));
-    }
+    crate::sbi::system_reset();
 }
 
 /// `head [-n N] [file]`：输出前 N 行（默认 10；无文件时读 stdin/管道）。

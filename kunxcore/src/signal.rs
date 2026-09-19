@@ -4,21 +4,21 @@
 //! - 每进程两张表：`sig_handlers[64]`（0 = 默认动作）与 `sig_masks[64]`。
 //! - 信号投递时机：syscall 入口（`linux_compat::dispatch`）检查待处理位图，
 //!   对注册了 handler 的信号，把用户现场压入**用户栈**上的信号帧
-//!   （288 字节，布局 = TrapFrame 头 + signum），然后：
-//!     - `elr` = handler 入口，`x0` = signum，`x30` = 蹦床地址
+//!   （304 字节，布局 = TrapFrame 头 + signum），然后：
+//!     - `elr` = handler 入口，`a0` = signum，`ra` = 蹦床地址
 //!   handler 返回时经蹦床 `rt_sigreturn` 恢复现场并继续原断点。
 //! - 蹦床：所有用户地址空间在固定 VA（`SIG_TRAMP_VA`）映射同一份只读代码页
-//!   （`mov x8, #139; svc #0; b .`），fork/exec 经页表继承。
+//!   （`li a7, #139; ecall; j .`），fork/exec 经页表继承。
 //!
-//! 信号帧布局（内核写入 / `rt_sigreturn` 读取）：
+//! 信号帧布局（内核写入 / `rt_sigreturn` 读取；与 TrapFrame 头同构）：
 //! ```text
-//! 0x000  x0..x30（248 字节）
-//! 0x0F8  sp_el0（信号打断时的用户栈指针）
-//! 0x100  elr（信号打断时的用户 PC）
-//! 0x108  spsr
-//! 0x110  signum
-//! 0x118  填充
-//! 0x120  帧总大小 288
+//! 0x000  x0..x31（256 字节）
+//! 0x100  sp（信号打断时的用户栈指针）
+//! 0x108  elr（sepc，信号打断时的用户 PC）
+//! 0x110  sstatus
+//! 0x118  signum
+//! 0x128  填充到 16 对齐
+//! 0x130  帧总大小 304
 //! ```
 
 use crate::allocator;
@@ -28,19 +28,21 @@ use crate::vm;
 
 /// 信号蹦床固定用户地址（低于 fb mmap 0x20000000，与 ELF/堆无冲突）。
 pub const SIG_TRAMP_VA: usize = 0x1FF0_0000;
-/// 信号帧大小（288 字节，16 对齐）。
-pub const SIG_FRAME_SIZE: usize = 0x120;
-/// 帧内偏移。
-const OFF_SP: usize = 0xF8;
-const OFF_ELR: usize = 0x100;
-const OFF_SPSR: usize = 0x108;
-const OFF_SIG: usize = 0x110;
+/// 信号帧大小（304 字节，16 对齐）。
+pub const SIG_FRAME_SIZE: usize = 0x130;
+/// 帧内偏移（与 TrapFrame 头同构）。
+const OFF_SP: usize = 0x100;
+const OFF_ELR: usize = 0x108;
+const OFF_SPSR: usize = 0x110;
+const OFF_SIG: usize = 0x118;
+/// 信号帧头大小（寄存器现场 + sp/elr/sstatus，sigreturn 恢复范围）。
+const SIG_FRAME_HEADER: usize = 0x118;
 
-/// 蹦床代码：`mov x8, #139(SYS_RT_SIGRETURN); svc #0; b .`（12 字节）。
+/// 蹦床代码：`li a7, #139(SYS_RT_SIGRETURN); ecall; j .`（12 字节，RISC-V）。
 const TRAMP_CODE: [u8; 12] = [
-    0x68, 0x11, 0x80, 0xD2, // mov x8, #139
-    0x01, 0x00, 0x00, 0xD4, // svc #0
-    0x00, 0x00, 0x00, 0x14, // b .
+    0x93, 0x08, 0xB0, 0x08, // addi a7, zero, 139（li a7, #139）
+    0x73, 0x00, 0x00, 0x00, // ecall
+    0x6F, 0x00, 0x00, 0x00, // jal zero, 0（j .）
 ];
 
 /// 蹦床物理页（启动时分配一次，只读映射到所有用户空间）。
@@ -150,10 +152,10 @@ fn deliver(f: &mut TrapFrame, sig: usize, handler: u64) -> Option<u64> {
     // 改写陷阱帧：进入 handler
     f.sp_el0 = frame;
     f.elr = handler;
-    f.x[0] = sig as u64; // signum
-    f.x[1] = 0; // siginfo
-    f.x[2] = 0; // ucontext
-    f.x[30] = SIG_TRAMP_VA as u64; // handler 返回 → 蹦床 → rt_sigreturn
+    f.x[10] = sig as u64; // a0 = signum
+    f.x[11] = 0; // a1 = siginfo
+    f.x[12] = 0; // a2 = ucontext
+    f.x[1] = SIG_TRAMP_VA as u64; // ra：handler 返回 → 蹦床 → rt_sigreturn
     Some(frame)
 }
 
@@ -204,7 +206,7 @@ pub fn handle_pending(f: &mut TrapFrame) -> bool {
     false
 }
 
-/// `rt_sigreturn`：从信号帧恢复现场（陷阱帧头 272 字节 + signum）。
+/// `rt_sigreturn`：从信号帧恢复现场（帧头 280 字节 + signum）。
 /// 恢复后由 syscall 返回路径按 `f.elr` 返回到信号打断点。
 pub fn sigreturn(f: &mut TrapFrame) -> i64 {
     let frame = f.sp_el0 as usize;
@@ -213,23 +215,25 @@ pub fn sigreturn(f: &mut TrapFrame) -> i64 {
     // （deliver 侧同理放宽，否则工作线程 handler 返回永远恢复失败）。
     let stack_base = crate::elf::current_stack_base();
     let stack_top = crate::elf::current_stack_top();
-    let in_main_stack = frame >= stack_base && frame + 272 <= stack_top;
+    let in_main_stack = frame >= stack_base && frame + SIG_FRAME_HEADER <= stack_top;
     let in_user_space = frame >= vm::PAGE_SIZE
-        && frame.checked_add(272).map_or(false, |e| e <= crate::linux_compat::USER_TOP as usize);
+        && frame
+            .checked_add(SIG_FRAME_HEADER)
+            .map_or(false, |e| e <= crate::linux_compat::USER_TOP as usize);
     if (!in_main_stack && !in_user_space)
-        || !vm::user_range_mapped(process::current_root(), frame, 272)
+        || !vm::user_range_mapped(process::current_root(), frame, SIG_FRAME_HEADER)
     {
         return -1;
     }
     // LAZY 页兜底：帧范围若仍含预留未落地页，先落地（记录级校验已通过但页表
     // 尚未映射时 EL1 读会触发 translation fault 挂死内核）。
-    if !crate::process::ensure_user_range_mapped(frame, 272) {
+    if !crate::process::ensure_user_range_mapped(frame, SIG_FRAME_HEADER) {
         return -1;
     }
     unsafe {
         // PAN 下 EL1 读用户信号帧需 uaccess 放行
         crate::mmu::uaccess_begin();
-        // 恢复 x0..x30
+        // 恢复 x0..x31
         for (i, slot) in f.x.iter_mut().enumerate() {
             *slot = *((frame + i * 8) as *const u64);
         }
@@ -238,27 +242,24 @@ pub fn sigreturn(f: &mut TrapFrame) -> i64 {
         f.spsr = *((frame + OFF_SPSR) as *const u64);
         crate::mmu::uaccess_end();
     }
-    // ★ SPSR 清洗：帧内容完全由用户控制，若原样恢复 M[3:0]（如伪造 EL1h），
-    // eret 会以 EL1 特权返回用户地址 —— 指令中止直接挂死内核（无条件
-    // DoS）。信号帧只在 EL0 间跳转，强制 EL0t（M[3:0]=0），保留 NZCV 标志。
-    // 同时清 DAIF（bit 9:6）：AArch64 的 EL0 可直接 `msr daifset` 屏蔽中断，
-    // 伪造帧携带 DAIF=0xF 会让 eret 后的 EL0 吞掉全部定时器 tick（单核整机
-    // 冻结）；SS/IL（bit 21/20）为单步/非法异常状态位，同样不得从用户帧恢复。
-    // syscall_return_restore 的 eret 路径另有同款硬件掩码兜底。
-    f.spsr &= !(0xF | (0xF << 6) | (1 << 20) | (1 << 21));
+    // ★ sstatus 清洗：帧内容完全由用户控制。SPP（bit8，伪造 S 模式返回）与
+    // SIE（bit1，吞定时器 tick）不得从用户帧恢复。trap_return 的白名单
+    //（只保留 FS + 强制 SUM/MXR/SPIE）是硬件级兜底，此处先行清洗减小
+    // 观测面。
+    f.spsr &= !((1 << 8) | 2);
     // 注意：上面 `f.sp_el0 = *(frame + OFF_SP)` 恢复的就是被打断时的原始
     // 栈指针（deliver 把 sp 而非帧地址存进 OFF_SP），信号帧本身位于原始 sp
     // 下方、随 sp 恢复已被隐式"弹出"。此处绝不能再 `+= SIG_FRAME_SIZE`，
-    // 否则每次信号处理返回用户栈就永久上漂 288 字节，叠加数次后
-    // 被打断函数的尾声从错误槽位恢复 x29/x30 → ret 到垃圾地址。
+    // 否则每次信号处理返回用户栈就永久上漂 304 字节，叠加数次后
+    // 被打断函数的尾声从错误槽位恢复 s0/ra → ret 到垃圾地址。
     0
 }
 
 /// 供 linux_compat 的 syscall 表使用。
 pub fn rt_sigaction_syscall(f: &mut TrapFrame) -> i64 {
-    let sig = f.x[0] as usize;
-    let act = f.x[1];
-    let old = f.x[2];
+    let sig = f.x[10] as usize;
+    let act = f.x[11];
+    let old = f.x[12];
     if sig == 0 || sig >= 64 {
         return -22; // EINVAL
     }

@@ -39,13 +39,13 @@ static mut PAGE_TAG: [u16; MAX_PAGES] = [0; MAX_PAGES];
 /// 保存 DAIF 并屏蔽 IRQ（嵌套安全：恢复的是调用前的完整 DAIF 值）。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 unsafe fn irq_restore(saved: u64) {
-    asm!("msr daif, {}", in(reg) saved);
+    asm!("csrw sstatus, {}", in(reg) saved);
 }
 
 /// 单个 slab 的描述。

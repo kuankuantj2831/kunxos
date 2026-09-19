@@ -82,14 +82,14 @@ const WAITERS: usize = 4;
 /// 破坏嵌套屏蔽上下文 —— 若调用方已处于屏蔽态，`daifclr` 会提前开中断）。
 unsafe fn irq_save() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
-    asm!("msr daifset, #2");
+    asm!("csrr {}, sstatus", out(reg) d);
+    asm!("csrci sstatus, 2");
     d
 }
 
 /// 恢复调用前的 DAIF 状态。
 unsafe fn irq_restore(saved: u64) {
-    asm!("msr daif, {}", in(reg) saved);
+    asm!("csrw sstatus, {}", in(reg) saved);
 }
 
 /// 输入设备：事件环形缓冲 + 阻塞读等待者。

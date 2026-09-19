@@ -37,13 +37,13 @@ mod sys {
     #[inline(always)]
     pub unsafe fn syscall1(n: usize, a1: usize) -> usize {
         let ret: usize;
-        asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+        asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
         ret
     }
     #[inline(always)]
     pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
         let ret: usize;
-        asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, in("x1") a2, in("x2") a3, options(nostack));
+        asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, in("a2") a3, options(nostack));
         ret
     }
 

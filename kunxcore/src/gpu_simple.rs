@@ -69,7 +69,8 @@ static mut CFG: [u8; 28] = [0; 28];
 /// # 安全
 /// 需要有效映射的 `FWCFG_BASE`。
 unsafe fn fwcfg_select(key: u16) {
-    // selector 寄存器为 DEVICE_BIG_ENDIAN：写大端 16 位（等价 Linux `writew_be`）
+    // selector 寄存器为 DEVICE_BIG_ENDIAN：写大端 16 位
+    //（QEMU fw_cfg MMIO 布局：data@+0 / selector@+8 / dma@+0x10）
     write_volatile((FWCFG_BASE + 0x08) as *mut u16, key.swap_bytes());
 }
 
@@ -108,7 +109,7 @@ unsafe fn fwcfg_dma(key: u16, buf_pa: usize, len: usize, write: bool) -> bool {
     DMA.length = (len as u32).to_be();
     DMA.address = (buf_pa as u64).to_be();
     // 保证 QEMU DMA 能看到写入的结构
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
 
     // 触发传输：把 DMA 结构的物理地址（大端）写入 DMA 寄存器
     let dma_pa = addr_of!(DMA) as usize;
@@ -124,7 +125,7 @@ unsafe fn fwcfg_dma(key: u16, buf_pa: usize, len: usize, write: bool) -> bool {
             return false; // 超时（约数百 ms）
         }
     }
-    asm!("dsb sy");
+    asm!("fence iorw, iorw");
     read_volatile(&DMA.control) == 0
 }
 
@@ -205,12 +206,12 @@ fn clean_dcache(va: usize, len: usize) {
     let end = (va + len + 63) & !63usize;
     while a < end {
         unsafe {
-            asm!("dc cvac, {}", in(reg) a);
+            asm!("fence iorw, iorw");
         }
         a += 64;
     }
     unsafe {
-        asm!("dsb sy");
+        asm!("fence iorw, iorw");
     }
 }
 

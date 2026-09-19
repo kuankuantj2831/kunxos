@@ -33,7 +33,7 @@ pub const SEEK_END: usize = 2;
 #[inline(always)]
 pub unsafe fn syscall1(n: usize, a1: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
     ret
 }
 
@@ -41,10 +41,10 @@ pub unsafe fn syscall1(n: usize, a1: usize) -> usize {
 pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
         options(nostack)
     );
     ret
@@ -54,11 +54,11 @@ pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
 pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret
@@ -68,12 +68,12 @@ pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
 pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
-        in("x3") a4,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
+        in("a3") a4,
         options(nostack)
     );
     ret
@@ -83,13 +83,13 @@ pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> 
 pub unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
-        in("x3") a4,
-        in("x4") a5,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
+        in("a3") a4,
+        in("a4") a5,
         options(nostack)
     );
     ret

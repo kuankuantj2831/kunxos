@@ -1,8 +1,8 @@
 ENTRY(_start)
 SECTIONS {
     . = 0x400000;
-    .text : { *(.text*) }
-    .rodata : { *(.rodata*) *(.rodata.*) }
-    .data : { *(.data*) }
-    .bss : { *(.bss*) *(COMMON) }
+    .text : { *(.text*) *(.text.*) }
+    .rodata : { *(.rodata*) *(.rodata.*) *(.srodata*) }
+    .data : { *(.data*) *(.sdata*) }
+    .bss : { *(.bss*) *(.sbss*) *(COMMON) }
 }

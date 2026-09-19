@@ -1,0 +1,5 @@
+# RISC-V 移植：rustc 对 global_asm!/asm! 的汇编器默认只开基础 ISA，
+# 显式补全 riscv64gc 的标准扩展（M/A/F/D/C），否则陷阱入口的 fsd/fld
+# （保存用户浮点现场）报 "instruction requires 'D'"。
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "target-feature=+m,+a,+f,+d,+c"]

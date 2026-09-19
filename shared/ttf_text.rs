@@ -11,35 +11,20 @@ extern crate alloc;
 // ==================== 内存原语（编译器内建 memcpy/memset 实现） ====================
 
 /// 宽通道前向拷贝（与内核 kunxcore/src/main.rs 同款）：两端 16B 对齐走
-/// `ldp/stp`，仅 8B 对齐走 `ldr/str x`，尾部/未对齐回退字节循环。
+/// `ld/sd` 8 字节宽通道，尾部/未对齐回退字节循环。
 /// launcher 每个动画帧仅背景恢复 + flip 就有 ~4MB 拷贝走这里，纯字节
 /// 循环喂不满帧预算（TCG 慢宿主下尤甚）。
 unsafe fn wide_copy(dest: *mut u8, src: *const u8, n: usize) {
     let mut d = dest as usize;
     let mut s = src as usize;
     let end = d.saturating_add(n);
-    if (d & 15) == 0 && (s & 15) == 0 {
-        while end.saturating_sub(d) >= 16 {
-            asm!(
-                "ldp {v0}, {v1}, [{s}]",
-                "add {s}, {s}, #16",
-                "stp {v0}, {v1}, [{d}]",
-                "add {d}, {d}, #16",
-                v0 = out(reg) _,
-                v1 = out(reg) _,
-                s = inout(reg) s,
-                d = inout(reg) d,
-                options(nostack),
-            );
-        }
-    }
     if (d & 7) == 0 && (s & 7) == 0 {
         while end.saturating_sub(d) >= 8 {
             asm!(
-                "ldr {v}, [{s}]",
-                "add {s}, {s}, #8",
-                "str {v}, [{d}]",
-                "add {d}, {d}, #8",
+                "ld {v}, 0({s})",
+                "addi {s}, {s}, 8",
+                "sd {v}, 0({d})",
+                "addi {d}, {d}, 8",
                 v = out(reg) _,
                 s = inout(reg) s,
                 d = inout(reg) d,
@@ -91,22 +76,11 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
         (p as *mut u8).write_volatile(v as u8);
         p += 1;
     }
-    // 16B/8B 主体
-    if p & 15 == 0 {
-        while end.saturating_sub(p) >= 16 {
-            asm!(
-                "stp {w}, {w}, [{p}]",
-                "add {p}, {p}, #16",
-                w = in(reg) word,
-                p = inout(reg) p,
-                options(nostack),
-            );
-        }
-    }
+    // 8B 主体
     while end.saturating_sub(p) >= 8 {
         asm!(
-            "str {w}, [{p}]",
-            "add {p}, {p}, #8",
+            "sd {w}, 0({p})",
+            "addi {p}, {p}, 8",
             w = in(reg) word,
             p = inout(reg) p,
             options(nostack),
@@ -143,7 +117,7 @@ const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 #[inline(always)]
 unsafe fn syscall1(n: usize, a1: usize) -> usize {
     let ret: usize;
-    asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
+    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
     ret
 }
 
@@ -151,10 +125,10 @@ unsafe fn syscall1(n: usize, a1: usize) -> usize {
 unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
         options(nostack)
     );
     ret
@@ -164,11 +138,11 @@ unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
 unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret

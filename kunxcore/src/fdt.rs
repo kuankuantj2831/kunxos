@@ -456,13 +456,35 @@ impl Node {
     }
 
     /// 读取 `interrupts` 属性第 index 个三元组 `(type, number, flags)`（GIC #interrupt-cells = 3）。
+    ///
+    /// RISC-V 平台额外处理两种形态：`interrupts` 的 PLIC 1 单元直通，以及
+    /// QEMU riscv virt 外设实际使用的 `interrupts-extended`（每条 =
+    /// `<phandle><arg...>`，目标 PLIC 的 #interrupt-cells = 1，故第 index
+    /// 条的参数在 cell 偏移 index*2 + 1；phandle 本身不解析，平台目标只有
+    /// QEMU virt）。
     pub fn interrupt(self, fdt: &Fdt, index: usize) -> Option<(u32, u32, u32)> {
-        let t = self.prop_u32(fdt, "interrupts", index * 3)?;
-        let n = self.prop_u32(fdt, "interrupts", index * 3 + 1)?;
-        let f = self.prop_u32(fdt, "interrupts", index * 3 + 2)?;
-        Some((t, n, f))
+        // GIC 3 单元（type, number, flags）—— aarch64 DTB
+        if let (Some(t), Some(n), Some(f)) = (
+            self.prop_u32(fdt, "interrupts", index * 3),
+            self.prop_u32(fdt, "interrupts", index * 3 + 1),
+            self.prop_u32(fdt, "interrupts", index * 3 + 2),
+        ) {
+            return Some((t, n, f));
+        }
+        // PLIC 1 单元（直接 IRQ 号）—— RISC-V DTB（#interrupt-cells = <1>）
+        if let Some(n) = self.prop_u32(fdt, "interrupts", index) {
+            return Some((PLIC_DIRECT, n, 0));
+        }
+        // interrupts-extended：跳过 phandle cell，取第 index 条的 PLIC 参数
+        if let Some(n) = self.prop_u32(fdt, "interrupts-extended", index * 2 + 1) {
+            return Some((PLIC_DIRECT, n, 0));
+        }
+        None
     }
 }
+
+/// 中断单元类型标记：PLIC 单 cell 直通（gic_irq 对其返回原号）。
+pub const PLIC_DIRECT: u32 = 2;
 
 /// 将 FDT 中断单元 `(type, number)` 转换为 GIC 中断号：
 /// SPI（type=0）→ 32 + number，PPI（type=1）→ 16 + number。

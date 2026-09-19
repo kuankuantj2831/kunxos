@@ -1,8 +1,9 @@
-//! QEMU `virt` 平台后端：硬编码现有设备的地址 / 中断号 / 时钟。
+//! QEMU `virt` 平台后端（RISC-V）：硬编码现有设备的地址 / 中断号 / 时钟。
 //!
 //! 电源相关能力：
-//!   - 关机 / 重启：PSCI 0.2（QEMU virt 的 PSCI conduit 为 hvc，见内核
-//!     shell 的 `poweroff`/`reboot` 实现），经 EL2 固件退出模拟器。
+//!   - 关机 / 重启：SBI（SRST 扩展，回退旧式 shutdown / sifive test 器件，
+//!     见内核 shell 的 `poweroff`/`reboot` 与 `kunxcore::sbi`），经 OpenSBI
+//!     退出模拟器。
 //!   - 温度：QEMU 不模拟 SoC 温度传感器（virt DTB 无 thermal-zones），
 //!     返回 `None`；内核策略引擎回退到「软件热模型」（由 CPU 负载驱动）。
 //!   - DVFS：QEMU 不模拟时钟树，提供**虚拟 DVFS 控制器**（频点表 + 频率
@@ -23,7 +24,7 @@ use crate::storage::StorageInfo;
 /// QEMU virt 平台单例。
 pub static QEMU: QemuPlatform = QemuPlatform;
 
-/// QEMU `virt` 机器（Cortex-A72）平台参数。
+/// QEMU `virt` 机器（rv64）平台参数。
 pub struct QemuPlatform;
 
 impl Platform for QemuPlatform {
@@ -32,27 +33,27 @@ impl Platform for QemuPlatform {
     }
 
     fn uart_base(&self) -> usize {
-        0x0900_0000 // PL011
+        0x1000_0000 // ns16550a
     }
 
     fn uart_irq(&self) -> u32 {
-        33
+        10
     }
 
     fn uart_clock(&self) -> u32 {
-        24_000_000 // 24MHz
+        24_000_000 // 时钟缺失时回退（QEMU 16550 不校验分频）
     }
 
     fn gicd_base(&self) -> usize {
-        0x0800_0000 // GICv2 Distributor
+        0x0C00_0000 // PLIC（RISC-V 中断控制器；HAL 沿用 gicd_base 语义）
     }
 
     fn gicc_base(&self) -> usize {
-        0x0801_0000 // GICv2 CPU Interface
+        0 // PLIC 单基址，无独立 CPU 接口窗
     }
 
     fn ram_base(&self) -> usize {
-        0x4000_0000
+        0x8000_0000
     }
 
     fn ram_size(&self) -> usize {
@@ -60,16 +61,16 @@ impl Platform for QemuPlatform {
     }
 
     fn timer_freq(&self) -> u64 {
-        62_500_000 // CNTFRQ 62.5MHz
+        10_000_000 // timebase 10MHz（/cpus/timebase-frequency）
     }
     fn rtc_base(&self) -> Option<usize> {
-        // QEMU virt PL031：RTC 位于 0x09010000（MMIO，DTB /pl031）
-        Some(0x0901_0000)
+        // QEMU virt RISC-V goldfish RTC：0x101000（DTB /soc/rtc@101000）
+        Some(0x0010_1000)
     }
 
     fn display_init(&self) -> Option<DisplayInfo> {
-        // ramfb：帧缓冲置于 RAM 偏移 128MB 处（0x40000000 + 0x08000000）。
-        Some(DisplayInfo::new(0x4800_0000, 540, 960, 32))
+        // ramfb：帧缓冲置于 RAM 偏移 128MB 处（0x80000000 + 0x08000000）。
+        Some(DisplayInfo::new(0x8800_0000, 540, 960, 32))
     }
 
     fn net_init(&self) -> Option<NetInfo> {
@@ -86,7 +87,7 @@ impl Platform for QemuPlatform {
     }
 
     fn input_init(&self) -> Option<InputInfo> {
-        // QEMU virt 无真实触摸屏：用主 PL011 UART 上的协议帧模拟绝对坐标触摸。
+        // QEMU virt 无真实触摸屏：用主 ns16550 UART 上的协议帧模拟绝对坐标触摸。
         // 面板物理范围与 ramfb 逻辑分辨率一致（540x960），launcher 据此做
         // 物理坐标 → 屏幕像素坐标的映射（此处为 1:1，真实面板按 max_x/max_y 缩放）。
         Some(InputInfo::new(
@@ -135,35 +136,41 @@ impl Platform for QemuPlatform {
     }
 }
 
-// ==================== PSCI 电源控制（hvc conduit） ====================
+// ==================== SBI 电源控制 ====================
 
-/// PSCI 0.2 函数 ID（arm, psci-0.2 spec）。
-const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
-const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
-
-/// QEMU PSCI 电源控制单例。
+/// QEMU 电源控制单例。
 pub static QEMU_POWER: QemuPower = QemuPower;
 
-/// QEMU 电源控制：`hvc #0` 交给 QEMU 固件（DTB psci 节点 method="hvc"）。
+/// QEMU 电源控制：转发 `kunxcore::sbi`（SRST / 旧式 shutdown / test 器件）。
+///
+/// kunxhal 不直接依赖 kunxcore —— 经函数指针注入：kunxcore 启动时调用
+/// `qemu_power_set_hooks` 安装 sbi::shutdown / sbi::system_reset。
 pub struct QemuPower;
+
+/// 电源钩子（shutdown / reboot），由 kunxcore 注入。
+static mut POWER_HOOKS: (fn() -> !, fn() -> ! ) = (fallback_halt, fallback_halt);
+
+/// 未注入时的兜底：死循环（不应发生——kunxcore 启动必装钩子）。
+fn fallback_halt() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// 注入 SBI 电源实现（kunxcore rust_main 早期调用）。
+pub fn qemu_power_set_hooks(shutdown: fn() -> !, reboot: fn() -> !) {
+    unsafe {
+        POWER_HOOKS = (shutdown, reboot);
+    }
+}
 
 impl PowerControl for QemuPower {
     fn shutdown(&self) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("hvc #0", in("x0") PSCI_SYSTEM_OFF, options(noreturn));
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        loop {}
+        unsafe { (POWER_HOOKS.0)() }
     }
 
     fn reboot(&self) {
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("hvc #0", in("x0") PSCI_SYSTEM_RESET, options(noreturn));
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        loop {}
+        unsafe { (POWER_HOOKS.1)() }
     }
 
     // sleep：QEMU virt 无低功耗挂起支持，保持运行。

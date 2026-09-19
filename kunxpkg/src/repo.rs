@@ -208,10 +208,10 @@ const SYS_GETRANDOM: usize = 278;
 unsafe fn tls_syscall2(n: usize, a1: usize, a2: usize) -> usize {
     let ret: usize;
     core::arch::asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
         options(nostack)
     );
     ret
@@ -221,11 +221,11 @@ unsafe fn tls_syscall2(n: usize, a1: usize, a2: usize) -> usize {
 unsafe fn tls_syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
     core::arch::asm!(
-        "svc #0",
-        in("x8") n,
-        inlateout("x0") a1 => ret,
-        in("x1") a2,
-        in("x2") a3,
+        "ecall",
+        in("a7") n,
+        inlateout("a0") a1 => ret,
+        in("a1") a2,
+        in("a2") a3,
         options(nostack)
     );
     ret

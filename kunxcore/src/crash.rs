@@ -9,33 +9,35 @@
 
 use core::arch::asm;
 
-// ==================== 信号 / ESR 解码 ====================
+// ==================== 信号 / scause 解码 ====================
 
-/// 由 ESR_EL1 的 EC 字段（bits[31:26]）推断信号与描述。
+/// 由 scause 异常码（低位，中断位已剥离）推断信号与描述。
+///
+/// RISC-V 异常码：0=取指未对齐 1=取指访问错 2=非法指令 3=断点 4=读未对齐
+/// 5=读访问错 6=写未对齐 7=写访问错 8=ecall(U) 9=ecall(S) 12/13/15=缺页。
 pub fn esr_describe(esr: u64) -> (i32, &'static str) {
-    let ec = (esr >> 26) & 0x3F;
-    let desc = match ec {
-        0x00 => "未知原因 / 未定义指令",
-        0x15 => "SVC（来自 EL0）",
-        0x20 => "取指中止（来自 EL0）",
-        0x21 => "取指中止（来自 EL1）",
-        0x24 => "数据中止（来自 EL0）",
-        0x25 => "数据中止（来自 EL1）",
-        0x26 => "SP 对齐错误",
-        0x30 => "断点（BRK，来自 EL0）",
-        0x31 => "断点（BRK，来自 EL1）",
-        0x32 => "软件单步（来自 EL0）",
-        0x33 => "软件单步（来自 EL1）",
-        0x34 => "监视点（来自 EL0）",
-        0x3C => "BRK64（来自 EL0）",
+    let cause = esr & 0xFFF;
+    let desc = match cause {
+        0 => "取指地址未对齐",
+        1 => "取指访问错误",
+        2 => "非法指令",
+        3 => "断点（EBREAK）",
+        4 => "读地址未对齐",
+        5 => "读访问错误",
+        6 => "写地址未对齐",
+        7 => "写访问错误",
+        8 => "ecall（来自 U）",
+        9 => "ecall（来自 S）",
+        12 => "取指缺页",
+        13 => "读缺页",
+        15 => "写缺页",
         _ => "未知异常类别",
     };
-    let sig = match ec {
-        0x00 => 4,      // SIGILL
-        0x20 | 0x24 | 0x25 => 11, // SIGSEGV
-        0x26 => 7,      // SIGBUS
-        0x30 | 0x31 | 0x3C | 0x32 | 0x33 => 5, // SIGTRAP
-        0x34 => 5,
+    let sig = match cause {
+        2 => 4,             // SIGILL
+        3 => 5,             // SIGTRAP
+        0 | 4 | 6 => 7,     // SIGBUS（未对齐）
+        12 | 13 | 15 => 11, // SIGSEGV（缺页）
         _ => 11,
     };
     (sig, desc)
@@ -106,7 +108,7 @@ pub fn regs_from_panic_regs() -> Regs {
         }
     }
     let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp) };
+    unsafe { asm!("mv {}, sp", out(reg) sp) };
     Regs { x, sp, pc: 0, cpsr: 0 }
 }
 
@@ -603,7 +605,7 @@ pub fn kernel_panic(fi: &FaultInfo) {
     );
     let regs = regs_from_panic_regs();
     let elr: u64;
-    unsafe { asm!("mrs {}, elr_el1", out(reg) elr) };
+    unsafe { asm!("csrr {}, sepc", out(reg) elr) };
     let fi2 = FaultInfo {
         kind: fi.kind,
         pid: fi.pid,

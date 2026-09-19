@@ -556,7 +556,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_FTRUNCATE => sys_ftruncate(f),
         SYS_TRUNCATE => sys_truncate(f),
         SYS_SYNC => vfs::sync_all() as i64,
-        SYS_FSYNC | SYS_FDATASYNC => vfs::fsync(f.x[0] as i32) as i64,
+        SYS_FSYNC | SYS_FDATASYNC => vfs::fsync(f.x[10] as i32) as i64,
         SYS_FALLOCATE => ENOSYS, // 不支持文件预分配：明确报错而非假装成功
         // Linux ABI：93=exit 仅终止当前线程（最后一个线程退出才终结进程），
         // 94=exit_group 终止整个线程组。此前混同 —— 任何工作线程收尾都会
@@ -570,7 +570,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_SETUID => sys_setuid(f),
         SYS_SETGID => sys_setgid(f),
         SYS_GETTID => sched_cfs::current_tid() as i64,
-        SYS_SET_TID_ADDRESS => bionic_shim::set_tid_address(f.x[0] as usize) as i64,
+        SYS_SET_TID_ADDRESS => bionic_shim::set_tid_address(f.x[10] as usize) as i64,
         SYS_FUTEX => sys_futex(f),
         SYS_SET_ROBUST_LIST | SYS_GET_ROBUST_LIST => 0,
         SYS_UNAME => sys_uname(f),
@@ -609,7 +609,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_EXECVE | SYS_EXECVEAT => sys_execve(f),
         SYS_PRCTL => 0, // PR_SET_NAME 等良性调用，无对应机制时接受
         // umask：返回旧值并更新（此前恒返回 0o022、忽略参数，语义错误）。
-        SYS_UMASK => sys_umask(f.x[0] as u32),
+        SYS_UMASK => sys_umask(f.x[10] as u32),
         // getrlimit 必须把默认值写入用户缓冲区（否则调用方读到垃圾）。
         SYS_GETRLIMIT => sys_getrlimit(f),
         SYS_PRLIMIT64 => sys_prlimit64(f),
@@ -622,8 +622,8 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_SOCKET => sys_socket(f),
         SYS_CONNECT => sys_connect(f),
         SYS_BIND => sys_bind(f),
-        SYS_LISTEN => socket::listen(f.x[0] as i32, f.x[1] as usize) as i64,
-        SYS_ACCEPT | SYS_ACCEPT4 => socket::accept(f.x[0] as i32) as i64,
+        SYS_LISTEN => socket::listen(f.x[10] as i32, f.x[11] as usize) as i64,
+        SYS_ACCEPT | SYS_ACCEPT4 => socket::accept(f.x[10] as i32) as i64,
         SYS_SENDTO => sys_sendto(f),
         SYS_RECVFROM => sys_recvfrom(f),
         SYS_SETSOCKOPT | SYS_GETSOCKOPT => ENOSYS, // 未实现：明确报错而非假装成功
@@ -641,7 +641,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
         // 电源管理（自研 syscall：查询 / 调速器 / Doze）
         SYS_KUNX_PM_GET => crate::power::sys_pm_get() as i64,
         SYS_KUNX_PM_SET_GOVERNOR => {
-            match crate::power::Governor::from_id(f.x[0] as u32) {
+            match crate::power::Governor::from_id(f.x[10] as u32) {
                 Some(g) => {
                     crate::power::set_governor(g);
                     0
@@ -650,8 +650,8 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             }
         }
         SYS_KUNX_PM_SET_CPU_CAP => {
-            let pid = f.x[0] as u32;
-            let cap = f.x[1] as u16;
+            let pid = f.x[10] as u32;
+            let cap = f.x[11] as u16;
             if cap > 100 {
                 EINVAL
             } else if !pm_target_allowed(pid) {
@@ -663,15 +663,15 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             }
         }
         SYS_KUNX_PM_FREEZE => {
-            let pid = f.x[0] as u32;
+            let pid = f.x[10] as u32;
             if !pm_target_allowed(pid) {
                 EPERM
             } else {
-                let freeze = f.x[1] != 0;
+                let freeze = f.x[11] != 0;
                 crate::sched_cfs::set_task_cpu_cap(pid, if freeze { 0 } else { 100 }) as i64
             }
         }
-        SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[0] as u64),
+        SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[10] as u64),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -734,9 +734,9 @@ unsafe fn write_stat(stat_ptr: u64, t: u16, size: u64) -> bool {
 }
 
 fn sys_openat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
-    let flags = f.x[2] as u32;
-    let _dirfd = f.x[0] as i64; // 单根文件系统：忽略 dirfd（含 AT_FDCWD）
+    let path_ptr = f.x[11];
+    let flags = f.x[12] as u32;
+    let _dirfd = f.x[10] as i64; // 单根文件系统：忽略 dirfd（含 AT_FDCWD）
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -776,7 +776,7 @@ fn sys_openat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_close(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
+    let fd = f.x[10] as i32;
     match process::get_fd(fd) {
         Some(e) => match e.kind {
             FdKind::File => vfs::close(fd) as i64,
@@ -820,9 +820,9 @@ fn sys_close(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_read(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let count = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let count = f.x[12] as usize;
     if count == 0 {
         return 0;
     }
@@ -849,9 +849,9 @@ fn sys_read(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_write(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let count = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let count = f.x[12] as usize;
     if count == 0 {
         return 0;
     }
@@ -906,9 +906,9 @@ fn sys_write(f: &mut TrapFrame) -> i64 {
 
 /// iovec：`{ base: u64, len: u64 }`。
 fn sys_writev(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let iov = f.x[1];
-    let iovcnt = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let iov = f.x[11];
+    let iovcnt = f.x[12] as usize;
     if iovcnt == 0 || iovcnt > 64 {
         return EINVAL;
     }
@@ -979,9 +979,9 @@ fn sys_writev(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_readv(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let iov = f.x[1];
-    let iovcnt = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let iov = f.x[11];
+    let iovcnt = f.x[12] as usize;
     if iovcnt == 0 || iovcnt > 64 {
         return EINVAL;
     }
@@ -1046,10 +1046,10 @@ fn sys_readv(f: &mut TrapFrame) -> i64 {
 
 /// `pread64`：在指定偏移处读取（不改变文件位置）。
 fn sys_pread64(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let count = f.x[2] as usize;
-    let offset = f.x[3] as i64;
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let count = f.x[12] as usize;
+    let offset = f.x[13] as i64;
     // ★ 负偏移防护：此前负 offset 直接当 SEEK_SET 绝对位置使用（语义错乱），
     // 且 seek 失败返回值被吞掉——非法偏移仍在错误位置读写。现拒绝负偏移并对
     // seek 失败上抛（不移动文件位置）。
@@ -1069,10 +1069,10 @@ fn sys_pread64(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_pwrite64(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let count = f.x[2] as usize;
-    let offset = f.x[3] as i64;
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let count = f.x[12] as usize;
+    let offset = f.x[13] as i64;
     // ★ 负偏移防护（与 pread64 同源修复）：此前负 offset 被直接当 SEEK_SET 绝对
     // 位置使用、seek 失败返回值被吞——非法偏移下仍在错位读写。
     if offset < 0 {
@@ -1162,14 +1162,14 @@ fn sys_write_at(fd: i32, buf_ptr: u64, count: usize) -> i64 {
 }
 
 fn sys_lseek(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let offset = f.x[1] as i64; // 64 位偏移，不再截断为 i32
-    let whence = f.x[2] as u32;
+    let fd = f.x[10] as i32;
+    let offset = f.x[11] as i64; // 64 位偏移，不再截断为 i32
+    let whence = f.x[12] as u32;
     vfs::seek(fd, offset, whence)
 }
 
 fn sys_pipe2(f: &mut TrapFrame) -> i64 {
-    let fds_ptr = f.x[0];
+    let fds_ptr = f.x[10];
     if !user_ok_writable(fds_ptr, 8) {
         return EFAULT;
     }
@@ -1313,14 +1313,14 @@ FdKind::Pipe => {
 }
 
 fn sys_dup(f: &mut TrapFrame) -> i64 {
-    let oldfd = f.x[0] as i32;
+    let oldfd = f.x[10] as i32;
     dup_fd_common(oldfd, -1)
 }
 
 /// `dup3(oldfd, newfd, flags)`：复制到指定描述符（flags 本内核恒等，忽略）。
 fn sys_dup3(f: &mut TrapFrame) -> i64 {
-    let oldfd = f.x[0] as i32;
-    let newfd = f.x[1] as i32;
+    let oldfd = f.x[10] as i32;
+    let newfd = f.x[11] as i32;
     if newfd < 0 {
         return EINVAL;
     }
@@ -1342,9 +1342,9 @@ fn sys_dup3(f: &mut TrapFrame) -> i64 {
 
 /// `fcntl`：仅支持 F_DUPFD / F_GETFD / F_SETFD / F_GETFL / F_SETFL（其余忽略）。
 fn sys_fcntl(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let cmd = f.x[1] as i32;
-    let _arg = f.x[2];
+    let fd = f.x[10] as i32;
+    let cmd = f.x[11] as i32;
+    let _arg = f.x[12];
     match cmd {
         // F_DUPFD = 0：复制 fd（分配最小可用描述符），语义与 dup 一致
         0 => dup_fd_common(fd, -1),
@@ -1355,9 +1355,9 @@ fn sys_fcntl(f: &mut TrapFrame) -> i64 {
 
 /// `ioctl`：终端相关请求，以及字符设备（如 evdev）的 ioctl。
 fn sys_ioctl(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let request = f.x[1] as u32;
-    let arg = f.x[2];
+    let fd = f.x[10] as i32;
+    let request = f.x[11] as u32;
+    let arg = f.x[12];
 
     let is_tty = bionic_shim::isatty(fd);
     match request {
@@ -1485,9 +1485,9 @@ fn pm_target_allowed(pid: u32) -> bool {
 }
 
 fn sys_getdents64(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let dirp = f.x[1];
-    let count = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let dirp = f.x[11];
+    let count = f.x[12] as usize;
     if count == 0 {
         return EINVAL;
     }
@@ -1541,8 +1541,8 @@ fn sys_getdents64(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_getcwd(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
-    let size = f.x[1] as usize;
+    let buf = f.x[10];
+    let size = f.x[11] as usize;
     if size < 2 {
         return ERANGE;
     }
@@ -1565,7 +1565,7 @@ fn sys_getcwd(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_chdir(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[0];
+    let path_ptr = f.x[10];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1585,7 +1585,7 @@ fn sys_chdir(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_mkdirat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
+    let path_ptr = f.x[11];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1598,7 +1598,7 @@ fn sys_mkdirat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_unlinkat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
+    let path_ptr = f.x[11];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1611,9 +1611,9 @@ fn sys_unlinkat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_mknodat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
-    let mode = f.x[2] as u32;
-    let dev = f.x[3] as u32;
+    let path_ptr = f.x[11];
+    let mode = f.x[12] as u32;
+    let dev = f.x[13] as u32;
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1640,8 +1640,8 @@ fn sys_mknodat(f: &mut TrapFrame) -> i64 {
 fn sys_renameat(f: &mut TrapFrame) -> i64 {
     let mut old = [0u8; 128];
     let mut new = [0u8; 128];
-    let no = unsafe { read_cstr(f.x[1], &mut old) };
-    let nn = unsafe { read_cstr(f.x[3], &mut new) };
+    let no = unsafe { read_cstr(f.x[11], &mut old) };
+    let nn = unsafe { read_cstr(f.x[13], &mut new) };
     if no == 0 || nn == 0 {
         return EFAULT;
     }
@@ -1666,7 +1666,7 @@ fn sys_renameat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_faccessat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
+    let path_ptr = f.x[11];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1688,9 +1688,9 @@ fn sys_faccessat(f: &mut TrapFrame) -> i64 {
 ///
 /// 目标非符号链接返回 `EINVAL`；`bufsiz` 不足时截断（Linux 语义，不补 \0）。
 fn sys_readlinkat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
-    let buf_ptr = f.x[2];
-    let bufsiz = f.x[3] as usize;
+    let path_ptr = f.x[11];
+    let buf_ptr = f.x[12];
+    let bufsiz = f.x[13] as usize;
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1718,8 +1718,8 @@ fn sys_readlinkat(f: &mut TrapFrame) -> i64 {
 
 /// `symlinkat(target, newdirfd, linkpath)`：创建符号链接（单根文件系统忽略 dirfd）。
 fn sys_symlinkat(f: &mut TrapFrame) -> i64 {
-    let target_ptr = f.x[0];
-    let link_ptr = f.x[2];
+    let target_ptr = f.x[10];
+    let link_ptr = f.x[12];
     let mut target = [0u8; 256];
     let mut link = [0u8; 128];
     let tn = unsafe { read_cstr(target_ptr, &mut target) };
@@ -1734,8 +1734,8 @@ fn sys_symlinkat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_newfstatat(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
-    let stat_ptr = f.x[2];
+    let path_ptr = f.x[11];
+    let stat_ptr = f.x[12];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1756,8 +1756,8 @@ fn sys_newfstatat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_fstat(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let stat_ptr = f.x[1];
+    let fd = f.x[10] as i32;
+    let stat_ptr = f.x[11];
     match vfs::fstat(fd) {
         Some((t, size)) => {
             if !unsafe { write_stat(stat_ptr, t, size) } {
@@ -1771,8 +1771,8 @@ fn sys_fstat(f: &mut TrapFrame) -> i64 {
 
 /// `ftruncate`：把 fd 对应文件截断为 0（本内核仅支持截断到 0）。
 fn sys_ftruncate(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let length = f.x[1] as i64;
+    let fd = f.x[10] as i32;
+    let length = f.x[11] as i64;
     if length != 0 {
         return EINVAL;
     }
@@ -1781,8 +1781,8 @@ fn sys_ftruncate(f: &mut TrapFrame) -> i64 {
 
 /// `truncate(path, length)`：按路径截断；本内核仅支持截断到 0。
 fn sys_truncate(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[0];
-    let length = f.x[1] as i64;
+    let path_ptr = f.x[10];
+    let length = f.x[11] as i64;
     if length != 0 {
         return EINVAL;
     }
@@ -1810,8 +1810,8 @@ fn sys_truncate(f: &mut TrapFrame) -> i64 {
 /// frsize(i64) + spare[5](40B)。只填写块尺寸/总数/空闲等有意义的字段，
 /// 其余清零。
 fn sys_statfs(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[0];
-    let buf_ptr = f.x[1];
+    let path_ptr = f.x[10];
+    let buf_ptr = f.x[11];
     let mut path = [0u8; 128];
     let n = unsafe { read_cstr(path_ptr, &mut path) };
     if n == 0 {
@@ -1852,9 +1852,9 @@ fn sys_statfs(f: &mut TrapFrame) -> i64 {
 /// `socketpair(domain, type, protocol, sv)`：创建双向字节流套接字对。
 /// 仅支持 `AF_UNIX, SOCK_STREAM`；返回两个 fd 写入 `sv[2]`。
 fn sys_socketpair(f: &mut TrapFrame) -> i64 {
-    let domain = f.x[0] as i32;
-    let ty = f.x[1] as i32;
-    let sv = f.x[3];
+    let domain = f.x[10] as i32;
+    let ty = f.x[11] as i32;
+    let sv = f.x[13];
     if domain != AF_UNIX {
         return EAFNOSUPPORT;
     }
@@ -1885,20 +1885,15 @@ fn sys_socketpair(f: &mut TrapFrame) -> i64 {
 /// LINUX_REBOOT_CMD_RESTART（0x1234567）→ PSCI SYSTEM_RESET；
 /// 其它命令返回 EINVAL。QEMU `-no-reboot` 下关机即退出模拟器。
 fn sys_reboot(f: &mut TrapFrame) -> i64 {
-    let cmd = f.x[2] as u32;
+    let cmd = f.x[12] as u32;
     match cmd {
         0x4321_FEDC => {
             crate::uart_send_str("[kernel] 通过 reboot(2) 关机\n");
-            // PSCI 0x84000008 = SYSTEM_OFF；QEMU virt 的 conduit 是 hvc
-            unsafe {
-                core::arch::asm!("hvc #0", in("x0") 0x8400_0008u64, options(noreturn));
-            }
+            crate::sbi::shutdown();
         }
         0x1234_567 => {
             crate::uart_send_str("[kernel] 通过 reboot(2) 重启\n");
-            unsafe {
-                core::arch::asm!("hvc #0", in("x0") 0x8400_0009u64, options(noreturn));
-            }
+            crate::sbi::system_reset();
         }
         _ => EINVAL,
     }
@@ -1911,8 +1906,8 @@ static mut CLIPBOARD: [u8; CLIPBOARD_CAP] = [0; CLIPBOARD_CAP];
 static mut CLIPBOARD_LEN: usize = 0;
 
 fn sys_clipboard_set(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
-    let len = f.x[1] as usize;
+    let buf = f.x[10];
+    let len = f.x[11] as usize;
     if len == 0 || len > CLIPBOARD_CAP {
         return EINVAL;
     }
@@ -1929,8 +1924,8 @@ fn sys_clipboard_set(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_clipboard_get(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
-    let cap = f.x[1] as usize;
+    let buf = f.x[10];
+    let cap = f.x[11] as usize;
     let len = unsafe { CLIPBOARD_LEN };
     if len == 0 {
         return 0; // 空剪贴板
@@ -1979,15 +1974,15 @@ fn sys_kunx_ota(f: &mut TrapFrame) -> i64 {
     // 此前任何应用都能 wipe /data 或从任意路径刷写 —— 按 setuid/kill 的
     // 同一隔离模型仅允许 root（uid 0）。STATUS/CHECK 只读，保持开放。
     let mutating = matches!(
-        f.x[0],
+        f.x[10],
         OTA_CMD_INSTALL | OTA_CMD_SET_RECOVERY | OTA_CMD_FORCE_SLOT | OTA_CMD_WIPE_DATA
     );
     if mutating && process::current_uid() != 0 {
         return EPERM;
     }
-    match f.x[0] {
+    match f.x[10] {
         OTA_CMD_INSTALL | OTA_CMD_CHECK => {
-            let path = match copy_user_string(f.x[1] as usize, 255) {
+            let path = match copy_user_string(f.x[11] as usize, 255) {
                 Some(p) => p,
                 None => return EFAULT,
             };
@@ -1999,7 +1994,7 @@ fn sys_kunx_ota(f: &mut TrapFrame) -> i64 {
                 Ok(s) => s,
                 Err(_) => return EINVAL,
             };
-            let r = if f.x[0] == OTA_CMD_INSTALL {
+            let r = if f.x[10] == OTA_CMD_INSTALL {
                 crate::ota::ota_install(s)
             } else {
                 crate::ota::ota_check(s)
@@ -2018,7 +2013,7 @@ fn sys_kunx_ota(f: &mut TrapFrame) -> i64 {
             }
         }
         OTA_CMD_FORCE_SLOT => {
-            let c = (f.x[1] & 0xFF) as u8;
+            let c = (f.x[11] & 0xFF) as u8;
             if crate::ota::ota_force_slot(c) {
                 0
             } else {
@@ -2033,7 +2028,7 @@ fn sys_kunx_ota(f: &mut TrapFrame) -> i64 {
 /// `dns_resolve(name)`：解析域名（NUL 结尾字符串），返回主机字节序 IPv4；
 /// 0 表示失败（未配置 DNS / 解析超时）。
 fn sys_dns_resolve(f: &mut TrapFrame) -> i64 {
-    let ptr = f.x[0];
+    let ptr = f.x[10];
     if ptr == 0 || ptr >= USER_TOP {
         return 0;
     }
@@ -2067,8 +2062,8 @@ fn sys_dns_resolve(f: &mut TrapFrame) -> i64 {
 /// `statx(dirfd, path, flags, mask, buf)`：以 statx 布局返回文件信息。
 /// 内核无完整 statx；填充基础字段（类型/大小），其余置 0。
 fn sys_statx(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[1];
-    let buf = f.x[4];
+    let path_ptr = f.x[11];
+    let buf = f.x[14];
     if !user_ok_writable(buf, 256) {
         return EFAULT;
     }
@@ -2116,21 +2111,21 @@ fn sys_statx(f: &mut TrapFrame) -> i64 {
 // ==================== 进程 / 线程 ====================
 
 fn sys_exit(f: &mut TrapFrame) -> i64 {
-    process::exit(f.x[0] as i32)
+    process::exit(f.x[10] as i32)
 }
 
 /// exit(93)：仅退出当前线程（最后一个线程自动升级为整进程退出）。
 fn sys_exit_thread(f: &mut TrapFrame) -> i64 {
-    process::exit_thread(f.x[0] as i32)
+    process::exit_thread(f.x[10] as i32)
 }
 
 fn sys_wait4(f: &mut TrapFrame) -> i64 {
-    let pid = f.x[0] as i32;
-    let status_ptr = f.x[1];
+    let pid = f.x[10] as i32;
+    let status_ptr = f.x[11];
     // Linux ABI：wait4(pid, status, options, rusage) —— options 在 x2，
     // rusage 指针在 x3。此前误读 x3，把 rusage 指针当 options（真实
     // bionic/glibc 调用 WNOHANG 会退化为阻塞等待）。
-    let options = f.x[2] as u32;
+    let options = f.x[12] as u32;
     // WNOHANG（1）：无已退出子进程时立即返回 0，不阻塞。
     // 供 launcher 非阻塞轮询应用子进程（应用可能处于 SIGSTOP 后台态，
     // wait 只对 Zombie 返回，停止中的子进程不会被视为"已退出"）。
@@ -2155,8 +2150,8 @@ fn sys_wait4(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_kill(f: &mut TrapFrame) -> i64 {
-    let pid = f.x[0] as i32;
-    let sig = f.x[1] as u32;
+    let pid = f.x[10] as i32;
+    let sig = f.x[11] as u32;
     // 信号号校验：内核仅使用 0..64 位图
     if sig >= 64 {
         return EINVAL;
@@ -2216,9 +2211,9 @@ fn sys_kill(f: &mut TrapFrame) -> i64 {
 /// 与 CFS 调度器集成但不替换其语义。
 fn sys_setpriority(f: &mut TrapFrame) -> i64 {
     const PRIO_PROCESS: i32 = 0;
-    let which = f.x[0] as i32;
-    let who = f.x[1] as i32;
-    let prio = f.x[2] as i32;
+    let which = f.x[10] as i32;
+    let who = f.x[11] as i32;
+    let prio = f.x[12] as i32;
     if which != PRIO_PROCESS {
         return 0; // 组/用户优先级无对应机制：接受调用
     }
@@ -2243,7 +2238,7 @@ fn sys_setpriority(f: &mut TrapFrame) -> i64 {
 /// POSIX 语义：仅 root 可切换到任意 uid；非 root 只能设为自身 uid（no-op）。
 /// 供 launcher 在 execve 应用前调用，实现 per-app UID（Android 式沙箱地基）。
 fn sys_setuid(f: &mut TrapFrame) -> i64 {
-    let uid = f.x[0] as u32;
+    let uid = f.x[10] as u32;
     if uid >= 65536 {
         return EINVAL;
     }
@@ -2256,7 +2251,7 @@ fn sys_setuid(f: &mut TrapFrame) -> i64 {
 
 /// `setgid(gid)`：切换当前进程组 ID（权限规则同 setuid）。
 fn sys_setgid(f: &mut TrapFrame) -> i64 {
-    let gid = f.x[0] as u32;
+    let gid = f.x[10] as u32;
     if gid >= 65536 {
         return EINVAL;
     }
@@ -2272,11 +2267,11 @@ fn sys_setgid(f: &mut TrapFrame) -> i64 {
 ///
 /// AArch64 参数：x0=flags, x1=child_stack, x2=parent_tidptr, x3=tls, x4=child_tidptr。
 fn sys_clone(f: &mut TrapFrame) -> i64 {
-    let flags = f.x[0];
-    let child_stack = f.x[1] as usize;
-    let parent_tidptr = f.x[2] as usize;
-    let tls = f.x[3] as usize;
-    let child_tidptr = f.x[4] as usize;
+    let flags = f.x[10];
+    let child_stack = f.x[11] as usize;
+    let parent_tidptr = f.x[12] as usize;
+    let tls = f.x[13] as usize;
+    let child_tidptr = f.x[14] as usize;
 
     if flags & CLONE_THREAD == 0 {
         // 标准 fork 语义（如 clone(SIGCHLD)）：父返回子 pid，子返回 0。
@@ -2297,9 +2292,9 @@ fn sys_clone(f: &mut TrapFrame) -> i64 {
 /// 抢占，若另一任务并发 execve 会覆写共享的 static 缓冲，导致本任务读到
 /// 被污染的参数/路径（此前 EXEC_PATH/ARGV/ENVP 为 static mut，存在此竞态）。
 fn sys_execve(f: &mut TrapFrame) -> i64 {
-    let path_ptr = f.x[0];
-    let argv_ptr = f.x[1];
-    let envp_ptr = f.x[2];
+    let path_ptr = f.x[10];
+    let argv_ptr = f.x[11];
+    let envp_ptr = f.x[12];
 
     let mut exec_path = [0u8; 128];
     let mut exec_argv: [[u8; EXEC_STR_LEN]; MAX_EXEC_ARGS] =
@@ -2372,19 +2367,19 @@ unsafe fn read_str_array(arr_ptr: u64, bufs: &mut [[u8; EXEC_STR_LEN]; MAX_EXEC_
 
 /// `futex`：pthread 互斥量/条件变量的等待与唤醒。
 fn sys_futex(f: &mut TrapFrame) -> i64 {
-    let addr = f.x[0] as usize;
-    let op = f.x[1] as u32;
-    let val = f.x[2] as u32;
-    let timeout = f.x[3];
-    let addr2 = f.x[4] as usize;
-    let val3 = f.x[5] as u32;
+    let addr = f.x[10] as usize;
+    let op = f.x[11] as u32;
+    let val = f.x[12] as u32;
+    let timeout = f.x[13];
+    let addr2 = f.x[14] as usize;
+    let val3 = f.x[15] as u32;
 
     let (base_op, private) = (op & 0x7F, op & FUTEX_PRIVATE_FLAG != 0);
     let _ = private;
     match base_op {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // 超时：用户 timespec{sec,nsec} 指针 → 单调时钟截止点（µs）。
-            // 此前 `let _timeout = f.x[3]` 直接忽略——futex_wait 无限阻塞，
+            // 此前 `let _timeout = f.x[13]` 直接忽略——futex_wait 无限阻塞，
             // 无竞争互斥量的应用（如 SDL 条件变量）永久挂起。
             let mut deadline = None;
             if timeout != 0 {
@@ -2421,7 +2416,7 @@ fn sys_futex(f: &mut TrapFrame) -> i64 {
 // ==================== 内存 ====================
 
 fn sys_brk(f: &mut TrapFrame) -> i64 {
-    let addr = f.x[0] as usize;
+    let addr = f.x[10] as usize;
     let r = if addr == 0 {
         bionic_shim::brk_get() as i64
     } else {
@@ -2432,12 +2427,12 @@ fn sys_brk(f: &mut TrapFrame) -> i64 {
 
 /// `mmap`：匿名映射（MAP_ANONYMOUS）分配新内存；`/dev/fb0` 映射到显存。
 fn sys_mmap(f: &mut TrapFrame) -> i64 {
-    let addr = f.x[0] as usize;
-    let len = f.x[1] as usize;
-    let prot = f.x[2] as u32;
-    let flags = f.x[3] as u32;
-    let fd = f.x[4] as i32;
-    let _offset = f.x[5];
+    let addr = f.x[10] as usize;
+    let len = f.x[11] as usize;
+    let prot = f.x[12] as u32;
+    let flags = f.x[13] as u32;
+    let fd = f.x[14] as i32;
+    let _offset = f.x[15];
 
     if len == 0 {
         return EINVAL;
@@ -2494,8 +2489,8 @@ fn sys_mmap(f: &mut TrapFrame) -> i64 {
 /// 只处理记录表中的私有映射（匿名 mmap/brk 页）；共享内存、帧缓冲等
 /// 非私有映射不在此列，不会被误释放。地址/长度按页向下/向上取整。
 fn sys_munmap(f: &mut TrapFrame) -> i64 {
-    let addr = f.x[0] as usize;
-    let len = f.x[1] as usize;
+    let addr = f.x[10] as usize;
+    let len = f.x[11] as usize;
     if len == 0 {
         return EINVAL;
     }
@@ -2521,9 +2516,9 @@ fn sys_munmap(f: &mut TrapFrame) -> i64 {
 /// - `PROT_NONE`（0）保持现状（不取消映射），返回成功；
 /// - 授予写权限的 COW/共享只读页先 break 出本进程私有副本（防写穿共享页）。
 fn sys_mprotect(f: &mut TrapFrame) -> i64 {
-    let addr = f.x[0] as usize;
-    let len = f.x[1] as usize;
-    let prot = f.x[2] as u32;
+    let addr = f.x[10] as usize;
+    let len = f.x[11] as usize;
+    let prot = f.x[12] as u32;
     if addr % vm::PAGE_SIZE != 0 || len == 0 {
         return EINVAL;
     }
@@ -2693,7 +2688,7 @@ fn now_usec() -> u64 {
 }
 
 fn sys_gettimeofday(f: &mut TrapFrame) -> i64 {
-    let tv = f.x[0];
+    let tv = f.x[10];
     if tv != 0 {
         if !user_ok_writable(tv, 16) {
             return EFAULT;
@@ -2710,8 +2705,8 @@ fn sys_gettimeofday(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_clock_gettime(f: &mut TrapFrame) -> i64 {
-    let _clk = f.x[0] as i32;
-    let tp = f.x[1];
+    let _clk = f.x[10] as i32;
+    let tp = f.x[11];
     if tp != 0 {
         if !user_ok_writable(tp, 16) {
             return EFAULT;
@@ -2727,7 +2722,7 @@ fn sys_clock_gettime(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_clock_getres(f: &mut TrapFrame) -> i64 {
-    let tp = f.x[1];
+    let tp = f.x[11];
     if tp != 0 {
         if !user_ok_writable(tp, 16) {
             return EFAULT;
@@ -2745,8 +2740,8 @@ fn sys_clock_getres(f: &mut TrapFrame) -> i64 {
 /// UART 待读字节判断。无就绪 fd 时按超时小睡（50ms 切片，提前返回 0
 /// 合法——调用方会重巡 schedule 回调）。
 fn sys_poll_family(f: &mut TrapFrame, tmo_reg: usize) -> i64 {
-    let nfds = f.x[0] as usize;
-    let readfds = f.x[1] as usize;
+    let nfds = f.x[10] as usize;
+    let readfds = f.x[11] as usize;
     let timeout = f.x[tmo_reg] as usize;
     let mut count = 0i64;
     if readfds != 0 && nfds > 0 {
@@ -2826,9 +2821,9 @@ const POLLNVAL: i16 = 0x020;
 const PPOLL_MAX: usize = 256;
 
 fn sys_ppoll(f: &mut TrapFrame) -> i64 {
-    let fds_ptr = f.x[0] as u64;
-    let nfds = f.x[1] as usize;
-    let timeout = f.x[2] as usize;
+    let fds_ptr = f.x[10] as u64;
+    let nfds = f.x[11] as usize;
+    let timeout = f.x[12] as usize;
     if fds_ptr == 0 || nfds == 0 {
         return 0;
     }
@@ -2898,7 +2893,7 @@ fn sys_ppoll(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_nanosleep(f: &mut TrapFrame) -> i64 {
-    let req = f.x[0];
+    let req = f.x[10];
     if !user_ok(req, 16) {
         return EFAULT;
     }
@@ -2926,7 +2921,7 @@ fn sys_nanosleep(f: &mut TrapFrame) -> i64 {
 // ==================== 系统信息 ====================
 
 fn sys_uname(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
+    let buf = f.x[10];
     unsafe {
         if !user_ok_writable(buf, 6 * 65) {
             return EFAULT;
@@ -2944,7 +2939,7 @@ fn sys_uname(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_sysinfo(f: &mut TrapFrame) -> i64 {
-    let info = f.x[0];
+    let info = f.x[10];
     if info != 0 {
         unsafe {
             if !user_ok_writable(info, 112) {
@@ -2970,7 +2965,7 @@ fn sys_sysinfo(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_times(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
+    let buf = f.x[10];
     if buf != 0 {
         unsafe {
             // struct tms = 4 × clock_t = 32 字节（aarch64 Linux ABI）。
@@ -2989,7 +2984,7 @@ fn sys_times(f: &mut TrapFrame) -> i64 {
 /// getrlimit：把默认资源限额写入用户缓冲区（RLIM_INFINITY），
 /// 避免调用方读到未初始化的垃圾。此前该路径返回 0 但不写任何数据。
 fn sys_getrlimit(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
+    let buf = f.x[10];
     if buf == 0 {
         return EFAULT;
     }
@@ -3014,10 +3009,10 @@ fn sys_getrlimit(f: &mut TrapFrame) -> i64 {
 /// 本内核资源无上限：new_rlim 接受但不生效（write 侧调用方传 RLIM_INFINITY），
 /// old_rlim 回填 RLIM_INFINITY。
 fn sys_prlimit64(f: &mut TrapFrame) -> i64 {
-    let pid = f.x[0] as i32;
-    let _resource = f.x[1];
-    let new_rlim = f.x[2];
-    let old_rlim = f.x[3];
+    let pid = f.x[10] as i32;
+    let _resource = f.x[11];
+    let new_rlim = f.x[12];
+    let old_rlim = f.x[13];
     // pid：0 = 当前进程；否则必须指向已存在进程（sig-0 探测语义）
     if pid != 0 && (pid < 0 || pid as usize >= process::MAX_PROC) {
         return ESRCH;
@@ -3055,8 +3050,8 @@ fn sys_umask(mask: u32) -> i64 {
 }
 
 fn sys_getrandom(f: &mut TrapFrame) -> i64 {
-    let buf = f.x[0];
-    let len = f.x[1] as usize;
+    let buf = f.x[10];
+    let len = f.x[11] as usize;
     if len == 0 {
         return 0;
     }
@@ -3118,8 +3113,8 @@ unsafe fn read_sockaddr(addr: u64) -> (u16, u32) {
 }
 
 fn sys_socket(f: &mut TrapFrame) -> i64 {
-    let domain = f.x[0] as i32;
-    let ty = f.x[1] as i32;
+    let domain = f.x[10] as i32;
+    let ty = f.x[11] as i32;
     if domain != AF_INET {
         return EAFNOSUPPORT;
     }
@@ -3131,22 +3126,22 @@ fn sys_socket(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_connect(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let (port, ip) = unsafe { read_sockaddr(f.x[1]) };
+    let fd = f.x[10] as i32;
+    let (port, ip) = unsafe { read_sockaddr(f.x[11]) };
     socket::connect(fd, ip, port) as i64
 }
 
 fn sys_bind(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let (port, _ip) = unsafe { read_sockaddr(f.x[1]) };
+    let fd = f.x[10] as i32;
+    let (port, _ip) = unsafe { read_sockaddr(f.x[11]) };
     socket::bind(fd, port) as i64
 }
 
 fn sys_sendto(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let len = f.x[2] as usize;
-    let (port, ip) = unsafe { read_sockaddr(f.x[4]) };
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    let (port, ip) = unsafe { read_sockaddr(f.x[14]) };
     // Linux 语义：零长度 send 合法（TCP 侧返回 0，不产生数据段）
     if len == 0 {
         if ip != 0 {
@@ -3168,9 +3163,9 @@ fn sys_sendto(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_recvfrom(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let buf_ptr = f.x[1];
-    let len = f.x[2] as usize;
+    let fd = f.x[10] as i32;
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
     let n = len.min(4096);
     let mut tmp = [0u8; 4096];
     let r = socket::recv(fd, &mut tmp[..n]);
@@ -3185,15 +3180,15 @@ fn sys_recvfrom(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_shutdown(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
+    let fd = f.x[10] as i32;
     socket::close(fd);
     0
 }
 
 /// msghdr：`{ name: u64, namelen: u32, iov: u64, iovlen: u64, ... }`。
 fn sys_sendmsg(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let msg = f.x[1];
+    let fd = f.x[10] as i32;
+    let msg = f.x[11];
     if !user_ok(msg, 24) {
         return EFAULT;
     }
@@ -3223,8 +3218,8 @@ fn sys_sendmsg(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_recvmsg(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[0] as i32;
-    let msg = f.x[1];
+    let fd = f.x[10] as i32;
+    let msg = f.x[11];
     if !user_ok(msg, 24) {
         return EFAULT;
     }

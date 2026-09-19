@@ -52,9 +52,6 @@ const WEIGHT_BASE: u32 = 1024;
 /// 一次 IRQ 尾重调度）。鸿蒙交互调度 / ColorOS 潮汐引擎对交互线程的同款优待。
 const WAKEUP_GRAN_NS: u64 = 2_000_000;
 
-/// EL1h 模式、中断全开（DAIF = 0）的 SPSR 值。
-const SPSR_EL1H: u64 = 0x5;
-
 // ==================== 任务状态 / 优先级 ====================
 
 /// 任务状态。
@@ -92,67 +89,59 @@ pub enum PriorityClass {
 
 // ==================== 任务上下文 ====================
 
-/// 任务上下文（寄存器保存区）。
+/// 任务上下文（寄存器保存区，RISC-V）。
 ///
-/// 字段顺序与 `switch_to` 汇编中的 stp/ldp 偏移严格对应：
-///   x19@0x00 .. x30@0x58, sp@0x60, elr@0x68, spsr@0x70, tpidr@0x78,
-///   ttbr0_el1@0x80, sp_el0@0x88
+/// 只保存 callee-saved 寄存器 + 栈指针 + 地址空间：caller-saved 由调用约定
+/// 由调用方保存；用户现场（含 sepc/sstatus/全部用户寄存器）在陷入时保存在
+/// 各任务自己的内核栈陷阱帧里，切换后再经 trap_return 恢复，与 TaskContext
+/// 无关。字段顺序与 `switch_to` 汇编中的 sd/ld 偏移严格对应：
+///   ra@0x00, s0@0x08 .. s11@0x60, sp@0x68, satp_root@0x70
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TaskContext {
-    pub x19: u64,
-    pub x20: u64,
-    pub x21: u64,
-    pub x22: u64,
-    pub x23: u64,
-    pub x24: u64,
-    pub x25: u64,
-    pub x26: u64,
-    pub x27: u64,
-    pub x28: u64,
-    pub x29: u64, // 帧指针
-    pub x30: u64, // link register，即程序计数器（恢复地址/任务入口）
-    pub sp: u64,  // 栈指针
-    pub elr: u64, // 异常返回地址
-    pub spsr: u64, // 保存的 PSTATE
-    pub tpidr: u64, // 线程本地存储基址（TPIDR_EL0）
-    pub ttbr0_el1: u64, // 用户地址空间页表根（TTBR0_EL1）
-    pub sp_el0: u64, // 用户栈指针（SP_EL0）——上下文切换必须保存/恢复，
-                     // 否则被抢占任务恢复后另一任务带着它的 SP_EL0 运行，
-                     // 会把数据写到错误任务的用户栈上（系统性随机崩溃根源）
+    pub ra: u64, // x1：恢复地址（任务入口蹦床 / switch 前的返回点）
+    pub s0: u64, // x8：帧指针
+    pub s1: u64, // x9
+    pub s2: u64, // x18
+    pub s3: u64, // x19
+    pub s4: u64, // x20
+    pub s5: u64, // x21
+    pub s6: u64, // x22
+    pub s7: u64, // x23
+    pub s8: u64, // x24
+    pub s9: u64, // x25
+    pub s10: u64, // x26
+    pub s11: u64, // x27
+    pub sp: u64, // x2：栈指针
+    pub satp_root: u64, // 地址空间根表物理地址（切换时换算 satp 装载值）
 }
 
 impl TaskContext {
     /// 全零上下文。
     pub const fn empty() -> Self {
         TaskContext {
-            x19: 0, x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
-            x25: 0, x26: 0, x27: 0, x28: 0, x29: 0, x30: 0,
-            sp: 0, elr: 0, spsr: 0, tpidr: 0, ttbr0_el1: 0, sp_el0: 0,
+            ra: 0, s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0,
+            s7: 0, s8: 0, s9: 0, s10: 0, s11: 0, sp: 0, satp_root: 0,
         }
     }
 
     /// 新建线程首次运行的上下文。
     ///
-    /// `x19` 存放参数、`x20` 存放入口地址，`x30` 指向 `thread_trampoline`，
-    /// 首次调度时由它把参数搬到 x0 并跳转入入口函数。
-    /// `ttbr0` 为该线程激活的地址空间根表（内核线程传 `vm::kernel_root_addr()`）。
+    /// `s0` 存放参数、`s1` 存放入口地址，`ra` 指向 `thread_trampoline`，
+    /// 首次调度时由它把参数搬到 a0 并跳转入入口函数。
+    /// `satp_root` 为该线程激活的地址空间根表（内核线程传
+    /// `vm::kernel_root_addr()`）。
     ///
-    /// `elr` 初始为 `thread_trampoline` 自身（而非 0）：首次调度后 trampoline
-    /// 会 `daifclr` 使能 IRQ，若在 `br x20` 之前被定时器抢占，`irq_entry` 的
-    /// `eret` 使用当前 ELR_EL1 —— 若为 0 会跳转到地址 0（EL0 指令 abort）。
-    /// 设为 trampoline 后，被抢占会回到 trampoline 重跑（x19/x20 已由
-    /// switch_to 恢复），消除偶发「eret 到 PC=0」的 EL0 故障。
-    pub fn new_thread(entry: fn(usize) -> !, arg: usize, stack_top: usize, ttbr0: usize) -> Self {
+    /// RISC-V 无 aarch64 的 ELR 抢占陷阱：内核态被抢占时 sepc 指向精确的
+    /// 恢复点（下一条指令），sret 必然回到 trampoline 继续执行，不需要
+    /// elr 双保险字段。
+    pub fn new_thread(entry: fn(usize) -> !, arg: usize, stack_top: usize, satp_root: usize) -> Self {
         TaskContext {
-            x19: arg as u64,
-            x20: entry as usize as u64,
-            x30: thread_trampoline as *const () as usize as u64,
+            s0: arg as u64,
+            s1: entry as usize as u64,
+            ra: thread_trampoline as *const () as usize as u64,
             sp: stack_top as u64,
-            elr: thread_trampoline as *const () as usize as u64,
-            spsr: SPSR_EL1H,
-            tpidr: 0,
-            ttbr0_el1: ttbr0 as u64, sp_el0: 0,
+            satp_root: satp_root as u64,
             ..TaskContext::empty()
         }
     }
@@ -307,59 +296,52 @@ extern "C" {
 
 global_asm!(
     r#"
-    // 上下文切换：x0 = from（保存目标），x1 = to（恢复来源）
+    // 上下文切换：a0 = from（保存目标），a1 = to（恢复来源）
     .section .text.switch_to, "ax"
     .global switch_to
     .type switch_to, %function
 switch_to:
-    // 保存 callee-saved 寄存器到 from
-    stp x19, x20, [x0, #0x00]
-    stp x21, x22, [x0, #0x10]
-    stp x23, x24, [x0, #0x20]
-    stp x25, x26, [x0, #0x30]
-    stp x27, x28, [x0, #0x40]
-    stp x29, x30, [x0, #0x50]
-    mov x9, sp
-    str x9, [x0, #0x60]
-    // 保存 ELR_EL1 / SPSR_EL1 / TPIDR_EL0 / TTBR0_EL1 / SP_EL0
-    mrs x9, elr_el1
-    str x9, [x0, #0x68]
-    mrs x9, spsr_el1
-    str x9, [x0, #0x70]
-    mrs x9, tpidr_el0
-    str x9, [x0, #0x78]
-    mrs x9, ttbr0_el1
-    str x9, [x0, #0x80]
-    mrs x9, sp_el0
-    str x9, [x0, #0x88]
+    // 保存 callee-saved（ra + s0-s11）与 sp 到 from
+    sd ra, 0x00(a0)
+    sd s0, 0x08(a0)
+    sd s1, 0x10(a0)
+    sd s2, 0x18(a0)
+    sd s3, 0x20(a0)
+    sd s4, 0x28(a0)
+    sd s5, 0x30(a0)
+    sd s6, 0x38(a0)
+    sd s7, 0x40(a0)
+    sd s8, 0x48(a0)
+    sd s9, 0x50(a0)
+    sd s10, 0x58(a0)
+    sd s11, 0x60(a0)
+    sd sp, 0x68(a0)
     // 从 to 恢复
-    ldp x19, x20, [x1, #0x00]
-    ldp x21, x22, [x1, #0x10]
-    ldp x23, x24, [x1, #0x20]
-    ldp x25, x26, [x1, #0x30]
-    ldp x27, x28, [x1, #0x40]
-    ldp x29, x30, [x1, #0x50]
-    ldr x9, [x1, #0x60]
-    mov sp, x9
-    ldr x9, [x1, #0x68]
-    msr elr_el1, x9
-    ldr x9, [x1, #0x70]
-    msr spsr_el1, x9
-    ldr x9, [x1, #0x78]
-    msr tpidr_el0, x9
-    // 恢复 TTBR0_EL1 并做完整 TLB 维护（tlbi vmalle1）
-    ldr x9, [x1, #0x80]
-    msr ttbr0_el1, x9
-    ldr x9, [x1, #0x88]
-    msr sp_el0, x9
-    isb
-    tlbi vmalle1
-    dsb ish
-    isb
-    // 跳转到恢复后的 x30（目标任务）
+    ld ra, 0x00(a1)
+    ld s0, 0x08(a1)
+    ld s1, 0x10(a1)
+    ld s2, 0x18(a1)
+    ld s3, 0x20(a1)
+    ld s4, 0x28(a1)
+    ld s5, 0x30(a1)
+    ld s6, 0x38(a1)
+    ld s7, 0x40(a1)
+    ld s8, 0x48(a1)
+    ld s9, 0x50(a1)
+    ld s10, 0x58(a1)
+    ld s11, 0x60(a1)
+    ld sp, 0x68(a1)
+    // 地址空间切换：satp = Sv39 | root>>12，随后全量 TLB 失效
+    ld t0, 0x70(a1)
+    srli t0, t0, 12
+    li t1, 0x8000000000000000
+    or t0, t0, t1
+    csrw satp, t0
+    sfence.vma
+    // 跳转到恢复后的 ra（目标任务）
     ret
 
-    // 线程入口蹦床：x19 = 参数，x20 = 入口函数
+    // 线程入口蹦床：s0 = 参数，s1 = 入口函数
     .section .text.thread_trampoline, "ax"
     .global thread_trampoline
     .type thread_trampoline, %function
@@ -367,13 +349,12 @@ thread_trampoline:
     // 首次运行：释放调度锁（切换路径在 switch 前获取、由被切到任务的
     // 恢复点释放；首次运行任务的恢复点是本蹦床而非某个 switch 路径，
     // 必须在此补齐解锁，否则调度锁永久持有 → 后续 block/yield 死锁）。
-    bl sched_unlock_from_asm
+    call sched_unlock_from_asm
     // 使能 IRQ（首次被调度进入时处于中断屏蔽态）
-    msr daifclr, #2
-    // 把参数搬到 x0，跳转入入口
-    mov x0, x19
-    mov x9, x20
-    br x9
+    csrsi sstatus, 2
+    // 把参数搬到 a0，跳转入入口（entry 为 fn(usize) -> !，不返回）
+    mv a0, s0
+    jr s1
 "#
 );
 
@@ -527,7 +508,7 @@ pub fn set_tid_deadline(tid: u32, deadline_us: u64) {
         return;
     }
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         if TASKS[t].state != TaskState::Empty && TASKS[t].state != TaskState::Exited {
@@ -742,7 +723,7 @@ pub fn spawn(
     // 自旋 → 被中断的 spawn 永远无法释放锁 → 单核硬死锁（audio ioctl 等路径
     // 在 IRQ 使能下调用本函数）。保存-恢复 DAIF，与 set_current_nice 同模式。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     // 先取槽位再分配栈：槽位不足时不浪费物理页
     sched_lock();
     let Some(tid) = alloc_tid() else { sched_unlock(); unsafe { write_daif(saved) }; return u32::MAX };
@@ -783,7 +764,7 @@ pub fn insert(
     // ★ 同 spawn：调度锁必须在 IRQ 屏蔽下获取（防 tick 自旋死锁）；
     // 且 fork_parent 在 IRQ 屏蔽临界区内调用本函数，保持调用方 IRQ 状态。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let Some(tid) = alloc_tid() else { sched_unlock(); unsafe { write_daif(saved) }; return u32::MAX };
     unsafe {
@@ -939,7 +920,7 @@ pub fn set_current_nice(nice: i32) {
     // tick 抢锁会自旋死锁。保存-恢复 DAIF（read_daif/write_daif 可嵌套，
     // 调用方已屏蔽时不会错误重开中断）。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     if let Some(cur) = current_idx() {
         unsafe {
@@ -966,7 +947,7 @@ pub fn current_class() -> PriorityClass {
 pub fn set_current_class(class: PriorityClass) {
     // 同 `set_current_nice`：调度锁须在 IRQ 屏蔽下获取（syscall 上下文 IRQ 使能）
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     if let Some(cur) = current_idx() {
         unsafe {
@@ -997,12 +978,10 @@ pub fn dump_tasks() {
             crate::print_hex(t.stack_top as u64);
             crate::uart_send_str("] sp=");
             crate::print_hex(t.context.sp);
-            crate::uart_send_str(" x30=");
-            crate::print_hex(t.context.x30);
-            crate::uart_send_str(" elr=");
-            crate::print_hex(t.context.elr);
-            crate::uart_send_str(" ttbr0=");
-            crate::print_hex(t.context.ttbr0_el1);
+            crate::uart_send_str(" ra=");
+            crate::print_hex(t.context.ra);
+            crate::uart_send_str(" satp_root=");
+            crate::print_hex(t.context.satp_root);
             crate::uart_send_str("\n");
         }
     }
@@ -1131,7 +1110,7 @@ pub fn sleep_until(deadline_us: u64) {
     let saved_daif = unsafe { read_daif() };
     let tid = current_tid();
     let mut registered = false;
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for s in SLEEPERS.iter_mut() {
@@ -1256,14 +1235,14 @@ pub fn resched_if_needed() {
 #[inline]
 pub unsafe fn read_daif() -> u64 {
     let d: u64;
-    asm!("mrs {}, daif", out(reg) d);
+    asm!("csrr {}, sstatus", out(reg) d);
     d
 }
 
 /// 写回 DAIF（恢复中断状态）。
 #[inline]
 pub unsafe fn write_daif(d: u64) {
-    asm!("msr daif, {}", in(reg) d);
+    asm!("csrw sstatus, {}", in(reg) d);
 }
 
 /// 主动让出 CPU（累加一个时间片的 vruntime 后再切换，保证公平轮转）。
@@ -1273,7 +1252,7 @@ pub unsafe fn write_daif(d: u64) {
 #[inline(never)]
 pub fn yield_now() {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let cpu = current_cpu();
     sched_lock();
     let cur = unsafe { CURRENT[cpu] };
@@ -1323,7 +1302,7 @@ pub fn yield_now() {
 #[inline(never)]
 pub fn block_current() {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let cpu = current_cpu();
     sched_lock();
     let cur = unsafe { CURRENT[cpu] };
@@ -1361,7 +1340,7 @@ pub fn block_current() {
 #[inline(never)]
 pub fn stop_current() {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let cpu = current_cpu();
     sched_lock();
     let cur = unsafe { CURRENT[cpu] };
@@ -1394,7 +1373,7 @@ pub fn stop_current() {
 pub fn cont_pid(pid: u32) {
     // 调度锁须在 IRQ 屏蔽下获取（sys_kill → syscall 上下文 IRQ 使能）。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
@@ -1418,7 +1397,7 @@ pub fn set_pid_nice(pid: u32, nice: i32) {
     }
     // 调度锁须在 IRQ 屏蔽下获取（sys_setpriority → syscall 上下文 IRQ 使能）。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
@@ -1445,7 +1424,7 @@ pub fn set_task_cpu_cap(pid: u32, cap: u16) -> i32 {
     let mut found = false;
     // 调度锁须在 IRQ 屏蔽下获取（SYS_KUNX_PM_* → syscall 上下文 IRQ 使能）
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
@@ -1471,7 +1450,7 @@ pub fn task_cpu_cap(pid: u32) -> u16 {
     }
     // 同 set_task_cpu_cap：调度锁须在 IRQ 屏蔽下获取
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let cap = unsafe {
         let mut found = 100u16;
@@ -1509,7 +1488,7 @@ pub fn wake(tid: u32) {
         // 保存-恢复 DAIF（而非无条件 daifclr）：从屏蔽中断的上下文调用时
         // 不得在返回后错误重开中断（与 wake_pid 同源）。
         let saved = unsafe { read_daif() };
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
         sched_lock();
         unsafe {
             if TASKS[tid as usize].state == TaskState::Blocked {
@@ -1549,7 +1528,7 @@ pub fn set_current_ttbr0(ttbr0: usize) {
     unsafe {
         let cur = CURRENT[current_cpu()];
         if cur < MAX_TASKS {
-            TASKS[cur].context.ttbr0_el1 = ttbr0 as u64;
+            TASKS[cur].context.satp_root = ttbr0 as u64;
         }
         vm::write_ttbr0_el1(ttbr0);
     }
@@ -1563,7 +1542,7 @@ pub fn wake_pid(pid: u32) {
     // IRQ 可能是使能的，持锁期间定时器 tick 抢锁会自旋死锁。保存-恢复 DAIF，
     // 调用方已屏蔽时不会错误重开中断。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
@@ -1586,7 +1565,7 @@ pub fn wake_pid(pid: u32) {
 pub fn kill_pid(pid: u32) {
     // 调度锁须在 IRQ 屏蔽下获取（sys_kill / process::exit 路径）。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
@@ -1625,7 +1604,7 @@ pub fn kill_pid(pid: u32) {
 pub fn kill_siblings_of(pid: u32) {
     // 调度锁须在 IRQ 屏蔽下获取（与 kill_pid 同模式）。
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let cur = unsafe { CURRENT[current_cpu()] };
     unsafe {
@@ -1664,7 +1643,7 @@ pub fn kill_siblings_of(pid: u32) {
     let deadline = crate::timer::now_us() + 1_000_000;
     loop {
         let saved2 = unsafe { read_daif() };
-        unsafe { asm!("msr daifset, #2") };
+        unsafe { asm!("csrci sstatus, 2") };
         sched_lock();
         let busy = unsafe {
             (0..MAX_TASKS).any(|i| {
@@ -1694,7 +1673,7 @@ pub fn kill_siblings_of(pid: u32) {
 /// 内部屏蔽 IRQ 并持调度锁保护任务表。
 pub fn reap_pid(pid: u32) {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         // ★ 护栏：该进程仍有存活任务（Running/Ready/Blocked/Stopped，含
@@ -1737,7 +1716,7 @@ pub fn reap_pid(pid: u32) {
 /// 先释放其页表 = 他核任务 use-after-free。
 pub fn has_live_tasks(pid: u32) -> bool {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let mut live = false;
     unsafe {
@@ -1761,7 +1740,7 @@ pub fn has_live_tasks(pid: u32) -> bool {
 pub fn process_stopped(pid: u32) -> bool {
     // 同 wake_pid：调度锁须在 IRQ 屏蔽下获取
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let mut stopped = false;
     unsafe {
@@ -1784,7 +1763,7 @@ pub fn is_blocked(tid: u32) -> bool {
         return false;
     }
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     let r = unsafe { TASKS[tid as usize].state == TaskState::Blocked };
     sched_unlock();
@@ -1798,7 +1777,7 @@ pub fn is_blocked(tid: u32) -> bool {
 /// Exited，不再返回。
 #[inline(never)]
 pub fn exit_current() -> ! {
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let cpu = current_cpu();
     sched_lock();
     let cur = unsafe { CURRENT[cpu] };
@@ -1835,7 +1814,7 @@ pub fn exit_current() -> ! {
 /// 良性的：两方都走 `exit()`，kill_pid/置 Zombie/唤醒等待者均幂等。
 pub fn exit_thread_current() -> bool {
     let saved = unsafe { read_daif() };
-    unsafe { asm!("msr daifset, #2") };
+    unsafe { asm!("csrci sstatus, 2") };
     let cpu = current_cpu();
     sched_lock();
     let cur = unsafe { CURRENT[cpu] };
