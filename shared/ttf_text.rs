@@ -19,6 +19,21 @@ unsafe fn wide_copy(dest: *mut u8, src: *const u8, n: usize) {
     let mut s = src as usize;
     let end = d.saturating_add(n);
     if (d & 7) == 0 && (s & 7) == 0 {
+        while end.saturating_sub(d) >= 16 {
+            asm!(
+                "ld {v0}, 0({s})",
+                "ld {v1}, 8({s})",
+                "addi {s}, {s}, 16",
+                "sd {v0}, 0({d})",
+                "sd {v1}, 8({d})",
+                "addi {d}, {d}, 16",
+                v0 = out(reg) _,
+                v1 = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
         while end.saturating_sub(d) >= 8 {
             asm!(
                 "ld {v}, 0({s})",
@@ -76,7 +91,17 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
         (p as *mut u8).write_volatile(v as u8);
         p += 1;
     }
-    // 8B 主体
+    // 16B 主体（2×sd）+ 尾部 8B
+    while end.saturating_sub(p) >= 16 {
+        asm!(
+            "sd {w}, 0({p})",
+            "sd {w}, 8({p})",
+            "addi {p}, {p}, 16",
+            w = in(reg) word,
+            p = inout(reg) p,
+            options(nostack),
+        );
+    }
     while end.saturating_sub(p) >= 8 {
         asm!(
             "sd {w}, 0({p})",

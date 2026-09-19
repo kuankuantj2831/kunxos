@@ -190,6 +190,16 @@ fn external_irq_dispatch() {
         unsafe { storm_probe(irq) };
         if let Some(handler) = unsafe { HANDLERS[irq as usize] } {
             handler();
+        } else {
+            // 未注册 handler 的源：当场从 PLIC 屏蔽并留痕。电平触发源
+            // （virtio 等）不处理就永远重挂起 —— complete 后立刻再陷入，
+            // 嵌套陷阱帧（每次 832B）会在风暴护栏（20 万次）生效前写穿
+            // 内核栈、砸烂静态数据（表现为路径字符串逐步损坏、全零寄存器、
+            // 垃圾 sepc 的同步异常）。
+            crate::uart_send_str("[irq] 未处理的 IRQ ");
+            crate::print_dec(irq as u64);
+            crate::uart_send_str("，已在 PLIC 屏蔽\n");
+            plic::plic_disable_irq(irq);
         }
         plic::plic_complete(irq);
     }

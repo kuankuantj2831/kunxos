@@ -105,6 +105,11 @@ pub fn user_va_range_ok(va: VirtAddr, len: usize) -> bool {
 /// 映射记录按页维护、由 `add_page/reserve_page/…` 在建立映射时同步写入，
 /// 是用户地址空间唯一权威来源；`LAZY_PAGE` 预留页（未落地）视为未映射。
 pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
+    // root=0：无地址空间（内核任务 / 未初始化进程槽）——视为未映射，
+    // 防止调用方在 tick/采样等内核上下文里解引用空根表打挂内核。
+    if root == 0 {
+        return false;
+    }
     if !user_va_range_ok(va, len) {
         return false;
     }
@@ -130,6 +135,9 @@ pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
 /// 此函数对它们返回 `false` —— 与记录表一致，不把设备寄存器区放行给
 /// 用户指针。
 fn user_page_pte_u(root: usize, va: usize) -> bool {
+    if root == 0 {
+        return false;
+    }
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
     let l3_idx = (va >> 12) & 0x1FF;
@@ -786,6 +794,9 @@ pub fn map_page(vaddr: usize, paddr: usize, flags: MapFlags) -> bool {
 
 /// 从指定根表翻译用户虚拟地址 → 物理地址（诊断用；未映射返回 0）。
 pub fn user_va_to_pa(root: usize, vaddr: usize) -> usize {
+    if root == 0 {
+        return 0;
+    }
     let l1_idx = (vaddr >> 30) & 0x1FF;
     let l2_idx = (vaddr >> 21) & 0x1FF;
     let l3_idx = (vaddr >> 12) & 0x1FF;

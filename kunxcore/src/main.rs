@@ -24,8 +24,24 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
     let mut d = dest as usize;
     let mut s = src as usize;
     let end = d.saturating_add(n);
-    // 两端 8 字节对齐：ld/sd 对（每迭代 8B）
+    // 两端 8 字节对齐：每迭代 16B（2×ld + 2×sd，减半循环开销；无向量
+    // 扩展时这是基础 ISA 的拷贝极限）
     if (d & 7) == 0 && (s & 7) == 0 {
+        while end.saturating_sub(d) >= 16 {
+            asm!(
+                "ld {v0}, 0({s})",
+                "ld {v1}, 8({s})",
+                "sd {v0}, 0({d})",
+                "sd {v1}, 8({d})",
+                "addi {s}, {s}, 16",
+                "addi {d}, {d}, 16",
+                v0 = out(reg) _,
+                v1 = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
         while end.saturating_sub(d) >= 8 {
             asm!(
                 "ld {v}, 0({s})",
@@ -76,6 +92,16 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     while p < end && (p & 7) != 0 {
         (p as *mut u8).write_volatile(v as u8);
         p += 1;
+    }
+    while end.saturating_sub(p) >= 16 {
+        asm!(
+            "sd {w}, 0({p})",
+            "sd {w}, 8({p})",
+            "addi {p}, {p}, 16",
+            w = in(reg) word,
+            p = inout(reg) p,
+            options(nostack),
+        );
     }
     while end.saturating_sub(p) >= 8 {
         asm!(
@@ -557,6 +583,10 @@ pub(crate) fn print_dec(mut v: u64) {
 /// # 安全
 /// 调用者必须已正确初始化 stvec 与 PLIC，否则开启 IRQ 会导致未定义行为。
 pub(crate) unsafe fn enable_irq() {
+    // 分源使能：sie.SEIE（bit9，PLIC 外部中断）+ STIE（bit5，监督定时器）。
+    // sstatus.SIE 只是总开关——此前漏置 sie.SEIE，UART RX / virtio 等一切
+    // PLIC 源的中断从不陷入（定时器经 SBI stimecmp 侥幸可用，掩盖了缺陷）。
+    asm!("csrsi sie, 0x240");
     asm!("csrsi sstatus, 2");
 }
 
@@ -2564,6 +2594,11 @@ _start:
     // SUM|MXR：S 模式可访问 U 页 / 读仅执行页（内核直读用户内存）
     li t0, 0xC0000
     csrs sstatus, t0
+    // ★ 每中断源使能：SSIE|STIE|SEIE（sstatus.SIE 只是总闸）。此前漏开
+    // 导致监督定时器与 PLIC 外部中断从不投递 —— 系统纯协作式裸奔（无
+    // 抢占、无定时唤醒、设备全靠轮询）。
+    li t0, 0x222
+    csrs sie, t0
     // 统一陷入入口
     la t0, trap_entry
     csrw stvec, t0
@@ -2588,6 +2623,9 @@ park:
     csrs sstatus, t0
     li t0, 0xC0000
     csrs sstatus, t0
+    // 每中断源使能（与 _start 一致，见彼处注释）
+    li t0, 0x222
+    csrs sie, t0
     csrci sstatus, 2
 1:
     la t0, SCHED_READY           // AtomicBool（1 字节）
@@ -2704,7 +2742,7 @@ syscall_return_restore:
     csrci sstatus, 2
     // ---- PC 护栏（仅用户来源）：elr 非 0 且低于内核恒等映射起点 ----
     ld t0, 0x110(sp)             // sstatus
-    andi t1, t0, 1               // SPP：1 = 来自内核
+    andi t1, t0, 0x100           // SPP=bit8（bit1 是 SIE！）：1 = 来自内核
     bnez t1, 2f
     ld t0, 0x108(sp)             // elr
     beqz t0, 3f
@@ -2740,7 +2778,7 @@ syscall_return_restore:
     call trap_restore_fp
     // ---- 分流出口 ----
     ld t0, 0x110(sp)
-    andi t0, t0, 1
+    andi t0, t0, 0x100           // SPP=bit8
     bnez t0, kexit               // 内核来源出口
     // 用户出口：先恢复全部通用寄存器（x2 除外），再经 sscratch 中转装回
     // 用户 sp —— RISC-V 的 x2 就是 sp：若直接 `ld x2, 0x100(sp)` 后弹帧，
@@ -2778,12 +2816,12 @@ syscall_return_restore:
     // ★ 用户 sp 装回序列（x2 == sp，禁止常规 ld+addi 组合）：
     //   1) t0 = 帧内用户 sp，暂存 sscratch；
     //   2) 弹帧（sp = 下一轮用户陷阱的停泊值）；
-    //   3) 从帧残留内存补恢复 t0 的用户值（偏移 48-832 = -784）；
+    //   3) 从帧残留内存补恢复 t0 的用户值（x5 槽 = 40-832 = -792）；
     //   4) csrrw 交换：sp ← 用户 sp，sscratch ← 停泊内核 sp（一次完成）。
     ld t0, 0x100(sp)
     csrw sscratch, t0
     addi sp, sp, 832
-    ld t0, -784(sp)
+    ld t0, -792(sp)               // x5 槽 = 帧基+40（40-832=-792；-784 是 x6 槽）
     csrrw sp, sscratch, sp
     sret
 kexit:
