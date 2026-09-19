@@ -19,7 +19,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     ttf_text::font_init();
     let mypid: usize;
     unsafe {
-        asm!("ecall", "mov {}, x0", out(reg) mypid, in("a7") SYS_GETPID, options(nostack));
+        asm!("ecall", "mv {}, a0", out(reg) mypid, in("a7") SYS_GETPID, options(nostack));
     }
     // kill(self, 9)
     unsafe {

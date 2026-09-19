@@ -5,7 +5,7 @@ on:
   pull_request:
 
 env:
-  TARGET: aarch64-unknown-none
+  TARGET: riscv64gc-unknown-none-elf
 
 jobs:
   build:
@@ -24,7 +24,17 @@ jobs:
       - name: cargo build
         run: |
           set -euo pipefail
-          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
+          # 只对裸机目标编译发布物 crate。宿主 crate（默认 feature 依赖 std，
+          # 裸机 target 编不过）按目录排除，其中部分在下方 cargo test 步骤
+          # 以宿主目标编译验证：
+          # - kos：对象存储格式库（test 清单内）
+          # - apps/browser/hosttest：TLS 客户端宿主测试 bin（test 清单内）
+          # - tests/text_host、tools/{kunxverify,sfs_host_test}：#[path] 直接
+          #   include 内核/共享源的旧测试壳，随源演进失修，暂不参与 CI
+          # - kunxboot：aarch64 专用 bootloader（mrs/ic/dsb 等 ARM 指令），
+          #   RISC-V 经 OpenSBI 启动不参与，riscv64 目标编不过
+          HOST_CRATES='^\./(kos|tests|tools|kunxboot)/|/hosttest/'
+          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*' | grep -Ev "$HOST_CRATES"); do
             echo "==> cargo build $m"
             cargo build --release --target "$TARGET" --manifest-path "$m"
           done
@@ -32,13 +42,16 @@ jobs:
       - name: cargo test (host-testable crates only)
         run: |
           set -euo pipefail
-          # 宿主可测 crate 清单：裸机 no_std bin（自定义 linker）与含 aarch64
+          # 宿主可测 crate 清单：裸机 no_std bin（自定义 linker）与含目标架构
           # 内联汇编的 crate（kunxhal/kunxcore）无法在宿主跑 libtest，只对
           # 纯逻辑 crate 运行 cargo test：
           # - shared/jpeg：JPEG 编码器
           # - wireless：Wi-Fi（扫描/连接/4-way/SAE/802.1X）与蓝牙（HCI/L2CAP/
           #   ATT/GATT/SMP/RFCOMM/HFP/A2DP）协议栈，QEMU 逻辑测试（模拟扫描等）
-          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml; do
+          # - kos：对象存储磁盘格式 / Merkle 校验 / 篡改检测（宿主可测设计）
+          # - apps/browser/hosttest：TLS 1.2 客户端宿主测试 bin（无 #[test]，
+          #   借此步做宿主编译检查）
+          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml kos/Cargo.toml apps/browser/hosttest/Cargo.toml; do
             echo "==> cargo test $m"
             cargo test --manifest-path "$m"
           done
