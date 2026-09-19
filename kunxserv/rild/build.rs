@@ -5,6 +5,27 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// 返回候选命令中第一个存在于 PATH 且可执行的（都没找到则取末位，让
+/// Command 报原始 NotFound）。
+fn first_in_path(candidates: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    for name in candidates {
+        if let Some(paths) = env::var_os("PATH") {
+            for dir in env::split_paths(&paths) {
+                let p = dir.join(name);
+                if p.is_file()
+                    && p.metadata()
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+                {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    candidates.last().unwrap().to_string()
+}
+
 fn main() {
     let dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     println!("cargo:rustc-link-arg=-T{}/linker.ld", dir);
@@ -17,8 +38,11 @@ fn main() {
     // ---- C PDU 编解码库 ----
     let target = env::var("TARGET").unwrap_or_default();
     let (cc, ar) = if target.contains("riscv") {
-        // clang 交叉（宿主无 riscv gcc）：lld 链接，medium-any 代码模型
-        ("clang".to_string(), "llvm-ar".to_string())
+        // clang 交叉（宿主无 riscv gcc）：lld 链接，medium-any 代码模型。
+        // ar 只做归档（架构无关）：优先 llvm-ar；发行版常只有带版本号的
+        // llvm-ar-XX 而无通用链接（如 CI 的 ubuntu），回退 binutils ar。
+        let ar = env::var("KUNXOS_AR").unwrap_or_else(|_| first_in_path(&["llvm-ar", "ar"]));
+        ("clang".to_string(), ar)
     } else {
         (
             env::var("KUNXOS_CC").unwrap_or_else(|_| "aarch64-linux-gnu-gcc".to_string()),
