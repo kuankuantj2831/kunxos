@@ -1011,8 +1011,14 @@ fn journal_recover(major: u32) -> i32 {
     jlog_dbg("scan1-done maxc=", max_commit, scan_end, c.jlog_head_seq);
 
     // 第二遍：按相同步进重放 seq ∈ (head_seq, max_commit] 的 DATA 记录。
+    // 与第一遍同样维护 seq 单调守卫：越过最新记录后进入上一周期的陈旧区，
+    // 其记录 seq ≤ max_commit 但内容更旧——若照放（仅靠 seq 范围过滤不够，
+    // 陈旧 seq 可能落在 (head_seq, max_commit] 内），旧镜像会覆盖同 target
+    // 的新状态（宿主掉电测试 k≈106 复现：旧 inode 表覆盖新表，已分配的
+    // inode 变无效）。必须在回退处停止，与第一遍的扫描终点保持一致。
     let mut applied = 0u32;
     let mut i = 0u64;
+    let mut last_seq = 0u64;
     let mut replay_failed = false;
     while i < jlog {
         let pos = ((c.jlog_head_abs + i) % jlog) as usize;
@@ -1025,6 +1031,11 @@ fn journal_recover(major: u32) -> i32 {
         }
         let flags = get_u32(&hdr, JH_FLAGS);
         let seq = get_u64(&hdr, JH_SEQ_LO);
+        if seq < last_seq {
+            jlog_dbg("replay:SEQ-REGRESS-brk pos=", pos as u64, seq, last_seq);
+            break;
+        }
+        last_seq = seq;
         if flags == JFLAG_DATA {
             if pos + 1 >= jlog as usize {
                 break;
@@ -1113,11 +1124,17 @@ fn txn_begin(major: u32) {
                     // head/next 一起跳过尾区推进到环首。跳过的是上一周期的
                     // 陈旧记录（seq ≤ head_seq，恢复扫描按序号过滤），不会
                     // 误重放；跳过后的空隙在下次扫描时作为「陈旧区」越过。
+                    // ★ 跳尾必须随检查点持久化到超级块：若只改 RAM，掉电后
+                    // sb 的 head 仍停在环尾，而新事务写在环首——恢复扫描从
+                    // head 起遇 INVALID 即停，环首的已提交事务永久不可见，
+                    // 其位图镜像无法重放（inode 表已 copy-out、imap 缺位的
+                    // 撕裂状态，宿主掉电测试 k≈88 起复现）。
                     let c = dev_mut(major);
                     let pos = (c.jlog_next_abs % c.jlog_blocks as u64) as usize;
                     if pos != 0 && pos as u64 + need > c.jlog_blocks as u64 {
                         c.jlog_next_abs += c.jlog_blocks as u64 - pos as u64;
                         c.jlog_head_abs = c.jlog_next_abs;
+                        write_superblock(major);
                     }
                 }
             }

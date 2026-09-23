@@ -29,8 +29,9 @@ jobs:
           # 以宿主目标编译验证：
           # - kos：对象存储格式库（test 清单内）
           # - apps/browser/hosttest：TLS 客户端宿主测试 bin（test 清单内）
-          # - tests/text_host、tools/{kunxverify,sfs_host_test}：#[path] 直接
-          #   include 内核/共享源的旧测试壳，随源演进失修，暂不参与 CI
+          # - tools/sfs_host_test：SFS 内核源 include 宿主测试（test 清单内）
+          # - tests/text_host：l10n 宿主测试（test 清单内）
+          # - tools/kunxverify、tests/weather_json：手动宿主工具
           # - kunxboot：aarch64 专用 bootloader（mrs/ic/dsb 等 ARM 指令），
           #   RISC-V 经 OpenSBI 启动不参与，riscv64 目标编不过
           HOST_CRATES='^\./(kos|tests|tools|kunxboot)/|/hosttest/'
@@ -51,7 +52,10 @@ jobs:
           # - kos：对象存储磁盘格式 / Merkle 校验 / 篡改检测（宿主可测设计）
           # - apps/browser/hosttest：TLS 1.2 客户端宿主测试 bin（无 #[test]，
           #   借此步做宿主编译检查）
-          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml kos/Cargo.toml apps/browser/hosttest/Cargo.toml; do
+          # - tests/text_host：shared/l10n 宿主测试 bin（同上，编译检查）
+          # - tools/sfs_host_test：include 内核 fs_simple.rs 真源的掉电/并发/
+          #   撕裂宿主测试（同上；真跑需生成测试盘，见 tools/mkfs_sfs.py）
+          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml kos/Cargo.toml apps/browser/hosttest/Cargo.toml tests/text_host/Cargo.toml tools/sfs_host_test/Cargo.toml; do
             echo "==> cargo test $m"
             cargo test --manifest-path "$m"
           done

@@ -35,6 +35,19 @@ mod sched_cfs {
     pub fn sleep_until(_deadline_us: u64) {
         std::thread::yield_now();
     }
+    /// 与内核 sched_cfs::tid_alive 对应：宿主测试线程由 current_tid 分配且
+    /// 从不消亡，恒真即还原「持有者存活、锁需等待」语义（holder==0 的无
+    /// 持有者情形调用方已单独判断，不会问到 tid_alive(0)）。
+    pub fn tid_alive(_tid: u32) -> bool {
+        true
+    }
+}
+
+mod smp {
+    /// 单核宿主测试桩（内核 smp::cpu_id 用于 fs_lock 记录持有 CPU）。
+    pub fn cpu_id() -> u32 {
+        0
+    }
 }
 
 mod timer {
@@ -72,6 +85,17 @@ fn check(name: &str, cond: bool) {
 /// 挂载测试盘（mkfs 后或崩溃后重挂载）。
 fn reboot() -> i32 {
     mount(MAJOR)
+}
+
+/// 模拟断电重启：真实硬件重启后 RAM 中的 static 状态全部归零。mount 会
+/// 重建 DevState 与事务挂起（TXN_*/PENDING_*），但 COPYOUT_FAILED 设计为
+/// 跨 mount 保留（copy-out 失败的日志记录必须保持可重放，阻止 head 前移
+/// 直到 checkpoint 成功）——宿主壳里它跨「断电」残留会把后续所有 checkpoint
+/// 连同日志环推进一起堵死，故须在此手工清零。
+fn power_off() {
+    unsafe {
+        COPYOUT_FAILED = [false; 16];
+    }
 }
 
 #[allow(dead_code)]
@@ -434,6 +458,7 @@ fn test_crash_recovery() {
             }
         }
         // 模拟断电：不做 fsync/checkpoint，直接丢弃运行期状态
+        power_off();
 
         // 重启：清除故障，挂载 → 恢复
         blkdev::clear_fault();
@@ -494,6 +519,7 @@ fn test_crash_recovery() {
 /// 撕裂写注入：第 k 次写只写半个块。
 fn test_crash_tear() {
     println!("== test_crash_tear ==");
+    power_off(); // 前序测试可能遗留 copy-out 失败标志
     let total = 8192usize;
     let mut disk = vec![0u8; total * blkdev::BLK_SIZE];
     blkdev::set_disk(disk.clone());
@@ -524,6 +550,7 @@ fn test_crash_tear() {
             let _ = write_file(MAJOR, root, &name, &data);
         }
         blkdev::clear_fault();
+        power_off(); // 撕裂注入期间 copy-out 失败置位的标志随断电清零
         if reboot() != 0 {
             println!("  [FAIL] mount failed after tear@{}", k);
             failures += 1;

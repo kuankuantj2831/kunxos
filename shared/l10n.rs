@@ -68,7 +68,8 @@ pub struct Msg {
 }
 
 /// 取当前语言下的字符串；未命中回退 zh。
-pub fn tr(id: &str) -> &'static str {
+/// 生命周期跟随入参：兜底分支透传 id，字面量调用点推断为 'static。
+pub fn tr<'a>(id: &'a str) -> &'a str {
     let l = lang();
     for m in CATALOG {
         if m.id == id {
@@ -83,7 +84,7 @@ pub fn tr(id: &str) -> &'static str {
 }
 
 /// 取指定语言下的字符串（不切换当前语言）。
-pub fn tr_in(id: &str, l: L10nLang) -> &'static str {
+pub fn tr_in<'a>(id: &'a str, l: L10nLang) -> &'a str {
     for m in CATALOG {
         if m.id == id {
             return match l {
