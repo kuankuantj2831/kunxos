@@ -56,6 +56,9 @@ const CLOSE_TIMEOUT_US: u64 = 10_000_000;
 const UDP_TIMEOUT_US: u64 = 30_000_000;
 /// 服务器侧 T_SYN_RCVD 子连接最长等待时间（客户端不回 ACK 则回收槽位）。
 const SYN_RCVD_TIMEOUT_US: u64 = 30_000_000;
+/// TIME_WAIT 最长滞留时间（简化 2MSL）：超时自动回收槽位，此前只能靠
+/// 用户 close 解除 —— 忘记 close 的连接永久占用 TCP 槽位。
+const TIME_WAIT_TIMEOUT_US: u64 = 30_000_000;
 
 const UDP_QUEUE: usize = 8;
 const UDP_MSZ: usize = 1472;
@@ -838,11 +841,22 @@ fn seq_le(a: u32, b: u32) -> bool {
 
 /// 回收长期停留在 T_SYN_RCVD 的子连接（客户端不回 ACK 或已离线），
 /// 避免子槽位永久泄漏；同时从监听者的待 accept 队列中移除。
+/// 同场回收滞留超时（2MSL）的 T_TIME_WAIT 连接 —— 进入 TIME_WAIT 的前提
+/// 是本端应用已 close（主动关闭方），槽位不再被句柄引用，超时回收安全。
 unsafe fn tcp_reap_syn_rcvd() {
     let now = crate::timer::now_us();
     for c in 0..MAX_TCP {
         let s = &TCPS[c];
-        if !s.used || s.state != T_SYN_RCVD {
+        if !s.used {
+            continue;
+        }
+        if s.state == T_TIME_WAIT {
+            if now.saturating_sub(s.last_send_us) >= TIME_WAIT_TIMEOUT_US {
+                TCPS[c] = TcpSock::empty();
+            }
+            continue;
+        }
+        if s.state != T_SYN_RCVD {
             continue;
         }
         if now.saturating_sub(s.last_send_us) < SYN_RCVD_TIMEOUT_US {
@@ -1137,6 +1151,8 @@ pub fn tcp_input(src_ip: u32, seg: &[u8]) {
                             TCPS[idx].state = T_CLOSE_WAIT;
                         } else if TCPS[idx].state == T_FIN_WAIT2 {
                             TCPS[idx].state = T_TIME_WAIT;
+                            // 2MSL 计时锚点：tcp_reap_syn_rcvd 超时自动回收
+                            TCPS[idx].last_send_us = crate::timer::now_us();
                         }
                         need_ack = true;
                     } else if seq_lt(fin_seq, TCPS[idx].rcv_nxt) {
