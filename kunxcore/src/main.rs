@@ -1293,6 +1293,8 @@ fn init_main(_: usize) -> ! {
         anim::poll_deferred_stats();
         // 应用直绘帧统计 / t2f 报告（perf 侧同样只置标记，此处冲刷）。
         crate::perf::poll_report();
+        // IRQ 上下文挂起的 health 控制台行在此冲刷（L-D）
+        crate::health::drain_console();
         thread::yield_now();
     }
 }
@@ -1306,6 +1308,9 @@ fn perf_log_main(_: usize) -> ! {
     loop {
         anim::poll_deferred_stats();
         crate::perf::poll_report();
+        // IRQ 上下文挂起的 health 控制台行在此冲刷（L-D：IRQ 路径禁止
+        // 毫秒级 UART 忙等）
+        crate::health::drain_console();
         // ---- 资源自愈扫描（每 2 秒一轮，200ms × 10）----
         tick = tick.wrapping_add(1);
         if tick % 10 == 0 {

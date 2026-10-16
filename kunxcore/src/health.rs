@@ -99,18 +99,56 @@ pub fn report_irq(irq_ctx: bool, sev: u8, subsys: &'static str, msg: &str, fix: 
         &RING[idx]
     };
     unsafe { irq_restore(saved) };
-    // 控制台：用户可见的「出了什么事 + 怎么修」
-    crate::uart_send_str("[health][");
-    crate::uart_send_str(sev_name(sev));
-    crate::uart_send_str("][");
-    crate::uart_send_str(subsys);
-    crate::uart_send_str("] ");
-    crate::uart_send_str(evt_str(&evt.msg));
-    if !evt_str(&evt.fix).is_empty() {
-        crate::uart_send_str("\n[health] 修复建议：");
-        crate::uart_send_str(evt_str(&evt.fix));
+    // 控制台：用户可见的「出了什么事 + 怎么修」。IRQ 上下文不直接打印
+    // （中文多行按 115200 波特约 10ms+ 忙等，仓库规则：IRQ 路径禁止）——
+    // 拼成一行进延迟打印环形缓冲，由主循环 drain_console 落地（L-D）。
+    if irq_ctx {
+        let mut line = [0u8; 256];
+        let mut n = 0usize;
+        for part in [
+            "[health][".as_bytes(),
+            sev_name(sev).as_bytes(),
+            "][".as_bytes(),
+            subsys.as_bytes(),
+            "] ".as_bytes(),
+            evt_str(&evt.msg).as_bytes(),
+        ] {
+            for &c in part {
+                if n < line.len() - 1 {
+                    line[n] = c;
+                    n += 1;
+                }
+            }
+        }
+        let fix_s = evt_str(&evt.fix);
+        if !fix_s.is_empty() {
+            for &c in b" | \xe4\xbf\xae\xe5\xa4\x8d: " {
+                if n < line.len() - 1 {
+                    line[n] = c;
+                    n += 1;
+                }
+            }
+            for &c in fix_s.as_bytes() {
+                if n < line.len() - 1 {
+                    line[n] = c;
+                    n += 1;
+                }
+            }
+        }
+        defer_console_line(&line[..n]);
+    } else {
+        crate::uart_send_str("[health][");
+        crate::uart_send_str(sev_name(sev));
+        crate::uart_send_str("][");
+        crate::uart_send_str(subsys);
+        crate::uart_send_str("] ");
+        crate::uart_send_str(evt_str(&evt.msg));
+        if !evt_str(&evt.fix).is_empty() {
+            crate::uart_send_str("\n[health] 修复建议：");
+            crate::uart_send_str(evt_str(&evt.fix));
+        }
+        crate::uart_send_str("\n");
     }
-    crate::uart_send_str("\n");
     // 结构化日志（log 快照会进 tombstone）
     log::log_write(
         if sev == SEV_CRITICAL { log::LOG_CRIT } else { log::LOG_WARNING },
@@ -126,6 +164,56 @@ pub fn report_irq(irq_ctx: bool, sev: u8, subsys: &'static str, msg: &str, fix: 
 /// 常规上下文上报（进程上下文/启动阶段）。
 pub fn report(sev: u8, subsys: &'static str, msg: &str, fix: &str) {
     report_irq(false, sev, subsys, msg, fix);
+}
+
+// ==================== IRQ 上下文延迟控制台输出（L-D） ====================
+
+const DEFER_CAP: usize = 2048;
+static mut DEFER_BUF: [u8; DEFER_CAP] = [0; DEFER_CAP];
+static mut DEFER_LEN: usize = 0;
+/// 溢出丢弃计数（诊断：被丢弃的延迟行数）。
+static mut DEFER_DROPPED: u64 = 0;
+
+/// 把一行控制台输出挂起（IRQ 上下文用，关中断拷贝，O(n) 字节级）。
+fn defer_console_line(line: &[u8]) {
+    let saved = unsafe { irq_save() };
+    unsafe {
+        if DEFER_LEN + line.len() + 1 > DEFER_CAP {
+            DEFER_DROPPED = DEFER_DROPPED.saturating_add(1);
+            irq_restore(saved);
+            return;
+        }
+        DEFER_BUF[DEFER_LEN..DEFER_LEN + line.len()].copy_from_slice(line);
+        DEFER_LEN += line.len();
+        DEFER_BUF[DEFER_LEN] = b'\n';
+        DEFER_LEN += 1;
+    }
+    unsafe { irq_restore(saved) };
+}
+
+/// 主循环冷路径调用：把挂起的控制台行真正打出去（进程上下文，可忙等）。
+pub fn drain_console() {
+    let saved = unsafe { irq_save() };
+    let n = unsafe {
+        let n = DEFER_LEN;
+        DEFER_LEN = 0;
+        n
+    };
+    unsafe { irq_restore(saved) };
+    if n == 0 {
+        return;
+    }
+    unsafe {
+        if let Ok(txt) = core::str::from_utf8(&DEFER_BUF[..n]) {
+            crate::uart_send_str(txt);
+        }
+        if DEFER_DROPPED > 0 {
+            crate::uart_send_str("[health] 延迟输出溢出丢弃 ");
+            crate::print_dec(DEFER_DROPPED);
+            crate::uart_send_str(" 行\n");
+            DEFER_DROPPED = 0;
+        }
+    }
 }
 
 /// 遍历健康事件（旧→新）。shell `health` 命令与内部诊断用。
