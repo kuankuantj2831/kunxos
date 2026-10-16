@@ -3143,6 +3143,116 @@ fn sys_umask(mask: u32) -> i64 {
     }
 }
 
+// ==================== getrandom 混合熵池 ====================
+//
+// BUG_REPORT Low 项「getrandom 用时间做种子的确定性 LCG，无真实熵」的修复：
+// 64 字节内核熵池 + 每次调用混入三类熵源——
+//   (a) virtio-rng 硬件随机字节（1ms 限时非阻塞轮询，设备未就绪/忙/超时
+//       只跳过该来源，绝不等设备）；
+//   (b) 高分辨率时间计数器（`time` CSR 原始计数 + 墙钟微秒：前者区分两次
+//       调用，后者区分两次启动）；
+//   (c) 调用者 pid/tid、全局调用序号与内核栈地址（任务间可区分）。
+// 输出仍基于移位/乘法类 PRNG（xorshift64*），但种子与状态全部来自熵池：
+// 池随每次调用搅拌演变，两次调用、两次启动的输出序列均不同。无 libm、
+// 纯四则/异或/移位；非密码学安全（无抗预测积累），但已消除纯时间种子的
+// 确定性。
+
+/// 熵池状态：8×u64 = 64 字节。初值取 π 的十六进制展开——非秘密常量，
+/// 只保证初始状态非零且各槽不对称（全零态会让 xorshift 自锁）。
+static mut ENTROPY_POOL: [u64; 8] = [
+    0x243F_6A88_85A3_08D3,
+    0x1319_8A2E_0370_7344,
+    0xA409_3822_299F_31D0,
+    0x082E_FA98_EC4E_6C89,
+    0x4528_21E6_38D0_1377,
+    0xBE54_66CF_34E9_0C6C,
+    0xC0AC_29B7_C97C_50DD,
+    0x3F84_D5B5_B547_0917,
+];
+/// getrandom 全局调用序号（单调递增，回绕安全：仅用于混熵与轮转槽位）。
+static mut ENTROPY_SEQ: u64 = 0;
+/// 熵池自旋锁（SMP 跨核互斥）。先屏蔽 IRQ 再抢锁：抢到后本核不可能被
+/// 抢占（防「持有者被换下、同核等待者死自旋」）；等待者自旋的临界区是
+/// 纯算术（微秒级），有界。
+static ENTROPY_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// 保存 sstatus 并屏蔽 S 态 IRQ（与 heap.rs 同款；嵌套安全——恢复完整值）。
+unsafe fn ent_irq_save() -> u64 {
+    let d: u64;
+    core::arch::asm!("csrr {}, sstatus", out(reg) d);
+    core::arch::asm!("csrci sstatus, 2");
+    d
+}
+
+unsafe fn ent_irq_restore(saved: u64) {
+    core::arch::asm!("csrw sstatus, {}", in(reg) saved);
+}
+
+/// 抢熵池锁（返回调用前的 sstatus，供 [`ent_unlock`] 恢复）。
+fn ent_lock() -> u64 {
+    let saved = unsafe { ent_irq_save() };
+    while ENTROPY_LOCK
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    saved
+}
+
+fn ent_unlock(saved: u64) {
+    ENTROPY_LOCK.store(false, Ordering::Release);
+    unsafe { ent_irq_restore(saved) };
+}
+
+/// SplitMix64 终结函数（纯乘法/异或/移位，no_std 无 libm 依赖）。
+#[inline]
+fn splitmix_fin(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// 把一个熵字吸收进池：SplitMix64 扩散后异或进轮转槽（`slot` 前进一步）。
+#[inline]
+fn pool_absorb(pool: &mut [u64; 8], slot: &mut usize, word: u64) {
+    pool[*slot] ^= splitmix_fin(word);
+    *slot = (*slot + 1) % pool.len();
+}
+
+/// 搅拌熵池：每槽与左右邻居交叉扩散（3 轮达到雪崩效应；串行轮内读到的
+/// 邻居可能已更新，属有意的扩散路径）。
+fn pool_stir(pool: &mut [u64; 8]) {
+    for _ in 0..3 {
+        for i in 0..pool.len() {
+            let prev = pool[(i + pool.len() - 1) % pool.len()];
+            let next = pool[(i + 1) % pool.len()];
+            let v = pool[i] ^ prev.rotate_left(23) ^ next.rotate_right(17);
+            let v = v.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            pool[i] = v ^ (v >> 29);
+        }
+    }
+}
+
+/// 搅拌后从池状态扩展出 `out.len()` 字节输出（xorshift64*，状态恒非零），
+/// 并把生成器末状态回混进池（同输入状态两次扩展的输出也不同）。
+fn pool_extract(pool: &mut [u64; 8], out: &mut [u8]) {
+    pool_stir(pool);
+    let mut x = 0u64;
+    for w in pool.iter() {
+        x ^= *w;
+    }
+    x |= 1; // xorshift 状态非零
+    for chunk in out.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+    }
+    pool[0] ^= splitmix_fin(x);
+}
+
 fn sys_getrandom(f: &mut TrapFrame) -> i64 {
     let buf = f.x[10];
     let len = f.x[11] as usize;
@@ -3151,32 +3261,64 @@ fn sys_getrandom(f: &mut TrapFrame) -> i64 {
     }
     let n = len.min(256);
     let mut tmp = [0u8; 256];
-    // 优先使用 virtio-rng 硬件熵源（/dev/urandom 同源）；无 RNG 时回退
-    // 到计时器 + tid 混合的伪随机（演示系统非密码学安全）。
-    let r = crate::virtio_rng::get_random(&mut tmp[..n]);
-    let filled = if r > 0 {
-        r as usize
-    } else {
-        let mut seed = now_usec()
-            .wrapping_mul(0x9E3779B97F4A7C15)
-            .rotate_left(17)
-            ^ ((sched_cfs::current_tid() as u64) << 32)
-            ^ 0xDEAD_BEEF;
-        for i in 0..n {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            tmp[i] = (seed >> 33) as u8;
-        }
-        n
+
+    // (a) virtio-rng 硬件熵：1ms 限时非阻塞（未就绪/忙/超时 → hw_len = 0，
+    //     只降熵、不报错、不等待）。
+    let mut hw = [0u8; 64];
+    let hw_len = match crate::virtio_rng::get_random_timed(&mut hw, 1_000) {
+        r if r > 0 => r as usize,
+        _ => 0,
     };
-    if !user_ok_writable(buf, filled) {
+    // (b) 高分辨率时间：time CSR 原始计数（10MHz 单调，区分两次调用）+
+    //     墙钟微秒（含 RTC 基准，区分两次启动）。
+    let now_ticks = crate::timer::read_time();
+    let wall_us = now_usec();
+    // (c) 调用者身份：pid/tid、全局调用序号、内核栈地址（任务间可区分）。
+    let pid_tid = ((process::current_pid() as u64) << 32) | sched_cfs::current_tid() as u64;
+    let stack_hint = &tmp as *const _ as u64;
+
+    // 临界区：取池副本 → 吸收三类熵 → 搅拌扩展 → 写回（读-改-写整体在
+    // 锁内完成，跨核/跨任务不会撕裂池状态）。
+    let saved = ent_lock();
+    unsafe {
+        let mut pool: [u64; 8] = core::ptr::read(core::ptr::addr_of!(ENTROPY_POOL));
+        let seq = ENTROPY_SEQ;
+        ENTROPY_SEQ = seq.wrapping_add(1);
+
+        let mut slot = (seq as usize) % pool.len();
+        // (a) 硬件熵按小端 8 字节字吸收（不足 8 字节尾部补零）
+        let mut i = 0usize;
+        while i < hw_len {
+            let take = (hw_len - i).min(8);
+            let mut w = 0u64;
+            for b in 0..take {
+                w |= (hw[i + b] as u64) << (8 * b);
+            }
+            pool_absorb(&mut pool, &mut slot, w);
+            i += take;
+        }
+        // (b) 时间熵
+        pool_absorb(&mut pool, &mut slot, now_ticks);
+        pool_absorb(&mut pool, &mut slot, wall_us);
+        // (c) 身份熵
+        pool_absorb(&mut pool, &mut slot, pid_tid);
+        pool_absorb(&mut pool, &mut slot, seq);
+        pool_absorb(&mut pool, &mut slot, stack_hint);
+
+        pool_extract(&mut pool, &mut tmp[..n]);
+        core::ptr::write(core::ptr::addr_of_mut!(ENTROPY_POOL), pool);
+    }
+    ent_unlock(saved);
+
+    if !user_ok_writable(buf, n) {
         return EFAULT;
     }
     unsafe {
         crate::mmu::uaccess_begin();
-        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, filled);
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n);
         crate::mmu::uaccess_end();
     }
-    filled as i64
+    n as i64
 }
 
 // ==================== 套接字（映射到 Phase 7 socket 层） ====================

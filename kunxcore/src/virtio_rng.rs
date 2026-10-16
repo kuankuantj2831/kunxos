@@ -8,6 +8,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::allocator;
 use crate::devfs;
@@ -59,6 +60,19 @@ static mut MODERN: bool = false;
 static mut RING: usize = 0;
 static mut LAST_USED: u16 = 0;
 static mut READY: bool = false;
+
+/// 单飞行互斥：[`get_random`] / [`get_random_timed`] 共用。
+///
+/// 此前两任务并发取熵会同时改写描述符 0 与 avail/used 游标（无任何锁），
+/// 可能彼此误判完成、读到对方请求的残数据。占用失败直接返回 -1：调用方
+/// （rng_read → EOF、熵池 → 回退时间混合）都有降级路径，绝不等锁。
+static RING_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// [`get_random_timed`] 的 DMA 目的地：模块常驻 64 字节暂存区。
+///
+/// 限时放弃后设备迟到的完成只覆写这块永久有效的内存，绝不 DMA 进可能已
+/// 回收的调用者栈缓冲（消除超时路径悬空描述符的栈破坏风险）。
+static mut TIMED_BUF: [u8; 64] = [0; 64];
 
 // ==================== MMIO 原语 ====================
 
@@ -207,9 +221,75 @@ pub fn init(devs: &[MmioDev]) -> bool {
 
 // ==================== 取随机数 ====================
 
+/// 尝试占用单飞行互斥（另一任务正在操作环时返回 false）。
+fn ring_acquire() -> bool {
+    RING_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn ring_release() {
+    RING_BUSY.store(false, Ordering::Release);
+}
+
+/// 投递单个「设备写入」描述符并轮询 used ring。
+///
+/// `deadline == None`：legacy 语义（100_000_000 次自旋上限，超时打印）；
+/// `deadline == Some(t)`：`time` CSR 计数到达 `t` 即静默返回 -1（不打印——
+/// 熵池可能高频调用，刷屏比缺一次硬件熵更糟；描述符留环内，迟到完成由
+/// 下一调用消费）。
+///
+/// # 安全
+/// 调用方须持有 `RING_BUSY` 且已确认 `READY`；`dst` 指向的缓冲在设备完成
+/// 前必须保持有效（deadline 超时路径除外——见 [`TIMED_BUF`]）。
+unsafe fn get_random_inner(dst: usize, len: usize, deadline: Option<u64>) -> i32 {
+    let ai = avail_idx();
+    let slot = (ai % QUEUE_SIZE as u16) as usize;
+
+    *desc_addr(0) = dst as u64;
+    *desc_len(0) = len as u32;
+    *desc_flags(0) = DESC_F_WRITE;
+    dcache_clean(RING + DESC_OFF, 16);
+
+    *avail_ring(slot) = 0;
+    mb();
+    set_avail_idx(ai.wrapping_add(1));
+    dcache_clean(RING + AVAIL_OFF, 4 + 2 * QUEUE_SIZE);
+
+    dsb();
+    w32(REG_QUEUE_NOTIFY, 0);
+
+    let mut tries = 0usize;
+    loop {
+        dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
+        if used_idx() != LAST_USED {
+            LAST_USED = used_idx();
+            break;
+        }
+        match deadline {
+            Some(d) => {
+                if crate::timer::read_time() >= d {
+                    return -1;
+                }
+            }
+            None => {
+                tries += 1;
+                if tries > 100_000_000 {
+                    crate::uart_send_str("[rng] get_random 超时\n");
+                    return -1;
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+    dcache_invalidate(dst, len);
+    len as i32
+}
+
 /// 同步从熵源取 `len` 字节写入 `buf`，返回实际字节数；失败 -1。
 ///
 /// 单飞行模型：一次只投递一个「设备写入」描述符并轮询 used ring。
+/// 并发占用（另一任务取熵中）返回 -1，`rng_read` 按 EOF 处理。
 pub fn get_random(buf: &mut [u8]) -> i32 {
     if !unsafe { READY } {
         return -1;
@@ -218,40 +298,52 @@ pub fn get_random(buf: &mut [u8]) -> i32 {
     if len == 0 {
         return 0;
     }
-    unsafe {
-        let ai = avail_idx();
-        let slot = (ai % QUEUE_SIZE as u16) as usize;
-
-        *desc_addr(0) = buf.as_ptr() as u64;
-        *desc_len(0) = len as u32;
-        *desc_flags(0) = DESC_F_WRITE;
-        dcache_clean(RING + DESC_OFF, 16);
-
-        *avail_ring(slot) = 0;
-        mb();
-        set_avail_idx(ai.wrapping_add(1));
-        dcache_clean(RING + AVAIL_OFF, 4 + 2 * QUEUE_SIZE);
-
-        dsb();
-        w32(REG_QUEUE_NOTIFY, 0);
-
-        let mut tries = 0usize;
-        loop {
-            dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
-            if used_idx() != LAST_USED {
-                LAST_USED = used_idx();
-                break;
-            }
-            tries += 1;
-            if tries > 100_000_000 {
-                crate::uart_send_str("[rng] get_random 超时\n");
-                return -1;
-            }
-            core::hint::spin_loop();
-        }
-        dcache_invalidate(buf.as_ptr() as usize, len);
-        len as i32
+    if !ring_acquire() {
+        return -1;
     }
+    let r = unsafe { get_random_inner(buf.as_mut_ptr() as usize, len, None) };
+    ring_release();
+    r
+}
+
+/// 限时非阻塞取熵（getrandom 熵池专用）。
+///
+/// 与 [`get_random`] 的差异：
+/// - DMA 目的地固定为模块静态 [`TIMED_BUF`]（超时后迟到的完成不会写入
+///   调用者栈缓冲）；
+/// - 以 `time` CSR 设 `max_us` 微秒量级的截止时刻，设备忙/超时静默返回 -1
+///   （调用方回退「时间 + pid」混合熵，绝不等设备）；
+/// - 与 [`get_random`] 共享单飞行互斥，并发直接失败。
+///
+/// 返回值：`>0` 写入 buf 的字节数（≤ min(buf.len(), 64)）；`-1` 设备未
+/// 就绪/忙/超时；`0` 请求长度为 0。
+pub fn get_random_timed(buf: &mut [u8], max_us: u64) -> i32 {
+    if !unsafe { READY } {
+        return -1;
+    }
+    let want = buf.len().min(64);
+    if want == 0 {
+        return 0;
+    }
+    if !ring_acquire() {
+        return -1;
+    }
+    let r = unsafe {
+        // 限时预算（time CSR 计数）：正常平台 10MHz × 1000µs = 10000 计数；
+        // freq < 1MHz 时 max(1) 防零预算（0 预算 = 立即假超时）。
+        let budget = (max_us.saturating_mul(crate::timer::frequency()) / 1_000_000).max(1);
+        let deadline = crate::timer::read_time().saturating_add(budget);
+        let dst = core::ptr::addr_of_mut!(TIMED_BUF) as usize;
+        get_random_inner(dst, want, Some(deadline))
+    };
+    ring_release();
+    if r > 0 {
+        let n = r as usize;
+        unsafe {
+            core::ptr::copy_nonoverlapping(core::ptr::addr_of!(TIMED_BUF) as *const u8, buf.as_mut_ptr(), n);
+        }
+    }
+    r
 }
 
 // ==================== devfs ====================
