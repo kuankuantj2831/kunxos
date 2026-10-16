@@ -156,3 +156,45 @@
 ### 第 15 轮（2026-10-17 05:4x，定时轮）
 - CHANGELOG 补记第 8-14 轮成果（R5/R6 审查修复、gdbstub 重构、三个新动效、验证统计）
 - 交付状态：待修清单清空（A1 转为诊断就位待自然复现）；全部提交经双轮独立审查（R3/R6 质量关）
+
+## 最终交付总结（2026-10-17 06:36，夜间十小时自动化收官）
+
+**总账**：本地 git 31 个提交（43eaaf9 之后，未 push）；6 轮并行代码审查（R1-R6）+ 主会话连续工作段 + 15 个工单轮次；全夜间每轮 `make` 全量 0 错误，`make test-sfsrace` 累计 12+ 次 PASS，10 次真实 GUI 启动链路 0 PANIC / 0 fault。
+
+### 一、修复的 bug（35+ 项，全部经审查确认有具体触发路径）
+
+**内核安全/正确性（High 级）**
+1. /proc/power、/proc/pressure 写路径无权限检查——任意应用可冻结/限速其它进程（syscall 层已修漏洞的旁路复活）→ root 门禁
+2. IRQ 故障遏制槽位跨任务残留——可展开他人陷阱帧跨地址空间 sret 执行任意代码 → tid 归属校验
+3. panic 遏制缺 IRQ 上下文守卫——中断 handler panic 错杀无辜进程/进程孤儿化
+4. virtio-rng 超时后 used-ring 失步——后续取熵返回垃圾 + 迟到 DMA 写调用者栈
+5. SCHED_LOCK 自愈抢锁与任务退出锁交接窗口竞态（SMP 双核入临界区）→ 遏制出口显式放锁
+
+**内核功能修复**
+6. getrandom 时间种子 LCG → virtio-rng 硬件熵 + 时间/身份混合熵池（跨调用/跨启动可区分）
+7. TIME_WAIT 30s 定时回收（含悬空句柄清理）；ARP 60s TTL（born_us 判定，LRU 不续命）
+8. OTA：load_otp 扇区数纠正（OTP 防回滚首次生效）、KXRL1 增量解压窗口（原 100% 失败）
+9. gdbstub 完整重构：RISC-V 软件单步（临时推进断点状态机）+ RVC 宽度感知 + TEMP 清算/失败回滚
+10. fdt 递归深度封顶、rename_task UTF-8 边界、wait4 WIFSIGNALED 编码、定时器遏制级联、health 环形缓冲 IRQ 防护、power status 双侧钳制、thermal force 溢出、crash_screen/bootfail 横幅修复
+
+**应用与服务（17 项）**
+alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（消息每次翻倍）、rild 长短信截断、settings 单位损坏/权限页守卫、gallery 不可见瓦片可点击、cloud 三处（越界闪退/poll 别名覆盖/备份 n 不一致）、audiomix、launcher 健康横幅选最轻事件等
+
+### 二、ColorOS 17 动效对标
+
+- **曲线体系**：三端（内核 anim.rs / shared/motion.rs / launcher 本地）接入 ColorOSStandard(0.22,1,0.36,1) + ColorOSEmphasized(0.3,0,0.1,1)，手势退出/多任务/页面切换/应用入场 20+ 站点统一
+- **新动效 7 项**：桌面翻页惯性+视差（B5）、开机/解锁亮度渐亮（B8）、应用启动骨架屏呼吸（B10）、状态栏充电动效-弹簧弹跳+呼吸闪电（B12）、控制中心错峰入场、dock 悬浮放大、解锁粒子迸发
+
+### 三、验证与质量关
+
+- 所有新代码经 R3/R6 两轮独立 fresh-eyes 审查（共抓出夜间自身引入的 5H+6M+7L 并全部修复）
+- 历史高发族（usize 返回值/from_utf8/CJK 定长拷贝）在全部 apps+服务核实清零
+- 内核 7 条预存警告清零；死代码清理（sync_gdb_entry 等，-88 行）
+
+### 四、遗留事项（均已记录，非阻塞）
+
+1. A1：launcher mmap /dev/fb0 偶发 EINVAL——10 次启动未复现，`[fb-mmap]` 诊断就位，复现时串口直接定位
+2. L-D：IRQ 上下文 health 上报的阻塞 UART 打印（事件稀有，毫秒级，已知取舍）
+3. gdbstub 软件单步仅跟踪顺序流（分支目标不埋临时断点，与常见实现同款）
+4. SMP 仍为实验特性；kunxui 控件库就绪待接入（设置应用候选）
+5. test-wireless 宿主测试在 RISC-V 移植后空置（以 test-sfsrace 为权威回归）
