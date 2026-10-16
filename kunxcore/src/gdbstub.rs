@@ -373,26 +373,49 @@ fn insn_len_at(addr: u64) -> usize {
 /// 临时 ebreak（若该处已有真实断点则不植入，命中时只重插原断点并停下）。
 /// `report` = 命中后是否停回 GDB（`s` 单步语义）。
 unsafe fn arm_temp_advance(bp_addr: u64, report: bool) {
-    let ilen = match bp_find(bp_addr) {
-        Some(i) => {
-            let o = BPS[i].orig;
-            if (o & 0xFFFF) as u8 & 0x3 != 0x3 {
-                2
-            } else {
-                4
-            }
-        }
-        None => insn_len_at(bp_addr),
-    };
-    let next = bp_addr + ilen as u64;
-    bp_remove(bp_addr);
     unsafe {
+        // 先清算残留的旧临时断点（R6-M）：断点 A 在分支指令、B 在跳转目标
+        // 的场景中，A 处 `c` 武装的 TEMP 在 B 停下时仍活着——直接覆写会
+        // 让 A 永久丢失、A+ilen 留下幽灵 ebreak。
+        if TEMP_BP_ADDR != 0 {
+            if TEMP_PLANTED {
+                bp_remove(TEMP_BP_ADDR);
+            }
+            bp_reinsert(TEMP_RESUME_ADDR);
+            TEMP_BP_ADDR = 0;
+            TEMP_RESUME_ADDR = 0;
+            TEMP_PLANTED = false;
+            TEMP_STOP_REPORT = false;
+        }
+        let ilen = match bp_find(bp_addr) {
+            Some(i) => {
+                let o = BPS[i].orig;
+                if (o & 0xFFFF) as u8 & 0x3 != 0x3 {
+                    2
+                } else {
+                    4
+                }
+            }
+            // bp_addr 处无断点也适用：非断点处 `s` 的单步推进（R6-H，
+            // 原 Step 分支只处理「停在断点上」的情况 → 连续两次 s 自由运行）
+            None => insn_len_at(bp_addr),
+        };
+        let next = bp_addr + ilen as u64;
+        if bp_find(bp_addr).is_some() {
+            bp_remove(bp_addr);
+        }
         TEMP_RESUME_ADDR = bp_addr;
         TEMP_BP_ADDR = next;
         TEMP_STOP_REPORT = report;
         TEMP_PLANTED = bp_find(next).is_none();
-        if TEMP_PLANTED {
-            bp_set(next);
+        if TEMP_PLANTED && !bp_set(next) {
+            // 植入失败（越界/不可写）：回滚——重插原断点并放弃推进，
+            // 目标停在原地，绝不自由运行（R6-L）
+            bp_reinsert(bp_addr);
+            TEMP_BP_ADDR = 0;
+            TEMP_RESUME_ADDR = 0;
+            TEMP_PLANTED = false;
+            TEMP_STOP_REPORT = false;
         }
     }
 }
@@ -891,10 +914,10 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
             }
         }
         LoopResult::Step => {
-            // 单步：同上但命中临时断点后停回 GDB（pc = 下一条指令）
-            if ec == 3 && bp_find(regs.pc).is_some() {
-                unsafe { arm_temp_advance(regs.pc, true) };
-            }
+            // 单步：武装临时推进断点，命中后停回 GDB（pc = 下一条指令）。
+            // 不要求当前停在断点上——非断点处 `s` 同样推进（R6-H：原实现
+            // 此处什么都不做 → sret 后自由运行，GDB 挂起）
+            unsafe { arm_temp_advance(regs.pc, true) };
         }
         LoopResult::Detach => {}
         LoopResult::Kill => {
@@ -973,10 +996,10 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
             }
         }
         LoopResult::Step => {
-            // 单步：同上但命中临时断点后停回 GDB（pc = 下一条指令）
-            if ec == 3 && bp_find(regs.pc).is_some() {
-                unsafe { arm_temp_advance(regs.pc, true) };
-            }
+            // 单步：武装临时推进断点，命中后停回 GDB（pc = 下一条指令）。
+            // 不要求当前停在断点上——非断点处 `s` 同样推进（R6-H：原实现
+            // 此处什么都不做 → sret 后自由运行，GDB 挂起）
+            unsafe { arm_temp_advance(regs.pc, true) };
         }
         LoopResult::Detach => {}
         LoopResult::Kill => {

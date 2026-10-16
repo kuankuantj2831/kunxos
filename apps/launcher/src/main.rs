@@ -1947,13 +1947,14 @@ static mut SPARKS: [UnlockSpark; 24] = [UnlockSpark {
 }; 24];
 static mut SPARK_T0: u64 = 0;
 
-/// 迸发总时长（µs）。
-const SPARK_LIFE_US: u64 = 520_000;
+/// 迸发总时长（µs）——不超过解锁上滑转场 300ms（转场结束锁层不再绘制，
+/// 更长的寿命会被硬切成集体瞬移消失，R6-L）。
+const SPARK_LIFE_US: u64 = 290_000;
 
-/// 触发一次迸发（unlock_success 调用）。中心取锁图标位置。
+/// 触发一次迸发（unlock_success 调用）。中心取锁图标位置 (W/2, 308)。
 unsafe fn unlock_sparks_burst() {
     let cx = DISPLAY_W as f32 / 2.0;
-    let cy = 660.0;
+    let cy = 308.0;
     // 无 sin：按黄金角均匀铺开 24 个方向，速度 120..300 px/s 分档。
     let mut ang = 0.0f32;
     for i in 0..SPARKS.len() {
@@ -1981,14 +1982,19 @@ unsafe fn unlock_sparks_draw(now: u64) {
     let fade = 1.0 - dt as f32 / SPARK_LIFE_US as f32;
     let alpha = (255.0 * fade) as u32;
     let pa = PIX_ALPHA;
+    PIX_ALPHA = alpha;
     for s in SPARKS.iter_mut() {
         if s.life == 0 {
             continue;
         }
         let px = s.x + s.vx * t;
         let py = s.y + s.vy * t + 240.0 * t * t; // g/2 = 240
-        PIX_ALPHA = alpha;
-        fill_rect(px as i32 - 1, py as i32 - 1, 3, 3, COLOR_ACCENT);
+        // 逐像素 put_pixel：fill_rect 不吃 PIX_ALPHA（R6-M，淡出原无效）
+        for dy in -1..2i32 {
+            for dx in -1..2i32 {
+                put_pixel(px as i32 + dx, py as i32 + dy, COLOR_ACCENT);
+            }
+        }
     }
     PIX_ALPHA = pa;
 }
@@ -4613,6 +4619,20 @@ fn draw_dock() {
 
 /// Dock 图标悬浮几何：光标在图标热区（外扩 6px）内 → 1.12x 居中放大，
 /// 否则原尺寸。返回 (size, ox, oy) 与 pressed_icon_rect 同约定。
+/// `DOCK_HOVER_IDX`（-1 = 无）由 move_cursor_fb 的进出检测维护。
+static mut DOCK_HOVER_IDX: i32 = -1;
+
+/// 光标当前悬停的 dock 图标下标（-1 = 无）。与 dock_hover_rect 同热区。
+unsafe fn dock_hover_index(cx: i32, cy: i32) -> i32 {
+    for i in 0..DOCK_COUNT {
+        let (dx, dy) = dock_rect(i);
+        if cx >= dx - 6 && cx < dx + DOCK_ICON + 6 && cy >= dy - 6 && cy < dy + DOCK_ICON + 6 {
+            return i as i32;
+        }
+    }
+    -1
+}
+
 unsafe fn dock_hover_rect(dx: i32, dy: i32) -> (i32, i32, i32) {
     let (cx, cy) = (CURSOR_X, CURSOR_Y);
     if cx >= dx - 6 && cx < dx + DOCK_ICON + 6 && cy >= dy - 6 && cy < dy + DOCK_ICON + 6 {
@@ -7148,6 +7168,14 @@ fn move_cursor_fb() {
         if !MOUSE_SEEN || FB.is_null() {
             CURSOR_DIRTY = false;
             return;
+        }
+        // dock 悬浮进出检测（R6-M）：光标移动本不触发整屏重绘，悬浮放大
+        // 在空闲桌面永不出现。廉价检测光标所处 dock 图标下标，仅在
+        // 进/出翻转时置 NEEDS_REDRAW（一次整屏重绘换取放大/还原即时性）。
+        let hover_idx = dock_hover_index(CURSOR_X, CURSOR_Y);
+        if hover_idx != DOCK_HOVER_IDX {
+            DOCK_HOVER_IDX = hover_idx;
+            NEEDS_REDRAW = true;
         }
         let (ox, oy) = (CUR_UNDER_X, CUR_UNDER_Y);
         if ox >= 0 {
