@@ -97,3 +97,8 @@
 - A1 launcher mmap /dev/fb0 偶发 EINVAL：诊断打印已就位，需下次复现读 [fb-mmap] 输出定位
 - L-D IRQ 上下文 health 上报的 UART 打印（事件稀有，毫秒级停顿，属取舍）
 - SMP 模式仍为实验特性（bootargs "smp"）；H2 修复后调度锁已无已知竞态，但整体未硬化
+
+### 第 7 轮（2026-10-17 凌晨，R4 剩余面 + 动效补充）
+- **R4 审查**（cloud/audiomix 等 12 应用 + 6 服务）：3 Medium（全在 cloud：seed 越界 panic / poll 响应别名覆盖 / 备份 n 不一致）+ 2 Low，全部修复提交；6 个服务核实无缺陷
+- **动效**：控制中心子元素错峰入场（面板展开/跟手期间各行卡片按序上移显现，ColorOS 风格）已提交
+- 回归：make 全量 0 错误 + test-sfsrace PASS
