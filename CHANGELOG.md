@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+### 2026-10-16/17 夜间十小时自动化轮：安全修复 + ColorOS 17 动效对标（24 提交）
+
+> 主会话连续工作 + 三波并行审查/修复子代理 + 每小时定时轮次。全程
+> `make` 全量 0 错误、`make test-sfsrace` 七次回归全 PASS。完整清单见
+> `docs/NIGHT_PLAN.md`。
+
+#### 内核（正确性/安全）
+- **getrandom 真实熵源**：virtio-rng 限时非阻塞取熵 + 64B 熵池（硬件熵/time CSR/墙钟/pid/tid/序号混合，SplitMix 终结 + xorshift64*），替代时间种子确定性 LCG；virtio-rng 单飞行互斥 + 超时失步排空（STALE_USED）+ legacy 路径统一静态 DMA 缓冲
+- **遏制机制四项加固**：IRQ 遏制槽位 tid 归属校验（原可展开他人帧跨地址空间 sret）；panic 遏制 IRQ 上下文守卫（不再错杀无辜进程/孤儿化）；is_sched_kthread 排除用户任务；遏制出口显式放调度锁（自持锁不再关中断死自旋）
+- **TIME_WAIT 30s 定时回收**（含悬空句柄清理）、**ARP 条目 60s TTL**（born_us 判定，LRU 刷新不续命）
+- rename_task 名字截断回退 UTF-8 字符边界；wait4 信号击杀按 WIFSIGNALED 编码；定时器遏制超限直转整机诊断；health 环形缓冲 IRQ 屏蔽；crash_screen/bootfail 横幅修复；内核 7 条预存警告清零
+
+#### 应用与服务（4 轮审查 17 项缺陷全修）
+- alarmd 贪睡响铃秒停 + 一次性闹钟静默禁用；sms 首启判定反（消息每次翻倍）；rild 长短信标记已读截断；settings 存储页单位损坏/权限页命中守卫；gallery 不可见瓦片可点击；cloud seed 越界闪退/poll 响应别名覆盖/备份 n 不一致；audiomix read 判界
+
+#### ColorOS 17 动效对标
+- 全系统三端（内核 anim / shared motion / launcher 本地）接入 **ColorOSStandard(0.22,1,0.36,1)** 与 **ColorOSEmphasized(0.3,0,0.1,1)** 标准曲线；手势退出/多任务/页面切换/应用入场 20+ 站点统一切换
+- 新动效：桌面翻页惯性减速 + 相邻页视差（B5）；开机/解锁亮度渐亮（B8，flip-LUT/烘焙双模式）；应用启动骨架屏呼吸（B10，脏矩形增量）；状态栏充电动效（真实电量+呼吸闪电+插电弹簧弹跳，B12）；控制中心子元素错峰入场
+
+
 ### 2026-09-18 深夜续轮：GUI 应用全挂的根因修复（tty_read 无视 O_NONBLOCK）
 
 > 第十九轮为 musl fgets 把 /dev/tty read 改成阻塞语义时，yield 循环实现
