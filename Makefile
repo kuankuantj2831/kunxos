@@ -646,7 +646,7 @@ $(DISK_IMG): $(KERNEL_IMG) $(DTB) $(RAMDISK) $(RECOV_RAMDISK) $(TOOLS)/mkdisk.py
 disk: $(DISK_IMG)
 
 boot: kernel $(BOOT_IMG) $(RECOV_RAMDISK) $(DISK_IMG)
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -smp 2 -bios $(OPENBI) -m 512M \
 		-device loader,file=$(BOOT_IMG),addr=0x46000000,cpu-num=0 \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device virtio-blk-device,drive=disk0 \
@@ -657,7 +657,7 @@ boot: kernel $(BOOT_IMG) $(RECOV_RAMDISK) $(DISK_IMG)
 
 # 以当前方式（-kernel）直接加载内核，并挂载磁盘镜像验证 /data 持久化。
 run-disk: kernel $(DISK_IMG)
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -smp 2 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) \
 		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
 		-device virtio-blk-device,drive=disk0 \
 		-device virtio-rng-device -audiodev none,id=aud0 \

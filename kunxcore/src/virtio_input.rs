@@ -314,8 +314,22 @@ pub fn init(devs: &[MmioDev]) -> bool {
                 w32(idx, REG_DRV_FEATURES, 0);
             }
 
-            DEVS[idx].ring = allocator::alloc_page().expect("virtio_input: ring page");
-            DEVS[idx].event_page = allocator::alloc_page().expect("virtio_input: event page");
+            // 启动期降级：环页分配失败只禁用本设备（continue 跳过探测），
+            // 不再 panic 挂死整机——其余输入设备照常工作。
+            let (Some(ring), Some(evt)) = (
+                allocator::alloc_page(),
+                allocator::alloc_page(),
+            ) else {
+                crate::health::report(
+                    crate::health::SEV_WARN,
+                    "input",
+                    "输入设备内存不足，该输入设备已禁用",
+                    "触摸/键盘可能部分不可用；请重启设备恢复",
+                );
+                continue;
+            };
+            DEVS[idx].ring = ring;
+            DEVS[idx].event_page = evt;
             core::ptr::write_bytes(DEVS[idx].ring as *mut u8, 0, allocator::PAGE_SIZE);
             core::ptr::write_bytes(DEVS[idx].event_page as *mut u8, 0, allocator::PAGE_SIZE);
             setup_queue(idx);

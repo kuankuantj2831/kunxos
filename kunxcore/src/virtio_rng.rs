@@ -161,7 +161,17 @@ pub fn init(devs: &[MmioDev]) -> bool {
         w32(REG_STATUS, ST_ACK | ST_DRIVER | if MODERN { ST_FEATURES_OK } else { 0 });
 
         // 环内存：2 个连续页（desc/avail 第一页，used 按 QueueAlign 对齐第二页）
-        RING = allocator::alloc_pages_contig(2).expect("virtio_rng: ring pages");
+        // 启动期降级：环内存不足返回 false（随机源缺席，回退时间戳种子）
+        let Some(ring) = allocator::alloc_pages_contig(2) else {
+            crate::health::report(
+                crate::health::SEV_INFO,
+                "rng",
+                "virtio-rng 环内存不足，硬件随机源已禁用",
+                "随机数质量略降（回退时间戳种子）；重启可恢复",
+            );
+            return false;
+        };
+        RING = ring;
         for i in 0..(allocator::PAGE_SIZE * 2) / 8 {
             *((RING + i * 8) as *mut u64) = 0;
         }

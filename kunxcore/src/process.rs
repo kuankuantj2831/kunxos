@@ -134,10 +134,14 @@ pub struct Process {
     pub cwd_len: usize,
     /// 用户 ID（安全模型：per-process 身份，Android 式 per-app UID 的地基）。
     /// 0 = root（init / 系统服务 / 内置 shell）；应用进程由 launcher 在
-    /// execve 前 setuid 到非零 UID（如 10000+），从而受 kill 权限等检查约束。
+    /// execve 前 setuid 到非零 UID（如 10000+），从而受 kill 杀限等检查约束。
     pub uid: u32,
     /// 组 ID（与 uid 配套，当前未参与文件权限判定——VFS 尚无 mode/owner）。
     pub gid: u32,
+    /// 内核线程标记：`process::spawn`（函数入口线程）置 true；ELF 用户进程
+    /// 恒 false。init 异常退出后的「用户态软复位」（kill_all_user）用它区分
+    /// 谁该被清理——内核线程（shell/perflog）是调试生命线，不能陪葬。
+    pub kthread: bool,
 }
 
 impl Process {
@@ -157,6 +161,7 @@ impl Process {
             cwd_len: 0,
             uid: 0,
             gid: 0,
+            kthread: false,
         }
     }
 }
@@ -917,6 +922,7 @@ pub fn spawn(
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
+        (*dst).kthread = true; // 函数入口线程（shell/perflog 等）：软复位不清理
         // 移动语义转入 PCB（pt 内含堆记录表 Box，deref-move 消费 Box 防双释放）
         core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
     }
@@ -989,6 +995,9 @@ pub fn create_process(mut pt: alloc::boxed::Box<vm::ProcPageTable>, name: &str) 
 /// 重命名进程（execve 替换映像后更新显示名）。
 pub fn rename(pid: u32, name: &str) {
     set_name(pid, name);
+    // execve 后任务名同步更新（主线程 tid == pid）：否则 top/crash 转储
+    // 一直显示 fork 创建时的「fork-child」，CPU 热点排查全部失真。
+    crate::sched_cfs::rename_task(pid, name);
 }
 
 /// 把指定进程的 fd 槽位设为 `entry`（用于为新进程初始化 stdio 等）。
@@ -1217,6 +1226,16 @@ pub fn processes_pub_find(pid: u32, va: usize) -> i64 {
         }
     }
     -1
+}
+
+/// 诊断：指定进程的用户页记录条数（缺页失败排查：区分「查错进程」与
+/// 「记录缺失」——recs=0 且 pid 异常 = 归属丢失；recs>0 但 find 失败 =
+/// 预约路径没写记录）。
+pub fn processes_pub_record_count(pid: u32) -> usize {
+    if (pid as usize) >= MAX_PROC {
+        return usize::MAX;
+    }
+    unsafe { PROCESSES[pid as usize].pt.count }
 }
 
 /// 公开指定进程的页表根（供故障诊断使用）。
@@ -1503,6 +1522,38 @@ pub fn terminate(pid: u32) {
     }
 }
 
+/// 用户态软复位：终止并回收除内核线程（`kthread` 标记）外的全部用户进程。
+///
+/// init 异常退出后、内核重拉 /init 之前调用——旧的守护进程/应用若放任
+/// 存活，新 init 会拉起重复实例（设备独占打开、IPC 信箱冲突）。内核线程
+/// （shell/perflog）是调试生命线，不参与清理。
+pub fn kill_all_user() {
+    // 第一遍：全部 terminate（他核 kill_req 由目标核下一 tick 兑现）
+    for i in 0..MAX_PROC {
+        unsafe {
+            if PROCESSES[i].state != ProcessState::Free
+                && PROCESSES[i].state != ProcessState::Zombie
+                && !PROCESSES[i].kthread
+            {
+                terminate(i as u32);
+            }
+        }
+    }
+    // 让渡数次：给他核兑现 kill_req 并切走（任务 Exited 后才允许回收栈）
+    for _ in 0..4 {
+        crate::thread::yield_now();
+    }
+    // 第二遍：回收僵尸（reap 对仍有存活任务的进程拒绝回收——留待
+    // 后续事件也无碍，槽位在下次软复位/退出路径中自然清理）
+    for i in 0..MAX_PROC {
+        unsafe {
+            if PROCESSES[i].state == ProcessState::Zombie && !PROCESSES[i].kthread {
+                reap(i as u32);
+            }
+        }
+    }
+}
+
 /// 判断当前进程是否存在已退出的子进程（Zombie，等待回收）。
 ///
 /// 供 `wait4(WNOHANG)` 使用：存在则 `wait` 可立即回收，否则调用方
@@ -1658,6 +1709,42 @@ match p.state {
     } else {
         (-1, 0)
     }
+}
+
+/// 回收「孤儿僵尸」：父进程槽位已释放（Free）的僵尸进程。
+///
+/// 常态无孤儿（exit 的收养路径把孤儿挂给 init）；init 死亡窗口 / 用户态
+/// 软复位期间的僵尸没有父进程来收，会永久占据 MAX_PROC 槽位——本函数由
+/// perflog 周期兜底回收，返回本次回收数。
+pub fn reap_orphan_zombies() -> usize {
+    let mut n = 0usize;
+    for i in 0..MAX_PROC {
+        let orphan = unsafe {
+            if PROCESSES[i].state != ProcessState::Zombie {
+                continue;
+            }
+            let p = PROCESSES[i].parent;
+            p < 0 || (p as usize) < MAX_PROC && PROCESSES[p as usize].state == ProcessState::Free
+        };
+        if orphan {
+            reap(i as u32);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 存活（非 Free）进程数（槽位压力观测）。
+pub fn active_count() -> usize {
+    let mut n = 0usize;
+    unsafe {
+        for i in 0..MAX_PROC {
+            if PROCESSES[i].state != ProcessState::Free {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// 遍历全部存活进程，对每个进程调用 `f(pid, name)`。

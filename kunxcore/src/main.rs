@@ -142,6 +142,7 @@ mod sbi;
 mod gpu_simple;
 mod gesture;
 mod heap;
+mod health;
 mod input;
 
 mod interrupt;
@@ -181,6 +182,7 @@ mod vm;
 mod wifi;
 // ===== 开发者工具链模块（日志 / 崩溃报告 / 性能统计） =====
 mod crash;
+mod crash_screen;
 mod log;
 mod perf;
 
@@ -322,6 +324,15 @@ pub(crate) fn bootargs_shell() -> bool {
 /// 读取 bootargs recovery 标志。
 pub(crate) fn bootargs_recovery() -> bool {
     unsafe { BOOT_RECOVERY }
+}
+
+/// bootargs 是否含 "smp"：显式激活次核（hart_start）。次核调度路径的
+/// SMP 正确性（锁交接/跨核切换）尚未硬化，默认关闭保持单核稳定；
+/// 互监看门狗只在多核会话生效，用 `-append "smp"` 测试。
+static mut BOOT_SMP: bool = false;
+
+pub(crate) fn bootargs_smp() -> bool {
+    unsafe { BOOT_SMP }
 }
 
 /// 读取安全启动链属性（内核 ota 模块 / 恢复挂载用）。
@@ -583,10 +594,11 @@ pub(crate) fn print_dec(mut v: u64) {
 /// # 安全
 /// 调用者必须已正确初始化 stvec 与 PLIC，否则开启 IRQ 会导致未定义行为。
 pub(crate) unsafe fn enable_irq() {
-    // 分源使能：sie.SEIE（bit9，PLIC 外部中断）+ STIE（bit5，监督定时器）。
+    // 分源使能：sie.SSIE(bit1) | STIE(bit5) | SEIE(bit9) = 0x222。
     // sstatus.SIE 只是总开关——此前漏置 sie.SEIE，UART RX / virtio 等一切
     // PLIC 源的中断从不陷入（定时器经 SBI stimecmp 侥幸可用，掩盖了缺陷）。
-    asm!("csrsi sie, 0x240");
+    // 注意 STIE 是 bit5（0x20），不是 bit6（0x40 = VS 定时器）。
+    asm!("csrsi sie, 0x222");
     asm!("csrsi sstatus, 2");
 }
 
@@ -687,6 +699,7 @@ pub extern "C" fn rust_main() -> ! {
     let mut boot_perftest = false; // bootargs 含 "perftest"：启动期动画性能基线（默认跳过）
     let mut boot_selftest = false; // bootargs 含 "selftest"：启动期内核自检（默认跳过）
     let mut boot_verbose = false; // bootargs 含 "verbose"：完整启动日志（默认安静控制台）
+    let mut boot_smp = false; // bootargs 含 "smp"：显式激活次核（SMP 调度未硬化，默认关）
     let mut virtio_devs: [net_virtio::MmioDev; 32] = [net_virtio::MmioDev::empty(); 32];
     let mut virtio_count = 0usize;
 
@@ -697,6 +710,7 @@ pub extern "C" fn rust_main() -> ! {
             // QEMU `-append "shell"` 会写入 /chosen/bootargs；含 "shell" 时
             // 在 /init 之外再拉起内置交互 shell（供 UART 驱动测试）。
             if let Some(args) = chosen.prop_str(&fdt, "bootargs") {
+                boot_smp = args.split_whitespace().any(|w| w == "smp");
                 boot_shell = args.split_whitespace().any(|w| w == "shell");
                 boot_wifitest = args.split_whitespace().any(|w| w == "wifitest");
                 boot_perftest = args.split_whitespace().any(|w| w == "perftest");
@@ -730,6 +744,7 @@ pub extern "C" fn rust_main() -> ! {
             BOOT_WIFITEST = boot_wifitest;
             BOOT_PERFTEST = boot_perftest;
             BOOT_SELFTEST = boot_selftest;
+            BOOT_SMP = boot_smp;
         }
         // verbose bootargs：关闭控制台安静模式（此时尚未开始打印，完整日志可见）。
         if boot_verbose {
@@ -1050,8 +1065,31 @@ pub extern "C" fn rust_main() -> ! {
     // ===== 10. 启动调度器（永不返回） =====
     // SMP：释放 secondary 核（它们等待此标志后初始化本核 GIC/定时器并
     // 进入调度器）；仅当确有多个 CPU 时才需要释放。
-    if smp::cpu_count() > 1 {
+    let ncpu = smp::cpu_count();
+    if ncpu > 1 && bootargs_smp() {
+        // ★ 显式拉起次核：OpenSBI 只带 boot hart 到 _start，其余核停在
+        // OpenSBI HSM 停车场。hart_start 使其进入内核 park（a0=hartid），
+        // park 等 SCHED_READY 后走 smp_secondary_main 上线。
+        extern "C" {
+            static park: u8; // 汇编标签（仅取地址）
+        }
+        let park_addr = core::ptr::addr_of!(park) as u64;
+        let boot = smp::cpu_id();
+        // ★ 先置 SCHED_READY 再 hart_start：park 的等待是 wfi 轮询，新核
+        // 尚无任何 pending 中断源（定时器在 secondary_main 里才编程），
+        // 若到达时标志未置会 wfi 永眠——置位在前，到达即通过首次检查。
         smp::SCHED_READY.store(true, core::sync::atomic::Ordering::Release);
+        for h in 0..ncpu {
+            if h == boot {
+                continue;
+            }
+            let r = sbi::hart_start(h as u64, park_addr, 0);
+            uart_send_str("[smp] hart_start ");
+            print_dec(h as u64);
+            uart_send_str(" → park r=");
+            print_dec(r as u64);
+            uart_send_str("\n");
+        }
     }
     sched_cfs::start();
 }
@@ -1157,9 +1195,17 @@ fn init_main(_: usize) -> ! {
             sched_cfs::PriorityClass::Normal,
             5,
         );
-        // 等待 /init 退出（正常情况下 /init 常驻，循环 wait4 回收子进程）。
+        // 等待 /init 退出，并监督其生死：
+        //   - 正常退出（code=0：launcher 干净退出后 init 的规划路径）→ 走
+        //     旧的「内核 shell 接管」路径；
+        //   - 异常退出（panic exit 1 / 被遏制 -11 等）→ 用户态软复位：清理
+        //     残余用户进程（防止新旧服务并存冲突）后重拉 /init，最多
+        //     INIT_RESPAWN_MAX 次；超限回退内置 shell（系统仍可用控制台）。
+        const INIT_RESPAWN_MAX: u32 = 3;
+        let mut init_pid = pid;
+        let mut respawns = 0u32;
         loop {
-            let (rpid, code) = process::wait(pid);
+            let (rpid, code) = process::wait(init_pid);
             if rpid < 0 {
                 break;
             }
@@ -1170,8 +1216,57 @@ fn init_main(_: usize) -> ! {
                 print_dec(code as u64);
                 uart_send_str("\n");
             }
+            // 退出码 2：kunxinit 在「launcher 崩溃循环放弃」后的规划退出
+            // （GUI 已死）——不再软复位（重拉也一样会崩），走崩溃告知屏。
+            if code == 2 {
+                crate::crash_screen::show(
+                    "桌面启动器反复崩溃，图形界面已停止",
+                    &[
+                        "系统其余部分（服务、网络、通话）仍在运行。",
+                    ],
+                );
+                break;
+            }
+            if code == 0 || respawns >= INIT_RESPAWN_MAX {
+                if code != 0 {
+                    // 软复位次数耗尽：init 自身有系统性问题——告知用户后
+                    // 回退控制台（系统仍运行，GUI 降级）。
+                    crate::crash_screen::show(
+                        "系统服务管理器反复崩溃，已回退控制台模式",
+                        &["系统以最小形态继续运行（串口可操作）。"],
+                    );
+                }
+                break;
+            }
+            respawns += 1;
+            bootfail_bump();
+            uart_send_str("[kernel] init 异常退出（code=");
+            print_dec(code as u64);
+            uart_send_str("）：用户态软复位，重拉 /init（第 ");
+            print_dec(respawns as u64);
+            uart_send_str(" 次）\n");
+            crate::health::report(
+                crate::health::SEV_CRITICAL,
+                "init",
+                "系统服务管理器（init）异常退出，正在自动恢复用户环境",
+                "应用与服务会被重新启动，未保存数据可能丢失；若反复出现请重启设备或重新刷机",
+            );
+            // 先回收旧 init 槽位（其僵尸态会阻断 pid 复用与孤儿收养）
+            elf::release(init_pid as u32);
+            // 清理残余用户进程（守护进程/应用），保留内核线程（shell/perflog）
+            process::kill_all_user();
+            let npid = elf::spawn_from_path("/init", &["init"]);
+            if npid < 0 {
+                uart_send_str("[kernel] 重拉 /init 失败，回退内置 shell\n");
+                crate::crash_screen::show(
+                    "系统服务管理器无法启动，已回退控制台",
+                    &["系统以控制台模式继续运行（串口可操作）。"],
+                );
+                break;
+            }
+            init_pid = npid;
         }
-        elf::release(pid as u32);
+        elf::release(init_pid as u32);
     } else {
         uart_send_str("[kernel] 未找到 /init，回退到内置 shell\n");
     }
@@ -1207,9 +1302,39 @@ fn init_main(_: usize) -> ! {
 /// 在 115200 波特下忙等 ~17ms，绝不能出现在呈现/IRQ 路径——本线程以
 /// 200ms 周期轮询，有标记才打印，无标记时完全让出 CPU。
 fn perf_log_main(_: usize) -> ! {
+    let mut tick = 0u32;
     loop {
         anim::poll_deferred_stats();
         crate::perf::poll_report();
+        // ---- 资源自愈扫描（每 2 秒一轮，200ms × 10）----
+        tick = tick.wrapping_add(1);
+        if tick % 10 == 0 {
+            // 孤儿僵尸回收（init 死亡窗口泄漏的槽位）
+            let reaped = process::reap_orphan_zombies();
+            if reaped > 0 {
+                crate::health::report(
+                    crate::health::SEV_INFO,
+                    "selfheal",
+                    "已自动清理无主残留进程，释放系统资源",
+                    "无需处理；若伴随功能异常请重启设备",
+                );
+            }
+            // 槽位压力（进程 24 / 任务 32，余量 4 以内告警）
+            let procs = process::active_count();
+            let tasks = sched_cfs::task_count();
+            if procs + 4 >= process::MAX_PROC || tasks + 4 >= sched_cfs::MAX_TASKS {
+                crate::health::report(
+                    crate::health::SEV_WARN,
+                    "selfheal",
+                    "进程/任务槽位接近耗尽，新进程可能启动失败",
+                    "请关闭不使用的应用；若持续出现请重启设备",
+                );
+            }
+            // 开机 120 秒稳定：清除崩溃循环计数（本次会话已证明健康）
+            if tick == 600 {
+                let _ = vfs::unlink("/data/.bootfails");
+            }
+        }
         sched_cfs::sleep_until(timer::now_us() + 200_000);
     }
 }
@@ -1223,6 +1348,46 @@ fn timer_rearm() {
 #[allow(dead_code)]
 fn file_exists(path: &str) -> bool {
     vfs::stat_path(path).is_some()
+}
+
+/// 读取崩溃循环计数（/data/.bootfails，单字节十进制；无文件返回 None）。
+fn bootfail_read() -> Option<u32> {
+    let fd = vfs::open("/data/.bootfails", vfs::O_RDONLY);
+    if fd < 0 {
+        return None;
+    }
+    let mut b = [0u8; 4];
+    let n = vfs::read(fd, &mut b);
+    vfs::close(fd);
+    if n <= 0 {
+        return None;
+    }
+    let mut v = 0u32;
+    for &c in &b[..n as usize] {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = (v * 10 + (c - b'0') as u32).min(99);
+    }
+    Some(v)
+}
+
+/// 崩溃循环计数 +1（用户态软复位时调用）。
+fn bootfail_bump() {
+    let n = bootfail_read().unwrap_or(0) + 1;
+    let b = [b'0' + (n % 100 / 10) as u8, b'0' + (n % 10) as u8];
+    let fd = vfs::open("/data/.bootfails", vfs::O_CREAT | vfs::O_WRONLY | vfs::O_TRUNC);
+    if fd >= 0 {
+        let mut off = 0usize;
+        while off < b.len() {
+            let w = vfs::write(fd, &b[off..]);
+            if w <= 0 {
+                break;
+            }
+            off += w as usize;
+        }
+        vfs::close(fd);
+    }
 }
 
 // ==================== 自检 ====================
@@ -1630,6 +1795,41 @@ fn data_boot(devs: &[net_virtio::MmioDev]) {
         return;
     }
     kinfo! { uart_send_str("[fs] /data 已挂载\n"); }
+
+    // 6. 脏启动检测（看门狗/崩溃复位的用户告知链）：上次启动若未正常
+    //    关机（/data/.bootdirty 残留），本次启动记健康事件告知用户；
+    //    随后重新落脏标志，正常关机路径（reboot/poweroff）会清除它。
+    if vfs::stat_path("/data/.bootdirty").is_some() {
+        crate::health::report(
+            crate::health::SEV_WARN,
+            "boot",
+            "上次关机异常（系统失去响应后被看门狗自动重启，或意外断电）",
+            "若非手动断电，且此提示反复出现，请查看 /data/crash 崩溃报告（shell: crash）并考虑重新刷机",
+        );
+        let _ = vfs::unlink("/data/.bootdirty");
+    }
+    let d = vfs::open(
+        "/data/.bootdirty",
+        vfs::O_CREAT | vfs::O_WRONLY | vfs::O_TRUNC,
+    );
+    if d >= 0 {
+        vfs::write(d, b"1");
+        vfs::close(d);
+    }
+
+    // 7. 崩溃循环检测：本分区记录的异常重启次数达到阈值时，开机即告知
+    //    用户（GUI 经健康横幅展示）并给出处置建议；开机 120 秒稳定后由
+    //    perflog 清零（一次成功会话即视为恢复）。
+    if let Some(n) = bootfail_read() {
+        if n >= 2 {
+            crate::health::report(
+                crate::health::SEV_CRITICAL,
+                "boot",
+                "系统近期反复异常重启（累计 N 次以上），可能存在深层故障",
+                "建议尽快备份 /data 中的数据；可尝试清除数据恢复出厂（将丢失用户数据），或重新刷机",
+            );
+        }
+    }
 
     // 数据迁移（首次持久化复制默认配置）在 init_main 中进行（见 init_main：
     // /data/oobe/.done 不存在时调用 copy_tree("/etc/oobe_default", "/data/oobe")），
@@ -2085,12 +2285,259 @@ fn panic(info: &PanicInfo) -> ! {
         far: 0,
     };
     crate::crash::kernel_panic(&fi);
+    // 故障遏制：panic 发生在 syscall 上下文（代表用户进程执行系统调用，
+    // 典型如用户传入坏指针/坏数据触发的切片越界、非法解引用、算术 panic）
+    // 时，把故障归咎于该进程并终止它，系统继续运行；内核自身 bug（非
+    // syscall 上下文 / 内核线程 / 中断嵌套）保持整机停机诊断。
+    if crate::sched_cfs::in_syscall_user() {
+        let pid = crate::sched_cfs::current_pid();
+        if (pid as usize) < crate::process::MAX_PROC
+            && crate::process::processes_pub_ttbr0(pid) != 0
+        {
+            crate::uart_send_str("[contain] 内核 panic 遏制：终止 pid=");
+            crate::print_dec(pid as u64);
+            crate::uart_send_str(" name=");
+            crate::uart_send_str(crate::sched_cfs::current_task_name());
+            crate::uart_send_str("（系统继续运行）\n");
+            crate::health::report_irq(
+                true,
+                crate::health::SEV_WARN,
+                "contain",
+                "内核处理应用请求时发现内部错误，已终止该进程",
+                "系统已自动恢复，无需处理。若同一应用反复出现，请更新或卸载它；详情见 /data/crash（shell: crash）",
+            );
+            // SIGSEGV 语义退出：内部屏蔽 IRQ 并切换任务，不返回
+            crate::process::exit(-11)
+        }
+    }
+    // 内核线程 panic（非 syscall 上下文）：只终止该线程，系统继续运行
+    // （tombstone 已由上方 kernel_panic 落盘）
+    if crate::kthread_fault_contain("panic", 0, 0) {
+        unreachable!()
+    }
     // 死循环，不再返回
     loop {
         unsafe {
             wfi();
         }
     }
+}
+
+/// S 态异常的故障遏制入口（`interrupt.rs` 的 trap_dispatch 在走整机诊断前
+/// 调用）。
+///
+/// 判定：当前任务处于 syscall 上下文（`sched_cfs::in_syscall_user`）且其
+/// 进程拥有用户地址空间——即内核正在代表该用户进程执行系统调用，S 态
+/// 异常（缺页/未对齐/非法指令）的来源大概率是它传入的坏指针或坏数据。
+/// 此时写 tombstone（SIGSEGV 语义）后终止该进程，`process::exit` 内部
+/// 切换任务不返回，系统继续调度；无法归咎（内核线程/idle/非 syscall
+/// 上下文）返回 false，由调用方走 `sync_exception_handler` 整机诊断。
+///
+/// 已知取舍：故障点持有的内核自旋锁不释放——fs_lock 等有「死亡持有者
+/// 抢锁自愈」（sched_cfs::tid_alive 判定），其余锁由后续取锁者等待；
+/// 与 Linux oops 杀进程的语义一致：牺牲状态一致性换系统存活。
+#[no_mangle]
+pub extern "C" fn kernel_fault_contain(
+    frame: *mut crate::syscall_table::TrapFrame,
+    cause: u64,
+    tval: u64,
+) -> bool {
+    if !crate::sched_cfs::in_syscall_user() {
+        return false;
+    }
+    let pid = crate::sched_cfs::current_pid();
+    if (pid as usize) >= crate::process::MAX_PROC || crate::process::processes_pub_ttbr0(pid) == 0 {
+        return false; // 内核任务（无用户地址空间）：不遏制
+    }
+    uart_send_str("[contain] S态异常遏制：故障归咎于 pid=");
+    print_dec(pid as u64);
+    uart_send_str(" name=");
+    uart_send_str(crate::sched_cfs::current_task_name());
+    uart_send_str(" scause=");
+    print_hex(cause);
+    uart_send_str(" stval=");
+    print_hex(tval);
+    uart_send_str("（终止进程，系统继续运行）\n");
+    // 健康事件（陷入上下文 IRQ 屏蔽态：跳过 VFS 落盘，tombstone 已有落盘副本）
+    let mut msg = [0u8; 88];
+    let mut n = 0usize;
+    let mut push = |s: &str, msg: &mut [u8; 88], n: &mut usize| {
+        for &c in s.as_bytes() {
+            if *n < msg.len() {
+                msg[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    push("内核处理进程 ", &mut msg, &mut n);
+    let mut pb = [0u8; 10];
+    let mut pi = pb.len();
+    let mut pv = pid as u64;
+    loop {
+        pi -= 1;
+        pb[pi] = b'0' + (pv % 10) as u8;
+        pv /= 10;
+        if pv == 0 {
+            break;
+        }
+    }
+    push(core::str::from_utf8(&pb[pi..]).unwrap_or(""), &mut msg, &mut n);
+    push("（", &mut msg, &mut n);
+    push(crate::sched_cfs::current_task_name(), &mut msg, &mut n);
+    push("）的请求时故障，已终止该进程", &mut msg, &mut n);
+    crate::health::report_irq(
+        true,
+        crate::health::SEV_WARN,
+        "contain",
+        core::str::from_utf8(&msg[..n]).unwrap_or("内核故障遏制：已终止进程"),
+        "系统已自动恢复，无需处理。若同一应用反复出现此问题，请更新或卸载该应用；详情见 /data/crash 崩溃报告（shell: crash）",
+    );
+    let elr = unsafe { read_sepc() };
+    let fi = crate::crash::FaultInfo {
+        kind: "S态故障(遏制)",
+        pid,
+        name: crate::sched_cfs::current_task_name(),
+        esr: cause,
+        elr,
+        far: tval,
+    };
+    crate::crash::el0_fault(&fi, frame as *const u64);
+    // SIGSEGV 语义终止：内部屏蔽 IRQ 并切换任务，不返回
+    crate::process::exit(-11)
+}
+
+/// 内核线程故障遏制：非 syscall 上下文的 S 态异常/panic，但当前任务是可
+/// 调度的内核线程（wifi/shell/perflog 等）时，只终止该线程保全系统。
+///
+/// 这是比看门狗重启温和一级的恢复：损失该内核线程承载的功能（如无线），
+/// 系统与其余功能继续运行；tombstone + 健康事件告知用户。线程持有的锁
+/// 不释放（fs_lock 有死亡持有者自愈，其余锁由后续取锁者兜底）。
+///
+/// 返回 false 表示无法遏制（idle/无任务上下文），调用方走整机诊断。
+#[no_mangle]
+pub extern "C" fn kthread_fault_contain(kind: &str, cause: u64, tval: u64) -> bool {
+    if !crate::sched_cfs::is_sched_kthread() {
+        return false;
+    }
+    let pid = crate::sched_cfs::current_pid();
+    uart_send_str("[contain] 内核线程故障遏制：");
+    uart_send_str(kind);
+    uart_send_str(" pid=");
+    print_dec(pid as u64);
+    uart_send_str(" name=");
+    uart_send_str(crate::sched_cfs::current_task_name());
+    uart_send_str(" scause=");
+    print_hex(cause);
+    uart_send_str(" stval=");
+    print_hex(tval);
+    uart_send_str("（终止该线程，系统继续运行）\n");
+    // tombstone（best-effort；递归保护内置）
+    let fi = crate::crash::FaultInfo {
+        kind: "内核线程故障(遏制)",
+        pid,
+        name: crate::sched_cfs::current_task_name(),
+        esr: cause,
+        elr: unsafe { read_sepc() },
+        far: tval,
+    };
+    crate::crash::kernel_panic(&fi);
+    crate::health::report_irq(
+        true,
+        crate::health::SEV_CRITICAL,
+        "kthread",
+        "内核后台线程故障已停止（对应功能停摆，系统其余功能正常）",
+        "相关功能（如无线/音频/日志之一）不可用；请重启设备恢复；反复出现请查看 /data/crash",
+    );
+    // 清睡眠登记后标记退出并切走（不返回；栈在槽位复用时回收）
+    unsafe { crate::sched_cfs::sleepers_clear_tid(crate::sched_cfs::current_tid()) };
+    crate::sched_cfs::exit_current()
+}
+
+// ==================== IRQ 故障遏制（帧展开） ====================
+
+// 展开汇编：a0 = 外层中断帧指针。把 sp 重指到该帧后复用 trap_return 的
+// 完整恢复逻辑（GPR/FP 恢复、sscratch 约定、SPP 分流、PC 护栏）——
+// 效果等于「这次中断从未发生过」：handler 的半成品工作被放弃，被打断
+// 的上下文（用户代码或内核代码）原地恢复执行。
+core::arch::global_asm!(
+    ".section .text.trap_entry, \"ax\"",
+    ".balign 4",
+    ".global irq_fault_unwind",
+    ".type irq_fault_unwind, %function",
+    "irq_fault_unwind:",
+    "    mv sp, a0",
+    "    j trap_return",
+);
+
+extern "C" {
+    fn irq_fault_unwind(frame: *mut crate::syscall_table::TrapFrame) -> !;
+}
+
+/// IRQ 故障遏制入口（`trap_dispatch` 在进程遏制之前调用）。
+///
+/// 判定：当前 CPU 处于中断处理上下文（`interrupt::irq_ctx_frame` 非零）——
+/// 即 S 态异常来自中断 handler 自身（驱动 bug / 半更新硬件状态），没有可
+/// 归咎的用户进程。遏制动作：
+///   - 外部中断（有线号）：PLIC 屏蔽该线——故障源从此静默，其余中断正常；
+///   - 定时器：无法屏蔽（调度依赖），仅展开；累计超过上限（系统性 bug）
+///     返回 false 转为整机诊断；
+///   - 健康事件 + 控制台告知用户；
+///   - 帧展开恢复被打断的上下文（不返回）。
+///
+/// 已知取舍：handler 持有的锁不释放（同进程遏制语义）；PLIC 的本次
+/// claim 不再 complete（该线已被屏蔽，无重投递）。
+#[no_mangle]
+pub extern "C" fn irq_fault_contain(
+    _frame: *mut crate::syscall_table::TrapFrame,
+    cause: u64,
+    tval: u64,
+) -> bool {
+    let outer = crate::interrupt::irq_ctx_frame();
+    if outer == 0 {
+        return false; // 非中断上下文：交由进程遏制/整机诊断
+    }
+    let line = crate::interrupt::irq_ctx_line();
+    let kind = crate::interrupt::irq_ctx_kind();
+    // 定时器故障：无法屏蔽，计数限流，超限转整机诊断（系统性 bug）
+    if kind == 5 && !crate::interrupt::timer_contain_tick() {
+        return false;
+    }
+    uart_send_str("[contain] IRQ 故障遏制：");
+    if line != 0 {
+        print_dec(line as u64);
+    } else if kind == 5 {
+        uart_send_str("定时器");
+    } else {
+        uart_send_str("中断 cause=");
+        print_dec(kind as u64);
+    }
+    uart_send_str(" 处理中故障 scause=");
+    print_hex(cause);
+    uart_send_str(" stval=");
+    print_hex(tval);
+    if line != 0 {
+        crate::plic::plic_disable_irq(line);
+        uart_send_str("（已屏蔽该 IRQ 线，恢复被打断的任务）\n");
+        crate::health::report_irq(
+            true,
+            crate::health::SEV_WARN,
+            "interrupt",
+            "某设备中断处理故障，对应功能已停用（其余功能正常）",
+            "相关硬件功能（如输入/网络/音频之一）可能失效；请保存工作后重启设备恢复",
+        );
+    } else {
+        uart_send_str("（放弃本次中断处理，恢复被打断的任务）\n");
+        crate::health::report_irq(
+            true,
+            crate::health::SEV_WARN,
+            "interrupt",
+            "定时器/中断公共路径故障，本次中断已跳过",
+            "若系统出现卡顿或时钟异常，请重启设备",
+        );
+    }
+    // 清标记后展开（不返回）
+    crate::interrupt::irq_ctx_reset();
+    unsafe { irq_fault_unwind(outer as *mut crate::syscall_table::TrapFrame) }
 }
 
 /// 同步异常处理入口：读取 ESR_EL1 / ELR_EL1 后打印并死循环（等效 panic）。
@@ -2451,8 +2898,22 @@ extern "C" fn el0_page_fault_handler(_frame: *mut u8, stval: usize) -> bool {
     // 记录自然落到 SIGSEGV 分支，语义不变。
     if crate::process::page_fault_resolve(va) {
         true
+    } else if crate::process::cow_break(va) {
+        true
     } else {
-        crate::process::cow_break(va)
+        // [diag] 落地失败诊断：musl 静态程序 mmap 首写崩溃排查用
+        // （mtest：va=0x11000000 且记录应在，却 pid=0 查空——见记忆）。
+        let (tid, pid) = (crate::sched_cfs::current_tid(), crate::sched_cfs::current_pid());
+        crate::uart_send_str("[pf-diag] va=");
+        crate::print_hex(va as u64);
+        crate::uart_send_str(" tid=");
+        crate::print_dec(tid as u64);
+        crate::uart_send_str(" pid=");
+        crate::print_dec(pid as u64);
+        crate::uart_send_str(" recs=");
+        crate::print_dec(crate::process::processes_pub_record_count(pid) as u64);
+        crate::uart_send_str("\n");
+        false
     }
 }
 
@@ -2613,6 +3074,7 @@ _start:
     // secondary hart 停车场：等待主核置 SCHED_READY 后进调度器
     // ============================================================
     .section .text._start
+    .global park
     .type park, %function
 park:
     mv tp, a0                    // tp = hartid

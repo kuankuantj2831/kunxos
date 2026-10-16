@@ -3358,10 +3358,10 @@ fn cmd_kill(cmd: &Command, sink: &mut Sink) {
         sink.emit_str("\n");
         return;
     }
-    crate::process::signal_send(pid, 9);
-    // 唤醒阻塞中的目标：被唤醒后其睡眠/等待系统调用返回，下一次系统调用
-    // 入口处 SIGKILL 位图被检查并终止进程。
-    crate::sched_cfs::wake_pid(pid);
+    // 直接终止（与 sys_kill 的 SIGKILL 同款）：挂起位图只在 syscall 入口
+    // 检查，长阻塞在 wait4/read 里的任务被唤醒后会在系统调用内部继续
+    // 等待，永远到不了入口检查——SIGKILL 必须当场兑现。
+    crate::process::terminate(pid);
     sink.emit_str("kill: 信号 9 已发送至进程 ");
     sink.emit_u32(pid);
     sink.emit_str("\n");
@@ -3605,6 +3605,7 @@ fn run_builtin(cmd: &Command, input: &[u8], sink: &mut Sink) {
         "tcp_echo" => cmd_tcp_echo(cmd, sink),
         "http_get" => cmd_http_get(cmd, sink),
         "gdb" => cmd_gdb(cmd, sink),
+        "health" => cmd_health(cmd, sink),
         "http_serve" => cmd_http_serve(cmd, sink),
         "netstat" => cmd_netstat(cmd, sink),
         "nslookup" => cmd_nslookup(cmd, sink),
@@ -3769,7 +3770,7 @@ const BUILTINS: &[&str] = &[
     "false", "basename", "dirname", "dmesg", "od", "tee", "ln", "beep",
     "verbose",
     "audio", "audiolat",
-    "top", "mount", "ifconfig", "log", "crash", "perf", "irqstat", "netdiag",
+    "top", "mount", "ifconfig", "log", "crash", "health", "perf", "irqstat", "netdiag",
 ];
 
 /// 在内置命令中匹配前缀；唯一匹配时写入 `out`，返回匹配数。
@@ -4496,6 +4497,70 @@ fn cmd_log(cmd: &Command, sink: &mut Sink) {
     }
     if printed == 0 {
         sink.emit_str("[log] 无匹配记录\n");
+    }
+}
+
+/// `health`：查看系统健康事件（故障告知 + 修复指引）；`health clear` 清空。
+fn cmd_health(cmd: &Command, sink: &mut Sink) {
+    let sub = if cmd.argc > 1 { word_str(&cmd.argv[1]) } else { "" };
+    if sub == "clear" {
+        crate::health::clear();
+        sink.emit_str("[health] 已清空健康事件\n");
+        return;
+    }
+    let mut n = 0usize;
+    crate::health::for_each(&mut |t, sev, subsys, msg, fix| {
+        let sev_name = match sev {
+            crate::health::SEV_CRITICAL => "严重",
+            crate::health::SEV_WARN => "警告",
+            _ => "提示",
+        };
+        sink.emit_str("[");
+        // 手工拼时间戳（sink 无 fmt 支持）
+        let mut tb = [0u8; 12];
+        let mut i = tb.len();
+        let mut v = t;
+        loop {
+            i -= 1;
+            tb[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let _ = core::str::from_utf8(&tb[i..]).map(|s| sink.emit_str(s));
+        sink.emit_str("ms][");
+        sink.emit_str(sev_name);
+        sink.emit_str("][");
+        sink.emit_str(subsys);
+        sink.emit_str("] ");
+        sink.emit_str(msg);
+        sink.emit_str("\n");
+        if !fix.is_empty() {
+            sink.emit_str("    修复建议：");
+            sink.emit_str(fix);
+            sink.emit_str("\n");
+        }
+        n += 1;
+    });
+    if n == 0 {
+        sink.emit_str("[health] 无健康事件（系统正常）\n");
+    } else {
+        sink.emit_str("[health] 共 ");
+        // 复用 emit_dec 若存在则更好；此处逐位输出
+        let mut pb = [0u8; 8];
+        let mut i = pb.len();
+        let mut v = n;
+        loop {
+            i -= 1;
+            pb[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let _ = core::str::from_utf8(&pb[i..]).map(|s| sink.emit_str(s));
+        sink.emit_str(" 条（health clear 清除）\n");
     }
 }
 

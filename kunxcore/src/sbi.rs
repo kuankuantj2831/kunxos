@@ -23,6 +23,10 @@ const EID_SRST: u64 = 0x5352_5354; // "SRST"
 const EID_LEGACY_SHUTDOWN: u64 = 0x08;
 
 /// SBI v0.2+ ecall：返回 (错误码, 值)。
+///
+/// 参数按约定进 a0/a1/a2（此前 a1/a2 参数误入 a2/a3 寄存器——单参数
+/// 调用（set_timer）不受影响，首个双参数调用 hart_start 把入口地址
+/// 传成了垃圾，次核跳转到随机地址静默死亡）。
 #[inline]
 fn sbi_call(eid: u64, fid: u64, a0: u64, a1: u64, a2: u64) -> (i64, i64) {
     let err: i64;
@@ -31,9 +35,8 @@ fn sbi_call(eid: u64, fid: u64, a0: u64, a1: u64, a2: u64) -> (i64, i64) {
         core::arch::asm!(
             "ecall",
             inlateout("a0") a0 as i64 => err,
-            lateout("a1") val,
-            in("a2") a1 as i64,
-            in("a3") a2 as i64,
+            inlateout("a1") a1 as i64 => val,
+            in("a2") a2 as i64,
             in("a6") fid as i64,
             in("a7") eid as i64,
             options(nostack)
@@ -58,6 +61,20 @@ fn srst_available() -> bool {
         }
         SRST_OK != 0
     }
+}
+
+/// HSM 扩展 EID（"HSM"）。
+const EID_HSM: u64 = 0x4853_4D;
+
+/// 启动指定 hart：使其从 `start_addr`（a0=hartid, a1=opaque）开始执行。
+///
+/// OpenSBI 只把 **boot hart** 带到内核入口，其余核停在 OpenSBI 的 HSM
+/// 停车场——内核必须主动 hart_start 它们（此前假设「所有 hart 都到达
+/// _start」，次核从未上线，SMP 实际不可用：互监看门狗/负载均衡全部空转）。
+/// 返回 0 成功；-1 表示已在运行/不存在等（幂等，忽略即可）。
+pub fn hart_start(hartid: u64, start_addr: u64, opaque: u64) -> i64 {
+    let (err, _val) = sbi_call(EID_HSM, 0, hartid, start_addr, opaque);
+    err
 }
 
 /// 设置下一个监督定时器到期时刻（绝对 time 值，TIME 扩展 fid 0）。

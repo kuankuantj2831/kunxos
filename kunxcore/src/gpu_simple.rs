@@ -263,7 +263,20 @@ pub fn fb_pages() -> usize {
 /// 分配一整屏连续、页对齐的帧缓冲，返回其物理地址（恒等映射下即虚拟地址）。
 pub fn alloc_fb() -> usize {
     let pages = fb_pages();
-    allocator::alloc_pages_contig(pages).expect("gpu：帧缓冲内存不足")
+    // 启动期降级：帧缓冲内存不足不再 panic 挂死——返回 0 表示无显存，
+    // fb_init/compositor 据此跳过 GUI，系统以控制台模式继续运行。
+    match allocator::alloc_pages_contig(pages) {
+        Some(pa) => pa,
+        None => {
+            crate::health::report(
+                crate::health::SEV_CRITICAL,
+                "display",
+                "帧缓冲内存不足，图形界面已禁用（控制台模式运行）",
+                "请重启设备；若反复出现，请检查内存占用或增加系统内存",
+            );
+            0
+        }
+    }
 }
 
 /// 把扫描输出切换到 `pa` 处的帧缓冲（clean 缓存后写配置 → 页翻转）。
@@ -318,6 +331,9 @@ static mut FB_BASE: usize = 0;
 /// open/mmap `/dev/fb0` 并写入像素，无需经过 displayd 合成器。
 pub fn fb_init() -> usize {
     let pa = alloc_fb();
+    if pa == 0 {
+        return 0; // 无显存：不 present、不登记，fb0 缺席（launcher 会干净退出）
+    }
     present(pa);
     unsafe { FB_BASE = pa; }
     pa

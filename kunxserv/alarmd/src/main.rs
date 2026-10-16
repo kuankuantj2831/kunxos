@@ -71,7 +71,11 @@ const CTL_PATH: &str = "/var/run/alarmd.ctl";
 /// 最大闹钟数。
 const MAX_ALARMS: usize = 16;
 /// 主循环轮询间隔（ms，与 10ms 音频块对齐）。
-const LOOP_MS: usize = 10;
+// 50ms（20Hz）：闹钟到点检测与命令信箱轮询周期。曾为 10ms（100Hz）——
+// riscv TCG 下每次迭代的 gettimeofday + ctl 文件 open/read/close 成本被
+// 放大 5-10 倍，alarmd 一度吃掉整机 1/3 CPU（top 滴答数第一，桌面卡顿
+// 元凶）。20Hz 对闹钟语义（秒级）与命令延迟（50ms）均无感知影响。
+const LOOP_MS: usize = 50;
 /// 响铃最长时长（秒，超时自动静音；一次性闹钟随即停用）。
 const RING_MAX_SECS: u64 = 60;
 /// 贪睡时长（秒）。

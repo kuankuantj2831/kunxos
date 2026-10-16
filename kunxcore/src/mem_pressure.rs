@@ -83,6 +83,16 @@ pub fn poll(now_us: u64) {
             }
         };
         if new != LEVEL {
+            // 用户告知：内存压力升级到 Critical 时记健康事件（降级不刷屏）
+            if new == PressureLevel::Critical {
+                crate::health::report_irq(
+                    true,
+                    crate::health::SEV_WARN,
+                    "memory",
+                    "系统内存严重不足（空闲低于 10%）",
+                    "请关闭不使用的应用；系统可能自动结束后台应用以保持运行",
+                );
+            }
             crate::uart_send_str("[mem] 压力 ");
             crate::print_dec(LEVEL as u64);
             crate::uart_send_str(" → ");

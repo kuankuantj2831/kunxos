@@ -409,7 +409,17 @@ fn ramdisk_write(base: usize, sector: usize, count: usize, buf: &[u8]) -> i32 {
 /// 创建 RAM 磁盘：连续分配 `blocks` 个 4KB 物理页作为磁盘，注册为 `major` 号块设备。
 pub fn ramdisk_create(name: &'static str, major: u32, blocks: usize) -> i32 {
     assert!(blocks > 0, "blkdev：ramdisk 至少需要 1 个块");
-    let base = allocator::alloc_pages_contig(blocks).expect("blkdev：ramdisk 物理内存不足");
+    // 启动期降级：物理内存不足返回 -1（tmpfs 退化为 rootfs 目录；rootfs
+    // ramdisk 失败则 /init 不可达，内核回退内置 shell），不再 panic 挂死。
+    let Some(base) = allocator::alloc_pages_contig(blocks) else {
+        crate::health::report(
+            crate::health::SEV_CRITICAL,
+            "storage",
+            "RAM 磁盘内存不足，对应文件系统不可用",
+            "请重启设备；若反复出现请减少同时运行的应用或增加内存",
+        );
+        return -1;
+    };
     register_blkdev(
         major,
         name,

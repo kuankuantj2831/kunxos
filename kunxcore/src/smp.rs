@@ -34,17 +34,25 @@ pub fn cpu_id() -> u32 {
 }
 
 /// 从设备树统计 CPU 数（`/cpus` 下 compatible = "riscv" 的节点数）。
+///
+/// 结果缓存：`sched_cfs::current_cpu()` 每次陷入都可能调用（tp 被用户
+/// 运行时用作 TLS 时尤其频繁），FDT 解析太贵不能走热路径。
 pub fn cpu_count() -> u32 {
+    static mut CACHED: u32 = 0;
     unsafe {
-        if let Some(fdt) = crate::fdt::Fdt::parse(crate::DTB_ADDR) {
-            let mut nodes = [crate::fdt::Node::empty(); 8];
-            let n = fdt.find_all_compatible("riscv", &mut nodes);
-            if n > 0 {
-                return n as u32;
+        if CACHED == 0 {
+            let mut n = 1u32;
+            if let Some(fdt) = crate::fdt::Fdt::parse(crate::DTB_ADDR) {
+                let mut nodes = [crate::fdt::Node::empty(); 8];
+                let c = fdt.find_all_compatible("riscv", &mut nodes);
+                if c > 0 {
+                    n = c as u32;
+                }
             }
+            CACHED = n;
         }
+        CACHED
     }
-    1
 }
 
 /// 多核启动（CPU0 侧）：统计核数并报告。
@@ -53,8 +61,11 @@ pub fn cpu_count() -> u32 {
 /// 已在停车场等待 `SCHED_READY`（rust_main 尾部置位）。
 pub fn smp_init() {
     let total = cpu_count();
+    // 诊断（无条件上串口）：SMP 释放链路的可见性
+    crate::uart_send_str("[smp] cpu_count=");
+    crate::print_dec(total as u64);
+    crate::uart_send_str("\n");
     if total <= 1 {
-        crate::kinfo! { crate::uart_send_str("[smp] cpus=1\n"); }
         return;
     }
     crate::kinfo! {
@@ -89,11 +100,11 @@ pub extern "C" fn smp_secondary_main(cpu: u32) -> ! {
     crate::timer::timer_init();
     crate::timer::timer_set_interval(10_000);
 
-    crate::kinfo! {
-        crate::uart_send_str("[smp] cpu");
-        crate::print_dec(cpu as u64);
-        crate::uart_send_str(" 已上线\n");
-    }
+    // 无条件上串口：SMP 上线链路曾多次静默失效（次核停在 OpenSBI /
+    // sbi_call 参数错位），这 1 行是唯一可靠的「真的多核了」证据。
+    crate::uart_send_str("[smp] cpu");
+    crate::print_dec(cpu as u64);
+    crate::uart_send_str(" 已上线\n");
 
     // 进入调度器（运行本核 idle 任务；此后由 tick 取全局就绪队列任务）
     crate::sched_cfs::start_secondary(cpu);

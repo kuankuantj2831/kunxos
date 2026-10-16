@@ -120,6 +120,91 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
     }
 }
 
+// ==================== IRQ 故障遏制跟踪 ====================
+//
+// 「中断处理自身崩溃」没有可归咎的进程（不能杀无辜任务），遏制手段是：
+// 屏蔽肇事 IRQ 线 + 放弃本次中断处理、恢复被打断的上下文（帧展开，
+// main.rs `irq_fault_contain` + `irq_fault_unwind`）。为此需要知道故障
+// 发生时「正在处理哪个中断、其外层陷阱帧在哪」：
+//   - IRQ_FRAME[cpu]：trap_dispatch 进入中断分支时记录的外层帧指针；
+//   - IRQ_LINE[cpu]：external_irq_dispatch 进入 handler 前记录的线号；
+//   - IRQ_KIND[cpu]：5=定时器 9=外部中断。
+// 已知局限：处理中途被抢占换出时，槽位可能被后续中断覆写/迟清——只
+// 影响遏制归因精度，不影响正常中断路径。
+
+static mut IRQ_FRAME: [usize; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
+static mut IRQ_LINE: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
+static mut IRQ_KIND: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
+/// 定时器中断内的遏制次数（定时器无法屏蔽——屏蔽即调度停摆；超上限
+/// 说明定时器路径有系统性 bug，转为整机诊断停机）。
+static mut TIMER_CONTAIN_N: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
+/// 定时器遏制上限。
+const TIMER_CONTAIN_MAX: u32 = 64;
+
+/// CPU 数上界（与 sched_cfs::MAX_CPUS 一致，避免跨模块常量耦合）。
+const MAX_CPUS_TRACK: usize = crate::sched_cfs::MAX_CPUS;
+
+fn cur_cpu() -> usize {
+    (crate::smp::cpu_id() as usize).min(MAX_CPUS_TRACK - 1)
+}
+
+/// 标记进入中断处理（trap_dispatch 中断分支入口调用）。
+fn irq_ctx_enter(frame: *mut TrapFrame, kind: u32) {
+    unsafe {
+        let c = cur_cpu();
+        IRQ_FRAME[c] = frame as usize;
+        IRQ_KIND[c] = kind;
+    }
+}
+
+/// 标记离开中断处理（trap_dispatch 中断分支返回前调用）。
+fn irq_ctx_exit() {
+    unsafe {
+        let c = cur_cpu();
+        IRQ_FRAME[c] = 0;
+        IRQ_KIND[c] = 0;
+        IRQ_LINE[c] = 0;
+    }
+}
+
+/// 标记进入/离开具体外部中断 handler（external_irq_dispatch 调用）。
+fn irq_line_set(irq: u32) {
+    unsafe { IRQ_LINE[cur_cpu()] = irq };
+}
+
+fn irq_line_clear() {
+    unsafe { IRQ_LINE[cur_cpu()] = 0 };
+}
+
+/// 当前 CPU 是否处于中断处理上下文（供故障遏制判定），返回外层帧指针。
+pub fn irq_ctx_frame() -> usize {
+    unsafe { IRQ_FRAME[cur_cpu()] }
+}
+
+/// 当前正在处理的外部中断线号（0=不在 handler 内）。
+pub fn irq_ctx_line() -> u32 {
+    unsafe { IRQ_LINE[cur_cpu()] }
+}
+
+/// 当前中断来源（5=定时器 9=外部）。
+pub fn irq_ctx_kind() -> u32 {
+    unsafe { IRQ_KIND[cur_cpu()] }
+}
+
+/// 清除本 CPU 的中断上下文标记（遏制展开前调用）。
+pub fn irq_ctx_reset() {
+    irq_ctx_exit();
+}
+
+/// 定时器遏制计数（超上限不再遏制）。返回 true 表示仍可遏制。
+pub fn timer_contain_tick() -> bool {
+    unsafe {
+        let c = cur_cpu();
+        TIMER_CONTAIN_N[c] += 1;
+        TIMER_CONTAIN_N[c] <= TIMER_CONTAIN_MAX
+    }
+}
+
 /// 注销中断处理函数。
 #[allow(dead_code)]
 pub fn unregister_handler(irq: u32) {
@@ -189,7 +274,10 @@ fn external_irq_dispatch() {
         unsafe { IRQ_COUNTS[irq as usize] += 1 };
         unsafe { storm_probe(irq) };
         if let Some(handler) = unsafe { HANDLERS[irq as usize] } {
+            // 记录当前 handler 线号：处理中故障时据此屏蔽肇事 IRQ 线
+            irq_line_set(irq);
             handler();
+            irq_line_clear();
         } else {
             // 未注册 handler 的源：当场从 PLIC 屏蔽并留痕。电平触发源
             // （virtio 等）不处理就永远重挂起 —— complete 后立刻再陷入，
@@ -231,6 +319,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
     let code = cause & 0xFFF_FFFF_FFFF_FFFF;
 
     if is_interrupt {
+        irq_ctx_enter(frame, code as u32);
         match code {
             5 => {
                 // 监督定时器：动画通道先判到期（120Hz 与调度 10ms 复用硬件）
@@ -255,6 +344,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
                 crate::uart_send_str("\n");
             }
         }
+        irq_ctx_exit();
         return;
     }
 
@@ -295,8 +385,20 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             crate::el0_fault_handler(frame as *mut u8);
         }
         _ => {
-            // S 模式异常：内核诊断（不返回）
-            crate::sync_exception_handler();
+            // S 模式异常：三级遏制，优先级从高到低——
+            //   1. IRQ 遏制：故障发生在中断处理里 → 屏蔽肇事 IRQ 线 +
+            //      帧展开恢复被打断的上下文（不杀无辜进程，不返回）；
+            //   2. 进程遏制：发生在 syscall 上下文（坏指针/坏数据）→
+            //      归咎该进程并终止（不返回）；
+            //   3. 内核线程遏制：非 syscall 上下文但当前是可调度内核线程
+            //      （wifi/perflog 等）→ 只终止该线程，系统继续运行；
+            //   4. 整机诊断停机（idle 自身的 bug → 看门狗最后兜底复位）。
+            if !crate::irq_fault_contain(frame, code, tval)
+                && !crate::kernel_fault_contain(frame, code, tval)
+                && !crate::kthread_fault_contain("S态异常", code, tval)
+            {
+                crate::sync_exception_handler();
+            }
         }
     }
 }

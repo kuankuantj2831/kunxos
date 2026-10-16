@@ -260,7 +260,17 @@ pub fn init(devs: &[MmioDev]) -> bool {
 
         // 分配并清零环内存（2 个连续页：desc/avail 在第一页，used 按
         // QueueAlign=4096 对齐到第二页）
-        RING = allocator::alloc_pages_contig(2).expect("virtio_blk: ring pages");
+        // 启动期降级：环内存不足返回 false（块设备缺席，SFS/数据分区不可用）
+        let Some(ring) = allocator::alloc_pages_contig(2) else {
+            crate::health::report(
+                crate::health::SEV_CRITICAL,
+                "storage",
+                "virtio-blk 环内存不足，磁盘设备已禁用",
+                "持久存储将不可用；请重启设备，若反复出现请增加内存",
+            );
+            return false;
+        };
+        RING = ring;
         for i in 0..(allocator::PAGE_SIZE * 2) / 8 {
             *((RING + i * 8) as *mut u64) = 0;
         }

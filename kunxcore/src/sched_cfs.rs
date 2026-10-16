@@ -196,6 +196,12 @@ pub struct Task {
     /// 置此标志；目标核下次 tick（本任务现场已由 IRQ 帧保存完整）兑现为
     /// `Exited` 并切走，栈随后由 reap 回收。
     pub kill_req: bool,
+    /// 系统调用上下文深度：`linux_compat::dispatch` 入口 +1、返回前 -1。
+    /// 供故障遏制判定——内核 panic / S 态异常发生在深度>0 的任务上时，
+    /// 故障源是「代表该用户进程执行 syscall 的内核代码」（坏指针/坏数据），
+    /// 只终止该进程而不整机停机。进程在 syscall 内退出时由 `reap_pid`
+    /// 的 `Task::empty()` 整槽复位兜底清零。
+    pub syscall_depth: u32,
 }
 
 impl Task {
@@ -216,6 +222,7 @@ impl Task {
             cpu_ticks: 0,
             deadline_us: 0,
             kill_req: false,
+            syscall_depth: 0,
         }
     }
 }
@@ -248,9 +255,46 @@ fn sched_unlock() {
     SCHED_LOCK.store(false, Ordering::Release);
 }
 
+/// 改名指定任务（execve 后同步任务名，主线程 tid == pid）。
+///
+/// 不改名的后果：top / crash 转储永远显示 fork 时的「fork-child」，
+/// CPU 热点与崩溃归属排查全部失真。
+pub fn rename_task(tid: u32, name: &str) {
+    if (tid as usize) >= MAX_TASKS {
+        return;
+    }
+    // 名字竞技场：Task.name 是 &'static str（spawn 传字面量），execve 的
+    // 动态名字须落进永久缓冲。每任务 32B，越界截断。
+    static mut NAME_ARENA: [[u8; 32]; MAX_TASKS] = [[0; 32]; MAX_TASKS];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(31);
+    let saved = unsafe { read_daif() };
+    sched_lock();
+    unsafe {
+        let slot = &mut NAME_ARENA[tid as usize];
+        slot[..n].copy_from_slice(&bytes[..n]);
+        slot[n] = 0;
+        let t = &mut TASKS[tid as usize];
+        if t.state != TaskState::Empty {
+            // 指向本任务槽的 NUL 结尾字节切片；缓冲随内核永久存活。
+            t.name = core::str::from_utf8_unchecked(&slot[..n]);
+        }
+    }
+    sched_unlock();
+    unsafe { write_daif(saved) };
+}
+
 /// 当前 CPU 号。
+///
+/// tp 在内核态的不变式是 hartid（启动汇编写入），但 musl 等用户运行时把
+/// tp 用作 TLS 指针——用户态陷阱进入内核后 cpu_id() 读到的是用户 TLS
+/// 值（巨大）。clamp 到**运行时核数 - 1**（而非编译期 MAX_CPUS - 1）：
+/// 单核下任何垃圾值都归 0（唯一核），CURRENT 槽位恒正确。多核下 musl
+/// 进程仍可能被误归属（已知局限，见记忆 kunxos-mouse-lag）；根治需在
+/// 陷入汇编里重建 tp = hartid（停泊值高 8 位织入核号方案，未完成）。
 fn current_cpu() -> usize {
-    (crate::smp::cpu_id() as usize).min(MAX_CPUS - 1)
+    let cpus = crate::smp::cpu_count().max(1) as usize;
+    (crate::smp::cpu_id() as usize).min(cpus - 1)
 }
 
 /// 睡眠等待槽位：每个任务同一时间至多登记一个截止时间。
@@ -268,7 +312,7 @@ static mut SLEEPERS: [Sleeper; MAX_TASKS] = [const { EMPTY_SLEEPER }; MAX_TASKS]
 /// （如无限 futex_wait 收到假 ETIMEDOUT）。
 ///
 /// 调用方须持有 sched_lock 且已屏蔽 IRQ。
-unsafe fn sleepers_clear_tid(tid: u32) {
+pub unsafe fn sleepers_clear_tid(tid: u32) {
     for s in SLEEPERS.iter_mut() {
         if s.active && s.tid == tid {
             *s = EMPTY_SLEEPER;
@@ -658,6 +702,11 @@ unsafe fn do_switch(cur: usize, next: usize) {
 /// 与空闲比例），并驱动 idle 状态机（enter/exit_wfi）。
 fn idle_loop(cpu: usize) -> ! {
     loop {
+        // 幂等重开总中断：故障遏制把任务标记退出后切换到本核 idle 时，
+        // 恢复点可能带着关中断状态（故障陷阱屏蔽了 SIE，TaskContext 不
+        // 保存 sstatus）——不重开则本核定时器不再陷入，心跳停跳会被互监
+        // 看门狗误判为楔死而整机复位。每轮循环一次 csrsi，开销可忽略。
+        unsafe { core::arch::asm!("csrsi sstatus, 2") };
         let t0 = timer::now_us();
         crate::power::enter_wfi(cpu as u32);
         unsafe { wfi() };
@@ -793,7 +842,7 @@ pub fn insert(
 ///
 /// 所有读取 `CURRENT` 的地方都应经此函数，避免在调度器启动前以 `usize::MAX`
 /// 下标访问任务数组触发越界 panic（index out of bounds）。
-fn current_idx() -> Option<usize> {
+pub fn current_idx() -> Option<usize> {
     let cur = unsafe { CURRENT[current_cpu()] };
     if cur < MAX_TASKS {
         Some(cur)
@@ -829,6 +878,56 @@ pub fn current_pid() -> u32 {
     match current_idx() {
         Some(i) => unsafe { TASKS[i].pid },
         None => 0,
+    }
+}
+
+// ==================== 系统调用上下文标记（故障遏制） ====================
+
+/// 标记当前任务进入系统调用上下文（`linux_compat::dispatch` 入口调用）。
+///
+/// 内核 panic / S 态异常发生时，`in_syscall_user` 据此判断故障是否发生在
+/// 「代表用户进程执行 syscall」的内核代码里（用户传坏指针/坏数据触发），
+/// 是则只终止该进程（SIGSEGV 语义），系统继续调度。
+pub fn syscall_enter() {
+    if let Some(i) = current_idx() {
+        unsafe { TASKS[i].syscall_depth = TASKS[i].syscall_depth.saturating_add(1) };
+    }
+}
+
+/// 离开系统调用上下文（`linux_compat::dispatch` 返回前调用）。
+pub fn syscall_leave() {
+    if let Some(i) = current_idx() {
+        unsafe {
+            if TASKS[i].syscall_depth > 0 {
+                TASKS[i].syscall_depth -= 1;
+            }
+        }
+    }
+}
+
+/// 当前任务是否是**可调度的内核线程**（非 idle、占用任务槽位、不在
+/// syscall 上下文）——其故障可只杀线程保全系统（kthread_fault_contain）。
+pub fn is_sched_kthread() -> bool {
+    match current_idx() {
+        Some(i) => unsafe {
+            TASKS[i].state != TaskState::Empty
+                && TASKS[i].class != PriorityClass::Idle
+                && TASKS[i].syscall_depth == 0
+        },
+        None => false,
+    }
+}
+
+/// 当前任务是否处于系统调用上下文，且不是内核任务（排除 idle）。
+///
+/// idle / 内核线程不带用户地址空间，其上的故障无法归咎于用户进程，
+/// 遏制判定须配合 `process::processes_pub_ttbr0(pid) != 0` 使用。
+pub fn in_syscall_user() -> bool {
+    match current_idx() {
+        Some(i) => unsafe {
+            TASKS[i].syscall_depth != 0 && TASKS[i].class != PriorityClass::Idle
+        },
+        None => false,
     }
 }
 

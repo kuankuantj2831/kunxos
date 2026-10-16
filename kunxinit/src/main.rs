@@ -241,6 +241,95 @@ unsafe fn spawn_service(name: &str, path: &str) -> isize {
     pid
 }
 
+// ==================== 服务监督（崩溃自动重启） ====================
+
+/// launcher 崩溃循环放弃标记：k_main 以退出码 2 退出（内核显示崩溃告知屏）。
+static mut GUI_GAVE_UP: bool = false;
+
+/// 单个服务的重启次数上限：超过即放弃（防「秒崩秒拉」循环刷爆系统，
+/// 8 次 × execve 成本远低于让故障服务无限空转）。
+const SUPERVISE_MAX_RESTARTS: u32 = 8;
+
+/// 受监督的常驻子进程：init 拉起的守护进程与 launcher。
+/// 主循环 wait4(-1) 收到退出事件时按 pid 匹配，命中则重启。
+struct Supervised {
+    name: &'static str,
+    path: &'static str,
+    pid: isize,
+    restarts: u32,
+}
+
+static mut SUPERVISED: [Supervised; 12] =
+    [const { Supervised { name: "", path: "", pid: 0, restarts: 0 } }; 12];
+
+/// 登记一个受监督服务（fork 失败的 pid<=0 跳过）。
+fn supervise_remember(name: &'static str, path: &'static str, pid: isize) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        for s in SUPERVISED.iter_mut() {
+            if s.name.is_empty() {
+                s.name = name;
+                s.path = path;
+                s.pid = pid;
+                s.restarts = 0;
+                return;
+            }
+        }
+        // 表满：不监督（仅打印一次告警）
+        print("[init] WARNING: 监督表已满，");
+        print(name);
+        print(" 不受监督\n");
+    }
+}
+
+/// 按 pid 查找受监督服务（未命中返回 None）。
+fn supervise_find(pid: isize) -> Option<&'static mut Supervised> {
+    unsafe {
+        for s in SUPERVISED.iter_mut() {
+            if s.pid == pid && !s.name.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// 服务放弃重启时写入 /var/run/health.log（内核 health 模块同格式：
+/// `<t>ms <sev> <subsys> | <msg> | 修复: <fix>`，launcher 桌面横幅解析）。
+/// best-effort：文件不可写只打控制台（内存侧无用户态环形缓冲）。
+fn health_note(name: &str) {
+    const O_WRONLY: usize = 1;
+    const O_CREAT: usize = 0x40;
+    const O_APPEND: usize = 0x400;
+    let mut line = [0u8; 192];
+    let mut n = 0usize;
+    let mut push = |s: &str, l: &mut [u8; 192], n: &mut usize| {
+        for &c in s.as_bytes() {
+            if *n < l.len() {
+                l[*n] = c;
+                *n += 1;
+            }
+        }
+    };
+    push("0ms 警告 service | 系统服务 ", &mut line, &mut n);
+    push(name, &mut line, &mut n);
+    push(" 反复崩溃已停摆（系统其余功能正常）", &mut line, &mut n);
+    push(" | 修复: 重启设备可恢复该服务；若反复停摆请重新刷机", &mut line, &mut n);
+    push("\n", &mut line, &mut n);
+    unsafe {
+        let fd = sys_open(
+            "/var/run/health.log",
+            O_WRONLY | O_CREAT | O_APPEND,
+        );
+        if fd >= 0 {
+            write_fd(fd as usize, &line[..n]);
+            syscall1(SYS_CLOSE, fd as usize);
+        }
+    }
+}
+
 // ==================== 主流程 ====================
 
 #[no_mangle]
@@ -249,30 +338,35 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     unsafe {
         let net_pid = spawn_service("networkd", "/bin/networkd");
+        supervise_remember("networkd", "/bin/networkd", net_pid);
         if net_pid <= 0 {
             print("[init] FATAL: 无法启动 networkd\n");
         }
         // wifid：Wi-Fi 守护进程（/dev/wifi 事件 + 配置存储 /data/wifi/networks +
         // 状态机，见 docs/wifi.md）。与 networkd 并行，扫描/连接由内核 wifi 模块推进。
         let wifi_pid = spawn_service("wifid", "/bin/wifid");
+        supervise_remember("wifid", "/bin/wifid", wifi_pid);
         if wifi_pid <= 0 {
             print("[init] FATAL: 无法启动 wifid\n");
         }
         // camerad：相机服务（QEMU 软件传感器 / Pi4 硬件骨架）。先于 launcher
         // 启动，相机应用打开时命令通道已就绪。
         let cam_pid = spawn_service("camerad", "/bin/camerad");
+        supervise_remember("camerad", "/bin/camerad", cam_pid);
         if cam_pid <= 0 {
             print("[init] FATAL: 无法启动 camerad\n");
         }
         // audiod：音频守护进程（焦点管理 + 多应用混音），常驻。
         // 必须在 launcher/OOBE 之前拉起，保证应用开流时服务已就绪。
         let audiod_pid = spawn_service("audiod", "/bin/audiod");
+        supervise_remember("audiod", "/bin/audiod", audiod_pid);
         if audiod_pid <= 0 {
             print("[init] FATAL: 无法启动 audiod\n");
         }
         // lifd：应用生命周期守护进程（状态机/后台任务/LMK）。必须先于
         // launcher 启动——应用启动时会经 launcher 向 lifd 登记。
         let lifd_pid = spawn_service("lifd", "/bin/lifd");
+        supervise_remember("lifd", "/bin/lifd", lifd_pid);
         if lifd_pid <= 0 {
             print("[init] FATAL: 无法启动 lifd\n");
         }
@@ -280,12 +374,14 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // /var/run/alarmd.state 供时钟应用叠加响铃界面；命令信箱 alarmd.ctl）。
         // 必须在 launcher 之前拉起，保证时钟应用打开时信箱已就绪。常驻。
         let alarmd_pid = spawn_service("alarmd", "/bin/alarmd");
+        supervise_remember("alarmd", "/bin/alarmd", alarmd_pid);
         if alarmd_pid <= 0 {
             print("[init] FATAL: 无法启动 alarmd\n");
         }
         // sensord：传感器融合守护进程（/dev/sensor0 → Mahony 融合 + 计步 +
         // 抬腕亮屏，状态写入 /var/run/sensord.state，应用轮询）。常驻。
         let sensord_pid = spawn_service("sensord", "/bin/sensord");
+        supervise_remember("sensord", "/bin/sensord", sensord_pid);
         if sensord_pid <= 0 {
             print("[init] FATAL: 无法启动 sensord\n");
         }
@@ -293,11 +389,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 调制解调器 / Pi4 UART2），实现 AT 命令层、通话状态机、SMS PDU
         // 编解码与持久化；应用经 /var/run/rild.cmd + rild.state 交互。
         let rild_pid = spawn_service("rild", "/bin/rild");
+        supervise_remember("rild", "/bin/rild", rild_pid);
 
         // pushd：本地通知队列（/data/push/in/<pid>_<seq> → lifd DELIVER）。
         // 此前被移出启动列表导致通知子系统开机不可用（lifecycle_core_test
         // 的推送链路断言全部依赖 pushd 运行）。
         let _pushd_pid = spawn_service("pushd", "/bin/pushd");
+        supervise_remember("pushd", "/bin/pushd", _pushd_pid);
         if rild_pid <= 0 {
             print("[init] FATAL: 无法启动 rild\n");
         }
@@ -413,53 +511,92 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         }
 
         let launcher_pid = spawn_service("launcher", "/bin/launcher");
+        supervise_remember("launcher", "/bin/launcher", launcher_pid);
         if launcher_pid <= 0 {
             print("[init] FATAL: 无法启动 launcher\n");
         }
 
-        // 先回收一遍已退出的守护进程：pid 特定的阻塞 wait4 收不到其它子
-        // 进程的退出，它们会一直挂着变僵尸（占进程槽位；wait4(-1) 才能收）。
+        // 监督主循环：阻塞回收任意子进程（wait4(-1) 顺带收编上面各守护
+        // 进程退出后留下的僵尸），受监督服务崩溃自动重启（带上限防崩溃
+        // 循环）；launcher 彻底放弃后 init 退出，守护进程作为孤儿继续运行，
+        // 内核随即回退到内置 Shell，可继续交互调试（如 `run /bin/audiotest`）。
         loop {
-            let mut st = 0i32;
-            let r = wait4_nohang(-1, &mut st);
+            let mut status = 0i32;
+            let r = wait4(-1, &mut status);
             if r <= 0 {
+                // ECHILD：已无任何子进程（全部放弃或拉起失败）——退出
                 break;
             }
-            print("[init] 已回收退出的子进程 pid=");
+            let code = ((status as u32) >> 8) as usize;
+            let sig = (status as u32) & 0x7F;
+            print("[init] 子进程 pid=");
             print_dec(r as usize);
-            print("\n");
-        }
-
-        // 主循环：等待 launcher 退出（GUI 常驻时不返回）。launcher 退出
-        // （无帧缓冲 / 用户退出）后，init 退出并把 daemon（networkd/audiod）
-        // 留作孤儿继续运行 —— 内核随即回退到内置 Shell，可继续交互调试
-        // （如 `run /bin/audiotest ...`），audiod 仍提供焦点/混音服务。
-        let mut status = 0i32;
-        if launcher_pid > 0 {
-            let r = wait4(launcher_pid as i32, &mut status);
-            if r < 0 {
-                // ECHILD(-10)：launcher 在上面的收尸循环里已被回收（如无头
-                // 模式秒退），打印原始寄存器值会是天文数字
-                print("[init] launcher (pid ");
-                print_dec(launcher_pid as usize);
-                print(") 已在此前回收（wait4 返回 ");
-                print_dec(r as usize);
-                print("）\n");
-            } else {
-                let code = ((status as u32) >> 8) as usize;
-                print("[init] launcher (pid ");
-                print_dec(launcher_pid as usize);
-                print(") 已退出, r=");
-                print_dec(r as usize);
-                print(" status=");
-                print_dec(code);
-                print("\n");
+            print(" 已退出 status=");
+            print_dec(code);
+            if sig != 0 {
+                print("(被信号终止 sig=");
+                print_dec(sig as usize);
+                print(")");
             }
+            print("\n");
+            if let Some(svc) = supervise_find(r) {
+                let is_launcher = svc.name == "launcher";
+                // launcher 正常退出（退出码 0 且非信号终止，如无帧缓冲的
+                // 无头环境 / 用户退出桌面）：有意退出，不重启——init 随之
+                // 退出，内核 Shell 接管（与旧语义一致，无头测试依赖此路径）。
+                if is_launcher && code == 0 && sig == 0 {
+                    print("[init] launcher 正常退出，init 退出（内核 Shell 接管）\n");
+                    svc.pid = 0;
+                    svc.name = "";
+                    svc.path = "";
+                    break;
+                }
+                let give_up = svc.restarts >= SUPERVISE_MAX_RESTARTS;
+                if give_up {
+                    print("[init] 放弃重启 ");
+                    print(svc.name);
+                    print("（超过重启上限，子系统停摆但系统继续运行）\n");
+                    health_note(svc.name);
+                } else {
+                    svc.restarts += 1;
+                    print("[init] 正在重启 ");
+                    print(svc.name);
+                    print("（第 ");
+                    print_dec(svc.restarts as usize);
+                    print(" 次）\n");
+                    let npid = spawn_service(svc.name, svc.path);
+                    if npid > 0 {
+                        svc.pid = npid;
+                        // 重启成功：继续监督
+                        continue;
+                    }
+                    // fork 失败（进程/任务槽满等）：等同放弃
+                    print("[init] 重启 fork 失败，放弃 ");
+                    print(svc.name);
+                    print("\n");
+                }
+                // 放弃：清槽（name 置空即可被复用）
+                svc.pid = 0;
+                svc.name = "";
+                svc.path = "";
+                if is_launcher {
+                    // 桌面彻底放弃：以退出码 2 退出 init——内核据此显示
+                    // 崩溃告知屏（GUI 已死，用户需要知道系统降级了）并让
+                    // 内核 Shell 接管。区别于干净退出的 0 与 panic 的 1。
+                    GUI_GAVE_UP = true;
+                    break;
+                }
+            }
+            // 非监督子进程（OOBE/测试程序）：仅回收，不重启
         }
     }
 
     print("[init] 正在退出（守护进程作为孤儿继续运行，内核 Shell 随后接管）\n");
-    0
+    if unsafe { GUI_GAVE_UP } {
+        2 // GUI 崩溃循环放弃：内核显示崩溃告知屏
+    } else {
+        0
+    }
 }
 
 // ==================== 入口 ====================

@@ -860,6 +860,140 @@ fn draw_call_banner() {
     }
 }
 
+// ==================== 系统健康横幅（故障告知 + 修复指引） ====================
+//
+// 内核 health 模块把故障事件落盘 /var/run/health.log（格式：
+// `<t>ms <sev> <subsys> | <msg> | 修复: <fix>`）。launcher 桌面首帧读取，
+// 非空则在状态栏下方展示琥珀色横幅：第一行「系统检测到问题：<msg>」，
+// 第二行「修复：<fix>」——重大系统问题必须告知用户并给出修复方法。
+//
+// 通话横幅优先（同视觉位）；展示 30 秒后 400ms 淡出；无文件/为空不展示。
+
+/// 健康横幅：0=未读取，1=展示中，2=已退场（本次开机不再出现）。
+static mut HEALTH_BANNER: u8 = 0;
+/// 第一条事件的 msg（NUL 截断存储）。
+static mut HEALTH_MSG: [u8; 72] = [0; 72];
+static mut HEALTH_MSG_LEN: usize = 0;
+/// 第一条事件的修复建议。
+static mut HEALTH_FIX: [u8; 108] = [0; 108];
+static mut HEALTH_FIX_LEN: usize = 0;
+/// 展示起始时刻（µs）。
+static mut HEALTH_T0: u64 = 0;
+/// 展示时长与退场淡出时长。
+const HEALTH_SHOW_US: u64 = 30_000_000;
+const HEALTH_FADE_US: u64 = 400_000;
+/// 健康横幅高度（两行文本）。
+const HEALTH_BANNER_H: i32 = 56;
+
+/// 懒加载：首次绘制时读取 /var/run/health.log 的第一条数据行。
+fn health_load() {
+    unsafe {
+        let mut buf = [0u8; 2048];
+        let n = read_file("/var/run/health.log", &mut buf) as usize;
+        if n == 0 {
+            HEALTH_BANNER = 2; // 无事件：不再尝试
+            return;
+        }
+        // 取第一条完整行（找首个 \n）
+        let end = buf[..n].iter().position(|&c| c == b'\n').unwrap_or(n);
+        let line = &buf[..end];
+        // 行格式：`<t>ms <sev> <subsys> | <msg> | 修复: <fix>`
+        // msg：第一个 "| " 之后；fix："| 修复: " 之后（可能缺席）
+        let p1 = line.iter().position(|&c| c == b'|');
+        let (msg_from, fix_from) = match p1 {
+            Some(i) => {
+                let m0 = (i + 2).min(line.len());
+                let rest = &line[m0..];
+                let p2 = rest.iter().position(|&c| c == b'|');
+                match p2 {
+                    Some(j) => (m0, m0 + j + 1),
+                    None => (m0, line.len()),
+                }
+            }
+            None => (0, line.len()),
+        };
+        // msg 到第二个 | 前
+        let msg_to = if fix_from < line.len() { fix_from.saturating_sub(1) } else { line.len() };
+        let mlen = msg_to.saturating_sub(msg_from).min(HEALTH_MSG.len());
+        HEALTH_MSG[..mlen].copy_from_slice(&line[msg_from..msg_from + mlen]);
+        HEALTH_MSG_LEN = mlen;
+        // fix：跳过 "| 修复: " 前缀
+        let f0 = (fix_from + " 修复: ".len()).min(line.len());
+        let flen = line.len().saturating_sub(f0).min(HEALTH_FIX.len());
+        if flen > 0 {
+            HEALTH_FIX[..flen].copy_from_slice(&line[f0..f0 + flen]);
+            HEALTH_FIX_LEN = flen;
+        }
+        HEALTH_BANNER = 1;
+        HEALTH_T0 = now_us();
+    }
+}
+
+/// 健康横幅绘制（桌面态，状态栏下方；通话横幅优先）。
+fn draw_health_banner() {
+    unsafe {
+        if HEALTH_BANNER == 0 {
+            health_load();
+        }
+        if HEALTH_BANNER != 1 || (CALL_BANNER != 0) {
+            return;
+        }
+        let now = now_us();
+        let t = now.saturating_sub(HEALTH_T0);
+        // 300ms 淡入 → 停留 → 400ms 淡出退场
+        let alpha: u32 = if t < 300_000 {
+            (255 * t / 300_000) as u32
+        } else if t <= HEALTH_SHOW_US {
+            255
+        } else if t < HEALTH_SHOW_US + HEALTH_FADE_US {
+            let over = t - HEALTH_SHOW_US;
+            (255 * (HEALTH_FADE_US - over) / HEALTH_FADE_US) as u32
+        } else {
+            HEALTH_BANNER = 2;
+            return;
+        };
+        // 两行文本：问题 + 修复建议
+        let mut l1 = [0u8; 88];
+        let mut n1 = 0usize;
+        for &c in "系统检测到问题：".as_bytes() {
+            if n1 < l1.len() { l1[n1] = c; n1 += 1; }
+        }
+        let ml = HEALTH_MSG_LEN.min(l1.len() - n1);
+        for i in 0..ml {
+            l1[n1 + i] = HEALTH_MSG[i];
+        }
+        n1 += ml;
+        let mut l2 = [0u8; 128];
+        let mut n2 = 0usize;
+        for &c in "修复：".as_bytes() {
+            if n2 < l2.len() { l2[n2] = c; n2 += 1; }
+        }
+        let fl = HEALTH_FIX_LEN.min(l2.len() - n2);
+        for i in 0..fl {
+            l2[n2 + i] = HEALTH_FIX[i];
+        }
+        n2 += fl;
+        if n2 == "修复：".len() {
+            // 无修复建议字段：给通用指引
+            for &c in "重启设备可恢复；详情见系统健康记录".as_bytes() {
+                if n2 < l2.len() { l2[n2] = c; n2 += 1; }
+            }
+        }
+        let w1 = text_width(&l1[..n1]);
+        let w2 = text_width(&l2[..n2]);
+        let w = w1.max(w2) + 40;
+        let x = (DISPLAY_W as i32 - w) / 2;
+        let y = BANNER_Y;
+        // 琥珀玻璃药丸 + 双行文本（问题=白，修复=琥珀）
+        let prev = PIX_ALPHA;
+        PIX_ALPHA = alpha.min(255);
+        draw_glass_style(x, y, w, HEALTH_BANNER_H, 16, &GLASS_FROST);
+        draw_text(x + 20, y + 10, &l1[..n1], COLOR_TEXT);
+        draw_text(x + 20, y + 31, &l2[..n2], 0xFFB3_00);
+        PIX_ALPHA = prev;
+    }
+}
+
 /// 桌面与系统面板状态。全部采用定长数据，保持 no_std/无堆。
 static mut CURRENT_PAGE: usize = 0;
 
@@ -6450,6 +6584,7 @@ fn draw_desktop_full() {
         }
         draw_status_bar();
         draw_call_banner();
+        draw_health_banner();
         draw_page();
         draw_dock();
         // 文件夹（含打开/关闭 350ms 弹簧缩放动画）

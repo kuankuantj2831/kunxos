@@ -265,6 +265,10 @@ const SYS_KUNX_PM_FREEZE: usize = 413;
 /// 自定义：当前任务设置一次性调度 deadline（x0 = 相对期限 µs，0 = 清除）。
 /// 统一响应 deadline 体系的用户态入口（渲染线程把帧预算显式告知调度器）。
 const SYS_KUNX_SCHED_SET_DEADLINE: usize = 414;
+/// 故障注入（开发/CI 验证遏制路径，root 专用）：x0=1 在 S 态解引用坏地址
+/// x1（触发 kernel_fault_contain），x0=2 内核切片越界（触发 panic 遏制）。
+/// 真正注入时进程被 SIGSEGV 语义终止（不返回）；crashme kfault/kpanic 用。
+const SYS_KUNX_FAULT_INJECT: usize = 415;
 
 // ==================== Linux 常量 ====================
 
@@ -516,7 +520,18 @@ pub fn dump_sys_trace() {
 }
 
 /// Linux 系统调用分发：`nr` 为 x8 系统调用号，`f` 为陷阱帧（x0..x5 为参数）。
+///
+/// 入口/出口维护 syscall 上下文标记（`sched_cfs::syscall_enter/leave`）：
+/// 其间发生的内核 panic / S 态异常可被故障遏制归咎于当前用户进程并只
+/// 终止它，整机不停机。
 pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
+    sched_cfs::syscall_enter();
+    let ret = dispatch_inner(nr, f);
+    sched_cfs::syscall_leave();
+    ret
+}
+
+fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
     trace_syscall(nr, f);
     // 信号投递：待处理信号在 syscall 入口检查；已注册 handler 的信号改写
     // 陷阱帧进入 handler（跳过本次 syscall），未注册的按默认动作（终止/忽略）。
@@ -672,6 +687,7 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             }
         }
         SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[10] as u64),
+        SYS_KUNX_FAULT_INJECT => sys_kunx_fault_inject(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -681,6 +697,60 @@ pub fn dispatch(nr: usize, f: &mut TrapFrame) -> i64 {
             crate::uart_send_str("\n");
             ENOSYS
         }
+    }
+}
+
+/// 故障注入（SYS_KUNX_FAULT_INJECT，root 专用，开发/CI 用）：
+/// - x0=1：S 态解引用 x1 地址（未映射 → S 态缺页 → `kernel_fault_contain`
+///   遏制路径：tombstone + 终止本进程，系统继续运行）；
+/// - x0=2：内核切片越界（panic → panic 处理器遏制路径）；
+/// - x0=3：下一次定时器中断在 handler 上下文解引用坏地址（IRQ 遏制：
+///   帧展开恢复被打断的上下文，系统继续运行）。
+/// 注入生效时 x0=1/2 进程以 SIGSEGV 语义被终止不返回；x0=3 返回 0，
+/// 故障在下个 tick（10ms 内）发生。非 root 或未知模式返回错误码。
+/// crashme kfault / kpanic / kirq 经此验证「报错不死机」。
+fn sys_kunx_fault_inject(f: &mut TrapFrame) -> i64 {
+    if process::current_uid() != 0 {
+        return EPERM;
+    }
+    match f.x[10] {
+        1 => {
+            let bad = if f.x[11] != 0 { f.x[11] as usize } else { 0x1 };
+            // read_volatile 防优化；S 态无 SUM 放行，用户地址/未映射地址
+            // 直接触发缺页异常，由 trap_dispatch → kernel_fault_contain 遏制
+            let v = unsafe { core::ptr::read_volatile(bad as *const u64) };
+            v as i64 // 地址意外可映射时才会到达（注入未生效）
+        }
+        2 => {
+            let probe = [0u8; 4];
+            // 索引经 volatile 读获得：躲开 unconditional_panic 的编译期
+            // 判定（panic 本身就是注入目标，运行时触发走遏制路径）
+            let idx = unsafe { core::ptr::read_volatile(&0x1000usize) };
+            probe[idx] as i64 // 越界 → panic → panic 处理器遏制
+        }
+        3 => {
+            crate::timer::INJECT_IRQ_FAULT.store(true, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        // 主核楔死注入（crashme kwedge）：本核关中断 + wfi 永眠——存活核
+        // 的互监看门狗应在 5 秒内 SBI 冷复位（QEMU -no-reboot 下模拟器
+        // 退出）。端到端验证「崩了 → 自动重启 → （下次启动脏标志告知）」。
+        4 => {
+            crate::health::report_irq(
+                true,
+                crate::health::SEV_INFO,
+                "watchdog",
+                "故障注入：本核心即将楔死（验证看门狗）",
+                "预期 5 秒内系统自动重启",
+            );
+            unsafe {
+                core::arch::asm!("csrci sstatus, 2", options(nostack));
+            }
+            loop {
+                unsafe { core::arch::asm!("wfi", options(nostack)) };
+            }
+        }
+        _ => EINVAL,
     }
 }
 
@@ -1889,10 +1959,13 @@ fn sys_reboot(f: &mut TrapFrame) -> i64 {
     match cmd {
         0x4321_FEDC => {
             crate::uart_send_str("[kernel] 通过 reboot(2) 关机\n");
+            // 正常关机：清脏标志，下次启动不误报「异常关机」
+            let _ = vfs::unlink("/data/.bootdirty");
             crate::sbi::shutdown();
         }
         0x1234_567 => {
             crate::uart_send_str("[kernel] 通过 reboot(2) 重启\n");
+            let _ = vfs::unlink("/data/.bootdirty");
             crate::sbi::system_reset();
         }
         _ => EINVAL,
@@ -2766,15 +2839,14 @@ fn sys_poll_family(f: &mut TrapFrame, tmo_reg: usize) -> i64 {
                         if ready {
                             count += 1;
                         } else {
-                            // 清掉该 fd 的就绪位（用户侧 FD_ISSET 判定）
+                            // 清掉该 fd 的就绪位（用户侧 FD_ISSET 判定）。
+                            // 读改写全走 copy 辅助：裸写只做过读校验，COW
+                            // 只读页会触发 S 态写故障（此前=整机挂死）。
                             let byte_idx = readfds as usize + fd / 8;
                             let mut b = [0u8; 1];
-                            unsafe {
-                                copy_from_user(byte_idx as u64, &mut b);
-                                let nv = b[0] & !(1 << (fd % 8));
-                                crate::mmu::uaccess_begin();
-                                core::ptr::write_volatile(byte_idx as *mut u8, nv);
-                                crate::mmu::uaccess_end();
+                            if unsafe { copy_from_user(byte_idx as u64, &mut b) } == 1 {
+                                b[0] &= !(1u8 << (fd % 8));
+                                unsafe { copy_to_user(byte_idx as u64, &b) };
                             }
                         }
                     }

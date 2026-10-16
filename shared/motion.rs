@@ -23,6 +23,10 @@ pub enum Easing {
     LinearOutSlowIn,
     FastOutLinearIn,
     Emphasized,
+    /// ColorOS 17 标准曲线：快速前冲 + 长尾缓停（ColorOS 动效规范主曲线）。
+    ColorOSStandard,
+    /// ColorOS 强调进入曲线：起步快、收尾极缓（用于入场/展开类动画）。
+    ColorOSEmphasized,
 }
 
 impl Easing {
@@ -36,6 +40,8 @@ impl Easing {
             Easing::LinearOutSlowIn => (0.0, 0.0, 0.2, 1.0),
             Easing::FastOutLinearIn => (0.4, 0.0, 1.0, 1.0),
             Easing::Emphasized => (0.2, 0.0, 0.0, 1.0),
+            Easing::ColorOSStandard => (0.22, 1.0, 0.36, 1.0),
+            Easing::ColorOSEmphasized => (0.3, 0.0, 0.1, 1.0),
         }
     }
 

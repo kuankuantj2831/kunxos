@@ -441,8 +441,18 @@ pub fn init(devs: &[MmioDev]) -> bool {
         }
 
         // 4. 分配并清零环页
-        RX_RING = allocator::alloc_page().expect("net_virtio: rx ring page");
-        TX_RING = allocator::alloc_page().expect("net_virtio: tx ring page");
+        // 启动期降级：环页不足返回 false（网络缺席，浏览器等联网应用报错）
+        let (Some(rx), Some(tx)) = (allocator::alloc_page(), allocator::alloc_page()) else {
+            crate::health::report(
+                crate::health::SEV_WARN,
+                "network",
+                "virtio-net 环内存不足，网络已禁用",
+                "联网功能不可用；请重启设备恢复",
+            );
+            return false;
+        };
+        RX_RING = rx;
+        TX_RING = tx;
         for i in 0..allocator::PAGE_SIZE / 8 {
             *((RX_RING + i * 8) as *mut u64) = 0;
             *((TX_RING + i * 8) as *mut u64) = 0;

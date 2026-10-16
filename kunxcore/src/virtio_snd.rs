@@ -529,8 +529,16 @@ pub fn init(devs: &[crate::net_virtio::MmioDev]) -> bool {
         }
 
         // 4. 分配并清零环页
-        let ctrl = allocator::alloc_page().expect("virtio_snd：控制环页分配失败");
-        let tx = allocator::alloc_page().expect("virtio_snd：发送环页分配失败");
+        // 启动期降级：环页不足返回 false（音频设备缺席，应用静音运行）
+        let (Some(ctrl), Some(tx)) = (allocator::alloc_page(), allocator::alloc_page()) else {
+            crate::health::report(
+                crate::health::SEV_WARN,
+                "audio",
+                "virtio-snd 环内存不足，音频已禁用",
+                "系统静音运行；请重启设备恢复",
+            );
+            return false;
+        };
         CTRL_RING = ctrl;
         TX_RING = tx;
         for i in 0..allocator::PAGE_SIZE / 8 {

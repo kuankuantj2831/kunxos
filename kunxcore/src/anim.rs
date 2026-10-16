@@ -49,6 +49,8 @@ unsafe fn irq_restore(saved: u64) {
 /// | `LinearOutSlowIn` | (0,0,0.2,1) | Android `linear_out_slow_in`（Decelerate） |
 /// | `FastOutLinearIn` | (0.4,0,1,1) | Android `fast_out_linear_in`（Accelerate） |
 /// | `Emphasized` | (0.2,0,0,1) | Material 3 强调曲线 |
+/// | `ColorOSStandard` | (0.22,1,0.36,1) | ColorOS 标准曲线（强减速回弹手感） |
+/// | `ColorOSEmphasized` | (0.3,0,0.1,1) | ColorOS 强调进入曲线（快出缓停） |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Easing {
     Linear,
@@ -59,6 +61,8 @@ pub enum Easing {
     LinearOutSlowIn,
     FastOutLinearIn,
     Emphasized,
+    ColorOSStandard,
+    ColorOSEmphasized,
 }
 
 impl Easing {
@@ -73,6 +77,8 @@ impl Easing {
             Easing::LinearOutSlowIn => (0.0, 0.0, 0.2, 1.0),
             Easing::FastOutLinearIn => (0.4, 0.0, 1.0, 1.0),
             Easing::Emphasized => (0.2, 0.0, 0.0, 1.0),
+            Easing::ColorOSStandard => (0.22, 1.0, 0.36, 1.0),
+            Easing::ColorOSEmphasized => (0.3, 0.0, 0.1, 1.0),
         }
     }
 

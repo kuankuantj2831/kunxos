@@ -7,6 +7,7 @@
 //! `/cpus/timebase-frequency`（QEMU virt RISC-V = 10MHz），缺失回退 10MHz。
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sbi;
 
@@ -207,6 +208,14 @@ pub fn timer_register_handler(handler: TimerHandler) {
 /// 其后的栈弹出会取错误槽位，导致跳转垃圾地址（PC=0 崩溃）。
 #[inline(never)]
 pub fn timer_handle_irq() {
+    wdt_tick();
+    // 故障注入（crashme kirq，root 专用）：在定时器中断上下文故意解引用
+    // 坏地址一次——验证 IRQ 遏制（帧展开恢复被打断的上下文，系统存活）。
+    // 常态为一次 relaxed load，零开销。
+    if INJECT_IRQ_FAULT.swap(false, Ordering::Relaxed) {
+        let v = unsafe { core::ptr::read_volatile(0x1usize as *const u64) };
+        core::hint::black_box(v);
+    }
     let now = read_time();
     let ticks = us_to_ticks(unsafe { INTERVAL_US });
     unsafe {
@@ -319,6 +328,66 @@ pub fn timer2_handle_irq() {
             if let Some(h) = h {
                 h();
             }
+        }
+    }
+}
+
+
+// ==================== SMP 看门狗 ====================
+//
+// 「任何地方崩了都能继续运行」的兜底：主核在 IRQ 关死状态下楔死（panic
+// 死循环、调度器死锁、驱动 IRQ 风暴关中断）时，本核软件已无法自救——
+// 由次核检测主核心跳停跳并触发 SBI 冷复位（手机厂商的真实做法：watchdog
+// 重启 + 事后告知）。次核的定时器独立于主核，主核楔死不影响本核检测。
+//
+// 单核系统没有次核，看门狗不生效（已知限制，见 docs）。
+
+/// 每 CPU 心跳（µs）：本核定时器中断更新。主核楔死 = 心跳停跳。
+static HEARTBEAT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// 主核心跳静默阈值（µs）。覆盖最长的合法关中断段（风暴转储/长 SBI 调用）。
+const WDT_TIMEOUT_US: u64 = 5_000_000;
+/// 已触发标记（只复位一次，防级联）。
+static WDT_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// IRQ 故障注入开关（crashme kirq 经 syscall 415 置位）：下一次定时器
+/// 中断在 handler 上下文解引用坏地址，验证 IRQ 遏制路径。
+pub static INJECT_IRQ_FAULT: AtomicBool = AtomicBool::new(false);
+
+/// 心跳记录 + 互监看门狗（本核定时器中断入口调用）。
+///
+/// 每个核检测**其它**核的心跳（自检无意义——楔死的核恰好无法自检），
+/// 因此任意一核楔死（IRQ 关死的 panic / 调度器死锁 / 驱动风暴关中断）
+/// 都会被存活核发现并触发整机复位。多核互监在 -smp 2 下即主次互查。
+fn wdt_tick() {
+    let cpu = (crate::smp::cpu_id() as usize).min(3);
+    let now = now_us();
+    HEARTBEAT[cpu].store(now, Ordering::Relaxed);
+    // GDB 调试会话挂起全机：合法停跳，不触发
+    if unsafe { crate::gdbstub::ACTIVE } {
+        return;
+    }
+    for h in 0..4usize {
+        if h == cpu {
+            continue;
+        }
+        let hb = HEARTBEAT[h].load(Ordering::Relaxed);
+        // hb == 0：该核从未上线（心跳只在定时器首跳后非零），不监控
+        if hb == 0 || now.saturating_sub(hb) <= WDT_TIMEOUT_US {
+            continue;
+        }
+        if !WDT_FIRED.swap(true, Ordering::AcqRel) {
+            crate::uart_send_str("[watchdog] 核心 ");
+            crate::print_dec(h as u64);
+            crate::uart_send_str(" 心跳停跳超过 5 秒，判定楔死，自动重启\n");
+            // IRQ 上下文：健康事件只入内存环形 + 控制台（脏标志让下次启动告知用户）
+            crate::health::report_irq(
+                true,
+                crate::health::SEV_CRITICAL,
+                "watchdog",
+                "系统失去响应已自动重启",
+                "重启后若反复出现，请查看 /data/crash 崩溃报告并考虑重新刷机",
+            );
+            crate::sbi::system_reset(); // 冷复位，不返回
         }
     }
 }
