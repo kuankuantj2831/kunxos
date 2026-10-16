@@ -897,11 +897,14 @@ fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
 fn health_load() {
     unsafe {
         let mut buf = [0u8; 2048];
-        let n = read_file("/var/run/health.log", &mut buf) as usize;
-        if n == 0 {
-            HEALTH_BANNER = 2; // 无事件：不再尝试
+        // 按 isize 判负（读失败 -1 经 as usize 变巨大正数会穿透 n==0 守卫
+        // → 切片越界 panic + init 重启成 panic 循环；GUI 冒烟实测抓到）
+        let rn = read_file("/var/run/health.log", &mut buf) as isize;
+        if rn <= 0 {
+            HEALTH_BANNER = 2; // 无事件/读失败：不再尝试
             return;
         }
+        let n = rn as usize;
         // L-6：按严重级挑选事件行（原取首行=最旧事件，INFO 级自愈事件
         // 排最前时会掩盖后面的 CRITICAL）。行格式含 ` <严重|警告|提示> `。
         let mut best: (u8, usize, usize) = (0, 0, 0); // (优先级, 行起, 行止)

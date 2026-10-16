@@ -202,3 +202,8 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 ### 第 17 轮（2026-10-17 06:5x，定时轮）
 - **L-D 修复**：IRQ 上下文的 health 上报不再做阻塞 UART 打印（中文多行 ~10ms+ 忙等，违反仓库「IRQ 路径禁止」规则）——拼行进 2KB 延迟环形缓冲（关中断拷贝 + 溢出丢弃计数），由 perf_log 内核线程与无头回退主循环冲刷；非 IRQ 上下文打印路径不变
 - 回归：make 0 错误 + test-sfsrace PASS
+
+### 第 18 轮（2026-10-17 07:1x，定时轮）
+- **GUI 全链路冒烟抓到真 bug 并修复**：OOBE 自动推进（13 步 × 30s）→ launcher 拉起后 `PANIC main.rs:910` panic 循环——health_load 的 read_file 失败返回 -1 经 `as usize` 变巨大正数穿透 n==0 守卫 → 切片越界（历史第 12/13 轮 usize 清剿族漏网，因 /var/run/health.log 打开失败路径此前从未在 GUI 真机走到）。改按 isize 判负
+- 修复后复跑完整 GUI 冒烟：OOBE→launcher 桌面（tile/dock 全部就位）稳定运行 3.5 分钟 **0 PANIC / 0 fault**
+- 回归：make 0 错误 + test-sfsrace PASS
