@@ -1923,6 +1923,76 @@ fn lock_input_display_len() -> usize {
 }
 
 /// 解锁成功：清除锁定标志、清远程锁定、重绘桌面。
+// ==================== 解锁粒子迸发（ColorOS 解锁点睛动效） ====================
+//
+// 解锁瞬间自锁图标位置迸发 24 颗光点（径向初速 + 轻重力 + 淡出），
+// 随解锁上滑转场同帧推进；无独立动画循环——渲染时按真实时间积分。
+
+#[derive(Clone, Copy)]
+struct UnlockSpark {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    /// 剩余寿命（µs），0 = 消亡。
+    life: u64,
+}
+
+static mut SPARKS: [UnlockSpark; 24] = [UnlockSpark {
+    x: 0.0,
+    y: 0.0,
+    vx: 0.0,
+    vy: 0.0,
+    life: 0,
+}; 24];
+static mut SPARK_T0: u64 = 0;
+
+/// 迸发总时长（µs）。
+const SPARK_LIFE_US: u64 = 520_000;
+
+/// 触发一次迸发（unlock_success 调用）。中心取锁图标位置。
+unsafe fn unlock_sparks_burst() {
+    let cx = DISPLAY_W as f32 / 2.0;
+    let cy = 660.0;
+    // 无 sin：按黄金角均匀铺开 24 个方向，速度 120..300 px/s 分档。
+    let mut ang = 0.0f32;
+    for i in 0..SPARKS.len() {
+        let spd = 130.0 + (i % 4) as f32 * 55.0;
+        SPARKS[i] = UnlockSpark {
+            x: cx,
+            y: cy,
+            vx: fcos(ang) * spd,
+            vy: fsin(ang) * spd,
+            life: SPARK_LIFE_US,
+        };
+        // 黄金角步进（无 π 常量：137.5° ≈ 2.39996 弧度）
+        ang += 2.4f32;
+    }
+    SPARK_T0 = now_us();
+}
+
+/// 解锁转场中逐帧绘制粒子（dt 按真实时间积分，重力 480 px/s²）。
+unsafe fn unlock_sparks_draw(now: u64) {
+    let dt = now.saturating_sub(SPARK_T0);
+    if dt > SPARK_LIFE_US {
+        return;
+    }
+    let t = dt as f32 / 1_000_000.0;
+    let fade = 1.0 - dt as f32 / SPARK_LIFE_US as f32;
+    let alpha = (255.0 * fade) as u32;
+    let pa = PIX_ALPHA;
+    for s in SPARKS.iter_mut() {
+        if s.life == 0 {
+            continue;
+        }
+        let px = s.x + s.vx * t;
+        let py = s.y + s.vy * t + 240.0 * t * t; // g/2 = 240
+        PIX_ALPHA = alpha;
+        fill_rect(px as i32 - 1, py as i32 - 1, 3, 3, COLOR_ACCENT);
+    }
+    PIX_ALPHA = pa;
+}
+
 fn unlock_success() {
     unsafe {
         LOCK_INPUT_LEN = 0;
@@ -1939,6 +2009,7 @@ fn unlock_success() {
         LOCK_DRAG = false;
         LOCK_PHASE = LockPhase::Unlocking;
         LOCK_T0 = now_us();
+        unlock_sparks_burst();
         NEEDS_REDRAW = true;
     }
 }
@@ -6394,6 +6465,8 @@ fn draw_lock_content(off: i32) {
                 clock_col,
             );
             PIX_ALPHA = pa;
+            // 解锁粒子迸发：叠在正在上滑的锁屏层之上
+            unlock_sparks_draw(now_us());
         } else if LOCK_MIN_T0 != u64::MAX
             && now_us().saturating_sub(LOCK_MIN_T0) < 320_000
         {
