@@ -916,10 +916,15 @@ pub fn handle_cmd(args: &[&str]) -> i32 {
         }
         "thermal" if args.len() >= 3 && args[1] == "force" => {
             match args[2].parse::<u32>() {
-                Ok(c) => {
-                    unsafe { THERMAL_FORCE_MC = Some(c * 1000) };
-                    0
-                }
+                    Ok(c) => {
+                        // checked_mul（R5-L3）：`thermal force 5000000` 的
+                        // c*1000 超 u32::MAX 会静默回绕出错误强制温度
+                        match c.checked_mul(1000) {
+                            Some(mc) => unsafe { THERMAL_FORCE_MC = Some(mc) },
+                            None => return -1,
+                        }
+                        0
+                    }
                 Err(_) => -1,
             }
         }
@@ -991,7 +996,8 @@ fn push_dec(buf: &mut [u8], pos: usize, mut v: u64) -> usize {
     if pos + n <= buf.len() {
         buf[pos..pos + n].copy_from_slice(&tmp[i..]);
     }
-    pos + n
+    // 钳到 buf.len()（R5-M3 根因）：缓冲满后不写入，返回值也绝不能越界
+    (pos + n).min(buf.len())
 }
 
 fn push_str(buf: &mut [u8], pos: usize, s: &str) -> usize {

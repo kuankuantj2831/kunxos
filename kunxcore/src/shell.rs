@@ -1447,7 +1447,9 @@ fn cmd_power(cmd: &Command, sink: &mut Sink) {
         }
         let mut buf = [0u8; 2048];
         let len = crate::power::render_status(&mut buf);
-        sink.emit(&buf[..len]);
+        // 钳制（R5-M3）：render_status 的 push_dec 缓冲满后返回值仍继续
+        // 累加，可超 buf.len() → 切片 panic（procfs 路径已有同款钳制）
+        sink.emit(&buf[..len.min(buf.len())]);
         return;
     }
 

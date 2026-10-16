@@ -187,7 +187,13 @@ pub fn apply_patch(
         if diff_scratch.len() < p.diff_full {
             return None;
         }
-        let n = inflate_kxrl1(&patch_blob[p.diff_off..p.diff_off + p.diff_stored], diff_scratch)?;
+        // 只传恰好 diff_full 长度的输出窗口：inflate_kxrl1 的唯一正常出口
+        // 是「填满输出缓冲」，传整块大 scratch（如 ota.rs 的 64MB）会在
+        // 解码完成后读到流尾而失败（R5-M2，增量 OTA 100% 不可用）。
+        let n = inflate_kxrl1(
+            &patch_blob[p.diff_off..p.diff_off + p.diff_stored],
+            &mut diff_scratch[..p.diff_full],
+        )?;
         if n != p.diff_full {
             return None;
         }
@@ -202,7 +208,7 @@ pub fn apply_patch(
         }
         let n = inflate_kxrl1(
             &patch_blob[p.extra_off..p.extra_off + p.extra_stored],
-            extra_scratch,
+            &mut extra_scratch[..p.extra_full],
         )?;
         if n != p.extra_full {
             return None;

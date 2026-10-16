@@ -126,6 +126,13 @@ fn proc_write(minor: u32, buf: &[u8]) -> i32 {
     if minor != POWER_MINOR && minor != THERMAL_MINOR && minor != PRESSURE_MINOR {
         return -1;
     }
+    // ★ 权限门禁（R5-H1）：写路径可冻结/限速任意进程（freeze/cap）、注入
+    // 假温度/内存压力（force）—— 与 syscall 层 SYS_KUNX_PM_* 的
+    // pm_target_allowed 门禁对齐，变更类接口统一限 root（应用 uid 10000+
+    // 经 /proc/power 绕过 = 已修漏洞的旁路复活，跨进程确定性 DoS）。
+    if crate::process::current_uid() != 0 {
+        return -13; // -EACCES
+    }
     if minor == PRESSURE_MINOR {
         let mut args: [&str; 2] = ["", ""];
         let mut n = 0usize;

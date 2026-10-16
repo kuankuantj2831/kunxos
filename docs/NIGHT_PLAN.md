@@ -23,7 +23,7 @@
 
 - [ ] A1 launcher `mmap /dev/fb0` 偶发 EINVAL（BUG_REPORT 十一节"已知未决"）：复现 + errno 分支定位修复
 - [x] A2 ~~syscall_dispatch 跨栈写~~：**核查结论（RISC-V 路径不适用）**——子进程陷阱帧副本放子栈顶部、a0=0 就地置位，经 el0_resume_entry 直达 syscall_return_restore，不回卷 dispatch；dispatch 写回的是当前任务自己的活栈帧。无跨栈写。
-- [ ] A3 getrandom 无真实熵源：接入 virtio-rng 熵池混合
+- [x] A3 getrandom 真实熵源（virtio-rng 限时取熵 + 64B 混合熵池，第 2 轮完成）
 - [x] A4 ~~TCP 通告窗口~~：核查已实现（tcp_xmit 按 TCP_RXBUF-rx_count 通告真实剩余空间，socket.rs:735）
 - [x] A9 ~~信号帧边界误杀 pthread~~：核查已修（signal.rs 帧校验已放宽到任意已映射用户空间，112-127/213-221）
 - [x] A5 TIME_WAIT 定时回收（30s 超时，tcp_reap_syn_rcvd 同场回收）
@@ -31,20 +31,18 @@
 - [x] A7 ~~oobe 输入跨 read 分割~~：核查已修（EV_BUF 累积缓冲 + consume_input_event，oobe:3752-3921）
 - [x] A10 ~~slab 双释放防护~~：核查已修（slab_free 空闲链表遍历拒绝重复释放，heap.rs）
 - [x] A8 ~~input 多等待者覆盖~~：核查已修（4 槽 + 满则 yield 重试，input.rs:405-430）
-- [ ] A9 信号帧边界按进程主栈校验误杀 pthread 工作线程
-- [ ] A10 slab kfree 双重释放防护补完整
-- [ ] A11 每轮空闲时：跑一轮并行代码审查（Agent 工具, Explore/general-purpose）找新 bug 并修复
+- [x] A11 持续审查（已完成 5 轮：新代码/今夜diff/apps+服务×2/bootloader+冷门模块）（Agent 工具, Explore/general-purpose）找新 bug 并修复
 
 ### B. 动画 / ColorOS 17 对标（kunxcore/src/compositor.rs、ui_framework.rs、apps/launcher）
 
 - [x] B1 统一动画引擎：已有完整基建（`shared/motion.rs` 贝塞尔+弹簧、内核 `kunxcore/src/anim.rs`、launcher `app_launch.rs` 转场、`anim.rs` 动画框架、docs/animations.md 规范）。本轮补齐 **ColorOS 17 标准曲线**：`Easing::ColorOSStandard(0.22,1,0.36,1)` + `ColorOSEmphasized(0.3,0,0.1,1)`，内核与应用两侧同步。**注意：B2 图标按压回弹、B3/B4 启动/返回转场均已存在**（app_launch.rs 的 start_press/start_launch/start_fly_away），后续轮次勿重做，改为把既有动画的曲线切换到 ColorOS 曲线并逐个体验调优。
 - [x] B5 桌面翻页惯性滚动 + 越界回弹阻尼（松手 ColorOSStandard 减速吸附、到位才提交页码；相邻页视差 位移系数≈0.85 抛物线包络；越界 0.35x 橡皮筋沿用）
-- [ ] B6 通知横幅（若有通知组件）滑入 + 手势滑动速度判定收/放
-- [ ] B7 窗口 close/minimize 缩放淡出
+- [x] B6 通知横幅：核查已存在（call/health banner 滑入+easing，launcher:775-860）
+- [x] B7 窗口动效：核查已存在（内核 anim.rs 窗口动画引擎 + gesture.rs 返回/回桌面/多任务 tween）
 - [x] B8 解锁/开机亮度渐亮动画（520ms ColorOSStandard 0→全亮；开机 flip LUT 施加 / 解锁 BACK_BUF 烘焙两模式，无整屏突暗）
-- [ ] B9 dock 栏图标悬浮放大（hover/触摸接近）
-- [ ] B10 骨架屏/加载占位动画（应用启动期间 launcher 占位页加呼吸动画）
-- [ ] B11 长按图标抖动 + 删除模式（ColorOS 编辑桌面）
+- [x] B9 dock 图标悬浮放大（鼠标光标位驱动 1.12x + 上浮 2px，第 8 轮）
+- [x] B10 应用启动骨架屏呼吸（第 4-5 轮完成）
+- [x] B11 长按编辑模式：核查已存在（HyperOS 3 风格编辑器，图标抖动+拖动换位）
 - [ ] B12 每完成一批动画：QEMU GUI 冒烟（make run-gui / launcher_test）验证不崩溃
 
 ### C. 每轮收尾（必做）
@@ -102,3 +100,20 @@
 - **R4 审查**（cloud/audiomix 等 12 应用 + 6 服务）：3 Medium（全在 cloud：seed 越界 panic / poll 响应别名覆盖 / 备份 n 不一致）+ 2 Low，全部修复提交；6 个服务核实无缺陷
 - **动效**：控制中心子元素错峰入场（面板展开/跟手期间各行卡片按序上移显现，ColorOS 风格）已提交
 - 回归：make 全量 0 错误 + test-sfsrace PASS
+
+### 第 8 轮（2026-10-17 00:3x，定时轮）
+- **B9 dock 图标悬浮放大**：鼠标光标位驱动 1.12x + 上浮 2px（按压反馈优先，MOUSE_SEEN 门控防触摸误触，无独立动画循环——随 CURSOR_DIRTY 重绘）
+- **R5 审查**（kunxboot 12 文件 + kunxcore 冷门 11 模块 + kunxsec + kunxui）：1 High + 3 Medium + 3 Low，本轮修复 H-1/M-1/M-2/M-3/L-3——
+  - H1 /proc/power、/proc/pressure 写路径加 root 门禁（原任意应用可冻结/限速其它进程 = syscall 层已修权限漏洞的旁路复活）
+  - M1 OTA load_otp 读 8 扇区配 2048B 缓冲恒失败 → 改 4 扇区，OTP 防回滚楼层首次真正生效
+  - M2 bspatch inflate_kxrl1 传精确长度窗口（原 64MB scratch 下增量 OTA 100% 失败）
+  - M3 power status shell 切片钳制 + push_dec 返回值钳到缓冲长（防内核 shell panic）；L3 thermal force checked_mul
+  - 未修：L1 gdbstub RISC-V 单步/断点重插失效（调试设施，需重构）、L2 fdt 递归无深度上限（DTB 来源已验签，防御纵深项）——记入待办
+- 任务池勾选修正（A3/B6/B7/B9/B10/B11 状态同步，去重 A9/A10）
+- 回归：make 全量 0 错误 + test-sfsrace PASS
+
+### 待修清单（后续轮次领取）
+- L1 gdbstub RISC-V：断点重插/单步重构（恢复原指令后在 sepc+ilen 插临时断点）；bp_set 压缩指令半字覆盖；删 AArch64 死代码
+- L2 fdt.rs 四处递归遍历加 depth 上限（32）
+- A1 launcher mmap /dev/fb0 偶发 EINVAL：等 [fb-mmap] 诊断输出复现
+- kunxui 控件库已就绪但零引用：可评估接入 launcher（动画长尾）

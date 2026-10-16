@@ -4520,9 +4520,36 @@ fn draw_dock() {
             }
             let app = &APPS[app_idx];
             let (dx, dy) = dock_rect(i);
-            let (size, ox, oy) = pressed_icon_rect(app.key);
+            // B9 悬浮放大（鼠标光标位驱动，ColorOS Dock 手感）：光标落在
+            // 图标热区内时放大 12%（锚点居中）。无独立动画循环——光标移动
+            // 本就置 CURSOR_DIRTY 触发桌面重绘，位置驱动即视觉平滑；
+            // 触摸设备无光标不误触：要求 MOUSE_SEEN；按压反馈优先。
+            let (size, ox, oy) = if MOUSE_SEEN {
+                let (hs, hx, hy) = dock_hover_rect(dx, dy);
+                let (ps, px, py) = pressed_icon_rect(app.key);
+                if ps != DOCK_ICON {
+                    (ps, px, py) // 按压反馈优先于悬浮放大
+                } else {
+                    (hs, hx, hy)
+                }
+            } else {
+                pressed_icon_rect(app.key)
+            };
             draw_app_icon(app, dx + ox, dy + oy, size);
         }
+    }
+}
+
+/// Dock 图标悬浮几何：光标在图标热区（外扩 6px）内 → 1.12x 居中放大，
+/// 否则原尺寸。返回 (size, ox, oy) 与 pressed_icon_rect 同约定。
+unsafe fn dock_hover_rect(dx: i32, dy: i32) -> (i32, i32, i32) {
+    let (cx, cy) = (CURSOR_X, CURSOR_Y);
+    if cx >= dx - 6 && cx < dx + DOCK_ICON + 6 && cy >= dy - 6 && cy < dy + DOCK_ICON + 6 {
+        let size = (DOCK_ICON as f32 * 1.12) as i32;
+        let off = (DOCK_ICON - size) / 2;
+        (size, off, off - 2) // 轻微上浮 2px（悬浮感）
+    } else {
+        (DOCK_ICON, 0, 0)
     }
 }
 

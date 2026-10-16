@@ -82,7 +82,11 @@ pub fn save_bcb(b: &Bcb) -> bool {
 /// 读取 OTP。
 pub fn load_otp() -> Option<otp::Otp> {
     let mut raw = [0xFFu8; otp::OTP_SIZE];
-    if !misc_read(OTP_LBA, OTP_SECTORS, &mut raw) {
+    // OTP 载荷 2048B = 4 扇区（与 bootloader sec_boot 的 OTP_SECTORS_NEEDED
+    // 对齐）。此前误用 8 扇区：blk_read_sectors 要求 buf ≥ count*512=4096，
+    // 2048B 缓冲恒失败 → OTP 防回滚楼层内核侧从未生效（R5-M1）。
+    const OTP_SECTORS_NEEDED: usize = otp::OTP_SIZE / 512;
+    if !misc_read(OTP_LBA, OTP_SECTORS_NEEDED, &mut raw) {
         return None;
     }
     otp::parse(&raw)
