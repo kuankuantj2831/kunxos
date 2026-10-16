@@ -147,3 +147,8 @@
 - 死代码清理（R6-L 收尾）：删除 gdbstub sync_gdb_entry（AArch64 残留解码、全仓库无调用者的误导性死代码）；删除 kunxcore ota.rs 已无引用的 OTP_SECTORS=8 死常量（bootloader 侧同名常量不受影响）
 - 摸底：make test-wireless 现为 0 测试（RISC-V 移植后宿主测试已空置，BUG_REPORT 历史"105"数字过期）——以 test-sfsrace 为权威回归
 - 回归：make 全量 0 错误 + test-sfsrace PASS
+
+### 第 14 轮（2026-10-17 04:4x，定时轮）
+- **A1 复现实验**：重建正式（非测试）内核后 4 次完整 GUI 启动 + 6 次测试模式启动，`[fb-mmap]` 诊断零输出——偶发 EINVAL 未复现（OOBE 链路正常：输入设备就绪、字体加载、30s 空闲推进均在）。诊断打印保留在位，下次自然复现时串口日志将直接定位到具体 EINVAL 分支
+- 顺带验证：今晚全部内核+launcher 改动在真实 GUI 启动链路（OpenSBI→内核→init→oobe）正常工作，0 PANIC / 0 fault
+- 回归：make 全量 0 错误 + test-sfsrace PASS
