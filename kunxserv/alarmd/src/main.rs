@@ -1013,10 +1013,14 @@ fn stop_ring() {
         RINGING = false;
         let id = RING_ID;
         RING_ID = 0;
+        // ★ 本次响铃是否真正发过声（写出过声音块）：从未响过的停铃路径
+        // 不得静默禁用一次性闹钟（否则秒停/瞬间操作把闹钟悄悄关掉）。
+        let rang = RING_CHUNK > 0;
+        RING_CHUNK = 0;
         beep_close();
         if let Some(idx) = find_index(id) {
             let a = &mut ALARMS[idx];
-            if a.on && a.repeat == 0 && a.snooze_until == 0 {
+            if rang && a.on && a.repeat == 0 && a.snooze_until == 0 {
                 a.on = false;
                 log2("一次性闹钟已停用 id=", id as u64);
                 persist_alarms();
@@ -1080,11 +1084,22 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             if now.saturating_sub(unsafe { RING_START_EPOCH }) >= RING_MAX_SECS {
                 log("响铃超时，自动停止");
                 stop_ring();
-            } else if let Some(idx) = due_index(now) {
-                let id = unsafe { ALARMS[idx].id };
-                if id != unsafe { RING_ID } {
-                    start_ring(idx);
+            } else {
+                // ★ 响铃中的闹钟直接视为 due：贪睡目标已在 start_ring 消费、
+                // 原触发窗口也可能早已过去（贪睡 5 分钟后重响），若依赖
+                // is_due 窗口重判会 50ms 秒停。仅当该闹钟被删除/关闭时停。
+                let cur_on = find_index(unsafe { RING_ID })
+                    .map(|i| unsafe { ALARMS[i].on })
+                    .unwrap_or(false);
+                if !cur_on {
+                    stop_ring();
                 } else {
+                    // 其他闹钟到点且目标更早 → 切换（是否切换由 start_ring 裁决）。
+                    if let Some(j) = due_index(now) {
+                        if unsafe { ALARMS[j].id } != unsafe { RING_ID } {
+                            start_ring(j);
+                        }
+                    }
                     let mut chunk = [0u8; audio::CHUNK_BYTES];
                     synth_ring_chunk(unsafe { RING_CHUNK }, &mut chunk);
                     let rw = audio::write_chunk(&chunk);
@@ -1095,8 +1110,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     }
                     unsafe { RING_CHUNK += 1 };
                 }
-            } else {
-                stop_ring();
             }
         } else {
             if let Some(idx) = due_index(now) {

@@ -348,6 +348,10 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                 // 网格点击
                 for i in 0..PHOTO_COUNT {
                     let (tx, ty) = tile_rect(i as i32);
+                    // 与 render_grid 一致：超出屏幕下缘的瓦片不参与命中。
+                    if ty + TILE_H > DISPLAY_H as i32 {
+                        break;
+                    }
                     if x >= tx && x < tx + TILE_W && y >= ty && y < ty + TILE_H {
                         unsafe { VIEWING = i; }
                         print("[gallery] 打开照片 ");

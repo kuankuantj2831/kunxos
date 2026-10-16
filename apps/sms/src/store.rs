@@ -667,7 +667,10 @@ pub fn init_db() {
         MSG_N = 0;
         CONV_N = 0;
     }
-    let first = load_db();
+    // load_db 返回 true = 索引已存在（非首次）；false 才是首次运行，
+    // 需要一次性迁移 rild 历史。此前把返回值当「首次」用，每次启动都
+    // 全量重导入，历史消息成倍翻倍。
+    let first = !load_db();
     if first {
         import_migration();
     } else {

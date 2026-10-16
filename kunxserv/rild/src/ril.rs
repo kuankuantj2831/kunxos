@@ -1253,39 +1253,32 @@ fn rewrite_store(path: &str, id: u32, delete: bool) {
                 if delete {
                     keep = false;
                 } else {
-                    // 标记已读：第 4 字段
-                    let mut new_line = [0u8; 300];
-                    let mut q = 0;
+                    // 标记已读：第 4 字段 '0'→'1'（等长替换，直接写入 out）。
+                    // ★ 不经行缓冲：级联长短信单行最长 ~1700B（append_record
+                    // 上限），此前 300B 行缓冲把标记已读的长短信截断。
                     let mut field = 0;
-                    let mut copied = 0usize;
                     for &b in line {
-                        if b == 0x1F {
+                        let ob = if b == 0x1F {
                             field += 1;
-                            new_line[q] = b;
-                            q += 1;
+                            b
                         } else if field == 3 && b == b'0' {
-                            new_line[q] = b'1';
-                            q += 1;
+                            b'1'
                         } else {
-                            new_line[q] = b;
-                            q += 1;
-                        }
-                        copied += 1;
-                        if copied > 299 {
-                            break;
-                        }
+                            b
+                        };
+                        out[p] = ob;
+                        p += 1;
                     }
-                    out[p..p + q].copy_from_slice(&new_line[..q]);
-                    p += q;
                     out[p] = b'\n';
                     p += 1;
                     keep = false; // 已写入，跳过原行
                 }
             }
             if keep {
-                let l = line.len().min(299);
-                out[p..p + l].copy_from_slice(&line[..l]);
-                p += l;
+                // 容量已在循环头守卫（p + line.len() + 1 <= out.len()），
+                // 整行原样保留 —— 不再 min(299) 截断长短信。
+                out[p..p + line.len()].copy_from_slice(line);
+                p += line.len();
                 out[p] = b'\n';
                 p += 1;
             }

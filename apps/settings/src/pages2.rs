@@ -868,12 +868,10 @@ unsafe fn fmt_bytes(buf: &mut [u8], v: u64) -> usize {
     buf[..n].copy_from_slice(&b[..n]);
     buf[n] = b'.';
     buf[n + 1] = b'0' + (frac % 10) as u8;
-    for &c in b" GB" {
-        buf[n + 2] = c;
-        // 越界保护：循环只填充一次。
-        break;
-    }
-    n + 6
+    buf[n + 2] = b' ';
+    buf[n + 3] = b'G';
+    buf[n + 4] = b'B';
+    n + 5
 }
 
 pub(crate) unsafe fn render_storage() {
@@ -1262,7 +1260,23 @@ unsafe fn tap_perm(x: i32, y: i32) -> crate::pages::TapEffect {
     let dy = y - (top + CARD_PAD);
     if dy >= 0 {
         let r = (dy / ROW_H) as usize;
-        if r < PERM_LEN {
+        // ★ 按实际渲染行数（非空行，与 render_perm 计数一致）守卫：
+        // PERM_LEN 是文件字节数，字节当行数会让内容区下方的空白
+        // 点击误入撤销路径。
+        let mut lines = 0usize;
+        let mut i = 0usize;
+        while i < PERM_LEN {
+            let e = PERM_BUF[i..PERM_LEN]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map(|p| i + p)
+                .unwrap_or(PERM_LEN);
+            if i < e {
+                lines += 1;
+            }
+            i = e + 1;
+        }
+        if r < lines {
             revoke_perm(r);
             return TapEffect::Redraw;
         }
@@ -1272,27 +1286,34 @@ unsafe fn tap_perm(x: i32, y: i32) -> crate::pages::TapEffect {
 
 /// 撤销第 r 条权限（从 PERM_BUF 移除该行并重新写盘）。
 unsafe fn revoke_perm(r: usize) {
-    // 找行起止。
+    // 找第 r 个非空行（与 render_perm/tap_perm 的行计数一致）的起止。
     let mut i = 0usize;
-    let mut line = 0usize;
+    let mut row = 0usize;
     let mut start = 0usize;
     let mut end = 0usize;
-    while i < PERM_LEN && line <= r {
+    let mut found = false;
+    while i < PERM_LEN {
         let e = PERM_BUF[i..PERM_LEN]
             .iter()
             .position(|&c| c == b'\n')
             .map(|p| i + p)
             .unwrap_or(PERM_LEN);
-        if line == r {
-            start = i;
-            end = e;
-            if end < PERM_LEN && PERM_BUF[end] == b'\n' {
-                end += 1;
+        if i < e {
+            if row == r {
+                start = i;
+                end = e;
+                if end < PERM_LEN && PERM_BUF[end] == b'\n' {
+                    end += 1;
+                }
+                found = true;
+                break;
             }
-            break;
+            row += 1;
         }
         i = e + 1;
-        line += 1;
+    }
+    if !found {
+        return;
     }
     let mut out = [0u8; 1024];
     let mut n = 0;
