@@ -886,6 +886,14 @@ const HEALTH_FADE_US: u64 = 400_000;
 const HEALTH_BANNER_H: i32 = 56;
 
 /// 懒加载：首次绘制时读取 /var/run/health.log 的第一条数据行。
+/// 字节子串包含判定（health_load 事件行严重级挑选用）。
+fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
 fn health_load() {
     unsafe {
         let mut buf = [0u8; 2048];
@@ -894,9 +902,26 @@ fn health_load() {
             HEALTH_BANNER = 2; // 无事件：不再尝试
             return;
         }
-        // 取第一条完整行（找首个 \n）
-        let end = buf[..n].iter().position(|&c| c == b'\n').unwrap_or(n);
-        let line = &buf[..end];
+        // L-6：按严重级挑选事件行（原取首行=最旧事件，INFO 级自愈事件
+        // 排最前时会掩盖后面的 CRITICAL）。行格式含 ` <严重|警告|提示> `。
+        let mut best: (u8, usize, usize) = (0, 0, 0); // (优先级, 行起, 行止)
+        let mut pos = 0usize;
+        while pos < n {
+            let eol = buf[pos..n].iter().position(|&c| c == b'\n').map_or(n, |i| pos + i);
+            let line = &buf[pos..eol];
+            let prio = if contains_sub(line, " 严重 ".as_bytes()) {
+                2
+            } else if contains_sub(line, " 警告 ".as_bytes()) {
+                1
+            } else {
+                0
+            };
+            if prio > best.0 {
+                best = (prio, pos, eol);
+            }
+            pos = eol + 1;
+        }
+        let line = &buf[best.1..best.2];
         // 行格式：`<t>ms <sev> <subsys> | <msg> | 修复: <fix>`
         // msg：第一个 "| " 之后；fix："| 修复: " 之后（可能缺席）
         let p1 = line.iter().position(|&c| c == b'|');
