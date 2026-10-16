@@ -12,7 +12,6 @@
 //! 入口：
 //!   - [`gdb_debug_entry`]：EL0 BRK64（EC=0x3C）与软件步进（EC=0x32）异常，
 //!     由 `main.rs` `lower_sync` 汇编调用，陷阱帧即寄存器现场。
-//!   - [`sync_gdb_entry`]：EL1 BRK64（EC=0x3C）与软件步进（EC=0x33）异常，
 //!     由 `main.rs` `sync_entry` 汇编调用（内核断点）。
 //!   - [`gdb_break`]：shell `gdb` 命令 / panic 的手动入口（内核上下文）。
 //!
@@ -931,92 +930,6 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
 }
 
 // ==================== EL1 调试异常入口（内核断点 / 步进） ====================
-
-/// `sync_entry` 汇编在 ESR.EC == 0x3C（BRK64）或 0x33（软件步进 from EL1）
-/// 时调用。返回 0 = 恢复寄存器并 eret（继续内核执行）；非 0 = 走 panic。
-#[no_mangle]
-pub extern "C" fn sync_gdb_entry() -> u32 {
-    let esr = read_esr();
-    let ec = (esr >> 26) & 0x3F;
-    let elr = read_elr();
-    let spsr = read_spsr();
-    let sp: u64;
-    unsafe { asm!("mv {}, sp", out(reg) sp) };
-
-    let mut regs = RegSet::from_panic_regs(sp);
-    regs.pc = elr;
-    regs.cpsr = spsr;
-
-    match ec {
-        0x3C => {
-            if bp_find(regs.pc).is_none() {
-                return 1; // 未注册断点的内核 BRK → panic
-            }
-        }
-        4 if false => {
-            unsafe {
-                if PENDING_REINSERT {
-                    bp_reinsert(PENDING_ADDR);
-                    PENDING_REINSERT = false;
-                }
-                if STEP_MODE == 2 {
-                    STEP_MODE = 0;
-                    set_ss(false);
-                    regs.cpsr &= !((1 << 7) | (1 << 21));
-                    regs.write_to_panic_regs();
-                    asm!("csrw sepc, {}", in(reg) regs.pc);
-                    asm!("csrw sstatus, {}", in(reg) regs.cpsr);
-                    return 0;
-                }
-                STEP_MODE = 0;
-            }
-            set_ss(false);
-            regs.cpsr &= !((1 << 7) | (1 << 21));
-        }
-        _ => {
-            return 1;
-        }
-    }
-
-    send_packet(b"S05");
-    crate::uart_send_str("[gdb] 内核停在 0x");
-    crate::print_hex(regs.pc);
-    crate::uart_send_str("\n");
-    let result = gdb_loop(&mut regs);
-
-    match result {
-        LoopResult::Continue => {
-            // RISC-V：断点处继续 = 摘断点 + 下一条指令植入临时推进断点
-            //（命中后重插原断点并静默继续）。原 AArch64 set_ss 方案在
-            // S 模式无硬件单步下是空操作 → 断点一次性消失（R5-L1）。
-            if ec == 3 {
-                if bp_find(regs.pc).is_some() {
-                    unsafe { arm_temp_advance(regs.pc, false) };
-                }
-            }
-        }
-        LoopResult::Step => {
-            // 单步：武装临时推进断点，命中后停回 GDB（pc = 下一条指令）。
-            // 不要求当前停在断点上——非断点处 `s` 同样推进（R6-H：原实现
-            // 此处什么都不做 → sret 后自由运行，GDB 挂起）
-            unsafe { arm_temp_advance(regs.pc, true) };
-        }
-        LoopResult::Detach => {}
-        LoopResult::Kill => {
-            loop {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    regs.write_to_panic_regs();
-    unsafe {
-        asm!("csrw sepc, {}", in(reg) regs.pc);
-        asm!("csrw sstatus, {}", in(reg) regs.cpsr);
-    }
-    0
-}
-
 // ==================== 手动入口（shell `gdb` / panic） ====================
 
 /// GDB 断点入口（内核上下文）：保存现场并进入 GDB 循环；`c` 后恢复

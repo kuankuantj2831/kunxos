@@ -142,3 +142,8 @@
   - 复核通过：procfs 门禁无 TOCTOU/无误伤、OTA 4 扇区几何与 bootloader 一致、bspatch 边界、fdt 无第五处递归、粒子越界安全
   - 未改：sync_gdb_entry 死代码（无调用者，编译期无害，记录在案）
 - 回归：make 0 错误 + test-sfsrace PASS
+
+### 第 13 轮（2026-10-17 03:4x，定时轮）
+- 死代码清理（R6-L 收尾）：删除 gdbstub sync_gdb_entry（AArch64 残留解码、全仓库无调用者的误导性死代码）；删除 kunxcore ota.rs 已无引用的 OTP_SECTORS=8 死常量（bootloader 侧同名常量不受影响）
+- 摸底：make test-wireless 现为 0 测试（RISC-V 移植后宿主测试已空置，BUG_REPORT 历史"105"数字过期）——以 test-sfsrace 为权威回归
+- 回归：make 全量 0 错误 + test-sfsrace PASS

@@ -25,7 +25,6 @@ pub const MISC_START_LBA: usize = 1_042_432;
 pub const BCB_PRIMARY_LBA: usize = MISC_START_LBA;
 pub const BCB_BACKUP_LBA: usize = MISC_START_LBA + 1;
 pub const OTP_LBA: usize = MISC_START_LBA + 2;
-pub const OTP_SECTORS: usize = 8;
 
 /// 挂载路径。
 pub const FAT_A_MNT: &str = "/mnt/fat32";
