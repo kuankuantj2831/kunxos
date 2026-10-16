@@ -1279,61 +1279,85 @@ fn cc_draw_content() {
     let oy = cc_panel_top() as i32;
     unsafe {
         cc_draw_status(oy);
-        for i in 0..4usize {
-            let (on, icon) = match i {
-                0 => (CC_SW[0], 0u8),
-                1 => (CC_SW[1], 1u8),
-                2 => (CC_SW[2], 2u8),
-                _ => (CC_SW[3], 3u8),
-            };
-            let scale = cc_el_scale(1, i as u8);
-            cc_tile(
-                cc_row1_x(i),
-                CC_ROW1_Y + oy,
-                CC_BIG,
-                CC_BIG_R,
-                on,
-                icon,
-                scale,
-            );
+        // ColorOS 控制中心错峰入场：面板展开进度驱动各行卡片按序上移显现
+        //（阈值随行号递增，Open/收起全程位置连续；稳态 prog=1 时 k=1、
+        // dy=0，零额外视觉差异）。跟手下拉（Drag）同样生效——面板拉到
+        // 哪一行哪一行出现，与 ColorOS 手感一致。
+        let (k1, dy1) = cc_reveal(0);
+        if k1 > 0.0 {
+            for i in 0..4usize {
+                let (on, icon) = match i {
+                    0 => (CC_SW[0], 0u8),
+                    1 => (CC_SW[1], 1u8),
+                    2 => (CC_SW[2], 2u8),
+                    _ => (CC_SW[3], 3u8),
+                };
+                let scale = cc_el_scale(1, i as u8);
+                cc_tile(
+                    cc_row1_x(i),
+                    CC_ROW1_Y + oy + dy1,
+                    CC_BIG,
+                    CC_BIG_R,
+                    on,
+                    icon,
+                    scale,
+                );
+            }
         }
-        for i in 0..4usize {
-            let (on, icon) = match i {
-                0 => (CC_FLASHLIGHT, 4u8),
-                1 => (false, 5u8),
-                2 => (false, 6u8),
-                _ => (false, 7u8),
-            };
-            let scale = cc_el_scale(1, (4 + i) as u8);
-            cc_tile(
-                cc_row2_x(i),
-                CC_ROW2_Y + oy,
-                CC_MED,
-                CC_MED_R,
-                on,
-                icon,
-                scale,
-            );
+        let (k2, dy2) = cc_reveal(1);
+        if k2 > 0.0 {
+            for i in 0..4usize {
+                let (on, icon) = match i {
+                    0 => (CC_FLASHLIGHT, 4u8),
+                    1 => (false, 5u8),
+                    2 => (false, 6u8),
+                    _ => (false, 7u8),
+                };
+                let scale = cc_el_scale(1, (4 + i) as u8);
+                cc_tile(
+                    cc_row2_x(i),
+                    CC_ROW2_Y + oy + dy2,
+                    CC_MED,
+                    CC_MED_R,
+                    on,
+                    icon,
+                    scale,
+                );
+            }
         }
+        let (_, dy3) = cc_reveal(2);
         cc_slider(
             CC_MX,
-            CC_BR_Y + oy,
+            CC_BR_Y + oy + dy3,
             cc_slider_w(),
             CC_SL_H,
             BRIGHTNESS,
             txt("Brightness", "亮度"),
         );
+        let (_, dy4) = cc_reveal(3);
         cc_slider(
             CC_MX,
-            CC_VOL_Y + oy,
+            CC_VOL_Y + oy + dy4,
             cc_slider_w(),
             CC_SL_H,
             CC_VOLUME,
             txt("Volume", "音量"),
         );
         cc_slider_pop(oy);
-        cc_music(oy);
-        cc_shortcuts(oy);
+        let (_, dy5) = cc_reveal(4);
+        cc_music(oy + dy5);
+        let (_, dy6) = cc_reveal(5);
+        cc_shortcuts(oy + dy6);
+    }
+}
+
+/// 错峰入场参数：`(显现进度 k∈[0,1], 垂直偏移 dy)`。行 `idx` 在面板进度
+/// `[0.30+idx*0.08, 0.55+idx*0.08]` 窗口内从下方 18px 滑入到原位。
+fn cc_reveal(idx: u8) -> (f32, i32) {
+    unsafe {
+        let t0 = 0.30 + idx as f32 * 0.08;
+        let k = ((CC_PROG - t0) / 0.25).clamp(0.0, 1.0);
+        (k, ((1.0 - k) * 18.0) as i32)
     }
 }
 
