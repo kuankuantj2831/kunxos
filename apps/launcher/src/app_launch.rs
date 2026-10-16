@@ -1156,7 +1156,7 @@ pub fn motion_advance(now: u64) -> bool {
                     return false;
                 }
                 // ease-out：从全屏（1:1 应用末帧）缩回图标原位，白闪淡入收尾
-                let p = Easing::EaseOut.sample(t);
+                let p = Easing::ColorOSStandard.sample(t);
                 m.cur_scale =
                     (SCALE_1 as f32 + (RETURN_END_SCALE as f32 - SCALE_1 as f32) * p) as u32;
                 m.cur_fade = (255.0 * p) as u32;

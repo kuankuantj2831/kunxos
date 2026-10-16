@@ -1836,7 +1836,7 @@ fn lock_advance(now: u64) -> bool {
             LockPhase::Rebound => {
                 // 上滑跟手未达阈值的回弹（250ms）。
                 let t = (now.saturating_sub(LOCK_T0)) as f32 / 250_000.0;
-                let e = Easing::EaseOut.sample(t.min(1.0));
+                let e = Easing::ColorOSStandard.sample(t.min(1.0));
                 LOCK_LAYER_OFF = LOCK_FROM * (1.0 - e);
                 if t >= 1.0 {
                     LOCK_PHASE = LockPhase::None;
@@ -7317,7 +7317,7 @@ fn draw_recents() {
         let now = now_us();
         // 关闭进度：压暗与内容随进度回落（150ms EaseOut）。
         let close_e = if RECENTS_CLOSING {
-            Easing::EaseOut.sample((now.saturating_sub(RECENTS_CLOSE_T0)) as f32 / 150_000.0)
+            Easing::ColorOSStandard.sample((now.saturating_sub(RECENTS_CLOSE_T0)) as f32 / 150_000.0)
         } else {
             0.0
         };
@@ -7349,14 +7349,14 @@ fn draw_recents() {
         draw_text(24, 96 + drop, title, COLOR_TEXT);
         // 补位进度（0..1，220ms EaseOut）。
         let shift_e = if REC_SHIFT_T0 > 0 {
-            Easing::EaseOut.sample((now.saturating_sub(REC_SHIFT_T0)) as f32 / 220_000.0)
+            Easing::ColorOSStandard.sample((now.saturating_sub(REC_SHIFT_T0)) as f32 / 220_000.0)
         } else {
             1.0
         };
         // 回弹中的卡位移（200ms EaseOut 回 0）。
         let back_off = if REC_BACK {
             let p = (now.saturating_sub(REC_BACK_T0)) as f32 / 200_000.0;
-            (REC_BACK_FROM as f32 * (1.0 - Easing::EaseOut.sample(p.min(1.0)))) as i32
+            (REC_BACK_FROM as f32 * (1.0 - Easing::ColorOSStandard.sample(p.min(1.0)))) as i32
         } else {
             0
         };
@@ -7371,7 +7371,7 @@ fn draw_recents() {
             let enter_e = if enter_t <= 0.0 {
                 0.0
             } else {
-                Easing::EaseOut.sample(enter_t.min(1.0))
+                Easing::ColorOSStandard.sample(enter_t.min(1.0))
             };
             cy += (24.0 * (1.0 - enter_e)) as i32;
             // 补位：从移除前的旧格位插值到新格位（x/y 同步）。
@@ -8371,6 +8371,10 @@ enum Easing {
     LinearOutSlowIn,
     FastOutLinearIn,
     Emphasized,
+    /// ColorOS 17 标准曲线（与 shared/motion.rs 同值）。
+    ColorOSStandard,
+    /// ColorOS 强调入场曲线。
+    ColorOSEmphasized,
 }
 
 impl Easing {
@@ -8384,6 +8388,8 @@ impl Easing {
             Easing::LinearOutSlowIn => (0.0, 0.0, 0.2, 1.0),
             Easing::FastOutLinearIn => (0.4, 0.0, 1.0, 1.0),
             Easing::Emphasized => (0.2, 0.0, 0.0, 1.0),
+            Easing::ColorOSStandard => (0.22, 1.0, 0.36, 1.0),
+            Easing::ColorOSEmphasized => (0.3, 0.0, 0.1, 1.0),
         }
     }
     fn sample(self, t: f32) -> f32 {

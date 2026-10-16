@@ -1857,7 +1857,7 @@ fn render_list() {
                     continue;
                 }
                 if p < 1.0 {
-                    ry += (20.0 * (1.0 - motion::Easing::EaseOut.eval(p))) as i32;
+                    ry += (20.0 * (1.0 - motion::Easing::ColorOSStandard.eval(p))) as i32;
                 }
             }
             let p = index::pkg(LIST[i]);
