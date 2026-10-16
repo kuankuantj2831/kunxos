@@ -405,6 +405,13 @@ pub fn cc_visible() -> bool {
     unsafe { CC_PROG > 0.001 }
 }
 
+/// 通知中心是否可见（含开合动画全程）。主循环据此抑制状态栏带状局部
+/// 重绘（B12 充电呼吸节拍）—— 通知面板覆盖状态栏区域时，带状重绘会把
+/// 状态栏画到面板上方。
+pub fn notif_visible() -> bool {
+    unsafe { NOTIF_OPEN || NOTIF_PROG > 0.001 }
+}
+
 fn cc_panel_top() -> f32 {
     unsafe { CC_PANEL_H as f32 * (CC_PROG - 1.0) }
 }

@@ -329,6 +329,8 @@ fn handle_launcher_evt(len: usize) -> bool {
                 APP_STATE = ST_BACKGROUND;
                 RECENT_APP = idx; // 最近任务列表首位
                                   // 返回动画（start_return 内部把 fb0 拷贝到 FRAME_BUF 并启动 Phase::Return）
+                // B10：停止占位页呼吸（应用后台化，占位态随之失效）。
+                app_launch::placeholder_stop();
                 app_launch::start_return(idx);
                 return true;
             }
@@ -344,6 +346,9 @@ fn handle_launcher_evt(len: usize) -> bool {
                 if APP_STATE == ST_LAUNCHING {
                     app_launch::clear_launch_pid();
                 }
+                // B10：停止占位页呼吸（呼吸基线属于已失效的前台等待态，
+                // 残留会在下次前台期闪现旧应用骨架）。
+                app_launch::placeholder_stop();
                 APP_STATE = ST_NONE;
                 APP_PID = -1;
                 SNAP_VALID = false;
@@ -397,6 +402,9 @@ pub fn resume_app_at(app_idx: usize, anchor: Option<(i32, i32)>) -> bool {
         if APP_STATE != ST_BACKGROUND || APP_IDX != app_idx || APP_PID <= 0 {
             return false;
         }
+        // B10：占位页呼吸态兜底清除（正常路径已在 BG 事件停止；此处防御
+        // 残留激活态在恢复后的前台期闪现旧骨架）。
+        app_launch::placeholder_stop();
         if !SNAP_VALID {
             // 无快照（异常）：直接通知 lifd 恢复
             request_fg(APP_PID);
@@ -521,6 +529,8 @@ fn report_exited(app_idx: usize, pid: isize) {
 fn handle_app_exit(app_idx: usize, pid: isize, status: i32) {
     let app = &APPS[app_idx];
     unsafe {
+        // B10：停止占位页呼吸（应用退出，返回动画即将接管显存）。
+        app_launch::placeholder_stop();
         let mut code = 0u32;
         if status != 0 {
             code = ((status >> 8) & 0xFF) as u32;

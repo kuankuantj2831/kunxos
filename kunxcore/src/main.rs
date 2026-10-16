@@ -2399,7 +2399,7 @@ pub extern "C" fn kernel_fault_contain(
     print_hex(tval);
     uart_send_str("（终止进程，系统继续运行）\n");
     // 健康事件（陷入上下文 IRQ 屏蔽态：跳过 VFS 落盘，tombstone 已有落盘副本）
-    let msg = [0u8; 88];
+    let mut msg = [0u8; 88];
     let mut n = 0usize;
     let push = |s: &str, msg: &mut [u8; 88], n: &mut usize| {
         for &c in s.as_bytes() {

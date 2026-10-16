@@ -61,8 +61,8 @@ const _: () = assert!(ICON_SIZE as usize == app_icons::ICON_PX);
 // 应用启动动画与并行加载（点击反馈 / 启动动画 / 占位页 / 返回动画）。
 mod app_launch;
 use app_launch::{
-    app_is_flying, cancel_press, launch_blit, motion_advance, poll_cancel_reap, start_fly_away,
-    start_launch, start_press, zoom_blit, Phase, Spring, MOTION,
+    app_is_flying, cancel_press, launch_blit, motion_advance, placeholder_breathe,
+    poll_cancel_reap, start_fly_away, start_launch, start_press, zoom_blit, Phase, Spring, MOTION,
 };
 
 // 生命周期：launcher × lifd 集成（非阻塞应用管理：后台化/恢复/回收）。
@@ -3136,11 +3136,65 @@ fn draw_wifi(x: i32, y: i32, color: u32) {
     }
 }
 
+/// 状态栏电池（B12）：真实电量填充；充电中绿色填充 + 白色闪电呼吸
+///（三角波 1.2s）；百分比数字在充电或用户开启时显示，右对齐于电池
+/// 图标左侧，插电瞬间随弹簧缩放弹跳入场（0.4→1.0，ζ=0.6 过冲回弹）。
 fn draw_battery(x: i32, y: i32, color: u32) {
-    // 主体 18x10，正极凸起 2x4，约 70% 电量
-    draw_rect(x, y, 18, 10, color);
-    fill_rect(x + 18, y + 3, 2, 4, color);
-    fill_rect(x + 2, y + 2, 12, 6, color);
+    unsafe {
+        let chg = CHG_CACHED;
+        // 电量仅在需要显示时读取（1s TTL 缓存，与锁屏/小组件共用槽位）。
+        let level = if chg || SHOW_BATTERY_PERCENT {
+            read_number_cached(3, BATTERY_PATH, 85).min(100)
+        } else {
+            85
+        };
+        draw_rect(x, y, 18, 10, color);
+        fill_rect(x + 18, y + 3, 2, 4, color);
+        // 电量填充：14px 内宽按电量比例（至少 2px 保持可见）；
+        // 充电中换绿色填充（与 COLOR_ACCENT 一致的充电语义色）。
+        let fw = ((14 * level as i32) / 100).max(2);
+        let fill = if chg { COLOR_ACCENT } else { color };
+        fill_rect(x + 2, y + 2, fw, 6, fill);
+        if chg {
+            // 白色闪电：PIX_ALPHA 三角波呼吸（90..255，周期 1.2s）。
+            let br = motion::triangle(now_us(), 1_200_000);
+            let prev = PIX_ALPHA;
+            PIX_ALPHA = (90.0 + 165.0 * br) as u32;
+            let w = 0x00_FF_FF_FF;
+            draw_line(x + 11, y + 1, x + 8, y + 5, w);
+            draw_line(x + 8, y + 5, x + 11, y + 5, w);
+            draw_line(x + 11, y + 5, x + 7, y + 9, w);
+            PIX_ALPHA = prev;
+        }
+        if chg || SHOW_BATTERY_PERCENT {
+            // 百分比数字：8x8 字形按弹簧缩放（弹跳窗口内 0.4→1.0 过冲）。
+            let mut buf = [0u8; 3];
+            let mut n = 0usize;
+            if level >= 100 {
+                buf[0] = b'1';
+                buf[1] = b'0';
+                buf[2] = b'0';
+                n = 3;
+            } else {
+                if level >= 10 {
+                    buf[n] = b'0' + (level / 10) as u8;
+                    n += 1;
+                }
+                buf[n] = b'0' + (level % 10) as u8;
+                n += 1;
+            }
+            let mut scale = 1.0f32;
+            if SB_BOUNCE_T0 != 0 {
+                scale = SB_BOUNCE_SPRING.pos.clamp(0.4, 1.15);
+            }
+            let gw = ((8.0 * scale + 0.5) as i32).max(1);
+            // draw_big_text_f 以 cx 为中心：右对齐到 WiFi 图标左侧
+            //（WiFi 起点 486，留 6px 间距；右侧电池区仅 12px 放不下两位数字）。
+            let cx = 480 - (n as i32 * gw) / 2;
+            let ty = (STATUS_H - gw) / 2;
+            draw_big_text_f(cx, ty, &buf[..n], scale, color);
+        }
+    }
 }
 
 fn draw_icon_at(x: i32, y: i32, size: i32, color: u32) {
@@ -3641,10 +3695,8 @@ fn draw_status_bar() {
             draw_line(500, 5, 486, 18, COLOR_WARN);
         }
     }
+    // 电量（B12：真实电量 + 充电呼吸闪电 + 插电弹跳百分比，见 draw_battery）
     draw_battery(512, (STATUS_H - 10) / 2, COLOR_TEXT_MAIN);
-    if unsafe { SHOW_BATTERY_PERCENT } {
-        draw_text(532, 8, b"85", COLOR_TEXT_MAIN);
-    }
 }
 
 /// 音量 HUD 绘制（P0-4）：顶部居中玻璃药丸 + 弹簧跟随的音量条。
@@ -6554,6 +6606,76 @@ unsafe fn draw_lock_charging(off: i32) {
     draw_big_text(cx, cy - 34, &buf[..n + 1], 1, col);
 }
 
+// ==================== 状态栏充电动效（B12） ====================
+
+/// 状态栏充电呼吸节拍基准（µs）与电量数字弹跳弹簧。
+static mut SB_CHG_LAST: u64 = 0;
+static mut SB_BOUNCE_T0: u64 = 0;
+static mut SB_BOUNCE_LAST: u64 = 0;
+static mut SB_BOUNCE_SPRING: Spring = Spring::fixed();
+/// 插电电量数字弹跳窗口（µs）。
+const SB_BOUNCE_US: u64 = 450_000;
+/// 呼吸节拍（µs）：1.2s 三角波下 15fps 足够平滑（24px 带状快速重绘，
+/// 玻璃缓存命中时仅为一次行 memcpy + 少量文本，TCG 亦无压力）。
+const SB_CHG_TICK_US: u64 = 66_000;
+
+/// 状态栏充电动效推进（B12）：充电中按节拍置 STATUS_DIRTY（带状快速
+/// 重绘驱动充电闪电呼吸）；插电边沿电量数字弹簧弹跳入场（0.4→1.0，
+/// ζ=0.6 过冲回弹，弹跳期提速至 ~30fps）。锁屏期间不驱动（锁屏充电动效
+/// 走 lock_charging_anim 整屏路径）；面板覆盖状态栏区域时暂停节拍。
+/// 由主循环桌面路径每帧调用 —— 刻意不进整屏重绘链，避免高频整屏渲染。
+fn status_charging_anim(now: u64) {
+    unsafe {
+        if LOCKED {
+            return; // 锁屏走 lock_charging_anim（整屏重绘已覆盖呼吸）
+        }
+        // 充电状态 1s 缓存轮询（与锁屏充电动效共用 CHG_* 缓存字段）。
+        if now.saturating_sub(CHG_CHECK_T0) > 1_000_000 {
+            CHG_CHECK_T0 = now;
+            let chg = read_number(CHARGING_PATH, 0) != 0;
+            if chg && !CHG_CACHED {
+                // 插电边沿：电量数字弹跳入场。
+                SB_BOUNCE_SPRING = Spring::ios(0.6, 0.0);
+                SB_BOUNCE_SPRING.pos = 0.4;
+                SB_BOUNCE_SPRING.target = 1.0;
+                SB_BOUNCE_T0 = now;
+                SB_BOUNCE_LAST = now;
+            }
+            CHG_CACHED = chg;
+        }
+        let bouncing = SB_BOUNCE_T0 != 0 && now.saturating_sub(SB_BOUNCE_T0) < SB_BOUNCE_US;
+        if bouncing {
+            // 真实 dt 推进弹簧（钳 40ms 防停顿后大步长）。
+            let dt = now.saturating_sub(SB_BOUNCE_LAST).min(40_000) as f32 / 1000.0;
+            SB_BOUNCE_LAST = now;
+            let _ = SB_BOUNCE_SPRING.step_ms(dt);
+        } else {
+            SB_BOUNCE_T0 = 0;
+        }
+        if !CHG_CACHED && !bouncing {
+            return; // 非充电且无弹跳：无动画
+        }
+        // 带状重绘仅在纯桌面态：文件夹/最近任务/控制中心/通知中心覆盖
+        // 状态栏区域，带状重绘会把状态栏画到面板上方（呼吸暂停即可，
+        // 面板关闭后的整屏重绘自然恢复）。
+        let plain_desktop = FOLDER_PHASE == FolderPhase::Closed
+            && !RENAME_OPEN
+            && !RECENTS_OPEN
+            && !control_center::cc_visible()
+            && !control_center::notif_visible()
+            && !EDIT_MODE
+            && !app_life::app_active();
+        if !plain_desktop {
+            return;
+        }
+        let tick = if bouncing { 33_000 } else { SB_CHG_TICK_US };
+        if now.saturating_sub(SB_CHG_LAST) >= tick {
+            SB_CHG_LAST = now;
+            STATUS_DIRTY = true; // 主循环走 redraw_status_bar_fast 带状路径
+        }
+    }
+}
+
 /// 锁屏整层（背景 + 内容）垂直平移绘制，供解锁/锁定转场使用：
 /// 调用前先绘制桌面内容，层滑出/滑入即露出/覆盖桌面。
 fn draw_lock_layer(off: i32) {
@@ -8498,6 +8620,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     }
                 }
             }
+            // B10 占位页骨架屏呼吸：应用首帧未就绪的等待期内保持加载反馈
+            //（内部 33ms 节流 + 骨架区脏矩形 flip，开销极小；应用首帧写入
+            // 显存后基线偏离自动停止）。
+            placeholder_breathe(now);
             sleep_ms(8);
             continue;
         }
@@ -8812,6 +8938,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 NEEDS_REDRAW = true;
             }
         }
+
+        // 2.52 状态栏充电动效（B12）：充电闪电呼吸节拍（STATUS_DIRTY 带状
+        //     快速重绘）+ 插电电量数字弹跳推进。独立于上方整屏链，避免
+        //     TCG 慢宿主下 15fps 整屏重绘。
+        status_charging_anim(now);
 
         // 3. 仅在需要时重绘：整屏（内容/动画变化）或状态栏局部（分钟变化）。
         //    鼠标移动走 overlay 快速路径（move_cursor_fb），不触发整屏重绘。

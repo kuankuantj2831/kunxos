@@ -1270,10 +1270,17 @@ fn fb_matches(sample: &[u32; 12]) -> bool {
     }
 }
 
+/// 占位页居中图标边长（px）。
+const PLACE_ICON_S: i32 = 96;
+
 /// 占位页面（应用主题色背景 + 居中图标）：应用 350ms 内未就绪时显示，
 /// 应用首帧绘制到显存后自然覆盖。`baseline` 是放行应用**之前**采的显存
 /// 基线（此刻显存必然还是启动动画末帧 = 基线本身；与基线一致 = 应用
 /// 尚未画首帧，允许覆盖）。
+///
+/// 绘制完成后武装骨架屏呼吸（B10）：应用首帧未就绪的等待期内，图标下方
+/// 骨架块以 1.2s 三角波呼吸（ColorOS 加载占位风格），由主循环前台分支
+/// 经 `placeholder_breathe` 逐帧推进。
 fn draw_placeholder(app_idx: usize, baseline: &[u32; 12]) {
     unsafe {
         if !fb_matches(baseline) {
@@ -1283,10 +1290,93 @@ fn draw_placeholder(app_idx: usize, baseline: &[u32; 12]) {
         for i in 0..DISPLAY_W * DISPLAY_H {
             BACK_BUF[i] = app.color;
         }
-        let s = 96;
+        let s = PLACE_ICON_S;
         let ox = (DISPLAY_W as i32 - s) / 2;
         let oy = (DISPLAY_H as i32 - s) / 2;
         draw_app_icon(app, ox, oy, s);
         flip();
+        // B10：武装呼吸态。基线在占位页上屏**之后**采样（12 个采样点均在
+        // 图标与骨架区之外），应用首帧写入显存后采样偏离即自动停止。
+        PLACE_APP = app_idx;
+        PLACE_T0 = now_us();
+        PLACE_LAST = PLACE_T0;
+        PLACE_BASE = fb_sample();
+        PLACE_ON = true;
+    }
+}
+
+// ==================== B10：占位页骨架屏呼吸 ====================
+
+/// 骨架屏呼吸状态（应用首帧到达或超时前由主循环前台分支推进）。
+static mut PLACE_ON: bool = false;
+static mut PLACE_T0: u64 = 0;
+static mut PLACE_LAST: u64 = 0;
+static mut PLACE_APP: usize = usize::MAX;
+static mut PLACE_BASE: [u32; 12] = [0; 12];
+
+/// 呼吸周期（µs）：与锁屏充电光晕同款 1.2s 三角波。
+const PLACE_PERIOD_US: u64 = 1_200_000;
+/// 呼吸帧节流（µs）：1.2s 周期下 30fps 足够平滑。
+const PLACE_FRAME_US: u64 = 33_000;
+/// 最长等待（µs）：超过后退回静态占位 —— 应用首帧始终未到（加载失败/
+/// 极慢）时不再与显存竞争，也让呼吸状态必然收敛。
+const PLACE_MAX_US: u64 = 6_000_000;
+/// 骨架块呼吸 alpha 范围（主题色底上整块混合，颜色每帧算一次）。
+const PLACE_SK_MIN: u32 = 60;
+const PLACE_SK_MAX: u32 = 150;
+/// 骨架块半宽与总高（px）：图标下方三行内容占位（标题 + 两行文本）。
+const PLACE_SK_HALF_W: i32 = 90;
+const PLACE_SK_H: i32 = 60;
+
+/// 停止占位页呼吸（应用退出/后台化/恢复转场起点由 app_life 调用；
+/// 重复调用无害）。不清显存 —— 画面停在当前占位帧，由后续路径
+/// （返回动画 / 应用首帧）自然接管。
+pub fn placeholder_stop() {
+    unsafe {
+        PLACE_ON = false;
+        PLACE_APP = usize::MAX;
+    }
+}
+
+/// 占位页骨架屏呼吸帧（B10）：主循环前台等待分支每帧调用（内部 33ms
+/// 节流）。骨架块为纯色矩形 —— 在均匀主题色底上按帧 alpha 整块混合成
+/// 单色后 `fill_rect`（O(面积) memset，无逐像素混合），仅骨架区域脏矩形
+/// flip。应用首帧写入显存（基线 12 采样点偏离）或超过 6s 后自动停止。
+/// 返回 true 表示仍在呼吸。
+pub fn placeholder_breathe(now: u64) -> bool {
+    unsafe {
+        if !PLACE_ON {
+            return false;
+        }
+        if now.saturating_sub(PLACE_LAST) < PLACE_FRAME_US {
+            return true;
+        }
+        PLACE_LAST = now;
+        if PLACE_APP >= APPS.len()
+            || !fb_matches(&PLACE_BASE)
+            || now.saturating_sub(PLACE_T0) > PLACE_MAX_US
+        {
+            placeholder_stop();
+            return false;
+        }
+        let app = &APPS[PLACE_APP];
+        // 三角波呼吸（0..1..0）：骨架块亮度 60..150 混合白色。
+        let br = super::motion::triangle(now.saturating_sub(PLACE_T0), PLACE_PERIOD_US);
+        let a = PLACE_SK_MIN + ((PLACE_SK_MAX - PLACE_SK_MIN) as f32 * br) as u32;
+        let sk = blend(app.color, 0x00_FF_FF_FF, a.min(255));
+        let cx = DISPLAY_W as i32 / 2;
+        let y0 = (DISPLAY_H as i32 - PLACE_ICON_S) / 2 + PLACE_ICON_S + 28;
+        // 三行骨架：标题宽块 + 两行文本块（ColorOS 加载占位层次）。
+        fill_rect(cx - PLACE_SK_HALF_W, y0, PLACE_SK_HALF_W * 2, 12, sk);
+        fill_rect(cx - PLACE_SK_HALF_W, y0 + 20, PLACE_SK_HALF_W * 2, 12, sk);
+        fill_rect(cx - PLACE_SK_HALF_W, y0 + 40, 120, 12, sk);
+        mark_dirty(
+            cx - PLACE_SK_HALF_W,
+            y0,
+            (PLACE_SK_HALF_W * 2) as u32,
+            PLACE_SK_H as u32,
+        );
+        flip();
+        true
     }
 }
