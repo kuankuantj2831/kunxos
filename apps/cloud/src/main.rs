@@ -238,6 +238,12 @@ fn hex_val(c: u8) -> u8 {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// b64 输出长度（与 b64_encode 的分块规则一致：每 3 字节进 4，且受 dst
+/// 容量截断——调用方保证 dst 足够）。
+fn b64_len(src: usize) -> usize {
+    (src + 2) / 3 * 4
+}
+
 fn b64_encode(src: &[u8], dst: &mut [u8]) -> usize {
     let mut n = 0usize;
     let mut i = 0usize;
@@ -470,16 +476,21 @@ fn ensure_credentials() {
                     n += 1;
                 }
             }
-            let mut seed = [0u8; 96];
+            let mut seed = [0u8; 160];
             let mut s = 0usize;
             for &c in &acc[..n] {
+                if s >= seed.len() {
+                    break;
+                }
                 seed[s] = c;
                 s += 1;
             }
-            seed[s] = b':';
-            s += 1;
+            if s < seed.len() {
+                seed[s] = b':';
+                s += 1;
+            }
             for &c in DEVID.iter() {
-                if c == 0 {
+                if c == 0 || s >= seed.len() {
                     break;
                 }
                 seed[s] = c;
@@ -727,7 +738,7 @@ fn api_register() -> i32 {
     unsafe {
         let mut body = [0u8; 320];
         let mut n = 0usize;
-        let mut enc = [0u8; 96];
+        let mut enc = [0u8; 200]; // R4-L2：64B 输入最坏全转义 192B+1
         for &c in b"u=" {
             body[n] = c;
             n += 1;
@@ -784,7 +795,7 @@ fn api_backup() -> bool {
             body[n] = c;
             n += 1;
         }
-        let mut enc = [0u8; 96];
+        let mut enc = [0u8; 200]; // R4-L2：64B 输入最坏全转义 192B+1
         let el = urlencode(cstr(&ACCOUNT), &mut enc);
         body[n..n + el].copy_from_slice(&enc[..el]);
         n += el;
@@ -802,16 +813,32 @@ fn api_backup() -> bool {
         let el = urlencode(cstr(&DEVID), &mut enc);
         body[n..n + el].copy_from_slice(&enc[..el]);
         n += el;
-        // 第一遍：统计将发送的文件数（与第二遍同判据：read_file > 0，
-        // 空文件跳过不发 F 行，避免 n 与 F 行数不一致）
+        // 第一遍：统计**实际能装进 body**的 F 行数（与第二遍同判据同预算
+        // 顺序模拟——原版只按「文件非空」计数，第二遇见容量 break 后头部
+        // n<count 与实际 F 行数不一致，gateway 校验 len(files)!=n 整体拒绝
+        // 备份（R4-M3））
+        let budget = body.len() - 512;
+        let mut sim = n; // 头部已占用
+        // 预留 n= 行自身（"n=" + 最多 10 位数字 + 换行）
+        sim += 2 + 10 + 1;
         let mut count = 0u32;
         for name in BACKUP_FILES {
-            let p = oobe_path(name);
+            let path = oobe_path(name);
+            let p = core::str::from_utf8(path).unwrap_or("");
             let mut fbuf = [0u8; 512];
-            let len = read_file(core::str::from_utf8(p).unwrap_or(""), &mut fbuf);
-            if len > 0 {
-                count += 1;
+            let len = read_file(p, &mut fbuf);
+            if len <= 0 {
+                continue;
             }
+            // 行长：F| + b64(path) + | + b64(data) + \n（b64 长度确定：4*ceil(n/3)）
+            let el = b64_len(path.len());
+            let dl = b64_len(len as usize);
+            let ln = 2 + el + 1 + dl + 1;
+            if sim + ln > budget {
+                continue; // 与第二遍 break 同判据：装不下的不计入 n
+            }
+            sim += ln;
+            count += 1;
         }
         // 写 n=<count> 行（直接写对，无预留回填）
         let mut num = [0u8; 8];
@@ -859,8 +886,10 @@ fn api_backup() -> bool {
             ln += 1;
             // ★ 预留 512B 请求头空间：build_request 会把「头 + body」整体写入
             // REQ[4096]，body 占满 4096 时头部追加必越界（REQ[n] panic）。
+            // 装不下时跳过（与第一遍计数同判据 continue——若此处 break 而
+            // 计数 continue，后续更小的文件会再次造成 n 与 F 行数不一致）。
             if n + ln > body.len() - 512 {
-                break;
+                continue;
             }
             body[n..n + ln].copy_from_slice(&line[..ln]);
             n += ln;
@@ -912,7 +941,7 @@ fn api_restore() -> bool {
             path[n] = c;
             n += 1;
         }
-        let mut enc = [0u8; 96];
+        let mut enc = [0u8; 200]; // R4-L2：64B 输入最坏全转义 192B+1
         let el = urlencode(cstr(&ACCOUNT), &mut enc);
         path[n..n + el].copy_from_slice(&enc[..el]);
         n += el;
@@ -1022,7 +1051,7 @@ fn api_poll() -> i32 {
     unsafe {
         let mut body = [0u8; 320];
         let mut n = 0usize;
-        let mut enc = [0u8; 96];
+        let mut enc = [0u8; 200]; // R4-L2：64B 输入最坏全转义 192B+1
         for &c in b"u=" {
             body[n] = c;
             n += 1;
@@ -1089,7 +1118,7 @@ fn api_ack(cmd_id: u32, result: &[u8]) -> bool {
     unsafe {
         let mut body = [0u8; 256];
         let mut n = 0usize;
-        let mut enc = [0u8; 96];
+        let mut enc = [0u8; 200]; // R4-L2：64B 输入最坏全转义 192B+1
         put(&mut body, &mut n, b"u=");
         let el = urlencode(cstr(&ACCOUNT), &mut enc);
         put(&mut body, &mut n, &enc[..el]);
@@ -1294,8 +1323,14 @@ fn do_poll() -> i32 {
             }
             return -1;
         }
-        // 重新读取 RESP（api_poll 之后 RESP 仍保留响应）
-        let body = resp_body(&RESP[..RESP_LEN]);
+        // 重新读取 RESP（api_poll 之后 RESP 仍保留响应）。先拷入独立缓冲再
+        // 逐条执行：exec_command → api_ack 会写同一 RESP（static mut，unsafe
+        // 下借用检查失效），split 迭代器剩余行被 ack 响应覆盖 → 一轮只执行
+        // 第一条命令（R4-M2）。
+        static mut POLL_BODY: [u8; 8192] = [0; 8192];
+        let blen = RESP_LEN.min(POLL_BODY.len());
+        core::ptr::copy_nonoverlapping(RESP.as_ptr(), POLL_BODY.as_mut_ptr(), blen);
+        let body = resp_body(&POLL_BODY[..blen]);
         let mut executed = 0;
         for line in body.split(|&c| c == b'\n') {
             if starts_with(line, b"C|") {

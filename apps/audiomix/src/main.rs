@@ -240,20 +240,24 @@ fn read_stream_state(pid: i32) -> (i32, u32) {
         let mut buf = [0u8; 32];
         let r = syscall3(SYS_READ, fd as usize, buf.as_mut_ptr() as usize, buf.len());
         syscall1(SYS_CLOSE, fd as usize);
-        if (r as usize) < 4 {
+        // 按 isize 判负（read 失败 -errno 转 usize 巨大正数会穿透
+        // 原 `< 4` 守卫，把读取失败误判为 FOCUS_FOCUSED —— 与
+        // shared/audio.rs stream_state 同族修复对齐，R4-L1）
+        let rn = r as isize;
+        if rn < 4 {
             return (-1, 99);
         }
         let mut gain: i32 = 0;
         let mut k = 0usize;
-        while k < (r as usize) && buf[k].is_ascii_digit() {
+        while k < (rn as usize) && buf[k].is_ascii_digit() {
             gain = gain * 10 + (buf[k] - b'0') as i32;
             k += 1;
         }
-        while k < (r as usize) && buf[k] == b' ' {
+        while k < (rn as usize) && buf[k] == b' ' {
             k += 1;
         }
         let mut state: u32 = 0;
-        while k < (r as usize) && buf[k].is_ascii_digit() {
+        while k < (rn as usize) && buf[k].is_ascii_digit() {
             state = state * 10 + (buf[k] - b'0') as u32;
             k += 1;
         }
