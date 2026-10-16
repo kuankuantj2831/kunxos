@@ -65,3 +65,13 @@
 - B1：内核 `anim.rs` 与 `shared/motion.rs` 新增 ColorOSStandard / ColorOSEmphasized 两条 ColorOS 17 标准曲线
 - 摸底结论：launcher 已有按压回弹、启动/返回转场、长按编辑抖动；后续动画工作重点是「切换曲线到 ColorOS + 补缺失动效（翻页惯性、通知横幅、亮度渐亮等）」
 - 验证与提交见 git log
+
+### 第 2-3 轮（2026-10-16 深夜，主会话 + 三路并行子代理）
+- **A3 getrandom 真实熵源**：virtio-rng 限时非阻塞接口 + 64B 熵池（硬件熵/time CSR/墙钟/pid/tid/序号混合），替代时间种子 LCG（已提交）
+- **A11 第一轮审查**（新代码 crash_screen/health 等）：2 High + 2 Medium + 6 Low，其中 H-1/H-2/M-1/M-2 与 L-2/L-3/L-4/L-5 **全部修复提交**；L-1/L-6 本轮跟进
+- **A5 TIME_WAIT 30s 定时回收、A6 ARP 60s 老化**（已提交）
+- **A1**：map_framebuffer 三个 EINVAL 分支加诊断打印（需复现定位，未决）
+- **B5 翻页惯性+视差、B8 开机/解锁渐亮**（launcher，ColorOSStandard，已提交）；内核手势 5 处 tween + 页面切换切 ColorOS 曲线（已提交）
+- 核查已修不需重做：A4/A7/A8/A9/A10、B2/B3/B4/B6/B7/B11
+- 回归：make 全量 0 错误；make test-sfsrace **PASS ×4**（期间定位并排除一次 launcher 中间版本引入的 MAILBOX 失败）
+- 剩余待做：L-1 定时器遏制级联、L-6 健康横幅选最严重事件、第二轮 apps/kunxserv 审查、充电动效/骨架屏等动画长尾

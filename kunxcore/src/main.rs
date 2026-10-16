@@ -2540,7 +2540,11 @@ pub extern "C" fn irq_fault_contain(
     let kind = crate::interrupt::irq_ctx_kind();
     // 定时器故障：无法屏蔽，计数限流，超限转整机诊断（系统性 bug）
     if kind == 5 && !crate::interrupt::timer_contain_tick() {
-        return false;
+        // L-1：超限说明定时器路径有系统性 bug，直接转整机诊断停机 ——
+        // 此前 return false 会落入 kernel_fault_contain，把打断时的用户
+        // 进程逐个击杀而非停机，掩盖系统性故障。
+        uart_send_str("[contain] 定时器遏制超限（系统性故障），转整机诊断\n");
+        sync_exception_handler()
     }
     uart_send_str("[contain] IRQ 故障遏制：");
     if line != 0 {
