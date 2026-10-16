@@ -232,17 +232,58 @@ fn ring_release() {
     RING_BUSY.store(false, Ordering::Release);
 }
 
+/// 超时后仍有请求挂在环上（迟到完成未被消费）。下一次取熵前必须先
+/// （有界地）排空 used ring，否则会把**上一次**请求的完成事件误当本次
+/// 成功 —— 返回未初始化数据、失步持续传播（R3-H1）。
+static mut STALE_USED: bool = false;
+
+/// 排空迟到的完成事件：等待 used ring 追平并在完成后消费。返回是否
+/// 排空成功（失败 = 设备仍无响应，调用方按设备忙降级返回 -1）。
+unsafe fn drain_stale(deadline: Option<u64>) -> bool {
+    loop {
+        dcache_invalidate(RING + USED_OFF, 4 + QUEUE_SIZE * 8);
+        if used_idx() != LAST_USED {
+            LAST_USED = used_idx();
+            STALE_USED = false;
+            return true;
+        }
+        match deadline {
+            Some(d) => {
+                if crate::timer::read_time() >= d {
+                    return false;
+                }
+            }
+            None => return false, // legacy 语义：有界预算由调用方给
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// 投递单个「设备写入」描述符并轮询 used ring。
 ///
 /// `deadline == None`：legacy 语义（100_000_000 次自旋上限，超时打印）；
 /// `deadline == Some(t)`：`time` CSR 计数到达 `t` 即静默返回 -1（不打印——
-/// 熵池可能高频调用，刷屏比缺一次硬件熵更糟；描述符留环内，迟到完成由
-/// 下一调用消费）。
+/// 熵池可能高频调用，刷屏比缺一次硬件熵更糟）；超时置 `STALE_USED`，
+/// 迟到完成由下一调用的 [`drain_stale`] 消费，绝不误当新请求的成功。
 ///
 /// # 安全
 /// 调用方须持有 `RING_BUSY` 且已确认 `READY`；`dst` 指向的缓冲在设备完成
-/// 前必须保持有效（deadline 超时路径除外——见 [`TIMED_BUF`]）。
+/// 前必须保持有效（超时路径除外——统一使用静态 [`TIMED_BUF`]，迟到 DMA
+/// 只覆写常驻内存，R3-L-B）。
 unsafe fn get_random_inner(dst: usize, len: usize, deadline: Option<u64>) -> i32 {
+    if STALE_USED {
+        // 排空预算 = 2×本次预算（deadline 模式）；legacy 有界自旋
+        let drain_dl = deadline.map(|d| crate::timer::read_time().saturating_add(d.saturating_sub(crate::timer::read_time()).max(0) * 2));
+        let mut drained = unsafe { drain_stale(drain_dl) };
+        if !drained && deadline.is_none() {
+            // legacy：给 1ms 排空预算
+            let budget = (1_000u64.saturating_mul(crate::timer::frequency()) / 1_000_000).max(1);
+            let dl = crate::timer::read_time().saturating_add(budget);
+            drained = unsafe { drain_stale(Some(dl)) };
+        }        if !drained {
+            return -1; // 设备仍无响应：降级，STALE 保持
+        }
+    }
     let ai = avail_idx();
     let slot = (ai % QUEUE_SIZE as u16) as usize;
 
@@ -269,6 +310,7 @@ unsafe fn get_random_inner(dst: usize, len: usize, deadline: Option<u64>) -> i32
         match deadline {
             Some(d) => {
                 if crate::timer::read_time() >= d {
+                    STALE_USED = true;
                     return -1;
                 }
             }
@@ -276,6 +318,7 @@ unsafe fn get_random_inner(dst: usize, len: usize, deadline: Option<u64>) -> i32
                 tries += 1;
                 if tries > 100_000_000 {
                     crate::uart_send_str("[rng] get_random 超时\n");
+                    STALE_USED = true;
                     return -1;
                 }
             }
@@ -294,15 +337,28 @@ pub fn get_random(buf: &mut [u8]) -> i32 {
     if !unsafe { READY } {
         return -1;
     }
-    let len = buf.len().min(4096);
+    // 统一经静态 TIMED_BUF（R3-L-B）：legacy 调用方（elf.rs AT_RANDOM /
+    // process.rs ASLR）传栈缓冲，超时后迟到的设备 DMA 会写进已退出的
+    // 栈帧 —— 与限时路径同风险，此处一并消除（上限 64B 后拷出）。
+    let len = buf.len().min(unsafe { TIMED_BUF.len() });
     if len == 0 {
         return 0;
     }
     if !ring_acquire() {
         return -1;
     }
-    let r = unsafe { get_random_inner(buf.as_mut_ptr() as usize, len, None) };
+    let dst = core::ptr::addr_of_mut!(TIMED_BUF) as usize;
+    let r = unsafe { get_random_inner(dst, len, None) };
     ring_release();
+    if r > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(TIMED_BUF) as *const u8,
+                buf.as_mut_ptr(),
+                r as usize,
+            );
+        }
+    }
     r
 }
 

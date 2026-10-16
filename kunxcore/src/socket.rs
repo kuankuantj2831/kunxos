@@ -852,6 +852,16 @@ unsafe fn tcp_reap_syn_rcvd() {
         }
         if s.state == T_TIME_WAIT {
             if now.saturating_sub(s.last_send_us) >= TIME_WAIT_TIMEOUT_US {
+                // 同步清除仍引用该槽位的句柄（R3-M1）：任务若在 tcp_close
+                // 的等待循环中被杀，SOCKETS[h] 与 TIME_WAIT 槽一起泄漏；
+                // 只清槽位会留下悬空句柄 → 新连接复用槽 c 后被陈旧句柄
+                // 误 close（对他人活连接发 FIN）。reaper 持 net_lock，安全。
+                for h in 0..MAX_SOCKETS {
+                    let so = &mut SOCKETS[h];
+                    if so.used && so.ty == SOCK_TCP && so.index == c {
+                        *so = EMPTY_SOCKET;
+                    }
+                }
                 TCPS[c] = TcpSock::empty();
             }
             continue;

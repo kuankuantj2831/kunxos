@@ -2344,7 +2344,9 @@ fn panic(info: &PanicInfo) -> ! {
                 "内核处理应用请求时发现内部错误，已终止该进程",
                 "系统已自动恢复，无需处理。若同一应用反复出现，请更新或卸载它；详情见 /data/crash（shell: crash）",
             );
-            // SIGSEGV 语义退出：内部屏蔽 IRQ 并切换任务，不返回
+            // SIGSEGV 语义退出：内部屏蔽 IRQ 并切换任务，不返回。
+            // 先强制放调度锁（故障点可能持锁，R3-L-C）
+            crate::sched_cfs::sched_force_unlock_if_owner();
             crate::process::exit(-11)
         }
     }
@@ -2398,6 +2400,9 @@ pub extern "C" fn kernel_fault_contain(
     uart_send_str(" stval=");
     print_hex(tval);
     uart_send_str("（终止进程，系统继续运行）\n");
+    // 故障点可能正持有调度锁（临界区内 S 态异常）：遏制路径 kill_pid 要
+    // 重取 sched_lock，先强制放锁防自旋死锁（R3-M-1/L-C）
+    crate::sched_cfs::sched_force_unlock_if_owner();
     // 健康事件（陷入上下文 IRQ 屏蔽态：跳过 VFS 落盘，tombstone 已有落盘副本）
     let mut msg = [0u8; 88];
     let mut n = 0usize;
@@ -2489,7 +2494,9 @@ pub extern "C" fn kthread_fault_contain(kind: &str, cause: u64, tval: u64) -> bo
         "内核后台线程故障已停止（对应功能停摆，系统其余功能正常）",
         "相关功能（如无线/音频/日志之一）不可用；请重启设备恢复；反复出现请查看 /data/crash",
     );
-    // 清睡眠登记后标记退出并切走（不返回；栈在槽位复用时回收）
+    // 清睡眠登记后标记退出并切走（不返回；栈在槽位复用时回收）。
+    // 先强制放调度锁（故障点可能持锁，R3-L-C）
+    crate::sched_cfs::sched_force_unlock_if_owner();
     unsafe { crate::sched_cfs::sleepers_clear_tid(crate::sched_cfs::current_tid()) };
     crate::sched_cfs::exit_current()
 }

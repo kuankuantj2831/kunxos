@@ -1377,6 +1377,15 @@ pub fn placeholder_breathe(now: u64) -> bool {
             PLACE_SK_H as u32,
         );
         flip();
+        // 绘制后二次校验（R3-M3）：校验通过与骨架 flip 之间应用首帧可能
+        // 已写入该区域 —— 本帧骨架被我们盖回，而下一 tick 采样点偏离即
+        // 停止、无人再重画 → 只绘一帧的应用留下永久骨架残块。发现基线
+        // 偏离立即停止（残块由应用下次交互/整屏重绘覆盖，且窗口已缩到
+        // 单帧）。
+        if !fb_matches(&PLACE_BASE) {
+            placeholder_stop();
+            return false;
+        }
         true
     }
 }

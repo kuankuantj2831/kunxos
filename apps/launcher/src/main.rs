@@ -921,6 +921,12 @@ fn health_load() {
             }
             pos = eol + 1;
         }
+        // 仅 INFO 级事件（自愈提示）不立「检测到问题」横幅（R3-LA：
+        // 原实现此时展示空问题文本）
+        if best.0 == 0 {
+            HEALTH_BANNER = 2;
+            return;
+        }
         let line = &buf[best.1..best.2];
         // 行格式：`<t>ms <sev> <subsys> | <msg> | 修复: <fix>`
         // msg：第一个 "| " 之后；fix："| 修复: " 之后（可能缺席）

@@ -153,11 +153,17 @@ struct ArpEntry {
     used: bool,
     ip: u32,
     mac: [u8; 6],
-    /// 最近一次使用/学习时刻（微秒），用于缓存淘汰（满了逐最旧）。
+    /// 最近一次使用时刻（微秒）：仅用于缓存淘汰（满了逐最旧）。
     age: u64,
+    /// 学习（映射建立/被应答刷新）时刻：TTL 过期判定专用。与 age 分离
+    /// （R3-M2）：若共用一字段，ip_send 每次发送的 LRU 刷新会把 TTL 无限
+    /// 续命 —— 网关换 MAC 后 RTO 重传（<30s）反复刷新，条目永不过期，
+    /// 发往旧 MAC 永久失联。
+    born_us: u64,
 }
 
-const EMPTY_ARP: ArpEntry = ArpEntry { used: false, ip: 0, mac: [0; 6], age: 0 };
+const EMPTY_ARP: ArpEntry =
+    ArpEntry { used: false, ip: 0, mac: [0; 6], age: 0, born_us: 0 };
 static mut ARP_CACHE: [ArpEntry; ARP_MAX] = [EMPTY_ARP; ARP_MAX];
 
 // ==================== ICMP / DNS 状态 ====================
@@ -379,14 +385,14 @@ fn arp_lookup(ip: u32) -> Option<[u8; 6]> {
         let now = crate::timer::now_us();
         for e in ARP_CACHE.iter_mut() {
             if e.used && e.ip == ip {
-                // 条目老化：超过 TTL 视为陈旧（对端可能已换 MAC/IP），
-                // 清除并重新解析 —— 此前条目一旦学得就永不过期，网络
-                // 拓扑变化后永远发往旧 MAC。
-                if now.saturating_sub(e.age) >= ARP_ENTRY_TTL_US {
+                // 条目老化（自学习时刻起算，R3-M2）：超过 TTL 视为陈旧
+                // （对端可能已换 MAC/IP），清除并重新解析。发送侧的 LRU
+                // age 刷新不续 TTL —— 持续通信的对端到点同样重学。
+                if now.saturating_sub(e.born_us) >= ARP_ENTRY_TTL_US {
                     *e = EMPTY_ARP;
                     return None;
                 }
-                e.age = now; // LRU 刷新
+                e.age = now; // LRU 刷新（仅淘汰序）
                 return Some(e.mac);
             }
         }
@@ -406,6 +412,7 @@ fn arp_cache_insert(ip: u32, mac: [u8; 6]) {
         for e in ARP_CACHE.iter_mut() {
             if e.used && e.ip == ip {
                 e.mac = mac;
+                e.born_us = now; // 重新学习重置 TTL（R3-M2）
                 e.age = now;
                 return;
             }
@@ -413,7 +420,7 @@ fn arp_cache_insert(ip: u32, mac: [u8; 6]) {
         // 新项：找空位
         for e in ARP_CACHE.iter_mut() {
             if !e.used {
-                *e = ArpEntry { used: true, ip, mac, age: now };
+                *e = ArpEntry { used: true, ip, mac, age: now, born_us: now };
                 return;
             }
         }
@@ -426,7 +433,7 @@ fn arp_cache_insert(ip: u32, mac: [u8; 6]) {
                 victim = i;
             }
         }
-        ARP_CACHE[victim] = ArpEntry { used: true, ip, mac, age: now };
+        ARP_CACHE[victim] = ArpEntry { used: true, ip, mac, age: now, born_us: now };
     }
 }
 

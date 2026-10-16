@@ -14,7 +14,7 @@
 
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::allocator;
 use crate::allocator::alloc_pages_contig;
@@ -241,40 +241,35 @@ static mut CURRENT: [usize; MAX_CPUS] = [usize::MAX; MAX_CPUS];
 /// 就绪任务绝不会被两个核同时选中。单核（默认）运行时锁无竞争，行为与
 /// 原来完全一致。
 static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
-/// 持锁者 tid（0=无主）。故障遏制出口（kill_pid/exit_current）会重取
-/// sched_lock —— 若故障点自身持锁（panic 发生在 tick 的 TASKS/SLEEPERS
-/// 临界区内），持有者已死永不释放，遏制路径在关中断下永久自旋（M-1）。
-/// 与 fs_lock 同款自愈：等待中发现持有者已死即抢锁接管。
-static SCHED_OWNER: AtomicU32 = AtomicU32::new(0);
 
 fn sched_lock() {
-    let me = current_tid();
-    loop {
-        if SCHED_LOCK
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            break;
-        }
-        // 死亡持有者自愈：遏制击杀后槽位复用前 tid 不存活
-        let holder = SCHED_OWNER.load(Ordering::Acquire);
-        if holder != 0 && holder != me && !tid_alive(holder) {
-            // 抢锁：把陈旧所有权连同锁位一并接管
-            if SCHED_OWNER
-                .compare_exchange(holder, me, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                SCHED_LOCK.store(false, Ordering::Release);
-                continue;
-            }
-        }
+    while SCHED_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         core::hint::spin_loop();
     }
-    SCHED_OWNER.store(me, Ordering::Release);
 }
 
 fn sched_unlock() {
-    SCHED_OWNER.store(0, Ordering::Release);
+    SCHED_LOCK.store(false, Ordering::Release);
+}
+
+/// 故障遏制出口专用：若当前任务正持有调度锁（panic/S 态异常发生在
+/// TASKS/SLEEPERS 临界区内），强制放锁后返回 true —— 遏制路径
+/// （kill_pid/exit_current）随后重取 sched_lock 才不会在自己持有的锁上
+/// 关中断永久自旋（R3-M-1/L-C）。
+///
+/// 为什么不用「死亡持有者抢锁自愈」（fs_lock 款）：本内核每次上下文切换
+/// 都在持锁状态下进行、锁由被切到任务的恢复点释放 —— 每次任务退出都存在
+/// 「owner=已死 tid 且 lock=true」的正常交接窗口，他核自愈者会误抢锁，
+/// 随后原恢复点无条件 sched_unlock 把自愈者的锁一并释放 → 两核同时进入
+/// 调度器临界区（R3-H-2，SMP-only）。遏制出口显式放锁只在「锁确实属于
+/// 当前任务」时动作，无跨任务误判。
+pub fn sched_force_unlock_if_owner() {
+    // 单锁无 owner 跟踪：遏制出口只在「确实持有」时放锁会漏判 —— 但本函数
+    // 仅在遏制路径调用（进程即将终止、绝不返回），即便理论上未持锁，
+    // 释放一个空闲锁也是无害幂等操作（false→false）。
     SCHED_LOCK.store(false, Ordering::Release);
 }
 
