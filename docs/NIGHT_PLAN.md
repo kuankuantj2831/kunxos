@@ -24,10 +24,12 @@
 - [ ] A1 launcher `mmap /dev/fb0` 偶发 EINVAL（BUG_REPORT 十一节"已知未决"）：复现 + errno 分支定位修复
 - [x] A2 ~~syscall_dispatch 跨栈写~~：**核查结论（RISC-V 路径不适用）**——子进程陷阱帧副本放子栈顶部、a0=0 就地置位，经 el0_resume_entry 直达 syscall_return_restore，不回卷 dispatch；dispatch 写回的是当前任务自己的活栈帧。无跨栈写。
 - [ ] A3 getrandom 无真实熵源：接入 virtio-rng 熵池混合
-- [ ] A4 TCP 通告窗口/流量控制（十三节"明确不改"升级为正式实现）
-- [ ] A5 TIME_WAIT 定时退出
-- [ ] A6 ARP 条目老化定时清理
-- [ ] A7 oobe/launcher 输入事件跨 read 分割丢事件
+- [x] A4 ~~TCP 通告窗口~~：核查已实现（tcp_xmit 按 TCP_RXBUF-rx_count 通告真实剩余空间，socket.rs:735）
+- [x] A9 ~~信号帧边界误杀 pthread~~：核查已修（signal.rs 帧校验已放宽到任意已映射用户空间，112-127/213-221）
+- [x] A5 TIME_WAIT 定时回收（30s 超时，tcp_reap_syn_rcvd 同场回收）
+- [x] A6 ARP 条目老化（60s TTL，lookup 命中超龄即作废重新解析）
+- [x] A7 ~~oobe 输入跨 read 分割~~：核查已修（EV_BUF 累积缓冲 + consume_input_event，oobe:3752-3921）
+- [x] A10 ~~slab 双释放防护~~：核查已修（slab_free 空闲链表遍历拒绝重复释放，heap.rs）
 - [ ] A8 input 阻塞读多等待者覆盖（4 槽不够时）
 - [ ] A9 信号帧边界按进程主栈校验误杀 pthread 工作线程
 - [ ] A10 slab kfree 双重释放防护补完整

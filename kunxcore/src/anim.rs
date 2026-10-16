@@ -489,7 +489,9 @@ fn reset_page_transform(window: usize) {
 }
 
 /// 页面切换：旧窗口 200ms 淡出（alpha 255->0）、新窗口 200ms 淡入
-/// （alpha 0->255），曲线 cubic-bezier(0.4, 0, 0.2, 1)，无位移、无缩放。
+/// （alpha 0->255）。曲线对齐 ColorOS 17：淡入用 ColorOSEmphasized
+/// （快起缓停，入场手感），淡出用 ColorOSStandard（整体标准曲线），
+/// 无位移、无缩放。
 ///
 /// 新窗口位置在切换前强制重置为默认居中（含边界检查），transform 为 identity；
 /// 淡入结束后再次强制重置 transform 为 identity。旧窗口淡出至 alpha 0 后由
@@ -503,7 +505,7 @@ pub fn page_transition(old_win: Option<usize>, new_win: Option<usize>) {
             255.0,
             0.0,
             PAGE_FADE_US,
-            Easing::FastOutSlowIn,
+            Easing::ColorOSStandard,
             None,
         );
     }
@@ -516,7 +518,7 @@ pub fn page_transition(old_win: Option<usize>, new_win: Option<usize>) {
             0.0,
             255.0,
             PAGE_FADE_US,
-            Easing::FastOutSlowIn,
+            Easing::ColorOSEmphasized,
             Some(reset_page_transform),
         );
     }

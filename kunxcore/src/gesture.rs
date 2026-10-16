@@ -487,7 +487,7 @@ fn trigger_home() {
             y as f32,
             compositor::height() as f32,
             HOME_DUR_US,
-            anim::Easing::EaseOut,
+            anim::Easing::ColorOSStandard,
             Some(finish_hide),
         );
         compositor::flush();
@@ -512,7 +512,7 @@ fn trigger_multitask() {
             256.0,
             RECENT_SCALE,
             RECENT_DUR_US,
-            anim::Easing::EaseOut,
+            anim::Easing::ColorOSStandard,
             None,
         );
         anim::tween(
@@ -521,7 +521,7 @@ fn trigger_multitask() {
             y as f32,
             (y - RECENT_UP) as f32,
             RECENT_DUR_US,
-            anim::Easing::EaseOut,
+            anim::Easing::ColorOSStandard,
             None,
         );
         if let Some(dim) = S.dim {
@@ -533,7 +533,7 @@ fn trigger_multitask() {
                 0.0,
                 RECENT_DIM_ALPHA,
                 RECENT_DUR_US,
-                anim::Easing::EaseOut,
+                anim::Easing::ColorOSStandard,
                 None,
             );
         }
@@ -578,7 +578,7 @@ fn trigger_back() {
             x as f32,
             compositor::width() as f32,
             BACK_DUR_US,
-            anim::Easing::EaseOut,
+            anim::Easing::ColorOSStandard,
             Some(finish_hide),
         );
         compositor::flush();
