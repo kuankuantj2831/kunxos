@@ -30,7 +30,7 @@
 - [x] A6 ARP 条目老化（60s TTL，lookup 命中超龄即作废重新解析）
 - [x] A7 ~~oobe 输入跨 read 分割~~：核查已修（EV_BUF 累积缓冲 + consume_input_event，oobe:3752-3921）
 - [x] A10 ~~slab 双释放防护~~：核查已修（slab_free 空闲链表遍历拒绝重复释放，heap.rs）
-- [ ] A8 input 阻塞读多等待者覆盖（4 槽不够时）
+- [x] A8 ~~input 多等待者覆盖~~：核查已修（4 槽 + 满则 yield 重试，input.rs:405-430）
 - [ ] A9 信号帧边界按进程主栈校验误杀 pthread 工作线程
 - [ ] A10 slab kfree 双重释放防护补完整
 - [ ] A11 每轮空闲时：跑一轮并行代码审查（Agent 工具, Explore/general-purpose）找新 bug 并修复

@@ -38,6 +38,8 @@ use crate::syscall_table::TrapFrame;
 use crate::vfs;
 use crate::vm;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 // ==================== errno ====================
 
 const EPERM: i64 = -1;
@@ -2721,6 +2723,14 @@ fn map_framebuffer(addr: usize, len: usize, flags: u32) -> i64 {
     }
     let map_len = len.min(fb_len);
     if map_len == 0 {
+        // 冷路径诊断：launcher 偶发 mmap EINVAL 排查（BUG_REPORT 十一节未决项）
+        crate::kinfo! {
+            crate::uart_send_str("[fb-mmap] EINVAL len=");
+            crate::print_hex(len as u64);
+            crate::uart_send_str(" fb_len=");
+            crate::print_hex(fb_len as u64);
+            crate::uart_send_str("\n");
+        }
         return EINVAL;
     }
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0
@@ -2728,10 +2738,22 @@ fn map_framebuffer(addr: usize, len: usize, flags: u32) -> i64 {
         && addr % vm::PAGE_SIZE == 0;
     let va = if fixed { addr } else { FB_MMAP_ADDR };
     if va % vm::PAGE_SIZE != 0 {
+        crate::kinfo! {
+            crate::uart_send_str("[fb-mmap] EINVAL 未对齐 va=");
+            crate::print_hex(va as u64);
+            crate::uart_send_str("\n");
+        }
         return EINVAL;
     }
     let pages = map_len.div_ceil(vm::PAGE_SIZE);
     if !vm::user_va_range_ok(va, pages * vm::PAGE_SIZE) {
+        crate::kinfo! {
+            crate::uart_send_str("[fb-mmap] EINVAL va_range va=");
+            crate::print_hex(va as u64);
+            crate::uart_send_str(" pages=");
+            crate::print_hex(pages as u64);
+            crate::uart_send_str("\n");
+        }
         return EINVAL;
     }
     if fixed {
