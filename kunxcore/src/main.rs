@@ -2289,7 +2289,12 @@ fn panic(info: &PanicInfo) -> ! {
     // 典型如用户传入坏指针/坏数据触发的切片越界、非法解引用、算术 panic）
     // 时，把故障归咎于该进程并终止它，系统继续运行；内核自身 bug（非
     // syscall 上下文 / 内核线程 / 中断嵌套）保持整机停机诊断。
-    if crate::sched_cfs::in_syscall_user() {
+    // ★ IRQ 上下文守卫（H-2）：中断打断某用户任务 mid-syscall 时
+    // in_syscall_user 同样为真，此刻中断 handler 自身 panic 若照走进程
+    // 遏制会错杀无辜进程。IRQ 上下文内的 panic 属内核自身 bug —— 停机
+    // 诊断（与下方「中断嵌套」注释语义对齐；tid 归属校验后 irq_ctx_frame
+    // 非零即确为本任务中断上下文）。
+    if crate::sched_cfs::in_syscall_user() && crate::interrupt::irq_ctx_frame() == 0 {
         let pid = crate::sched_cfs::current_pid();
         if (pid as usize) < crate::process::MAX_PROC
             && crate::process::processes_pub_ttbr0(pid) != 0
@@ -2311,8 +2316,10 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
     // 内核线程 panic（非 syscall 上下文）：只终止该线程，系统继续运行
-    // （tombstone 已由上方 kernel_panic 落盘）
-    if crate::kthread_fault_contain("panic", 0, 0) {
+    // （tombstone 已由上方 kernel_panic 落盘）。IRQ 上下文守卫同上：中断
+    // 打断用户态代码（depth==0）时 panic 若误入此分支会只杀线程、把
+    // 进程孤儿化（不置 Zombie、父进程永久阻塞、PCB 槽泄漏）。
+    if crate::interrupt::irq_ctx_frame() == 0 && crate::kthread_fault_contain("panic", 0, 0) {
         unreachable!()
     }
     // 死循环，不再返回

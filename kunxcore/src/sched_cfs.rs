@@ -14,7 +14,7 @@
 
 use core::arch::{asm, global_asm};
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::allocator;
 use crate::allocator::alloc_pages_contig;
@@ -241,17 +241,40 @@ static mut CURRENT: [usize; MAX_CPUS] = [usize::MAX; MAX_CPUS];
 /// 就绪任务绝不会被两个核同时选中。单核（默认）运行时锁无竞争，行为与
 /// 原来完全一致。
 static SCHED_LOCK: AtomicBool = AtomicBool::new(false);
+/// 持锁者 tid（0=无主）。故障遏制出口（kill_pid/exit_current）会重取
+/// sched_lock —— 若故障点自身持锁（panic 发生在 tick 的 TASKS/SLEEPERS
+/// 临界区内），持有者已死永不释放，遏制路径在关中断下永久自旋（M-1）。
+/// 与 fs_lock 同款自愈：等待中发现持有者已死即抢锁接管。
+static SCHED_OWNER: AtomicU32 = AtomicU32::new(0);
 
 fn sched_lock() {
-    while SCHED_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let me = current_tid();
+    loop {
+        if SCHED_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+        // 死亡持有者自愈：遏制击杀后槽位复用前 tid 不存活
+        let holder = SCHED_OWNER.load(Ordering::Acquire);
+        if holder != 0 && holder != me && !tid_alive(holder) {
+            // 抢锁：把陈旧所有权连同锁位一并接管
+            if SCHED_OWNER
+                .compare_exchange(holder, me, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                SCHED_LOCK.store(false, Ordering::Release);
+                continue;
+            }
+        }
         core::hint::spin_loop();
     }
+    SCHED_OWNER.store(me, Ordering::Release);
 }
 
 fn sched_unlock() {
+    SCHED_OWNER.store(0, Ordering::Release);
     SCHED_LOCK.store(false, Ordering::Release);
 }
 
@@ -267,7 +290,12 @@ pub fn rename_task(tid: u32, name: &str) {
     // 动态名字须落进永久缓冲。每任务 32B，越界截断。
     static mut NAME_ARENA: [[u8; 32]; MAX_TASKS] = [[0; 32]; MAX_TASKS];
     let bytes = name.as_bytes();
-    let n = bytes.len().min(31);
+    let mut n = bytes.len().min(31);
+    // 字符边界回退：字节截断可能落在多字节 UTF-8 字符中间（M-2），
+    // from_utf8_unchecked 会构造非法 &str（str API 全体 UB）。
+    while n > 0 && (bytes[n - 1] & 0xC0) == 0x80 {
+        n -= 1; // 回退连续的 UTF-8 续字节（10xxxxxx）
+    }
     let saved = unsafe { read_daif() };
     sched_lock();
     unsafe {
@@ -907,12 +935,16 @@ pub fn syscall_leave() {
 
 /// 当前任务是否是**可调度的内核线程**（非 idle、占用任务槽位、不在
 /// syscall 上下文）——其故障可只杀线程保全系统（kthread_fault_contain）。
+/// 必须排除用户任务：中断打断用户态代码（depth==0）的用户任务同样满足
+/// 前三条，误入只杀线程会把进程孤儿化（不置 Zombie、父进程永久阻塞、
+/// PCB 槽泄漏）—— 以「进程无用户地址空间」区分内核线程（H-2 另一半）。
 pub fn is_sched_kthread() -> bool {
     match current_idx() {
         Some(i) => unsafe {
             TASKS[i].state != TaskState::Empty
                 && TASKS[i].class != PriorityClass::Idle
                 && TASKS[i].syscall_depth == 0
+                && crate::process::processes_pub_ttbr0(TASKS[i].pid) == 0
         },
         None => false,
     }

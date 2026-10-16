@@ -135,6 +135,11 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
 static mut IRQ_FRAME: [usize; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
 static mut IRQ_LINE: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
 static mut IRQ_KIND: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
+/// 进入中断处理时的当前任务 tid：时间片抢占会在中断处理中途切走任务
+/// （tick → do_switch），槽位残留的是**被切出任务**的帧。若不加归属校验，
+/// 新任务在时间片窗口内发生 S 态异常会被误判为「中断处理故障」并展开到
+/// 他人帧 —— 跨地址空间 sret（H-1）。取用侧按 tid 一致才承认槽位。
+static mut IRQ_TID: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
 /// 定时器中断内的遏制次数（定时器无法屏蔽——屏蔽即调度停摆；超上限
 /// 说明定时器路径有系统性 bug，转为整机诊断停机）。
 static mut TIMER_CONTAIN_N: [u32; MAX_CPUS_TRACK] = [0; MAX_CPUS_TRACK];
@@ -154,6 +159,7 @@ fn irq_ctx_enter(frame: *mut TrapFrame, kind: u32) {
         let c = cur_cpu();
         IRQ_FRAME[c] = frame as usize;
         IRQ_KIND[c] = kind;
+        IRQ_TID[c] = crate::sched_cfs::current_tid();
     }
 }
 
@@ -177,8 +183,19 @@ fn irq_line_clear() {
 }
 
 /// 当前 CPU 是否处于中断处理上下文（供故障遏制判定），返回外层帧指针。
+/// tid 归属校验：槽位记录的是进入中断时的任务；此后时间片抢占切到别的
+/// 任务（中断处理中途 do_switch）时，残留帧属于被切出任务 —— 对当前任务
+/// 而言不算中断上下文，返回 0（故障按当前任务自己的路径遏制，绝不信
+/// 展开到他人帧的跨地址空间恢复）。
 pub fn irq_ctx_frame() -> usize {
-    unsafe { IRQ_FRAME[cur_cpu()] }
+    unsafe {
+        let c = cur_cpu();
+        if IRQ_FRAME[c] != 0 && IRQ_TID[c] == crate::sched_cfs::current_tid() {
+            IRQ_FRAME[c]
+        } else {
+            0
+        }
+    }
 }
 
 /// 当前正在处理的外部中断线号（0=不在 handler 内）。
