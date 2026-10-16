@@ -1822,10 +1822,43 @@ fn data_boot(devs: &[net_virtio::MmioDev]) {
     //    perflog 清零（一次成功会话即视为恢复）。
     if let Some(n) = bootfail_read() {
         if n >= 2 {
+            // 拼入实际次数（L-3：原为字面量「N」占位符）
+            let mut nb = [0u8; 10];
+            let mut i = nb.len();
+            let mut v = n;
+            loop {
+                i -= 1;
+                nb[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            let mut mb = [0u8; 96];
+            let mut m = 0usize;
+            for &c in "系统近期反复异常重启（累计 ".as_bytes() {
+                if m < mb.len() {
+                    mb[m] = c;
+                    m += 1;
+                }
+            }
+            for &c in &nb[i..] {
+                if m < mb.len() {
+                    mb[m] = c;
+                    m += 1;
+                }
+            }
+            for &c in " 次以上），可能存在深层故障".as_bytes() {
+                if m < mb.len() {
+                    mb[m] = c;
+                    m += 1;
+                }
+            }
+            let msg = core::str::from_utf8(&mb[..m]).unwrap_or("系统近期反复异常重启，可能存在深层故障");
             crate::health::report(
                 crate::health::SEV_CRITICAL,
                 "boot",
-                "系统近期反复异常重启（累计 N 次以上），可能存在深层故障",
+                msg,
                 "建议尽快备份 /data 中的数据；可尝试清除数据恢复出厂（将丢失用户数据），或重新刷机",
             );
         }

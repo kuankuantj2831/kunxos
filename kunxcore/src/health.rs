@@ -57,6 +57,19 @@ fn copy_str(dst: &mut [u8], s: &str) {
     dst[n] = 0;
 }
 
+// IRQ 屏蔽窗口（各模块私有同款实现；S 态 mie 位）
+unsafe fn irq_save() -> u64 {
+    let mut m: u64;
+    unsafe { core::arch::asm!("csrrc {}, sstatus, 2", out(reg) m) };
+    m
+}
+
+unsafe fn irq_restore(saved: u64) {
+    if saved & 2 != 0 {
+        unsafe { core::arch::asm!("csrsi sstatus, 2") };
+    }
+}
+
 fn evt_str(buf: &[u8]) -> &str {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     core::str::from_utf8(&buf[..len]).unwrap_or("")
@@ -68,6 +81,10 @@ fn evt_str(buf: &[u8]) -> &str {
 ///
 /// `irq_ctx` = 调用来自中断上下文（此时禁止 VFS 落盘，只留内存/控制台）。
 pub fn report_irq(irq_ctx: bool, sev: u8, subsys: &'static str, msg: &str, fix: &str) {
+    // IRQ 屏蔽窗口（L-4）：IRQ 上下文（mem_pressure 经 tick / wdt / 遏制）
+    // 与进程上下文并发上报时，单核 IRQ 可打断 copy_str 中途 → 事件撕裂、
+    // RING_N 丢计数。log_write 同款做法：写入环形槽全程关中断。
+    let saved = unsafe { irq_save() };
     let evt = unsafe {
         let idx = RING_N % EVT_CAP;
         RING[idx].t_ms = crate::timer::now_us() / 1000;
@@ -81,6 +98,7 @@ pub fn report_irq(irq_ctx: bool, sev: u8, subsys: &'static str, msg: &str, fix: 
         }
         &RING[idx]
     };
+    unsafe { irq_restore(saved) };
     // 控制台：用户可见的「出了什么事 + 怎么修」
     crate::uart_send_str("[health][");
     crate::uart_send_str(sev_name(sev));

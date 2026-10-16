@@ -74,7 +74,9 @@ pub fn show(reason: &str, extra: &[&str]) {
     // 健康事件计数提示
     let crit = crate::health::critical_count();
     if crit > 0 {
-        let mut b = [0u8; 48];
+        // 缓冲 48 → 96：标签 31B + 数字 + 尾缀 ~38B，48B 必截断尾缀
+        // （上屏残句，L-2）。
+        let mut b = [0u8; 96];
         let msg = make_count_line(crit, &mut b);
         crate::ui_framework::draw_text(&s, 40, y + 12, msg, Color::GRAY, 1);
     }
@@ -82,7 +84,7 @@ pub fn show(reason: &str, extra: &[&str]) {
     gpu_simple::present(base);
 }
 
-fn make_count_line<'a>(crit: u32, buf: &'a mut [u8; 48]) -> &'a str {
+fn make_count_line<'a>(crit: u32, buf: &'a mut [u8; 96]) -> &'a str {
     let mut n = 0usize;
     for &c in "本次开机累计严重故障 ".as_bytes() {
         if n < buf.len() {

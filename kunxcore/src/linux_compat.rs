@@ -2217,8 +2217,17 @@ fn sys_wait4(f: &mut TrapFrame) -> i64 {
             return EFAULT;
         }
         // PAN 放行（此前只校验后裸写）
+        // 编码（L-5）：code >= 0 走正常退出（exit code << 8）；code < 0 是
+        // 遏制/信号击杀（如 process::exit(-11)），按 Linux WIFSIGNALED 语义
+        // 写低 7 位信号号 + bit7（kunxinit 的 sig = status & 0x7F 从此可见，
+        // 「被信号终止」日志不再是死代码）。
+        let status = if code < 0 {
+            (((-code) as u32) & 0x7F) | 0x80
+        } else {
+            ((code & 0xFF) << 8) as u32
+        };
         unsafe {
-            write_u32_to_user(status_ptr, ((code & 0xFF) << 8) as u32);
+            write_u32_to_user(status_ptr, status);
         }
     }
     rpid as i64
