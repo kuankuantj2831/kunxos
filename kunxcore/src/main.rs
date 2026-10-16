@@ -2399,9 +2399,9 @@ pub extern "C" fn kernel_fault_contain(
     print_hex(tval);
     uart_send_str("（终止进程，系统继续运行）\n");
     // 健康事件（陷入上下文 IRQ 屏蔽态：跳过 VFS 落盘，tombstone 已有落盘副本）
-    let mut msg = [0u8; 88];
+    let msg = [0u8; 88];
     let mut n = 0usize;
-    let mut push = |s: &str, msg: &mut [u8; 88], n: &mut usize| {
+    let push = |s: &str, msg: &mut [u8; 88], n: &mut usize| {
         for &c in s.as_bytes() {
             if *n < msg.len() {
                 msg[*n] = c;
@@ -2455,6 +2455,7 @@ pub extern "C" fn kernel_fault_contain(
 ///
 /// 返回 false 表示无法遏制（idle/无任务上下文），调用方走整机诊断。
 #[no_mangle]
+#[allow(improper_ctypes_definitions)] // kind: &str 跨 FFI（Rust→Rust 内部约定，非真 C ABI）
 pub extern "C" fn kthread_fault_contain(kind: &str, cause: u64, tval: u64) -> bool {
     if !crate::sched_cfs::is_sched_kthread() {
         return false;
@@ -2756,7 +2757,7 @@ extern "C" fn el0_fault_handler(frame: *mut u8) -> ! {
 
     // 关键调用寄存器：s0(x8,fp)/ra(x1)/a0(x10)/a1(x11)/a7(x17)（定位跳转 0
     // 的调用点；riscv 帧指针为 s0，返回地址为 ra）
-    let (x29, x30, x0, x1, x8) = unsafe {
+    let (x29, x30, x0, x1, _x8) = unsafe {
         let p = frame as *const u64;
         (*p.add(8), *p.add(1), *p.add(10), *p.add(11), *p.add(8))
     };

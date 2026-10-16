@@ -4,7 +4,6 @@
 //! 每个线程通过 `TPIDR_EL0` 保存自己的本地存储（TLS）基址；该寄存器在
 //! 上下文切换时由 `switch_to` 一并保存/恢复，因此各线程的 TLS 互不干扰。
 
-use core::arch::asm;
 
 use crate::sched_cfs::{self, PriorityClass};
 use crate::vm;

@@ -148,9 +148,9 @@ pub fn critical_count() -> u32 {
 /// 追加一行到 /var/run/health.log（best-effort，失败静默——内存环形缓冲
 /// 与控制台已有副本）。格式：`<t_ms>ms <sev> <subsys> | <msg> | <fix>`。
 fn append_file(evt: &HealthEvent) {
-    let mut line = [0u8; 300];
+    let line = [0u8; 300];
     let mut n = 0usize;
-    let mut push = |s: &str, line: &mut [u8; 300], n: &mut usize| {
+    let push = |s: &str, line: &mut [u8; 300], n: &mut usize| {
         for &c in s.as_bytes() {
             if *n < line.len() - 1 {
                 line[*n] = c;
