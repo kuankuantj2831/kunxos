@@ -122,3 +122,7 @@
 - **L2 fdt.rs 四处递归遍历加 MAX_DEPTH=32 深度上限**（wrapper+depth 参数，防深层 DTB 栈耗尽；bootloader 侧同款）
 - **L1 gdbstub 部分修复**：断点宽度感知 RVC 压缩指令（2 字节 ebreak，不再瞬态清零下一半字）、对齐要求放宽到 2 字节、重插按记录宽度；AArch64 死代码 sync_gdb_entry 保留（编译期无害）——完整单步重构仍待做（RISC-V S 模式需临时断点方案）
 - 回归：make 全量 0 错误（仅预存 target-feature 旗标警告）+ test-sfsrace PASS
+
+### 第 10 轮（2026-10-17 02:3x，定时轮）
+- **L1 gdbstub 完整重构**：RISC-V S 模式无硬件单步，断点继续/单步改为「摘断点 → 下一条指令（RVC 宽度感知）植入临时 ebreak → 命中后重插原断点」的推进状态机；`c` 静默继续、`s` 停在下一条指令。替换失效的 AArch64 set_ss 残留（原断点一次性消失 + PENDING 永久悬空）。已知限制：仅跟踪顺序流（分支目标不埋临时断点，与常见软件单步同款）
+- 回归：make 0 错误 + test-sfsrace PASS

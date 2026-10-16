@@ -339,6 +339,64 @@ static mut STEP_MODE: u8 = 0;
 static mut PENDING_REINSERT: bool = false;
 static mut PENDING_ADDR: u64 = 0;
 
+// ==================== RISC-V 临时推进断点（软件单步替代） ====================
+//
+// S 模式无硬件单步（set_ss 空实现）：断点处继续/单步改用「摘除断点 →
+// 在下一条指令处植入临时 ebreak → 命中临时断点后重插原断点」的推进
+// 状态机（R5-L1：原 AArch64 步进残留使断点一次性且 PENDING 永久悬空）。
+// 已知限制：仅跟踪顺序流（分支目标不埋临时断点），与常见软件单步同款。
+
+/// 临时断点地址（0 = 无）。
+static mut TEMP_BP_ADDR: u64 = 0;
+/// 临时断点命中后需重插的原断点地址。
+static mut TEMP_RESUME_ADDR: u64 = 0;
+/// 临时断点是否由本状态机植入（false = 该处已有真实断点，命中后只重插原断点）。
+static mut TEMP_PLANTED: bool = false;
+/// true = 命中临时断点后停回 GDB（`s` 单步语义）；false = 静默继续（`c`）。
+static mut TEMP_STOP_REPORT: bool = false;
+
+/// 读 `addr` 处原指令宽度（RVC：首半字低 2 位 != 0b11 → 2 字节，否则 4）。
+fn insn_len_at(addr: u64) -> usize {
+    let mut b = [0u8; 4];
+    if mem_read(addr, 4, &mut b) == 4 {
+        if b[0] & 0x3 != 0x3 {
+            2
+        } else {
+            4
+        }
+    } else {
+        4
+    }
+}
+
+/// 武装「临时推进断点」：摘除 `bp_addr` 处断点，在其下一条指令处植入
+/// 临时 ebreak（若该处已有真实断点则不植入，命中时只重插原断点并停下）。
+/// `report` = 命中后是否停回 GDB（`s` 单步语义）。
+unsafe fn arm_temp_advance(bp_addr: u64, report: bool) {
+    let ilen = match bp_find(bp_addr) {
+        Some(i) => {
+            let o = BPS[i].orig;
+            if (o & 0xFFFF) as u8 & 0x3 != 0x3 {
+                2
+            } else {
+                4
+            }
+        }
+        None => insn_len_at(bp_addr),
+    };
+    let next = bp_addr + ilen as u64;
+    bp_remove(bp_addr);
+    unsafe {
+        TEMP_RESUME_ADDR = bp_addr;
+        TEMP_BP_ADDR = next;
+        TEMP_STOP_REPORT = report;
+        TEMP_PLANTED = bp_find(next).is_none();
+        if TEMP_PLANTED {
+            bp_set(next);
+        }
+    }
+}
+
 /// 单步标记（RISC-V S 模式无 MDSCR_EL1.SS 硬件单步 —— dcsr 在 M 模式；
 /// 置位时 GDB 桩在指令边界经软件断点推进，见 STEP_MODE）。
 fn set_ss(_on: bool) {}
@@ -762,9 +820,27 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
 
     match ec {
         3 => {
-            // ebreak：必须是已注册断点，否则交给 el0_fault（SIGTRAP 终止）
-            if bp_find(regs.pc).is_none() {
-                return 1;
+            // 临时推进断点命中：摘临时断点 → 重插原断点 → 静默继续或停回 GDB
+            unsafe {
+                if TEMP_BP_ADDR != 0 && regs.pc == TEMP_BP_ADDR {
+                    if TEMP_PLANTED {
+                        bp_remove(regs.pc);
+                    }
+                    bp_reinsert(TEMP_RESUME_ADDR);
+                    let report = TEMP_STOP_REPORT;
+                    TEMP_BP_ADDR = 0;
+                    TEMP_RESUME_ADDR = 0;
+                    TEMP_PLANTED = false;
+                    TEMP_STOP_REPORT = false;
+                    if !report {
+                        regs.write_to_trap_frame(frame);
+                        return 0; // `c` 的静默推进：继续运行
+                    }
+                    // `s` 的单步：落在下一条指令，停回 GDB（落入下方循环）
+                } else if bp_find(regs.pc).is_none() {
+                    // ebreak：必须是已注册断点，否则交给 el0_fault（SIGTRAP 终止）
+                    return 1;
+                }
             }
         }
         4 if false => {
@@ -805,32 +881,20 @@ pub extern "C" fn gdb_debug_entry(frame: *mut u64) -> u32 {
 
     match result {
         LoopResult::Continue => {
+            // RISC-V：断点处继续 = 摘断点 + 下一条指令植入临时推进断点
+            //（命中后重插原断点并静默继续）。原 AArch64 set_ss 方案在
+            // S 模式无硬件单步下是空操作 → 断点一次性消失（R5-L1）。
             if ec == 3 {
-                // 断点处继续：摘除断点、单步跳过原指令、静默重插
                 if bp_find(regs.pc).is_some() {
-                    bp_remove(regs.pc);
-                    unsafe {
-                        PENDING_REINSERT = true;
-                        PENDING_ADDR = regs.pc;
-                        STEP_MODE = 2;
-                    }
-                    set_ss(true);
-                    regs.cpsr |= 1 << 7; // 步进期间屏蔽 IRQ
+                    unsafe { arm_temp_advance(regs.pc, false) };
                 }
             }
         }
         LoopResult::Step => {
-            // 单步：置位 SS（断点处需先摘除，步进后重插）
+            // 单步：同上但命中临时断点后停回 GDB（pc = 下一条指令）
             if ec == 3 && bp_find(regs.pc).is_some() {
-                bp_remove(regs.pc);
-                unsafe {
-                    PENDING_REINSERT = true;
-                    PENDING_ADDR = regs.pc;
-                }
+                unsafe { arm_temp_advance(regs.pc, true) };
             }
-            unsafe { STEP_MODE = 1 };
-            set_ss(true);
-            regs.cpsr |= 1 << 7;
         }
         LoopResult::Detach => {}
         LoopResult::Kill => {
@@ -899,30 +963,20 @@ pub extern "C" fn sync_gdb_entry() -> u32 {
 
     match result {
         LoopResult::Continue => {
+            // RISC-V：断点处继续 = 摘断点 + 下一条指令植入临时推进断点
+            //（命中后重插原断点并静默继续）。原 AArch64 set_ss 方案在
+            // S 模式无硬件单步下是空操作 → 断点一次性消失（R5-L1）。
             if ec == 3 {
                 if bp_find(regs.pc).is_some() {
-                    bp_remove(regs.pc);
-                    unsafe {
-                        PENDING_REINSERT = true;
-                        PENDING_ADDR = regs.pc;
-                        STEP_MODE = 2;
-                    }
-                    set_ss(true);
-                    regs.cpsr |= 1 << 7;
+                    unsafe { arm_temp_advance(regs.pc, false) };
                 }
             }
         }
         LoopResult::Step => {
+            // 单步：同上但命中临时断点后停回 GDB（pc = 下一条指令）
             if ec == 3 && bp_find(regs.pc).is_some() {
-                bp_remove(regs.pc);
-                unsafe {
-                    PENDING_REINSERT = true;
-                    PENDING_ADDR = regs.pc;
-                }
+                unsafe { arm_temp_advance(regs.pc, true) };
             }
-            unsafe { STEP_MODE = 1 };
-            set_ss(true);
-            regs.cpsr |= 1 << 7;
         }
         LoopResult::Detach => {}
         LoopResult::Kill => {
