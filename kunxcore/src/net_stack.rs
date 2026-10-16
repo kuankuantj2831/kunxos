@@ -109,6 +109,9 @@ const DHCP_TIMEOUT_US: u64 = 15_000_000;
 const DHCP_RETX_US: u64 = 2_000_000;
 
 const ARP_MAX: usize = 8;
+/// ARP 条目生存期（简化 ARP 缓存 TTL，参考 Linux base_reachable_time）。
+/// lookup 命中超龄条目即作废并重新解析。
+const ARP_ENTRY_TTL_US: u64 = 60_000_000;
 const ARP_TIMEOUT_US: u64 = 2_000_000;
 const ARP_RETX_US: u64 = 300_000;
 
@@ -373,9 +376,17 @@ fn eth_send(dst: &[u8; 6], etype: u16, payload: &[u8]) -> i32 {
 
 fn arp_lookup(ip: u32) -> Option<[u8; 6]> {
     unsafe {
+        let now = crate::timer::now_us();
         for e in ARP_CACHE.iter_mut() {
             if e.used && e.ip == ip {
-                e.age = crate::timer::now_us(); // LRU 刷新
+                // 条目老化：超过 TTL 视为陈旧（对端可能已换 MAC/IP），
+                // 清除并重新解析 —— 此前条目一旦学得就永不过期，网络
+                // 拓扑变化后永远发往旧 MAC。
+                if now.saturating_sub(e.age) >= ARP_ENTRY_TTL_US {
+                    *e = EMPTY_ARP;
+                    return None;
+                }
+                e.age = now; // LRU 刷新
                 return Some(e.mac);
             }
         }
