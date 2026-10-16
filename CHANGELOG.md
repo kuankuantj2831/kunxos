@@ -19,6 +19,21 @@
 #### 应用与服务（4 轮审查 17 项缺陷全修）
 - alarmd 贪睡响铃秒停 + 一次性闹钟静默禁用；sms 首启判定反（消息每次翻倍）；rild 长短信标记已读截断；settings 存储页单位损坏/权限页命中守卫；gallery 不可见瓦片可点击；cloud seed 越界闪退/poll 响应别名覆盖/备份 n 不一致；audiomix read 判界
 
+#### 内核安全/正确性（R5-R6 审查轮，第 8-14 轮）
+- **/proc/power、/proc/pressure 写路径 root 门禁**：原任意应用可经 procfs 绕过 syscall 层权限冻结/限速其它进程（跨进程确定性 DoS）
+- **OTA 修复**：load_otp 扇区数纠正（OTP 防回滚楼层首次真正生效）；KXRL1 压缩增量 OTA 解压窗口修正（原 100% 失败）
+- **fdt 递归深度封顶 32**（防损坏 DTB 栈耗尽）；power status 双侧钳制防内核 shell panic；thermal force 溢出防护
+- **gdbstub 重构**：RISC-V 软件单步（临时推进断点状态机，含 RVC 宽度感知、TEMP 清算、失败回滚）——原断点一次性消失/单步自由运行；删除 AArch64 死代码
+- **getrandom/virtio-rng 失步排空**、SCHED_LOCK 遏制出口显式放锁（见上文夜间轮详述）
+
+#### ColorOS 17 动效对标（第 8-14 轮新增）
+- dock 图标鼠标悬浮放大（1.12x + 上浮，进出翻转检测触发重绘）
+- 解锁粒子迸发（24 光点黄金角径向 + 重力 + 290ms alpha 淡出，中心锁图标）
+- 控制中心子元素错峰入场（各行卡片按序上移显现，展开/跟手全程）
+
+#### 验证
+- make 全量 0 错误；test-sfsrace 累计 12+ 次 PASS；10 次真实 GUI 启动链路 0 PANIC/0 fault
+
 #### ColorOS 17 动效对标
 - 全系统三端（内核 anim / shared motion / launcher 本地）接入 **ColorOSStandard(0.22,1,0.36,1)** 与 **ColorOSEmphasized(0.3,0,0.1,1)** 标准曲线；手势退出/多任务/页面切换/应用入场 20+ 站点统一切换
 - 新动效：桌面翻页惯性减速 + 相邻页视差（B5）；开机/解锁亮度渐亮（B8，flip-LUT/烘焙双模式）；应用启动骨架屏呼吸（B10，脏矩形增量）；状态栏充电动效（真实电量+呼吸闪电+插电弹簧弹跳，B12）；控制中心子元素错峰入场
