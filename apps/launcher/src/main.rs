@@ -997,15 +997,22 @@ fn draw_health_banner() {
 /// 桌面与系统面板状态。全部采用定长数据，保持 no_std/无堆。
 static mut CURRENT_PAGE: usize = 0;
 
-// ==================== 桌面翻页动画（对标 ColorOS 15 跟手翻页） ====================
+// ==================== 桌面翻页动画（对标 ColorOS 17 跟手翻页） ====================
 //
 // PAGE_OFFSET 为当前页相对原位的水平像素偏移（右滑为正，px）：
 //   - 跟手段：手指横向拖动直接驱动 PAGE_OFFSET（页界外 0.35x 橡皮筋阻尼）；
-//   - 吸附段：松手后 PAGE_SPRING 把偏移弹回 0（翻页时先提交 CURRENT_PAGE，
-//     新当前页从 ±屏宽 弹入原位，视觉上内容连续滑动）。
+//   - 吸附段（B5）：松手后 ColorOSStandard 定时 tween 减速滑入目标位
+//     （起步斜率 ≈4.5 承接松手惯性、长尾缓停）。翻页目标为 ∓屏宽，动画
+//     到位的瞬间才提交 CURRENT_PAGE 并把 PAGE_OFFSET 归零 —— 页帧位置
+//     全程连续（无瞬移跳变），相邻页视差也随之平滑归零。
 static mut PAGE_OFFSET: f32 = 0.0;
-static mut PAGE_SPRING: Spring = Spring::fixed();
-static mut PAGE_SPRING_T: u64 = 0;
+// 吸附 tween 状态（ColorOSStandard 曲线，docs/animations.md §3.7）。
+static mut PAGE_TWEEN_T0: u64 = 0;
+static mut PAGE_TWEEN_FROM: f32 = 0.0;
+static mut PAGE_TWEEN_TARGET: f32 = 0.0;
+static mut PAGE_TWEEN_DUR: u64 = 0;
+/// 吸附到位后提交的翻页方向（1 下一页 / -1 上一页；0 = 回弹，不提交）。
+static mut PAGE_TWEEN_DIR: i32 = 0;
 /// 吸附弹簧动画进行中。
 static mut PAGE_ANIM: bool = false;
 /// 跟手翻页进行中（手指未抬起）。
@@ -1772,6 +1779,11 @@ fn lock_advance(now: u64) -> bool {
                     LOCKED = false;
                     LOCK_PHASE = LockPhase::None;
                     LOCK_LAYER_OFF = 0.0;
+                    // 解锁渐亮余量转回 flip 施加（桌面已完整可见，烘焙使命
+                    // 完成；两模式 α 连续，交接帧亮度无跳变）。
+                    if boot_fade_active() {
+                        BOOT_FADE_BAKE = false;
+                    }
                     NEEDS_REDRAW = true;
                     return false;
                 }
@@ -1889,6 +1901,9 @@ fn unlock_success() {
         print("[lock] 已解锁\n");
         // 解锁转场（ColorOS 风格）：锁屏整层从当前位置上滑出屏，露出桌面；
         // 完成后由 lock_advance 释放 LOCKED（转场期间输入已被屏蔽）。
+        // 解锁渐亮（B8）：上滑露出的桌面从 0→全亮烘焙点亮（锁屏层保持原
+        // 亮度，无整屏突暗）；转场结束切回 flip 施加余量。
+        boot_fade_start(true);
         LOCK_FROM = LOCK_LAYER_OFF;
         LOCK_DRAG = false;
         LOCK_PHASE = LockPhase::Unlocking;
@@ -2382,6 +2397,96 @@ static mut BOOT_TOTAL: usize = 0;
 /// 已构建缓存瓦片的可见应用数。
 static mut BOOT_BUILT: usize = 0;
 
+// ==================== 开机/解锁亮度渐亮（B8，ColorOS 点屏手感） ====================
+//
+// 桌面首帧出现时 0→全亮 alpha 渐亮（ColorOSStandard：快点亮 + 长尾收满）。
+// 两种施加方式（避免解锁瞬间整屏突暗）：
+//   - flip 施加（BOOT_FADE_BAKE=false，开机路径）：flip 按有效亮度走既有
+//     LUT 通道，BACK_BUF 始终保持全亮内容 —— 渐亮期只重组合上屏（一次 LUT
+//     扫描，与亮度<100 的常规路径同开销级别），不重渲染、无逐像素乘法；
+//   - BACK_BUF 烘焙（BOOT_FADE_BAKE=true，解锁路径）：锁屏层上滑露出桌面
+//     的转场期，渐亮只烘焙进桌面部分（随后绘制的锁屏层保持原亮度），
+//     转场结束（LOCKED=false）切回 flip 施放余量 —— 两模式交接处 α 连续。
+
+/// 渐亮起始时刻（0 = 未激活；读即推进，播完自动清 0）。
+static mut BOOT_FADE_T0: u64 = 0;
+/// 是否为 BACK_BUF 烘焙模式（解锁转场期）。
+static mut BOOT_FADE_BAKE: bool = false;
+/// 渐亮总时长（约 400~600ms 区间取 520ms）。
+const BOOT_FADE_US: u64 = 520_000;
+
+/// 启动一次渐亮（开机 flip 施加 / 解锁烘焙，重新触发则重置计时）。
+fn boot_fade_start(bake: bool) {
+    unsafe {
+        BOOT_FADE_T0 = now_us();
+        BOOT_FADE_BAKE = bake;
+    }
+}
+
+/// 渐亮是否仍在进行（主循环低开销重组合的唤醒条件）。
+fn boot_fade_active() -> bool {
+    unsafe { BOOT_FADE_T0 != 0 }
+}
+
+/// 当前渐亮 α ∈ (0,1]（ColorOSStandard）；播完自动清除（读即推进）。
+fn boot_fade_alpha(now: u64) -> f32 {
+    unsafe {
+        let t0 = BOOT_FADE_T0;
+        if t0 == 0 {
+            return 1.0;
+        }
+        let p = motion::progress(t0, BOOT_FADE_US, now);
+        if p >= 1.0 {
+            BOOT_FADE_T0 = 0;
+            BOOT_FADE_BAKE = false;
+            return 1.0;
+        }
+        motion::Easing::ColorOSStandard.eval(p)
+    }
+}
+
+/// flip 的有效亮度级别（0..=100）：仅 flip 施加模式参与渐亮；烘焙模式的
+/// 渐亮已写进 BACK_BUF，flip 再降会双重压暗，故返回用户亮度原值。
+fn boot_fade_flip_level(now: u64) -> u32 {
+    unsafe {
+        if BOOT_FADE_T0 == 0 || BOOT_FADE_BAKE {
+            return BRIGHTNESS;
+        }
+        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(now) + 0.5) as u32;
+        if lvl > BRIGHTNESS {
+            BRIGHTNESS
+        } else {
+            lvl
+        }
+    }
+}
+
+/// 解锁转场期把渐亮烘焙进 BACK_BUF（只压暗桌面，随后绘制的锁屏层不受影响）：
+/// 256 项 LUT 帧级重建 + 一遍过查表（无逐像素乘除），上滑露出的桌面从暗到亮
+/// 点起；已达全亮（α=1）时零开销直通。
+fn boot_fade_bake_back_buf() {
+    unsafe {
+        if BOOT_FADE_T0 == 0 || !BOOT_FADE_BAKE {
+            return;
+        }
+        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(now_us()) + 0.5) as u32;
+        if lvl >= BRIGHTNESS || BRIGHTNESS == 0 {
+            return;
+        }
+        let mut lut = [0u32; 256];
+        for v in 0..256usize {
+            lut[v] = v as u32 * lvl / 100;
+        }
+        for i in 0..DISPLAY_W * DISPLAY_H {
+            let p = BACK_BUF[i];
+            let r = lut[((p >> 16) & 0xFF) as usize];
+            let g = lut[((p >> 8) & 0xFF) as usize];
+            let b = lut[(p & 0xFF) as usize];
+            BACK_BUF[i] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 /// 全局像素写入透明度（255 = 不透明）。Toast 等浮层淡入淡出期间临时降低，
 /// put_pixel 写 BACK_BUF 时按它做 alpha 混合，绘制完毕即恢复 255。
 /// 瓦片渲染路径（图标/文件夹预渲染）不受影响（浮层不会与瓦片模式并存）。
@@ -2457,10 +2562,11 @@ fn current_pixel(x: i32, y: i32) -> u32 {
 
 /// 把 back buffer 一次性拷贝到显存。
 ///
-/// 重建亮度 LUT（亮度级别变化时调用；首次 flip 也会自动触发）。
-fn rebuild_brightness_lut() {
+/// 重建亮度 LUT（有效亮度级别变化时调用；首次 flip 自动触发）。
+/// `level` 为 0..=100 的百分比 —— 用户亮度，或开机/解锁渐亮期的
+/// `用户亮度 × α`（B8），与 LUT 语义一致。
+fn rebuild_brightness_lut(level: u32) {
     unsafe {
-        let level = BRIGHTNESS;
         for v in 0..256usize {
             BRIGHTNESS_LUT[v] = v as u32 * level / 100;
         }
@@ -2473,21 +2579,25 @@ fn rebuild_brightness_lut() {
 /// 未显式调用 `mark_dirty` 时退化为整屏拷贝 + 整屏脏区（与旧行为一致）；
 /// 调用过则只拷贝/提交已标记的矩形 —— 时钟/光标/通知等局部更新从 2MB
 /// 整屏 memcpy 降到矩形级拷贝。
-/// 亮度 < 100 时经 LUT 查表缩放（亮度改变时重建，避免每帧每像素乘除）。
+/// 亮度 < 100（含开机/解锁渐亮期 B8 的有效亮度）时经 LUT 查表缩放
+/// （级别改变时重建，避免每帧每像素乘除）。
 fn flip() {
     unsafe {
         if FB.is_null() {
             return;
         }
-        if BRIGHTNESS_LUT_LEVEL != BRIGHTNESS {
-            rebuild_brightness_lut();
+        // 有效亮度 = 用户亮度 × 渐亮 α（flip 施加模式）；非渐亮期恒等于
+        // BRIGHTNESS，与既有行为一致。
+        let lvl = boot_fade_flip_level(now_us());
+        if BRIGHTNESS_LUT_LEVEL != lvl {
+            rebuild_brightness_lut(lvl);
         }
         if DIRTY_COUNT == 0 && !DIRTY_FULL {
             DIRTY_FULL = true;
         }
         if DIRTY_FULL {
             if FB_W == DISPLAY_W && FB_H == DISPLAY_H && FB_STRIDE_PX == DISPLAY_W {
-                if BRIGHTNESS >= 100 {
+                if lvl >= 100 {
                     core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB, DISPLAY_W * DISPLAY_H);
                 } else {
                     for i in 0..DISPLAY_W * DISPLAY_H {
@@ -2526,7 +2636,7 @@ fn flip() {
                     continue;
                 }
                 let rw = (x1 - x0) as usize;
-                if BRIGHTNESS >= 100 {
+                if lvl >= 100 {
                     for y in y0..y1 {
                         core::ptr::copy_nonoverlapping(
                             BACK_BUF.as_ptr().add(y as usize * DISPLAY_W + x0 as usize),
@@ -3911,20 +4021,43 @@ fn draw_icon_rot_folder(cx: i32, cy: i32, ang_deg: f32) {
     }
 }
 
+/// 相邻页内容视差位移（px，B5）：非焦点页按抛物线包络向页外轻推。
+/// `frame` 为该页相对屏原点的帧偏移，x = frame/屏宽：
+///   shift = 0.15 · x · (1 - |x|) · 屏宽
+/// 起步段内容位移率 ≈0.85（图标比页面帧慢半拍，位移系数 0.85），
+/// 焦点处（frame=0）与满屏外（|frame|=屏宽）都精确归零 —— 相邻页滑到
+/// 焦点时内容恰好对齐、翻页提交/回弹瞬间无跳变，也绝不与焦点页重叠。
+fn page_parallax_shift(frame: f32) -> f32 {
+    let w = DISPLAY_W as f32;
+    let x = frame / w;
+    let ax = if x < 0.0 { -x } else { x };
+    if ax >= 1.0 {
+        return 0.0;
+    }
+    0.15 * x * (1.0 - ax) * w
+}
+
 fn draw_page() {
     unsafe {
         if PAGE_ANIM || PAGE_DRAG {
-            // 翻页动画：第 k 页绘制在 offset + k*屏宽（ColorOS 15 页面滑动）。
+            // 翻页动画：第 k 页帧绘制在 offset + k*屏宽（ColorOS 页面滑动）。
             // 窗口取 ±2 页：快速连续翻页时偏移可瞬时超过一屏，
             // 保证可视区域始终有页面覆盖；出屏的页由 draw_page_at 跳过。
-            let w = DISPLAY_W as i32;
-            let off = PAGE_OFFSET as i32;
+            // 非焦点页（k≠0）叠加视差位移（图标滞后 + 到位对齐，B5），
+            // 焦点页保持 1:1 跟手。
+            let w = DISPLAY_W as f32;
             let cur = CURRENT_PAGE as i32;
             let mut k = -2i32;
             while k <= 2 {
                 let p = cur + k;
                 if p >= 0 && (p as usize) < page_count() {
-                    draw_page_at(p as usize, off + k * w);
+                    let frame = PAGE_OFFSET + k as f32 * w;
+                    let off = if k == 0 {
+                        frame
+                    } else {
+                        frame + page_parallax_shift(frame)
+                    };
+                    draw_page_at(p as usize, off as i32);
                 }
                 k += 1;
             }
@@ -4051,21 +4184,31 @@ fn draw_page_dots() {
     unsafe {
         let gap = 16;
         let start = DISPLAY_W as i32 / 2 - ((pages as i32 - 1) * gap) / 2;
+        // 翻页吸附段页码在到位瞬间才提交（B5）：吸附期间按「已提交」视点
+        // 取显示页码/偏移（新页码 + 偏移±屏宽），页码点行为与到位后连续。
+        let (disp_page, disp_off) = if PAGE_ANIM && PAGE_TWEEN_DIR != 0 {
+            (
+                (CURRENT_PAGE as i32 + PAGE_TWEEN_DIR).clamp(0, pages as i32 - 1) as usize,
+                PAGE_OFFSET + DISPLAY_W as f32 * PAGE_TWEEN_DIR as f32,
+            )
+        } else {
+            (CURRENT_PAGE, PAGE_OFFSET)
+        };
         // 翻页进度（0..1）：页码点整体随偏移平移，当前页与目标页的颜色
         // 按进度交叉过渡（ColorOS 指示点跟随手感）。
-        let t = (PAGE_OFFSET.abs() / DISPLAY_W as f32).min(1.0);
-        let shift = (PAGE_OFFSET / DISPLAY_W as f32) * gap as f32;
-        let dir = if PAGE_OFFSET > 0.0 { -1i32 } else { 1 };
-        let other = CURRENT_PAGE as i32 + dir;
+        let t = (disp_off.abs() / DISPLAY_W as f32).min(1.0);
+        let shift = (disp_off / DISPLAY_W as f32) * gap as f32;
+        let dir = if disp_off > 0.0 { -1i32 } else { 1 };
+        let other = disp_page as i32 + dir;
         let active = COLOR_TEXT_MAIN;
         let idle = 0x00_78_85_98;
         for i in 0..pages {
-            let mut c = if i == CURRENT_PAGE { active } else { idle };
+            let mut c = if i == disp_page { active } else { idle };
             if t > 0.0 && other >= 0 && (other as usize) < pages {
                 let a = (t * 255.0) as u32;
                 if i as i32 == other {
                     c = blend(idle, active, a);
-                } else if i == CURRENT_PAGE {
+                } else if i == disp_page {
                     c = blend(active, idle, a);
                 }
             }
@@ -4121,57 +4264,82 @@ fn page_drag_update(dx: i32) {
 }
 
 /// 结算翻页：`dir` = 1 下一页 / -1 上一页 / 0 回弹；`vel` 为手势水平速度
-/// （px/s，带入弹簧作为初速度，快扫轻拨也能翻页）。
+/// （px/s，快扫轻拨也能翻页）。
+///
+/// 松手后按 ColorOSStandard 曲线减速滑入目标位（B5，ColorOS 17 翻页手感）：
+/// 起步斜率陡（≈4.5，天然承接松手惯性）+ 长尾缓停。翻页时 tween 终点为
+/// ∓屏宽，动画到位的瞬间才提交 CURRENT_PAGE 并归零偏移 —— 页帧位置全程
+/// 连续（无瞬移），相邻页视差在焦点处恰好归零，提交无跳变。
 fn page_settle(dir: i32, vel: f32) {
     unsafe {
         PAGE_DRAG = false;
         PAGE_TRACK = false;
-        if page_count() > 1 && dir != 0 {
-            let np = (CURRENT_PAGE as i32 + dir).clamp(0, page_count() as i32 - 1);
-            if np as usize != CURRENT_PAGE {
-                // 提交目标页：新当前页从原相邻页位置（±屏宽处）弹入原位，
-                // 与跟手段的页面位置无缝衔接。
-                let w = DISPLAY_W as f32;
-                PAGE_OFFSET = if dir > 0 {
-                    PAGE_OFFSET + w
-                } else {
-                    PAGE_OFFSET - w
-                };
-                CURRENT_PAGE = np as usize;
-                // 页码结算日志：宿主回归脚本据此确认翻页是否生效
-                // （注入帧在风暴窗口可能丢字节 → 滑动丢失，脚本重试）。
-                print("[launcher] page=");
-                print_dec(CURRENT_PAGE as u32);
-                print("\n");
+        // 边界：越界方向无页可翻 → 回弹。
+        let mut dir = dir;
+        if dir != 0 {
+            let np = CURRENT_PAGE as i32 + dir;
+            if np < 0 || np >= page_count() as i32 {
+                dir = 0;
             }
         }
+        let w = DISPLAY_W as f32;
+        let target = if dir > 0 {
+            -w
+        } else if dir < 0 {
+            w
+        } else {
+            0.0
+        };
+        let dist = (target - PAGE_OFFSET).abs();
+        // 时长：剩余距离为主（140ms + 0.45ms/px），快扫按松手速度折减 ——
+        // 起步斜率越快档越短，衔接「轻拨快滑」；整体钳在 200~460ms。
+        let vel_k = if vel.abs() > 1200.0 {
+            0.78
+        } else if vel.abs() > 600.0 {
+            0.9
+        } else {
+            1.0
+        };
+        let dur = ((140_000.0 + 450.0 * dist) * vel_k).clamp(200_000.0, 460_000.0);
+        PAGE_TWEEN_T0 = now_us();
+        PAGE_TWEEN_FROM = PAGE_OFFSET;
+        PAGE_TWEEN_TARGET = target;
+        // 剩余距离近一个像素时一帧内到位（直接走提交路径）。
+        PAGE_TWEEN_DUR = if dist < 0.5 { 1 } else { dur as u64 };
+        PAGE_TWEEN_DIR = dir;
         PAGE_ANIM = true;
-        PAGE_SPRING = Spring::page();
-        // 弹簧从当前偏移（翻页时为 ±屏宽附近，回弹时为拖动残位）弹回 0；
-        // 不初始化 pos 的话第一帧 PAGE_OFFSET 直接跳到弹簧 pos（≈0），页面瞬移。
-        PAGE_SPRING.pos = PAGE_OFFSET;
-        PAGE_SPRING.target = 0.0;
-        PAGE_SPRING.vel = vel.clamp(-4000.0, 4000.0);
-        PAGE_SPRING_T = now_us();
         NEEDS_REDRAW = true;
     }
 }
 
-/// 翻页弹簧推进：返回 true 表示动画仍在进行（需要继续重绘）。
+/// 翻页吸附推进（ColorOSStandard 减速滑动）：返回 true 表示动画仍在进行
+/// （需要继续重绘）。到位帧提交页码（页码日志供宿主回归脚本确认翻页）。
 fn page_advance(now: u64) -> bool {
     unsafe {
         if !PAGE_ANIM {
             return false;
         }
-        let dt = now.saturating_sub(PAGE_SPRING_T) as f32 / 1000.0;
-        PAGE_SPRING_T = now;
-        if PAGE_SPRING.step_ms(dt) {
-            PAGE_OFFSET = 0.0;
+        let p = motion::progress(PAGE_TWEEN_T0, PAGE_TWEEN_DUR, now);
+        if p >= 1.0 {
             PAGE_ANIM = false;
+            if PAGE_TWEEN_DIR != 0 {
+                let np = CURRENT_PAGE as i32 + PAGE_TWEEN_DIR;
+                PAGE_TWEEN_DIR = 0;
+                if np >= 0 && (np as usize) < page_count() {
+                    CURRENT_PAGE = np as usize;
+                    // 页码结算日志：宿主回归脚本据此确认翻页是否生效
+                    // （注入帧在风暴窗口可能丢字节 → 滑动丢失，脚本重试）。
+                    print("[launcher] page=");
+                    print_dec(CURRENT_PAGE as u32);
+                    print("\n");
+                }
+            }
+            PAGE_OFFSET = 0.0;
             NEEDS_REDRAW = true;
             return false;
         }
-        PAGE_OFFSET = PAGE_SPRING.pos;
+        let e = motion::Easing::ColorOSStandard.eval(p);
+        PAGE_OFFSET = motion::lerp(PAGE_TWEEN_FROM, PAGE_TWEEN_TARGET, e);
         true
     }
 }
@@ -6526,6 +6694,9 @@ fn render_frame() {
                 render_lock_screen();
             } else {
                 draw_desktop_full();
+                // 解锁渐亮（B8）：桌面条带按当前 α 压暗烘焙，随后绘制的锁屏
+                // 层保持原亮度 —— 上滑露出的桌面从暗到亮点起，flip 不再二次压暗。
+                boot_fade_bake_back_buf();
                 draw_lock_layer(LOCK_LAYER_OFF as i32);
             }
             return;
@@ -8179,6 +8350,9 @@ fn boot_begin() {
         BOOT_TOTAL = PAGES[0].count + DOCK_COUNT;
         BOOT_BUILT = 0;
     }
+    // 开机渐亮（B8）：首帧以 α≈0 上屏（首个 flip 走 LUT 通道），桌面/锁屏
+    // 在 ~520ms 内点亮；与内核启动画面 150ms 淡出自然交叠。
+    boot_fade_start(false);
     render_frame();
     flip();
     // 桌面首帧已渲染：触发内核侧启动画面 150ms 线性淡出（无启动画面时无操作）。
@@ -8659,6 +8833,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             unsafe {
                 CURSOR_DIRTY = false;
             }
+        } else if boot_fade_active() && unsafe { !BOOT_FADE_BAKE } {
+            // 3.1 开机/解锁渐亮余量（B8，flip 施加模式）：BACK_BUF 内容未变，
+            //     只按新的有效亮度重组合上屏（一次 LUT 扫描，不重渲染），
+            //     光标 overlay 随之补画 —— 渐亮期每帧开销与亮度<100 常规
+            //     路径同级，远低于整屏 render_frame。
+            flip();
+            draw_cursor_overlay();
         } else if unsafe { STATUS_DIRTY } {
             // 分钟刻度：只重绘顶部 24px 状态栏（脏矩形路径，非整屏）。
             redraw_status_bar_fast();

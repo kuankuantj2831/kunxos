@@ -70,20 +70,8 @@ impl Spring {
             vel: 0.0,
         }
     }
-    /// 桌面翻页吸附弹簧：≈260ms 收敛、近临界阻尼（ζ=0.8，几乎无过冲），
-    /// 对标 ColorOS 15 桌面翻页的利落吸附手感。
-    pub fn page() -> Spring {
-        let zeta = 0.8;
-        let omega = 4.6 / (zeta * 0.26);
-        Spring {
-            stiffness: omega * omega,
-            mass: 1.0,
-            damping: 2.0 * zeta * omega,
-            target: 0.0,
-            pos: 0.0,
-            vel: 0.0,
-        }
-    }
+    /// 桌面翻页吸附已改用 ColorOSStandard 定时 tween（B5，main.rs
+    /// page_settle/page_advance），弹簧版本退役删除。
     /// ColorOS 15 打断回弹弹簧：刚度 210 N/m、阻尼比 0.45 —— 比 iOS 打断弹簧
     /// （刚度 280、阻尼 0.5）更绵软，图标从最远处弹回时越过原位约 15~20%，
     /// 再以 2~3 次衰减摇摆收敛（果冻回弹）。`initial_velocity` 为弹出段末速

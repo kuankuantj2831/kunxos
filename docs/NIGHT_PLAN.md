@@ -38,10 +38,10 @@
 ### B. 动画 / ColorOS 17 对标（kunxcore/src/compositor.rs、ui_framework.rs、apps/launcher）
 
 - [x] B1 统一动画引擎：已有完整基建（`shared/motion.rs` 贝塞尔+弹簧、内核 `kunxcore/src/anim.rs`、launcher `app_launch.rs` 转场、`anim.rs` 动画框架、docs/animations.md 规范）。本轮补齐 **ColorOS 17 标准曲线**：`Easing::ColorOSStandard(0.22,1,0.36,1)` + `ColorOSEmphasized(0.3,0,0.1,1)`，内核与应用两侧同步。**注意：B2 图标按压回弹、B3/B4 启动/返回转场均已存在**（app_launch.rs 的 start_press/start_launch/start_fly_away），后续轮次勿重做，改为把既有动画的曲线切换到 ColorOS 曲线并逐个体验调优。
-- [ ] B5 桌面翻页惯性滚动 + 越界回弹阻尼
+- [x] B5 桌面翻页惯性滚动 + 越界回弹阻尼（松手 ColorOSStandard 减速吸附、到位才提交页码；相邻页视差 位移系数≈0.85 抛物线包络；越界 0.35x 橡皮筋沿用）
 - [ ] B6 通知横幅（若有通知组件）滑入 + 手势滑动速度判定收/放
 - [ ] B7 窗口 close/minimize 缩放淡出
-- [ ] B8 解锁/开机亮度渐亮动画
+- [x] B8 解锁/开机亮度渐亮动画（520ms ColorOSStandard 0→全亮；开机 flip LUT 施加 / 解锁 BACK_BUF 烘焙两模式，无整屏突暗）
 - [ ] B9 dock 栏图标悬浮放大（hover/触摸接近）
 - [ ] B10 骨架屏/加载占位动画（应用启动期间 launcher 占位页加呼吸动画）
 - [ ] B11 长按图标抖动 + 删除模式（ColorOS 编辑桌面）
