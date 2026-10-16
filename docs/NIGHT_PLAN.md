@@ -159,7 +159,7 @@
 
 ## 最终交付总结（2026-10-17 06:36，夜间十小时自动化收官）
 
-**总账**：本地 git 31 个提交（43eaaf9 之后，未 push）；6 轮并行代码审查（R1-R6）+ 主会话连续工作段 + 15 个工单轮次；全夜间每轮 `make` 全量 0 错误，`make test-sfsrace` 累计 12+ 次 PASS，10 次真实 GUI 启动链路 0 PANIC / 0 fault。
+**总账（07:36 终版）**：本地 git 35 个提交（43eaaf9 之后，未 push）；6 轮并行代码审查（R1-R6）+ 主会话连续工作段 + 19 个工单轮次；全夜间每轮 `make` 全量 0 错误，`make test-sfsrace` 累计 14+ 次 PASS。**端到端 GUI 实证**：OOBE 13 步自动推进 → launcher 桌面稳定运行 3.5 分钟 0 PANIC/0 fault（第 18 轮冒烟还抓到并修复了一个 launcher panic 循环——health_load 读失败 -1 经 as usize 穿透守卫，usize 清剿族漏网）；第 17 轮清掉 IRQ 上下文 health 上报的毫秒级 UART 忙等（延迟环形缓冲 + perf_log 线程冲刷）。
 
 ### 一、修复的 bug（35+ 项，全部经审查确认有具体触发路径）
 
@@ -194,7 +194,6 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 ### 四、遗留事项（均已记录，非阻塞）
 
 1. A1：launcher mmap /dev/fb0 偶发 EINVAL——10 次启动未复现，`[fb-mmap]` 诊断就位，复现时串口直接定位
-2. L-D：IRQ 上下文 health 上报的阻塞 UART 打印（事件稀有，毫秒级，已知取舍）
 3. gdbstub 软件单步仅跟踪顺序流（分支目标不埋临时断点，与常见实现同款）
 4. SMP 仍为实验特性；kunxui 控件库就绪待接入（设置应用候选）
 5. test-wireless 宿主测试在 RISC-V 移植后空置（以 test-sfsrace 为权威回归）
