@@ -117,3 +117,8 @@
 - L2 fdt.rs 四处递归遍历加 depth 上限（32）
 - A1 launcher mmap /dev/fb0 偶发 EINVAL：等 [fb-mmap] 诊断输出复现
 - kunxui 控件库已就绪但零引用：可评估接入 launcher（动画长尾）
+
+### 第 9 轮（2026-10-17 01:3x，定时轮）
+- **L2 fdt.rs 四处递归遍历加 MAX_DEPTH=32 深度上限**（wrapper+depth 参数，防深层 DTB 栈耗尽；bootloader 侧同款）
+- **L1 gdbstub 部分修复**：断点宽度感知 RVC 压缩指令（2 字节 ebreak，不再瞬态清零下一半字）、对齐要求放宽到 2 字节、重插按记录宽度；AArch64 死代码 sync_gdb_entry 保留（编译期无害）——完整单步重构仍待做（RISC-V S 模式需临时断点方案）
+- 回归：make 全量 0 错误（仅预存 target-feature 旗标警告）+ test-sfsrace PASS

@@ -168,8 +168,19 @@ impl Fdt {
         }
     }
 
+    /// 递归深度上限（R5-L2）：深层/损坏 DTB 防内核栈耗尽（bootloader 侧
+    /// dtb.rs 的 MAX_DEPTH=16 同款；正常设备树深度 < 10）。
+    const MAX_DEPTH: u32 = 32;
+
     /// 在 `p`（某节点内部第一个 token）开始的子树中按相对路径查找节点。
-    fn search(&self, mut p: usize, path: &str) -> Option<usize> {
+    fn search(&self, p: usize, path: &str) -> Option<usize> {
+        self.search_d(p, path, 0)
+    }
+
+    fn search_d(&self, mut p: usize, path: &str, depth: u32) -> Option<usize> {
+        if depth > Self::MAX_DEPTH {
+            return None;
+        }
         loop {
             let t = self.token(p);
             p += 4;
@@ -186,7 +197,7 @@ impl Fdt {
                         && path.as_bytes()[name.len()] == b'/'
                     {
                         let rest = &path[name.len() + 1..];
-                        if let Some(found) = self.search(p, rest) {
+                        if let Some(found) = self.search_d(p, rest, depth + 1) {
                             return Some(found);
                         }
                     }
@@ -241,7 +252,14 @@ impl Fdt {
     }
 
     /// 按 compatible 字符串遍历整棵树，返回第一个匹配节点。
-    fn search_compatible(&self, mut p: usize, compat: &str) -> Option<usize> {
+    fn search_compatible(&self, p: usize, compat: &str) -> Option<usize> {
+        self.search_compatible_d(p, compat, 0)
+    }
+
+    fn search_compatible_d(&self, mut p: usize, compat: &str, depth: u32) -> Option<usize> {
+        if depth > Self::MAX_DEPTH {
+            return None;
+        }
         loop {
             let t = self.token(p);
             p += 4;
@@ -255,7 +273,7 @@ impl Fdt {
                         }
                     }
                     // 递归进入子节点
-                    if let Some(found) = self.search_compatible(child, compat) {
+                    if let Some(found) = self.search_compatible_d(child, compat, depth + 1) {
                         return Some(found);
                     }
                     p = self.skip_subtree(child);
@@ -318,11 +336,25 @@ impl Fdt {
     /// `find_all_compatible` 的递归实现，累计写入 `out` 并由 `count` 记录个数。
     fn search_compatible_all(
         &self,
-        mut p: usize,
+        p: usize,
         compat: &str,
         out: &mut [Node],
         count: &mut usize,
     ) {
+        self.search_compatible_all_d(p, compat, out, count, 0)
+    }
+
+    fn search_compatible_all_d(
+        &self,
+        mut p: usize,
+        compat: &str,
+        out: &mut [Node],
+        count: &mut usize,
+        depth: u32,
+    ) {
+        if depth > Self::MAX_DEPTH {
+            return;
+        }
         loop {
             let t = self.token(p);
             p += 4;
@@ -337,7 +369,7 @@ impl Fdt {
                             }
                         }
                     }
-                    self.search_compatible_all(child, compat, out, count);
+                    self.search_compatible_all_d(child, compat, out, count, depth + 1);
                     p = self.skip_subtree(child);
                 }
                 FDT_END_NODE => return,
@@ -367,7 +399,20 @@ impl Fdt {
     }
 
     /// 遍历 `p` 起始的子树，查找第一个 `name` 属性值等于 `value` 的节点。
-    fn search_property(&self, mut p: usize, name: &str, value: &str) -> Option<usize> {
+    fn search_property(&self, p: usize, name: &str, value: &str) -> Option<usize> {
+        self.search_property_d(p, name, value, 0)
+    }
+
+    fn search_property_d(
+        &self,
+        mut p: usize,
+        name: &str,
+        value: &str,
+        depth: u32,
+    ) -> Option<usize> {
+        if depth > Self::MAX_DEPTH {
+            return None;
+        }
         loop {
             let t = self.token(p);
             p += 4;
@@ -380,7 +425,7 @@ impl Fdt {
                             return Some(child);
                         }
                     }
-                    if let Some(found) = self.search_property(child, name, value) {
+                    if let Some(found) = self.search_property_d(child, name, value, depth + 1) {
                         return Some(found);
                     }
                     p = self.skip_subtree(child);

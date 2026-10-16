@@ -226,10 +226,14 @@ pub const MAX_BPS: usize = 16;
 struct Bp {
     addr: u64,
     orig: u32,
+    /// 断点写入宽度（字节）：2=压缩指令半字 ebreak，4=32 位指令。
+    /// 原实现恒写 4 字节（0x9002+0x0000），目标为 16 位压缩指令时会
+    /// 把下一指令的半字瞬态清零（R5-L1）。
+    len: u8,
     active: bool,
 }
 
-const EMPTY_BP: Bp = Bp { addr: 0, orig: 0, active: false };
+const EMPTY_BP: Bp = Bp { addr: 0, orig: 0, len: 4, active: false };
 static mut BPS: [Bp; MAX_BPS] = [EMPTY_BP; MAX_BPS];
 static mut BP_COUNT: usize = 0;
 
@@ -258,7 +262,8 @@ fn bp_find(addr: u64) -> Option<usize> {
 
 /// 设置软件断点：保存原指令并写入 BRK #0。
 fn bp_set(addr: u64) -> bool {
-    if addr % 4 != 0 || addr == 0 {
+    // RVC 允许 2 字节对齐（原 4 字节对齐要求拒绝半字位置的合法断点）
+    if addr % 2 != 0 || addr == 0 {
         return false;
     }
     if let Some(_) = bp_find(addr) {
@@ -274,13 +279,21 @@ fn bp_set(addr: u64) -> bool {
         if n != 4 {
             return false;
         }
-        // 写入 BRK
+        // 指令宽度判定（RVC）：低 2 位 != 0b11 即 16 位压缩指令。
+        // 压缩指令只写 2 字节 ebreak（0x9002），不触碰下一半字。
+        let compressed = orig[0] & 0x3 != 0x3;
+        let len: u8 = if compressed { 2 } else { 4 };
         let brk = BRK_INS.to_le_bytes();
-        if mem_write(addr, &brk) != 4 {
+        if mem_write(addr, &brk[..len as usize]) != len as usize {
             return false;
         }
         flush_insn(addr);
-        BPS[BP_COUNT] = Bp { addr, orig: u32::from_le_bytes(orig), active: true };
+        BPS[BP_COUNT] = Bp {
+            addr,
+            orig: u32::from_le_bytes(orig),
+            len,
+            active: true,
+        };
         BP_COUNT += 1;
         true
     }
@@ -290,8 +303,9 @@ fn bp_set(addr: u64) -> bool {
 fn bp_remove(addr: u64) -> bool {
     if let Some(idx) = bp_find(addr) {
         unsafe {
+            let len = BPS[idx].len as usize;
             let orig = BPS[idx].orig.to_le_bytes();
-            if mem_write(addr, &orig) == 4 {
+            if mem_write(addr, &orig[..len]) == len {
                 flush_insn(addr);
             }
             BPS[idx].active = false;
@@ -309,8 +323,9 @@ fn bp_remove(addr: u64) -> bool {
 
 /// 重插断点（单步跳过原指令后）。
 fn bp_reinsert(addr: u64) {
+    let len = bp_find(addr).map(|i| unsafe { BPS[i].len as usize }).unwrap_or(4);
     let brk = BRK_INS.to_le_bytes();
-    if mem_write(addr, &brk) == 4 {
+    if mem_write(addr, &brk[..len]) == len {
         flush_insn(addr);
     }
 }
