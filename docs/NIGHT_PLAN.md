@@ -83,3 +83,17 @@
 - 内核 7 条预存警告清零（已提交；其中 2 个 mut 为必需，已恢复）
 - 回归：make test-sfsrace PASS ×3
 - 进行中：R3 审查今夜全部 diff（交付前质量关）
+
+### 第 6 轮（2026-10-17 凌晨，R3 复查关）
+- **R3 审查今夜全部 diff**（43eaaf9..HEAD 12 提交）：发现夜间代码自身 2 High + 3 Medium + 4 Low，已全部修复提交——
+  - H1 virtio-rng 超时后 used-ring 失步（后续取熵返回垃圾 + 迟到 DMA 写调用者栈）→ STALE_USED 有界排空 + legacy 路径统一 TIMED_BUF
+  - H2 SCHED_LOCK 自愈抢锁与任务退出锁交接窗口竞态（SMP 可达双核入临界区）→ 回退自愈、改遏制出口显式放锁（顺带修 L-C 自持锁死自旋）
+  - M1 TIME_WAIT 回收清悬空句柄；M2 ARP TTL 改 born_us（LRU 刷新不再续命）；M3 B10 骨架屏 flip 后二次校验；LA 仅 INFO 不立横幅
+  - L-D（IRQ 上下文 health 上报的阻塞 UART 打印）记录为已知取舍，未改
+- 同时核实夜间所有其它改动无缺陷（ColorOS 曲线数值单调≤1、B5/B8/B12、TIME_WAIT 锚点、IRQ_TID 校验、wait4 编码与 kunxinit 解码闭环等）
+- 回归：make 全量 0 错误 + test-sfsrace PASS
+
+## 未决事项（供后续轮次/用户决策）
+- A1 launcher mmap /dev/fb0 偶发 EINVAL：诊断打印已就位，需下次复现读 [fb-mmap] 输出定位
+- L-D IRQ 上下文 health 上报的 UART 打印（事件稀有，毫秒级停顿，属取舍）
+- SMP 模式仍为实验特性（bootargs "smp"）；H2 修复后调度锁已无已知竞态，但整体未硬化
