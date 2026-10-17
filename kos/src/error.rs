@@ -139,6 +139,8 @@ pub enum KosError {
     NotMutable,
     /// write_range 的偏移/长度非法（如负溢出、超上限）。
     OffsetInvalid,
+    /// 上传会话未完成即请求 finish。
+    UploadIncomplete { received: u32, total: u32 },
 }
 
 impl fmt::Display for KosError {
@@ -196,6 +198,9 @@ impl fmt::Display for KosError {
             KosError::ExtentTableCorrupt => write!(f, "区段表损坏"),
             KosError::NotMutable => write!(f, "目标不是可变记录"),
             KosError::OffsetInvalid => write!(f, "偏移/长度非法"),
+            KosError::UploadIncomplete { received, total } => {
+                write!(f, "上传未完成（{received}/{total} 块）")
+            }
             KosError::RootMismatch => write!(f, "顶层索引块哈希与 root 不符"),
         }
     }

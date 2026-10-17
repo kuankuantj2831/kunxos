@@ -18,6 +18,10 @@
 //! kosctl bench  <img>                           性能护栏（append/write_range/mount/GC 计时）
 //! kosctl gc     <img>                          回收不可达孤儿对象
 //! kosctl trunc  <img> <path> <len>             截断/扩展（可变记录）
+//! kosctl upbegin <img> <path> <len>            开启断点续传会话
+//! kosctl uppush  <img> <path> <file> [off]     推送数据（断点续传）
+//! kosctl upstat  <img> <path>                  查看续传进度
+//! kosctl upfin   <img> <path>                  完成并原子发布
 //! kosctl stat   <img>                          卷状态
 //! ```
 
@@ -190,6 +194,7 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
             let img = format!("{img}.bench.tmp");
             let dev = FileBlockDevice::open(Path::new(&img), Some(8192))?;
             let mut s = KosStore::mkfs(dev)?;
+            s.set_flush_policy(kos::store::FlushPolicy::Batched(32));
             let t = std::time::Instant::now();
             s.write_mutable("/bench", &[0u8; 4096], 0, perm::DEFAULT)?;
             let create = t.elapsed();
@@ -209,12 +214,14 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
             let t = std::time::Instant::now();
             let _ = s.open_path("/bench", 0)?;
             let read1 = t.elapsed();
+            s.sync_now().ok();
             let d = s.take_device();
             let t = std::time::Instant::now();
             let mut s2 = KosStore::open(d, VerifyLevel::HashOnly)?;
             let mount = t.elapsed();
             let fast = s2.was_fast_mounted();
             let t = std::time::Instant::now();
+            s2.set_flush_policy(kos::store::FlushPolicy::Batched(32));
             let (dead, freed) = s2.gc()?;
             let gc = t.elapsed();
             std::fs::remove_file(&img)?;
@@ -253,6 +260,39 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
                 "卷健康：{files} 个对象 {bytes} 字节 Full 验证通过；发现孤儿 {orphans} 个，已回收 {dead} 个（{} 块）",
                 freed
             ))
+        }
+        "upbegin" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let len: u64 = arg(args, 4)?.parse()?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            s.upload_begin(path, len, 0, perm::DEFAULT)?;
+            Ok(format!("续传会话已开启：{path}（{len} 字节）"))
+        }
+        "uppush" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let file = arg(args, 4)?;
+            let off: u64 = args.get(5).map(|v| v.parse()).transpose()?.unwrap_or(0);
+            let data = std::fs::read(&file)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            let (recv, total) = s.upload_push(path, off, &data, 0)?;
+            Ok(format!("已推送 {} 字节 @ {off}；进度 {recv}/{total} 块", data.len()))
+        }
+        "upstat" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            let (total, recv, cont) = s.upload_status(path, 0)?;
+            Ok(format!("{path}：{recv}/{}/{} 块已收（连续前缀 {cont}）",
+                total.div_ceil(4096), total.div_ceil(4096)))
+        }
+        "upfin" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            s.upload_finish(path, 0)?;
+            Ok(format!("{path} 已完成并原子发布"))
         }
         "trunc" => {
             let img = arg(args, 2)?;

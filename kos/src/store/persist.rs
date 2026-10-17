@@ -102,6 +102,8 @@ pub fn bitmap_block_bytes(first_bit: u32, bits: &[bool]) -> [u8; 4096] {
 }
 
 /// 解析位图块。返回 (first_bit, bits)；magic/CRC 不符返回 None。
+/// 词级快路径：整 u64 词全 0/全 1 直接批量填充（挂载流畅度：2TB 卷
+/// 绝大多数词是均匀的，逐位循环是此前挂载 16s 的主因）。
 pub fn bitmap_block_parse(b: &[u8; 4096]) -> Option<(u32, Vec<bool>)> {
     if b[0..4] != BITMAP_MAGIC.to_le_bytes() {
         return None;
@@ -111,7 +113,20 @@ pub fn bitmap_block_parse(b: &[u8; 4096]) -> Option<(u32, Vec<bool>)> {
         return None;
     }
     let first = u32::from_le_bytes(b[4..8].try_into().ok()?);
-    let bits = (0..BITS_PER_BMP_BLOCK).map(|i| b[16 + i / 8] & (1 << (i % 8)) != 0).collect();
+    let mut bits = Vec::with_capacity(BITS_PER_BMP_BLOCK);
+    let payload = &b[16..4096];
+    for w in payload.chunks_exact(8) {
+        let word = u64::from_le_bytes(w.try_into().unwrap());
+        match word {
+            0 => bits.resize(bits.len() + 64, false),
+            u64::MAX => bits.resize(bits.len() + 64, true),
+            _ => {
+                for k in 0..64 {
+                    bits.push(word & (1 << k) != 0);
+                }
+            }
+        }
+    }
     Some((first, bits))
 }
 

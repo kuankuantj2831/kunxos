@@ -24,6 +24,10 @@ const SYS_KOS_RENAME: usize = 471;
 const SYS_KOS_OPEN: usize = 472;
 const SYS_KOS_READ_FD: usize = 473;
 const SYS_KOS_CLOSE_FD: usize = 474;
+const SYS_KOS_UP_BEGIN: usize = 476;
+const SYS_KOS_UP_PUSH: usize = 477;
+const SYS_KOS_UP_STATUS: usize = 478;
+const SYS_KOS_UP_FINISH: usize = 479;
 const SYS_KOS_APPEND: usize = 467;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
@@ -114,6 +118,10 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                 p[n] = *s.add(n);
                 n += 1;
             }
+        }
+        let arg = core::str::from_utf8(&p[..n]).unwrap_or("");
+        if arg == "-u1" || arg == "-u2" {
+            return upload_phase(arg);
         }
         if &p[..n] == b"-r" {
             print("[kostest -r] /seed.txt: ");
@@ -384,6 +392,133 @@ unsafe fn kos_close_fd_raw(fd: u32) -> i64 {
 
 fn kos_close_fd(fd: u32) -> i64 {
     unsafe { kos_close_fd_raw(fd) }
+}
+
+/// 断点续传验收：-u1 = 传一半即退（模拟关机）；-u2 = 重启后续传完成。
+fn upload_phase(phase: &str) -> usize {
+    const TOTAL: u64 = 4096 * 40;
+    const HALF: u64 = 4096 * 20;
+    let chunk = [0x5Au8; 4096];
+    if phase == "-u1" {
+        if up_begin("/ota-pkg", TOTAL) != 0 {
+            print("KOSTEST FAIL:up-begin\n");
+            return 1;
+        }
+        let mut off = 0u64;
+        while off < HALF {
+            if up_push("/ota-pkg", off, &chunk) < 0 {
+                print("KOSTEST FAIL:up-push1\n");
+                return 1;
+            }
+            off += 4096;
+        }
+        print("[kostest -u1] 已传一半（20/40 块），模拟关机\n");
+        0
+    } else {
+        let (total, recv, cont) = match up_status("/ota-pkg") {
+            Some(v) => v,
+            None => {
+                print("KOSTEST FAIL:up-status\n");
+                return 1;
+            }
+        };
+        if total != TOTAL || cont < 20 {
+            print("KOSTEST FAIL:up-resume-progress\n");
+            return 1;
+        }
+        print("[kostest -u2] 重启后进度保留：");
+        print_hex64(recv as u64);
+        print("/");
+        print_hex64(total);
+        print(" 块，续传...\n");
+        let _ = recv;
+        let mut off = HALF;
+        while off < TOTAL {
+            if up_push("/ota-pkg", off, &chunk) < 0 {
+                print("KOSTEST FAIL:up-push2\n");
+                return 1;
+            }
+            off += 4096;
+        }
+        if up_finish("/ota-pkg") != 0 {
+            print("KOSTEST FAIL:up-finish\n");
+            return 1;
+        }
+        // 发布后整读校验。
+        let mut buf = [0u8; 4096];
+        let mut ok = true;
+        let mut off = 0u64;
+        while off < TOTAL {
+            let n = pread("/ota-pkg", off, &mut buf);
+            if n != 4096 || buf[0] != 0x5A {
+                ok = false;
+                break;
+            }
+            off += 4096;
+        }
+        if !ok {
+            print("KOSTEST FAIL:up-verify\n");
+            return 1;
+        }
+        print("KOSTEST UPLOAD-RESUME PASS\n");
+        0
+    }
+}
+
+unsafe fn up_call3(nr: usize, path: &str, a1: u64) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    asm!("ecall", in("a7") nr, in("a0") p.as_ptr() as usize, in("a1") a1,
+         lateout("a0") ret, options(nostack));
+    ret as i64
+}
+
+fn up_begin(path: &str, total: u64) -> i64 {
+    unsafe { up_call3(SYS_KOS_UP_BEGIN, path, total) }
+}
+
+fn up_finish(path: &str) -> i64 {
+    unsafe { up_call3(SYS_KOS_UP_FINISH, path, 0) }
+}
+
+fn up_push(path: &str, offset: u64, data: &[u8]) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    unsafe {
+        asm!("ecall", in("a7") SYS_KOS_UP_PUSH, in("a0") p.as_ptr() as usize,
+             in("a1") data.as_ptr() as usize, in("a2") data.len(), in("a3") offset,
+             lateout("a0") ret, options(nostack));
+    }
+    ret as i64
+}
+
+/// 返回 (total, received, contiguous)。
+fn up_status(path: &str) -> Option<(u64, u64, u64)> {
+    let mut out = [0u8; 24];
+    let r: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    unsafe {
+        asm!("ecall", in("a7") SYS_KOS_UP_STATUS, in("a0") p.as_ptr() as usize,
+             in("a1") out.as_mut_ptr() as usize, lateout("a0") r, options(nostack));
+    }
+    if r as i64 != 0 {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        u64::from_le_bytes(out[8..16].try_into().unwrap()),
+        u64::from_le_bytes(out[16..24].try_into().unwrap()),
+    ))
+}
+
+fn print_hex64(v: u64) {
+    print_hex(v);
 }
 
 fn print_hex(v: u64) {

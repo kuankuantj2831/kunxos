@@ -286,6 +286,11 @@ const SYS_KOS_RENAME: usize = 471;
 const SYS_KOS_OPEN: usize = 472;
 const SYS_KOS_READ_FD: usize = 473;
 const SYS_KOS_CLOSE_FD: usize = 474;
+const SYS_KOS_WRITE_RANGE: usize = 475;
+const SYS_KOS_UP_BEGIN: usize = 476;
+const SYS_KOS_UP_PUSH: usize = 477;
+const SYS_KOS_UP_STATUS: usize = 478;
+const SYS_KOS_UP_FINISH: usize = 479;
 
 // ==================== Linux 常量 ====================
 
@@ -720,6 +725,11 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_KOS_OPEN => kos_open(f),
         SYS_KOS_READ_FD => kos_read_fd(f),
         SYS_KOS_CLOSE_FD => kos_close_fd(f),
+        SYS_KOS_WRITE_RANGE => kos_wr(f),
+        SYS_KOS_UP_BEGIN => kos_up_begin(f),
+        SYS_KOS_UP_PUSH => kos_up_push(f),
+        SYS_KOS_UP_STATUS => kos_up_status(f),
+        SYS_KOS_UP_FINISH => kos_up_finish(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -847,6 +857,11 @@ fn sys_openat(f: &mut TrapFrame) -> i64 {
     let mut abspath = [0u8; 128];
     let p = core::str::from_utf8(&path[..n]).unwrap_or("");
     let Some(s) = resolve_user_path(p, &mut abspath) else { return ENAMETOOLONG; };
+    // POSIX 桥接：/kos/ 前缀路由到 KOS 对象存储。
+    if crate::kos_vfs::is_kos_path(s) {
+        let rel = &s[crate::kos_vfs::KOS_PREFIX.len()..];
+        return crate::kos_vfs::posix_open(rel, flags, process::current_uid());
+    }
     // 翻译访问模式与创建/截断标志；O_NONBLOCK 等其余标志透传给 VFS
     let acc = flags & 0x3;
     let creat = flags & O_CREAT;
@@ -878,6 +893,10 @@ fn sys_openat(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_close(f: &mut TrapFrame) -> i64 {
+    let fd = f.x[10] as i32;
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return crate::kos_vfs::posix_close(fd as u32);
+    }
     let fd = f.x[10] as i32;
     match process::get_fd(fd) {
         Some(e) => match e.kind {
@@ -922,6 +941,9 @@ fn sys_close(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_read(f: &mut TrapFrame) -> i64 {
+    if crate::kos_vfs::is_posix_fd(f.x[10] as i32) {
+        return kos_bridge_read(f);
+    }
     let fd = f.x[10] as i32;
     let buf_ptr = f.x[11];
     let count = f.x[12] as usize;
@@ -951,6 +973,9 @@ fn sys_read(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_write(f: &mut TrapFrame) -> i64 {
+    if crate::kos_vfs::is_posix_fd(f.x[10] as i32) {
+        return kos_bridge_write(f);
+    }
     let fd = f.x[10] as i32;
     let buf_ptr = f.x[11];
     let count = f.x[12] as usize;
@@ -1264,6 +1289,9 @@ fn sys_write_at(fd: i32, buf_ptr: u64, count: usize) -> i64 {
 }
 
 fn sys_lseek(f: &mut TrapFrame) -> i64 {
+    if crate::kos_vfs::is_posix_fd(f.x[10] as i32) {
+        return crate::kos_vfs::posix_lseek(f.x[10] as u32, f.x[11] as i64, f.x[12] as u32);
+    }
     let fd = f.x[10] as i32;
     let offset = f.x[11] as i64; // 64 位偏移，不再截断为 i32
     let whence = f.x[12] as u32;
@@ -3715,6 +3743,87 @@ fn kos_read_fd(f: &mut TrapFrame) -> i64 {
 
 fn kos_close_fd(f: &mut TrapFrame) -> i64 {
     crate::kos_vfs::sys_kos_close_fd(f.x[10] as u32)
+}
+
+/// POSIX 桥接 read/write 的用户缓冲区搬运。
+fn kos_bridge_read(f: &mut TrapFrame) -> i64 {
+    let len = f.x[12] as usize;
+    if len == 0 || len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::posix_read(f.x[10] as u32, &mut out);
+    if r < 0 {
+        return r;
+    }
+    let n = r as usize;
+    if n == 0 || unsafe { copy_to_user(f.x[11], &out[..n]) } != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+fn kos_bridge_write(f: &mut TrapFrame) -> i64 {
+    let len = f.x[12] as usize;
+    if len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 && unsafe { copy_from_user(f.x[11], &mut data) } == 0 {
+        return EFAULT;
+    }
+    crate::kos_vfs::posix_write(f.x[10] as u32, &data, process::current_uid())
+}
+
+/// write_range：a0=path a1=buf a2=len a3=offset。
+fn kos_wr(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let len = f.x[12] as usize;
+    if len > 8 << 20 {
+        return EINVAL;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 && unsafe { copy_from_user(f.x[11], &mut data) } == 0 {
+        return EFAULT;
+    }
+    crate::kos_vfs::sys_write_range(&path, f.x[13], &data)
+}
+
+fn kos_up_begin(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_upload_begin(&path, f.x[11])
+}
+
+fn kos_up_push(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let len = f.x[12] as usize;
+    if len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 && unsafe { copy_from_user(f.x[11], &mut data) } == 0 {
+        return EFAULT;
+    }
+    crate::kos_vfs::sys_upload_push(&path, f.x[13], &data)
+}
+
+fn kos_up_status(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let mut out = [0u8; 24];
+    let r = crate::kos_vfs::sys_upload_status(&path, &mut out);
+    if r != 0 {
+        return r;
+    }
+    // copy_to_user 成功返回字节数（24），失败返回 0。
+    if unsafe { copy_to_user(f.x[11], &out) } != 0 {
+        return 0;
+    }
+    EFAULT
+}
+
+fn kos_up_finish(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_upload_finish(&path)
 }
 
 fn kos_stat(f: &mut TrapFrame) -> i64 {

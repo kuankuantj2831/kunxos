@@ -93,8 +93,70 @@ KUNXOS 的对象存储层。设计文档见 [DESIGN.md](DESIGN.md)。
 - shell `kos` 新增 `mv` / `head`（随机读演示）。
 - 修 EOF 读被误判 EFAULT（0 字节 copy_to_user 返回 0）。
 
+### 断电保护与断点续传轮（2026-10-18 凌晨）
+
+- **断电注入测试矩阵**（`tests/crash.rs`）：CrashDev 在任意第 N 次块写
+  后模拟掉电，**枚举 append / write_range / truncate / 上传推送的全部
+  断点**，断言重挂载后对象内容 = 旧值或新值（绝无脏第三态）、二次
+  重挂载稳定。矩阵抓出并修复两个真 bug：
+  ① write_range/append 原地覆盖旧数据块（旧头 + 新数据 = 断电脏读）；
+  ② truncate 提交前回收旧索引块，新索引块复用旧位置（cut=1 即毁旧对象）。
+- **写时复制写路径**：受影响 chunk 一律写新块（`cow_write_window`：
+  内容增量 = 前零 + 数据 + 后零），旧块永不覆写；**头块换新块提交**
+  （旧头不动，新头块是唯一提交点）。可变记录的每一次修改在任意断点
+  下都严格旧-或-新。
+- **超级块损坏自愈**：布局可从设备容量纯推导（`mkfs_layout`），块 0
+  打花后挂载自动重建（测试：整块 0xEE 后数据完好可写）。
+- **断点续传**（`store/upload.rs` + syscall 476..=479 + kosctl
+  `upbegin/uppush/upstat/upfin`）：part 预扩展 + 进度位图 sidecar；
+  崩溃一致性 = 数据先落、位图后记（断电只欠记不超记，重传幂等）；
+  finish 用 rename **原子发布**。**QEMU 双启动实测：传 20/40 块"关机"
+  → 重启进度保留 → 续传 → 原子发布 → 全量校验 PASS**；推送断电矩阵
+  （每个断点后续传完成）全绿。
+- **错误处理**：系统调用统一 errno 映射（ENOENT/EACCES/ENOSPC/EIO/
+  EEXIST…；UploadIncomplete 把 received/total 编进返回值供续传换算）；
+  引擎写路径 panic 清零（介质错误走 Err）。
+- 系统调用号段扩至 **460..=479**（475=write_range、476..=479=上传）。
+
+### POSIX 桥接：全面接入（2026-10-18）
+
+- **`/kos/` 路径路由**：应用的普通 `openat("/kos/…")/read/write/
+  close/lseek` 由内核透明转发到 KOS 引擎——**零改造接入**。KOS fd
+  号从 1000 起（避开进程 fd 表）；O_CREAT/O_TRUNC/O_APPEND 语义
+  齐备；write 返回本次写入字节数（POSIX 语义）；SEEK_END =
+  end + offset。
+- 验收应用 `apps/kosdemo`：纯标准系统调用完成 创建→写→SEEK_SET
+  读→SEEK_END 读→O_APPEND 追加，QEMU PASS（幂等：O_TRUNC 重置）。
+- 系统调用总计 **460..=479** + 常规 Linux 号段的 `/kos/` 路由。
+
+### FAT32 经典优化移植轮（2026-10-18 二）
+
+- **F1 dentry 缓存**：路径 → (generation, 条目) 表，命名空间提交按代
+  整体失效——热路径 open/write/read 免逐级目录块读+解码。
+- **F2 顺序预读**：read_range 检测顺序流（offset 接续上次末尾）→
+  预取后续 8 chunk 进块缓存（FAT 驱动 readahead 等价物）。
+- **F3 分配局部性**：分配提示点起恰好够用 → 整段直取，append 流的
+  块保持物理连续（区段少碎片、顺序 IO 友好）。
+- **F4 低空间水位**：每次提交后 O(1) 检查，空闲 <10% 警告 / <3%
+  严重（接 health 面板，各报一次不刷屏）。
+- bench（宿主 debug，快设备收益有限）：append 776→757µs/次、
+  整读 27→23µs；慢介质（virtio 磁盘）上预读/局部性收益更大。
+
+### 流畅度轮（2026-10-18 三）
+
+- **挂载**：位图块词级快解析（整 u64 词全 0/全 1 批量填充）——
+  2TB 卷挂载 16.1s → **12.0s**（debug；release 约 1/5）。
+- **写入**：`FlushPolicy`（Eager=逐提交 sync 恒久默认；Batched(n)=每
+  n 次提交一次设备 FLUSH）。内核挂载即启用 Batched(64) + **500ms
+  定时兜底**（with_store 内 O(1) 检查）——崩溃一致性不变（写序与
+  原子提交照旧），持久性窗口有界。virtio 盘上每提交一次的
+  VBLK_T_FLUSH 设备往返变成 1/64。
+- **读取/加载**：open_path 走 dentry 缓存（热路径免逐级解析）。
+
 不包含：块缓存的 SMP 并发细化（现与 fs_lock 大锁绑定）、mmap、
-多卷同时挂载、kunxpkg .kunx 包对象模型迁移、Pack 小对象合并。
+getdents 的 /kos/ 目录枚举（用 `kos ls`）、多卷同时挂载、kunxpkg
+.kunx 包对象模型迁移、Pack 小对象合并、SFS→KOS 根文件系统切换、
+坏块重映射（需真实故障注入设备）。
 
 磁盘格式与 CPU 架构解耦：多字节字段一律小端（RISC-V RV64 / ARM64 均为小端）。
 KUNXOS 已决策切换 RISC-V 目标架构，本 crate 无需任何改动。

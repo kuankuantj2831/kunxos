@@ -128,6 +128,7 @@ MODEMTEST_ELF := $(APPS)/modemtest/target/$(TARGET)/release/modemtest
 SFSRACE_ELF   := $(APPS)/sfsrace/target/$(TARGET)/release/sfsrace
 CRASHME_ELF   := $(APPS)/crashme/target/$(TARGET)/release/crashme
 KOSTEST_ELF   := $(APPS)/kostest/target/$(TARGET)/release/kostest
+KOSDEMO_ELF   := $(APPS)/kosdemo/target/$(TARGET)/release/kosdemo
 BUSYBOX    := $(KUNXCORE)/apps/busybox.elf
 RAMDISK    := $(KUNXCORE)/ramdisk.img
 BOOT_IMG   := $(KUNXBOOT)/bootloader.img
@@ -252,6 +253,9 @@ $(CRASHME_ELF): $(shell find $(CRASHME)/src -name '*.rs') $(CRASHME)/Cargo.toml 
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(CRASHME)/Cargo.toml
 
 KOSTEST := $(APPS)/kostest
+KOSDEMO := $(APPS)/kosdemo
+$(KOSDEMO_ELF): $(shell find $(KOSDEMO)/src -name '*.rs') $(KOSDEMO)/Cargo.toml $(KOSDEMO)/build.rs $(KOSDEMO)/linker.ld
+	$(CARGO) build --release --target $(TARGET) --manifest-path $(KOSDEMO)/Cargo.toml
 $(KOSTEST_ELF): $(shell find $(KOSTEST)/src -name '*.rs') $(KOSTEST)/Cargo.toml $(KOSTEST)/build.rs $(KOSTEST)/linker.ld
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(KOSTEST)/Cargo.toml
 
@@ -385,7 +389,7 @@ $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done: $(CALC_ELF) $(TERMINAL_ELF) $(NOTES_
 $(ROOTFS)/var/lib/pkg/available: $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done
 	cp -f $(ROOTFS)/var/lib/pkg/repo/main/Packages $@
 
-$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
+$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(KOSDEMO_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
 	@mkdir -p $(ROOTFS)/bin $(ROOTFS)/dev $(ROOTFS)/etc/init.d $(ROOTFS)/proc \
 		$(ROOTFS)/tmp $(ROOTFS)/var/run $(ROOTFS)/var/log $(ROOTFS)/data $(ROOTFS)/data/oobe \
 		$(ROOTFS)/data/photos $(ROOTFS)/data/videos \
@@ -400,6 +404,7 @@ $(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(S
 	cp -f $(LOGD_ELF) $(ROOTFS)/bin/logd
 	cp -f $(CRASHME_ELF) $(ROOTFS)/bin/crashme
 	cp -f $(KOSTEST_ELF) $(ROOTFS)/bin/kostest
+	cp -f $(KOSDEMO_ELF) $(ROOTFS)/bin/kosdemo
 	cp -f $(AUDIOD_ELF) $(ROOTFS)/bin/audiod
 	cp -f $(CAMERAD_ELF) $(ROOTFS)/bin/camerad
 	cp -f $(SENSORD_ELF) $(ROOTFS)/bin/sensord

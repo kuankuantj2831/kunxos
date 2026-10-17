@@ -65,6 +65,11 @@ pub const SYS_KOS_RENAME: usize = 471;
 pub const SYS_KOS_OPEN: usize = 472;
 pub const SYS_KOS_READ_FD: usize = 473;
 pub const SYS_KOS_CLOSE_FD: usize = 474;
+pub const SYS_KOS_WRITE_RANGE: usize = 475;
+pub const SYS_KOS_UP_BEGIN: usize = 476;
+pub const SYS_KOS_UP_PUSH: usize = 477;
+pub const SYS_KOS_UP_STATUS: usize = 478;
+pub const SYS_KOS_UP_FINISH: usize = 479;
 
 // ==================== 块设备适配 ====================
 
@@ -120,8 +125,49 @@ fn with_store<T>(f: impl FnOnce(&mut KosStore<KosBlkDev>) -> T) -> Option<T> {
     // SAFETY：fs_lock 是任务身份可重入大锁，KOS_STORE 只在此临界区
     // 内访问；SMP 下与 SFS 路径互斥。
     let r = unsafe { KOS_STORE.as_mut().map(f) };
+    // F4：提交后低空间水位检查（O(1)）。
+    // 写流畅度：Batched 冲刷的定时兜底（>500ms 未落盘即补一次 FLUSH）。
+    if let Some(s) = unsafe { KOS_STORE.as_mut() } {
+        check_space_watermark(s.free_blocks(), s.pool_blocks());
+        let now = crate::timer::now_us();
+        if now - LAST_SYNC.load(core::sync::atomic::Ordering::Relaxed) > 500_000 {
+            LAST_SYNC.store(now, core::sync::atomic::Ordering::Relaxed);
+            let _ = s.sync_now();
+        }
+    }
     crate::fs_simple::fs_unlock();
     r
+}
+
+/// 低空间水位检查（F4 稳定性）：空闲 <10% 警告、<3% 严重，各报一次。
+static LOW_SPACE_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static LOW_SPACE_CRITICAL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static LAST_SYNC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn check_space_watermark(free: u64, pool: u64) {
+    if pool == 0 {
+        return;
+    }
+    let pct = free * 100 / pool;
+    if pct < 3 && !LOW_SPACE_CRITICAL.load(core::sync::atomic::Ordering::Relaxed) {
+        LOW_SPACE_CRITICAL.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::health::report(
+            crate::health::SEV_CRITICAL,
+            "storage",
+            "KOS 对象存储空间严重不足（<3%），写入即将失败",
+            "请清理不需要的对象（shell: kos 命令）或运行 GC 后重试",
+        );
+    } else if pct < 10 && !LOW_SPACE_WARNED.load(core::sync::atomic::Ordering::Relaxed) {
+        LOW_SPACE_WARNED.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::health::report(
+            crate::health::SEV_WARN,
+            "storage",
+            "KOS 对象存储空间不足（<10%）",
+            "建议清理旧对象或运行 GC",
+        );
+    }
 }
 
 /// 启动期挂载策略（P1 持久化）：
@@ -183,6 +229,9 @@ pub fn mount(major: u32) -> bool {
             if KOS_SIGN_SEED != [0u8; 32] {
                 s.set_signer(kos_commit_signer);
             }
+            // 写流畅度：批量冲刷（64 次提交一次设备 FLUSH），定时器
+            // 500ms 兜底（见 with_store）；持久性窗口有界。
+            s.set_flush_policy(kos::store::FlushPolicy::Batched(64));
             crate::fs_simple::fs_lock();
             // SAFETY：fs_lock 临界区内（见 with_store）。
             unsafe {
@@ -240,6 +289,9 @@ pub fn sys_mount(major: u32) -> i64 {
             if KOS_SIGN_SEED != [0u8; 32] {
                 s.set_signer(kos_commit_signer);
             }
+            // 写流畅度：批量冲刷（64 次提交一次设备 FLUSH），定时器
+            // 500ms 兜底（见 with_store）；持久性窗口有界。
+            s.set_flush_policy(kos::store::FlushPolicy::Batched(64));
             crate::fs_simple::fs_lock();
             // SAFETY：同上，fs_lock 临界区内。
             unsafe {
@@ -259,6 +311,28 @@ pub fn mounted() -> bool {
 
 // ==================== 数据面系统调用 ====================
 
+/// KosError → errno（负值）。系统调用统一走这里，替代裸 -1。
+pub fn kos_errno(e: KosError) -> i64 {
+    const ENOENT: i64 = -2;
+    const EIO: i64 = -5;
+    const EACCES: i64 = -13;
+    const EEXIST: i64 = -17;
+    const ENOSPC: i64 = -28;
+    match e {
+        KosError::ObjectNotFound | KosError::PathNotFound | KosError::NoValidManifest => ENOENT,
+        KosError::PermissionDenied => EACCES,
+        KosError::AlreadyExists => EEXIST,
+        KosError::NoSpace => ENOSPC,
+        KosError::Io(_) => EIO,
+        KosError::NotMutable => EACCES,
+        KosError::UploadIncomplete { received, total } => {
+            // 精确进度编进高 32 位：用户态可直接换算续传点。
+            -((0x1_0000_0000u64 | ((received as u64) << 20) | total as u64) as i64)
+        }
+        _ => EIO,
+    }
+}
+
 /// 读对象：成功返回字节数，失败 -1。路径由调用方以 C 字符串给出。
 pub fn sys_read(path: &str, buf: &mut [u8]) -> i64 {
     let uid = crate::process::current_uid();
@@ -268,7 +342,8 @@ pub fn sys_read(path: &str, buf: &mut [u8]) -> i64 {
             buf[..n].copy_from_slice(&data[..n]);
             n as i64
         }
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -286,26 +361,8 @@ pub fn sys_write(path: &str, data: &[u8], caps: u32, mutable: bool) -> i64 {
     });
     match r {
         Some(Ok(())) => data.len() as i64,
-        Some(Err(e)) => {
-            let msg = match e {
-                KosError::PermissionDenied => "perm",
-                KosError::NoSpace => "nospace",
-                KosError::PathNotFound => "pathnf",
-                KosError::AlreadyExists => "exists",
-                KosError::NotADirectory => "notdir",
-                KosError::ExtentTableCorrupt => "extcorr",
-                KosError::CorruptNamespace => "ns",
-                _ => "other",
-            };
-            crate::uart_send_str("[kos] write err: ");
-            crate::uart_send_str(msg);
-            crate::uart_send_str("\n");
-            -1
-        }
-        None => {
-            crate::uart_send_str("[kos] write err: not-mounted\n");
-            -1
-        }
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -314,7 +371,8 @@ pub fn sys_mkdir(path: &str, caps: u32) -> i64 {
     let caps = if caps == 0 { kos::store::perm::DIR_DEFAULT } else { caps };
     match with_store(|s| s.mkdir(path, uid, caps)) {
         Some(Ok(())) => 0,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -322,7 +380,8 @@ pub fn sys_unlink(path: &str) -> i64 {
     let uid = crate::process::current_uid();
     match with_store(|s| s.unlink(path, uid)) {
         Some(Ok(())) => 0,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -359,7 +418,8 @@ pub fn sys_truncate(path: &str, len: u64) -> i64 {
     let uid = crate::process::current_uid();
     match with_store(|s| s.truncate(path, len, uid)) {
         Some(Ok(n)) => n as i64,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -392,7 +452,8 @@ pub fn sys_append(path: &str, data: &[u8]) -> i64 {
     let uid = crate::process::current_uid();
     match with_store(|s| s.append(path, data, uid)) {
         Some(Ok(len)) => len as i64,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -401,7 +462,8 @@ pub fn sys_read_range(path: &str, offset: u64, buf: &mut [u8]) -> i64 {
     let uid = crate::process::current_uid();
     match with_store(|s| s.read_range(path, offset, buf, uid)) {
         Some(Ok(n)) => n as i64,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
 }
 
@@ -410,8 +472,167 @@ pub fn sys_rename(from: &str, to: &str) -> i64 {
     let uid = crate::process::current_uid();
     match with_store(|s| s.rename(from, to, uid)) {
         Some(Ok(())) => 0,
-        _ => -1,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
     }
+}
+
+// ==================== POSIX 桥接：/kos/ 路径路由 ====================
+//
+// 应用用普通 open/read/write/close/lseek 访问 `/kos/<对象路径>`，
+// 内核在此路由到 KOS 引擎——零改造接入。KOS fd 号从 1000 起，
+// 避开进程 fd 表（FD_MAX 远小于 1000）。
+
+/// KOS POSIX fd 起点。
+pub const KOS_FD_BASE: u32 = 1000;
+
+/// `/kos/` 前缀长度。
+pub const KOS_PREFIX: &str = "/kos/";
+
+struct PosixFd {
+    /// 命名空间内路径（去掉 /kos/ 前缀）。
+    path: alloc::string::String,
+    key: [u8; 32],
+    pos: u64,
+    append_mode: bool,
+}
+
+static mut POSIX_FDS: Option<alloc::collections::BTreeMap<u32, PosixFd>> = None;
+static mut POSIX_FD_NEXT: u32 = KOS_FD_BASE;
+
+fn posix_table() -> &'static mut alloc::collections::BTreeMap<u32, PosixFd> {
+    unsafe { POSIX_FDS.get_or_insert_with(alloc::collections::BTreeMap::new) }
+}
+
+/// 路径是否路由到 KOS。
+pub fn is_kos_path(p: &str) -> bool {
+    p.starts_with(KOS_PREFIX)
+}
+
+/// POSIX open：flags 支持 O_CREAT/O_TRUNC/O_APPEND/O_RDONLY/O_WRONLY。
+pub fn posix_open(rel: &str, flags: u32, uid: u32) -> i64 {
+    const O_CREAT: u32 = 0x40;
+    const O_TRUNC: u32 = 0x200;
+    const O_APPEND: u32 = 0x400;
+    let path = if rel.starts_with('/') { rel } else { &alloc::format!("/{rel}") };
+    // 已存在 → 直接打开；带 O_CREAT 且不存在 → 建可变记录。
+    let exists = matches!(
+        with_store(|s| s.resolve_pub(path)),
+        Some(Ok(Some(_)))
+    );
+    if !exists {
+        if flags & O_CREAT == 0 {
+            return kos_errno(KosError::PathNotFound);
+        }
+        if let Some(Err(e)) = with_store(|s| s.write_mutable(path, &[], uid, kos::store::perm::DEFAULT)) {
+            return kos_errno(e);
+        }
+    } else if flags & O_TRUNC != 0 {
+        if let Some(Err(e)) = with_store(|s| s.truncate(path, 0, uid)) {
+            return kos_errno(e);
+        }
+    }
+    let key = match with_store(|s| s.resolve_pub(path)) {
+        Some(Ok(Some(e))) => e.content_hash,
+        _ => return kos_errno(KosError::PathNotFound),
+    };
+    let table = posix_table();
+    let fd = unsafe { POSIX_FD_NEXT };
+    unsafe { POSIX_FD_NEXT += 1; }
+    table.insert(
+        fd,
+        PosixFd {
+            path: path.into(),
+            key,
+            pos: 0,
+            append_mode: flags & O_APPEND != 0,
+        },
+    );
+    fd as i64
+}
+
+/// POSIX read（fd >= 1000）。
+pub fn posix_read(fd: u32, buf: &mut [u8]) -> i64 {
+    let (key, pos) = match posix_table().get(&fd) {
+        Some(e) => (e.key, e.pos),
+        None => return kos_errno(KosError::ObjectNotFound),
+    };
+    let n = match with_store(|s| s.read_range_hash(&key, pos, buf)) {
+        Some(Ok(n)) => n,
+        Some(Err(e)) => return kos_errno(e),
+        None => return -1,
+    };
+    if let Some(e) = posix_table().get_mut(&fd) {
+        e.pos += n as u64;
+    }
+    n as i64
+}
+
+/// POSIX write：追加模式走 append（顺序高效），否则 write_range @ pos。
+pub fn posix_write(fd: u32, data: &[u8], uid: u32) -> i64 {
+    let (path, key, pos, append) = match posix_table().get(&fd) {
+        Some(e) => (e.path.clone(), e.key, e.pos, e.append_mode),
+        None => return kos_errno(KosError::ObjectNotFound),
+    };
+    let r = if append {
+        with_store(|s| s.append(&path, data, uid)).map(|v| v.map(|len| len as usize))
+    } else {
+        with_store(|s| s.write_range(&path, pos, data, uid))
+            .map(|v| v.map(|len| len as usize))
+    };
+    match r {
+        Some(Ok(new_len)) => {
+            // 新键（写入换代）：刷新 fd 引用并推进位置；POSIX 语义
+            // 返回**本次写入字节数**（而非文件新长度）。
+            let new_key = match with_store(|s| s.resolve_pub(&path)) {
+                Some(Ok(Some(e))) => e.content_hash,
+                _ => key,
+            };
+            if let Some(e) = posix_table().get_mut(&fd) {
+                e.key = new_key;
+                e.pos = new_len as u64;
+            }
+            data.len() as i64
+        }
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+/// POSIX lseek。
+pub fn posix_lseek(fd: u32, off: i64, whence: u32) -> i64 {
+    // whence: 0=SEEK_SET 1=SEEK_CUR 2=SEEK_END
+    let table = posix_table();
+    let e = match table.get_mut(&fd) {
+        Some(e) => e,
+        None => return kos_errno(KosError::ObjectNotFound),
+    };
+    let end = match with_store(|s| s.stat(&e.key)) {
+        Some(Ok(h)) => h.content_len as i64,
+        _ => -1,
+    };
+    let base = match whence {
+        0 => 0,
+        1 => e.pos as i64,
+        2 => end,
+        _ => return -22, // EINVAL
+    };
+    let np = base + off;
+    if np < 0 {
+        return -22;
+    }
+    e.pos = np as u64;
+    np
+}
+
+/// POSIX close。
+pub fn posix_close(fd: u32) -> i64 {
+    if posix_table().remove(&fd).is_some() { 0 } else { kos_errno(KosError::ObjectNotFound) }
+}
+
+/// fd 是否属于 POSIX 桥接（供 read/write/close/lseek 分发）。
+pub fn is_posix_fd(fd: i32) -> bool {
+    fd >= KOS_FD_BASE as i32
 }
 
 // ==================== KOS fd 层（470..=474 的 472..474） ====================
@@ -499,6 +720,57 @@ pub fn sys_kos_close_fd(fd: u32) -> i64 {
     };
     crate::fs_simple::fs_unlock();
     r
+}
+
+pub fn sys_write_range(path: &str, offset: u64, data: &[u8]) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.write_range(path, offset, data, uid)) {
+        Some(Ok(len)) => len as i64,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+pub fn sys_upload_begin(path: &str, total: u64) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.upload_begin(path, total, uid, kos::store::perm::DEFAULT)) {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+pub fn sys_upload_push(path: &str, offset: u64, data: &[u8]) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.upload_push(path, offset, data, uid)) {
+        Some(Ok((recv, total))) => ((recv as u64) << 32 | total as u64) as i64,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+/// 状态 → 24 字节小端 [total_len, received, contiguous]。
+pub fn sys_upload_status(path: &str, out: &mut [u8; 24]) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.upload_status(path, uid)) {
+        Some(Ok((total, recv, cont))) => {
+            out[..8].copy_from_slice(&total.to_le_bytes());
+            out[8..16].copy_from_slice(&(recv as u64).to_le_bytes());
+            out[16..24].copy_from_slice(&(cont as u64).to_le_bytes());
+            0
+        }
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+pub fn sys_upload_finish(path: &str) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.upload_finish(path, uid)) {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
 }
 
 /// 卷状态：返回 (generation, objects, free_blocks, pool_blocks)。
