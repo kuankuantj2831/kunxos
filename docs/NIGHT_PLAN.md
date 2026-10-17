@@ -257,3 +257,12 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 - **launcher 桌面同款「光标流畅优先」**：主循环帧预算睡眠在 CURSOR_DIRTY 待处理时跳过（原固定 16ms 预算叠加在光标路径上，桌面指针移动与 OOBE 同样发涩）
 - 回归：make 0 错误 + test-sfsrace PASS
 - 注：本轮提交顺带收录了并行产生的 kos/src/store/mod.rs（对象存储引擎 Phase 1 Step 2，747 行——非本工单产物，仅本地保护性入库）
+
+### 第 28 轮（2026-10-17 下午，定时轮）
+- **R7 审查第 22-27 轮帧率/光标改造批**：4 缺陷全部修复——
+  - A(P2) pump 的 any 门使纯移动不重画光标（动画期光标冻结的真相）→ 去 any 门，CURSOR_DIRTY 直接重画
+  - B(P2) store 转场终帧从不绘制（页面停在残缺偏移）→ transition_active 改 TRANS_T0!=0（p>=1 当拍自清+绘终帧，与 calculator 对齐）
+  - C(P3) transition_pages 漏接泵（转场期点击排队到新页生效/连跳两步）→ 补接
+  - D(P3) launcher 光标优先是死条件（CURSOR_DIRTY 帧内已被消费）→ 改 FRAME_INPUT 标志（handle_input 置位、睡眠判定后消费）
+  - 复核通过：五循环退出/终态齐备、nav_snap 181KB 栈安全（2MB 栈 8.7%）、HERO 快照坐标对齐、idle 时序修复正确、无忙转
+- 回归：make 0 错误 + test-sfsrace PASS

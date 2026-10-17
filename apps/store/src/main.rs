@@ -1300,7 +1300,10 @@ fn begin_transition(push: bool) {
 }
 
 fn transition_active() -> bool {
-    unsafe { TRANS_T0 != 0 && now_us() < TRANS_T0 + TRANS_DUR }
+    // ★ 到期当拍仍返回 true（R7-B）：store_redraw 在 p>=1.0 自清 TRANS_T0
+    // 并绘制干净终帧。原版到期即 false → 终帧（settle 到位的一帧）从不
+    // 绘制，页面停在残缺偏移上直到下次输入。
+    unsafe { TRANS_T0 != 0 }
 }
 
 fn compose_transition(e: f32) {

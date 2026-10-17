@@ -4654,6 +4654,8 @@ fn draw_dock() {
 /// 否则原尺寸。返回 (size, ox, oy) 与 pressed_icon_rect 同约定。
 /// `DOCK_HOVER_IDX`（-1 = 无）由 move_cursor_fb 的进出检测维护。
 static mut DOCK_HOVER_IDX: i32 = -1;
+/// 本帧消费过输入事件（帧预算睡眠据此跳过——光标流畅优先）。
+static mut FRAME_INPUT: bool = false;
 
 /// 光标当前悬停的 dock 图标下标（-1 = 无）。与 dock_hover_rect 同热区。
 unsafe fn dock_hover_index(cx: i32, cy: i32) -> i32 {
@@ -8480,7 +8482,10 @@ fn handle_input(input_fd: isize) -> bool {
         if n <= 0 {
             break; // EAGAIN（无事件）或读取错误
         }
-        unsafe { LAST_EV_US = now_us(); }
+        unsafe {
+            LAST_EV_US = now_us();
+            FRAME_INPUT = true; // 本帧有输入：帧预算睡眠据此跳过（光标流畅优先）
+        }
         let (g, _moved) = process_events(&buf[..n as usize]);
         if let Some(g) = g {
             if handle_gesture(g) {
@@ -9203,9 +9208,12 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 跟手/吸附中的翻页也走高刷新率（拖动流畅度优先）。
         let high_refresh = unsafe { control_center::cc_high_refresh() || PAGE_ANIM || PAGE_DRAG };
         let budget = if high_refresh { 8_000 } else { 16_000 };
-        // 光标流畅优先（与 OOBE 同款）：有光标更新/输入待处理时跳过帧
-        // 预算睡眠 —— 固定 16ms 预算叠加在光标路径上会让指针移动发涩。
-        if elapsed < budget && !unsafe { CURSOR_DIRTY } {
+        // 光标流畅优先（与 OOBE 同款，R7-D 修正为真生效条件）：本帧有
+        // 输入（CURSOR_DIRTY 多在帧内已被消费，静态判定是死条件）时跳过
+        // 帧预算睡眠，光标下一帧即刻处理，不叠 16ms 预算。
+        let had_input = unsafe { FRAME_INPUT };
+        unsafe { FRAME_INPUT = false };
+        if elapsed < budget && !had_input {
             let rem = (budget - elapsed) / 1000;
             if rem > 0 {
                 sleep_ms(rem as usize);

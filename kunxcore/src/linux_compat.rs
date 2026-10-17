@@ -271,6 +271,13 @@ const SYS_KUNX_SCHED_SET_DEADLINE: usize = 414;
 /// x1（触发 kernel_fault_contain），x0=2 内核切片越界（触发 panic 遏制）。
 /// 真正注入时进程被 SIGSEGV 语义终止（不返回）；crashme kfault/kpanic 用。
 const SYS_KUNX_FAULT_INJECT: usize = 415;
+const SYS_KOS_MOUNT: usize = 460;
+const SYS_KOS_READ: usize = 461;
+const SYS_KOS_WRITE: usize = 462;
+const SYS_KOS_MKDIR: usize = 463;
+const SYS_KOS_UNLINK: usize = 464;
+const SYS_KOS_LIST: usize = 465;
+const SYS_KOS_STAT: usize = 466;
 
 // ==================== Linux 常量 ====================
 
@@ -690,6 +697,13 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         }
         SYS_KUNX_SCHED_SET_DEADLINE => crate::sched_cfs::set_current_deadline(f.x[10] as u64),
         SYS_KUNX_FAULT_INJECT => sys_kunx_fault_inject(f),
+        SYS_KOS_MOUNT => kos_mount(f),
+        SYS_KOS_READ => kos_read(f),
+        SYS_KOS_WRITE => kos_write(f),
+        SYS_KOS_MKDIR => kos_mkdir(f),
+        SYS_KOS_UNLINK => kos_unlink(f),
+        SYS_KOS_LIST => kos_list(f),
+        SYS_KOS_STAT => kos_stat(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -3509,4 +3523,93 @@ fn sys_recvmsg(f: &mut TrapFrame) -> i64 {
         }
         r as i64
     }
+}
+
+
+// ==================== KOS 对象存储系统调用（460..=466） ====================
+
+fn kos_path_arg(f: &TrapFrame, reg: usize) -> Option<alloc::string::String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe { read_cstr(f.x[reg], &mut buf) };
+    if n == 0 {
+        return None;
+    }
+    core::str::from_utf8(&buf[..n]).ok().map(|s| s.into())
+}
+
+fn kos_mount(f: &mut TrapFrame) -> i64 {
+    crate::kos_vfs::sys_mount(f.x[10] as u32)
+}
+
+fn kos_read(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    if len == 0 || len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::sys_read(&path, &mut out);
+    if r < 0 {
+        return r;
+    }
+    // copy_to_user 成功返回拷贝字节数，失败返回 0。
+    if unsafe { copy_to_user(buf_ptr, &out[..r as usize]) } != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+fn kos_write(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    let caps = f.x[13] as u32;
+    if len > 8 << 20 {
+        return EINVAL;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 && unsafe { copy_from_user(buf_ptr, &mut data) } == 0 {
+        return EFAULT;
+    }
+    crate::kos_vfs::sys_write(&path, &data, caps)
+}
+
+fn kos_mkdir(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_mkdir(&path, f.x[11] as u32)
+}
+
+fn kos_unlink(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_unlink(&path)
+}
+
+fn kos_list(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    if len == 0 || len > 1 << 16 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::sys_list(&path, &mut out);
+    if r < 0 {
+        return r;
+    }
+    if unsafe { copy_to_user(buf_ptr, &out[..r as usize]) } != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+fn kos_stat(f: &mut TrapFrame) -> i64 {
+    let (gen, objs, free, pool) = crate::kos_vfs::sys_stat();
+    let buf_ptr = f.x[10];
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&gen.to_le_bytes());
+    out[8..16].copy_from_slice(&(objs as u64).to_le_bytes());
+    out[16..24].copy_from_slice(&free.to_le_bytes());
+    out[24..32].copy_from_slice(&pool.to_le_bytes());
+    if unsafe { copy_to_user(buf_ptr, &out) } != 0 { 0 } else { EFAULT }
 }

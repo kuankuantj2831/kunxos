@@ -8,6 +8,9 @@ pub mod device;
 
 pub use device::BlockDevice;
 
+#[cfg(feature = "std")]
+pub mod file;
+
 use crate::error::KosError;
 use alloc::vec;
 

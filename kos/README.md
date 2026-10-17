@@ -2,9 +2,24 @@
 
 KUNXOS 的对象存储层。设计文档见 [DESIGN.md](DESIGN.md)。
 
-**当前状态：Phase 1 Step 1**（磁盘格式 + 哈希封装 + Merkle 树 + 块设备抽象，
-宿主可测）。不包含：Object Pool 读写、命名空间 B-tree 逻辑、GC、VFS 集成、
-Ed25519 验签（依赖白名单所限，签名区按不透明字节存储）。
+**当前状态：Phase 1 Step 2**（存储引擎 + 宿主工具 + 内核集成）。
+
+- `src/store/`：**读写引擎**。Object Pool 连续布局（头块 + 数据 + Merkle
+  索引块）、CAS 去重（SHA-256 内容寻址）、目录即对象的无上限命名空间
+  （无 78 entry / 512 inode 限制）、Root Manifest 双槽崩溃安全提交、
+  Unix 风格权限位（`perm` + `check_access`）、`VerifyLevel::Full`
+  读取路径全量 Merkle 重建比对。
+- `src/block/file.rs` + `src/bin/kosctl.rs`：宿主 CLI
+  （mkfs / import / export / ls / put / get / unlink / verify / stat）。
+  实测：11MB rootfs 树 0.9s 导入、全树严格验证 0.8s、导出与源树
+  byte-identical（`diff -r` 为空）。
+- 内核集成（`kunxcore/src/kos_vfs.rs`）：块设备适配器 + 私有系统调用
+  号段 **460..=466**（mount/read/write/mkdir/unlink/list/stat），启动时
+  自动挂载内嵌 KOS 卷（`make kosdisk` 生成 kosdisk.img，主设备号 254），
+  与 SFS 双跑（Phase 1 计划）。用户态验收：`/bin/kostest`（QEMU 实跑
+  KOSTEST PASS）。
+
+不包含：GC / compaction、kunxpkg 对象模型迁移、Ed25519 验签集成。
 
 磁盘格式与 CPU 架构解耦：多字节字段一律小端（RISC-V RV64 / ARM64 均为小端）。
 KUNXOS 已决策切换 RISC-V 目标架构，本 crate 无需任何改动。

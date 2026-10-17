@@ -125,6 +125,7 @@ RILD_ELF      := $(RILD)/target/$(TARGET)/release/rild
 MODEMTEST_ELF := $(APPS)/modemtest/target/$(TARGET)/release/modemtest
 SFSRACE_ELF   := $(APPS)/sfsrace/target/$(TARGET)/release/sfsrace
 CRASHME_ELF   := $(APPS)/crashme/target/$(TARGET)/release/crashme
+KOSTEST_ELF   := $(APPS)/kostest/target/$(TARGET)/release/kostest
 BUSYBOX    := $(KUNXCORE)/apps/busybox.elf
 RAMDISK    := $(KUNXCORE)/ramdisk.img
 BOOT_IMG   := $(KUNXBOOT)/bootloader.img
@@ -181,7 +182,7 @@ else
   CARGO_FEATURES := --features qemu
 endif
 
-.PHONY: all kernel pi4 init networkd test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
+.PHONY: all kernel pi4 init networkd kosdisk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
 
 all: kernel
 
@@ -247,6 +248,10 @@ $(CALC_ELF): $(shell find $(CALC)/src -name '*.rs') $(CALC)/Cargo.toml $(CALC)/b
 CRASHME := $(APPS)/crashme
 $(CRASHME_ELF): $(shell find $(CRASHME)/src -name '*.rs') $(CRASHME)/Cargo.toml $(CRASHME)/build.rs $(CRASHME)/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(CRASHME)/Cargo.toml
+
+KOSTEST := $(APPS)/kostest
+$(KOSTEST_ELF): $(shell find $(KOSTEST)/src -name '*.rs') $(KOSTEST)/Cargo.toml $(KOSTEST)/build.rs $(KOSTEST)/linker.ld
+	$(CARGO) build --release --target $(TARGET) --manifest-path $(KOSTEST)/Cargo.toml
 
 $(OOBE_ELF): $(shell find $(OOBE)/src -name '*.rs') $(OOBE)/Cargo.toml $(OOBE)/build.rs $(OOBE)/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(OOBE)/Cargo.toml
@@ -378,7 +383,7 @@ $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done: $(CALC_ELF) $(TERMINAL_ELF) $(NOTES_
 $(ROOTFS)/var/lib/pkg/available: $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done
 	cp -f $(ROOTFS)/var/lib/pkg/repo/main/Packages $@
 
-$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
+$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
 	@mkdir -p $(ROOTFS)/bin $(ROOTFS)/dev $(ROOTFS)/etc/init.d $(ROOTFS)/proc \
 		$(ROOTFS)/tmp $(ROOTFS)/var/run $(ROOTFS)/var/log $(ROOTFS)/data $(ROOTFS)/data/oobe \
 		$(ROOTFS)/data/photos $(ROOTFS)/data/videos \
@@ -392,6 +397,7 @@ $(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(SENSORD_ELF) $(P
 	cp -f $(NET_ELF) $(ROOTFS)/bin/networkd
 	cp -f $(LOGD_ELF) $(ROOTFS)/bin/logd
 	cp -f $(CRASHME_ELF) $(ROOTFS)/bin/crashme
+	cp -f $(KOSTEST_ELF) $(ROOTFS)/bin/kostest
 	cp -f $(AUDIOD_ELF) $(ROOTFS)/bin/audiod
 	cp -f $(CAMERAD_ELF) $(ROOTFS)/bin/camerad
 	cp -f $(SENSORD_ELF) $(ROOTFS)/bin/sensord
@@ -473,7 +479,21 @@ $(TOPDIR)/shared/cursor.rgba: $(TOPDIR)/tubiao/shubiao.png $(TOOLS)/make_cursor.
 FORCE:
 
 # ---- 内核（内嵌 ramdisk 镜像，按平台传递 feature） ----
-kernel: $(RAMDISK)
+# KOS 对象存储卷（内嵌第二 RAM 磁盘，内核启动时挂载到 KOS 引擎）。
+KOSCTL    := $(TOPDIR)/kos/target/debug/kosctl
+KOSDISK   := $(KUNXCORE)/kosdisk.img
+
+kosctl:
+	cd $(TOPDIR)/kos && CARGO_TARGET_DIR=$(TOPDIR)/kos/target cargo build --bin kosctl
+
+kosdisk: kosctl
+	$(KOSCTL) mkfs $(KOSDISK).tmp 1024
+	echo "KOS volume seeded by make kosdisk" > /tmp/kos-seed.txt
+	$(KOSCTL) put $(KOSDISK).tmp /seed.txt /tmp/kos-seed.txt
+	mv $(KOSDISK).tmp $(KOSDISK)
+	@echo "kosdisk.img 已生成（1024 块 = 4MB，KOS_MAJOR=254）"
+
+kernel: $(RAMDISK) $(KOSDISK)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(KUNXCORE)/Cargo.toml $(CARGO_FEATURES)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_IMG)
 

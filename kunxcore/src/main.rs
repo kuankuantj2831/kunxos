@@ -168,6 +168,7 @@ mod sensor_dev;
 mod smp;
 mod shell;
 mod socket;
+mod kos_vfs;
 mod syscall_table;
 mod thread;
 mod timer;
@@ -1604,6 +1605,23 @@ const RAMDISK_BLOCKS: usize = 4096;
 /// 输出到 kunxcore/ramdisk.img，随内核一并编译进 .rodata）。
 const RAMDISK_IMG: &[u8] = include_bytes!("../ramdisk.img");
 
+/// 内嵌 KOS 对象存储卷（`make kosdisk` 用 kosctl 生成：mkfs + 导入
+/// /etc/kos-seed 种子树）。以第二个 RAM 磁盘注册（KOSDISK_MAJOR），
+/// 启动时由内核直接挂载到 KOS 引擎（Phase 1 双跑，不占用 SFS 路径）。
+const KOSDISK_IMG: &[u8] = include_bytes!("../kosdisk.img");
+/// KOS 卷主设备号（RAM 磁盘族：1=ramdisk、5=recovrd，取 254）。
+const KOSDISK_MAJOR: u32 = 254;
+
+/// 启动日志用十六进制打印。
+fn uart_hex(v: u64) {
+    uart_send_str("0x");
+    for i in (0..16).rev() {
+        let n = ((v >> (i * 4)) & 0xF) as u8;
+        let c = if n < 10 { b'0' + n } else { b'a' + n - 10 };
+        uart_send_char(c);
+    }
+}
+
 /// 初始化块设备、设备文件与 VFS，并把内嵌 rootfs 镜像挂载到根目录。
 fn fs_boot() {
     kinfo! { uart_send_str("[fs] Phase 5: 文件系统\n"); }
@@ -1638,6 +1656,28 @@ fn fs_boot() {
             }
         }
         kinfo! { uart_send_str("[sec] ramdisk 自检通过（sha256 与 bootloader 一致）\n"); }
+    }
+
+    // 3.2 KOS 对象存储卷：包装为第二 RAM 磁盘并挂载（Phase 1 双跑）。
+    // 镜像 4KB 对齐；ramdisk_read/write 直接按物理地址访问 .rodata 区。
+    if KOSDISK_IMG.len() % blkdev::BLK_SIZE == 0 && KOSDISK_IMG.len() > 0 {
+        let base = KOSDISK_IMG.as_ptr() as usize;
+        if blkdev::ramdisk_wrap("kosrd", KOSDISK_MAJOR, base, KOSDISK_IMG.len()) >= 0 {
+            if kos_vfs::mount(KOSDISK_MAJOR) {
+                let (gen, objs, free, pool) = kos_vfs::sys_stat();
+                uart_send_str("[kos] 对象存储卷已挂载：pool ");
+                uart_hex(pool);
+                uart_send_str(" gen ");
+                uart_hex(gen);
+                uart_send_str(" objects ");
+                uart_hex(objs as u64);
+                uart_send_str(" free ");
+                uart_hex(free);
+                uart_send_str("\n");
+            } else {
+                uart_send_str("[kos] 对象存储卷挂载失败（镜像损坏？）\n");
+            }
+        }
     }
 
     // 4. 挂载到 "/"（镜像含超级块，无需再 mkfs）

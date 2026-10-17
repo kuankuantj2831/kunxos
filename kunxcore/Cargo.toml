@@ -13,6 +13,7 @@ fontdue = "0.9.4"
 kunxhal = { path = "../kunxhal", default-features = false }
 kunxwireless = { path = "../wireless" }
 kunxsec = { path = "../kunxsec" }
+kos = { path = "../kos", default-features = false }
 
 # 裸机环境：panic 直接中止，不展开栈（无 unwinding 支持）
 [profile.dev]

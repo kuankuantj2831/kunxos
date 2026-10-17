@@ -111,6 +111,28 @@ pub enum KosError {
     },
     /// 顶层索引块哈希不等于给定 root。
     RootMismatch,
+    /// content_hash 在对象池中不存在。
+    ObjectNotFound,
+    /// 路径不存在（命名空间中找不到该条目）。
+    PathNotFound,
+    /// 路径中途的条目不是目录。
+    NotADirectory,
+    /// readlink 目标不是符号链接。
+    NotASymlink,
+    /// 条目已存在。
+    AlreadyExists,
+    /// 权限位检查未通过。
+    PermissionDenied,
+    /// 命名空间条目表解码失败。
+    CorruptNamespace,
+    /// Root Manifest 双槽均无法解析。
+    NoValidManifest,
+    /// 名字超过 MAX_NAME。
+    NameTooLong,
+    /// 对象池空间不足。
+    NoSpace,
+    /// 底层 I/O 错误（宿主 std 路径；值为 errno）。
+    Io(i32),
 }
 
 impl fmt::Display for KosError {
@@ -154,6 +176,17 @@ impl fmt::Display for KosError {
                 write!(f, "命名空间节点的未用槽位 {index} 非全零")
             }
             KosError::HashMismatch { context } => write!(f, "Merkle 哈希链不匹配：{context}"),
+            KosError::ObjectNotFound => write!(f, "对象不存在"),
+            KosError::PathNotFound => write!(f, "路径不存在"),
+            KosError::NotADirectory => write!(f, "不是目录"),
+            KosError::NotASymlink => write!(f, "不是符号链接"),
+            KosError::AlreadyExists => write!(f, "条目已存在"),
+            KosError::PermissionDenied => write!(f, "权限不足"),
+            KosError::CorruptNamespace => write!(f, "命名空间条目表损坏"),
+            KosError::NoValidManifest => write!(f, "Root Manifest 双槽均无效"),
+            KosError::NameTooLong => write!(f, "名字过长"),
+            KosError::NoSpace => write!(f, "对象池空间不足"),
+            KosError::Io(e) => write!(f, "I/O 错误 errno {e}"),
             KosError::RootMismatch => write!(f, "顶层索引块哈希与 root 不符"),
         }
     }

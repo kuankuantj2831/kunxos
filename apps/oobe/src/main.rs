@@ -596,15 +596,16 @@ fn print_dec(mut v: usize) {
 /// 在动画期吞掉（动画 <400ms）。
 fn pump_input_during_anim() {
     let mut ev = InputEvent { x: 0, y: 0, enter: false, back: false, ch: None, backspace: false };
-    let mut any = false;
     while read_input_event(&mut ev) {
-        any = true;
+        // 吞掉动作字段；指针位置已在 consume_input_event 内写入 CUR_X/Y
         ev.enter = false;
         ev.back = false;
         ev.ch = None;
         ev.backspace = false;
     }
-    if any && unsafe { CURSOR_DIRTY } {
+    // ★ 不设 any 门（R7-A）：read_input_event 对纯移动事件返回 false，
+    // 但位置已更新、CURSOR_DIRTY 已置位——门会让动画期光标冻结
+    if unsafe { CURSOR_DIRTY } {
         move_cursor_fb();
     }
 }
@@ -2876,6 +2877,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             }
         }
         present_fb();
+        pump_input_during_anim();
         // ★ 退出条件（此前改真实时间推进时漏加 → 转场死循环：OOBE 卡死、输入停摆指针消失）
         if t >= 1.0 {
             break;

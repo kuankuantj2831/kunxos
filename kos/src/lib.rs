@@ -54,5 +54,6 @@ pub mod error;
 pub mod format;
 pub mod hash;
 pub mod merkle;
+pub mod store;
 
 pub use error::KosError;
