@@ -119,18 +119,30 @@ fn gc_reclaims_orphans() {
     let objs_before = s.object_count();
     let free_before = s.free_blocks();
     let (dead, freed) = s.gc().unwrap();
-    assert!(dead >= 30, "至少 30 代孤儿目录+索引应被清扫（实际 {dead}）");
-    assert!(freed > 0);
+    // 稳定记录键：追加不再换代命名空间 → 孤儿数应≈0（反向护栏）。
+    assert!(dead <= 2, "追加不应再生产孤儿（实际 {dead}）");
+    let _ = freed;
     assert_eq!(s.object_count(), objs_before - dead);
     assert_eq!(s.free_blocks(), free_before + freed);
+    // 用不可变覆盖制造孤儿（write 整体替换留旧对象），GC 必须能清。
+    for i in 0..10 {
+        s.write(&format!("/ovw{i}"), &[i as u8; 4096], 0, perm::DEFAULT).unwrap();
+        s.write(&format!("/ovw{i}"), &[0xEE; 4096], 0, perm::DEFAULT).unwrap();
+    }
+    let pre2 = s.object_count();
+    let (dead2, freed2) = s.gc().unwrap();
+    assert!(dead2 >= 10 && freed2 > 0, "覆盖孤儿应被清扫（{dead2}）");
+    let _ = freed2;
+
     // 活数据完好。
     let d = s.open_path("/log", 0).unwrap();
     assert!(d.starts_with(b"v0chunk-0 "));
     assert!(d.ends_with(b"chunk-29 "));
-    // 重挂载后状态一致（持久索引反映 GC 后世界）。
+    // 重挂载后状态一致（持久索引反映 GC 后世界；含覆盖孤儿清扫计数）。
     let dev = s.take_device();
     let mut s2 = KosStore::open(dev, VerifyLevel::Full).unwrap();
-    assert_eq!(s2.object_count(), objs_before - dead);
+    let expect_after = pre2 - dead2; // 二次 GC 前计数 - 清扫数
+    assert_eq!(s2.object_count(), expect_after);
     assert_eq!(s2.open_path("/log", 0).unwrap(), d);
     // GC 后继续写入分配正常。
     s2.append("/log", b"post-gc", 0).unwrap();

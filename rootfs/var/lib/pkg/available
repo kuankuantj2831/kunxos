@@ -19,18 +19,6 @@ Size: 655
 KunxHash: 1ca9ff6a994a36fa277fba95f9c1f40e
 SignedBy: kunx-repo
 
-Package: calculator
-Version: 1.0.0
-ApiLevel: 1
-Permissions: INTERNET,LOCATION
-Depends: libc >=1.0.0
-Provides: calc
-Description: KunxOS 计算器（示例）
-Filename: files/calculator-1.0.0.kunx
-Size: 112370
-KunxHash: a889200864004aaa802314fd8d7be897
-SignedBy: kunx-repo
-
 Package: cyc-a
 Version: 1.0.0
 ApiLevel: 1
@@ -51,16 +39,6 @@ Size: 631
 KunxHash: 7d09f4c4d712010652d68f0898ae92f4
 SignedBy: kunx-repo
 
-Package: depdemo
-Version: 1.0.0
-ApiLevel: 1
-Depends: libgfx >=1.0.0,libbase >=1.2.0
-Description: 依赖链示例：目标应用（菱形依赖 libgfx + libbase）
-Filename: files/depdemo-1.0.0.kunx
-Size: 109491
-KunxHash: 0750b6ab48240798999478f88215b95e
-SignedBy: kunx-repo
-
 Package: missingdep
 Version: 1.0.0
 ApiLevel: 1
@@ -69,37 +47,5 @@ Description: 缺失依赖示例：依赖软件源中不存在的 ghost-lib（负
 Filename: files/missingdep-1.0.0.kunx
 Size: 652
 KunxHash: c6db16b71d4462ae1d367e83802f8a6a
-SignedBy: kunx-repo
-
-Package: libgfx
-Version: 1.1.0
-ApiLevel: 1
-Depends: libc >=1.0.0,libbase >=1.0.0
-Description: 依赖链示例：图形库（依赖 libbase，二级依赖）
-Filename: files/libgfx-1.1.0.kunx
-Size: 109483
-KunxHash: 8f43e40275b4501453ff2eee602af054
-SignedBy: kunx-repo
-
-Package: terminal
-Version: 1.1.0
-ApiLevel: 1
-Permissions: INTERNET
-Depends: libc >=1.0.0
-Provides: term
-Description: 系统终端模拟器
-Filename: files/terminal-1.1.0.kunx
-Size: 154081
-KunxHash: e56f775b25df58b8526592ceb86ef81a
-SignedBy: kunx-repo
-
-Package: libbase
-Version: 1.2.0
-ApiLevel: 1
-Depends: libc >=1.0.0
-Description: 依赖链示例：基础库（多级依赖的底层）
-Filename: files/libbase-1.2.0.kunx
-Size: 109456
-KunxHash: 872b4768de1ce337d8b0240fab991cbb
 SignedBy: kunx-repo
 

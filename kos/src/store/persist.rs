@@ -44,8 +44,8 @@ pub struct MountHint {
     pub index_head: u64,
     /// 索引块数。
     pub index_blocks: u32,
-    /// 保留。
-    pub reserved: u32,
+    /// 空闲块计数（挂载免全量数位；≤4G 块 = 16TB 卷）。
+    pub free_cnt: u32,
 }
 
 impl MountHint {
@@ -58,7 +58,7 @@ impl MountHint {
         b[12..16].copy_from_slice(&self.bitmap_blocks.to_le_bytes());
         b[16..24].copy_from_slice(&self.index_head.to_le_bytes());
         b[24..28].copy_from_slice(&self.index_blocks.to_le_bytes());
-        b[28..32].copy_from_slice(&self.reserved.to_le_bytes());
+        b[28..32].copy_from_slice(&self.free_cnt.to_le_bytes());
         b
     }
 
@@ -75,7 +75,7 @@ impl MountHint {
             bitmap_blocks: u32::from_le_bytes(b[12..16].try_into().ok()?),
             index_head: u64::from_le_bytes(b[16..24].try_into().ok()?),
             index_blocks: u32::from_le_bytes(b[24..28].try_into().ok()?),
-            reserved: u32::from_le_bytes(b[28..32].try_into().ok()?),
+            free_cnt: u32::from_le_bytes(b[28..32].try_into().ok()?),
         })
     }
 

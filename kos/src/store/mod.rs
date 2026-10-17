@@ -410,8 +410,18 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let per = crate::store::persist::BITS_PER_BMP_BLOCK;
         let n_bmp_blocks = (pool_blocks + per - 1) / per;
 
-        if let Some((objects, free)) = fast_mount(&dev, &sb, &manifest, pool_end) {
-            let free_cnt = free.iter().filter(|f| **f).count() as u64;
+        if let Some((objects, mut free, free_cnt)) = fast_mount(&dev, &sb, &manifest, pool_end) {
+            // 懒加载：只保留到最高已用块的前缀，尾区按需物化（挂载
+            // 免构建亿级位向量）。free_cnt 来自 hint，不受截断影响。
+            let hi = objects.values().map(|i| obj_max_block(i)).max();
+            if let Some(hi) = hi {
+                let rel = (hi - sb.obj_pool_start + 1) as usize;
+                if rel < free.len() {
+                    free.truncate(rel);
+                }
+            } else {
+                free.clear();
+            }
             return Ok(KosStore {
                 dev,
                 hasher: Sha256Hasher,
@@ -438,7 +448,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         }
 
         // 权威恢复路径：扫描全池。
-        let mut objects = BTreeMap::new();
+        let mut objects: BTreeMap<[u8; 32], ObjIndex> = BTreeMap::new();
         let mut free = alloc::vec![true; pool_blocks];
         let mut scan = [0u8; BLK];
         let mut b = pool_start;
@@ -448,7 +458,13 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                 if let Ok(hdr) = KosObject::from_bytes(&scan[..OBJECT_HEADER_SIZE]) {
                     if let Some(idx) = load_object(&dev, b, hdr, pool_end) {
                         mark_obj(&mut free, pool_start, &idx, false);
-                        objects.insert(idx.header.content_hash, idx);
+                        // 同键（稳定记录键）多代并存：取 version 最高者。
+                        match objects.get(&idx.header.content_hash) {
+                            Some(prev) if prev.header.version >= idx.header.version => {}
+                            _ => {
+                                objects.insert(idx.header.content_hash, idx);
+                            }
+                        }
                     }
                 }
             }
@@ -926,7 +942,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         data_extents.extend_from_slice(&new_extents);
         // 4) 重建树 + 新索引块 + 新区段表。
         let tree = MerkleTree::build_from_chunk_hashes(&leaf_hashes, &self.hasher);
-        let new_index_extents = self.write_index_blocks(&tree)?;
+        let (new_index_extents, reused_idx) = self.write_index_blocks_delta(&old_idx, &tree)?;
         let total_chunks = (old_chunks + new_chunks) as u32;
         let loc = self.build_table(
             &data_extents,
@@ -944,6 +960,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             loc,
             &entry.content_hash,
             path,
+            Some(reused_idx),
         )?;
         Ok(new_len)
     }
@@ -1008,12 +1025,12 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             (ext, PatchMap::new(), t)
         };
         let _ = patched;
-        let new_index_extents = self.write_index_blocks(&tree)?;
+        let (new_index_extents, reused_idx) = self.write_index_blocks_delta(&idx, &tree)?;
         let loc = self.build_table(&extents, &new_index_extents, tree.root_hash(), new_chunks as u32)?;
         self.dev.flush()?;
         self.commit_record_switch(
             &idx, tree.root_hash(), len, new_chunks as u32, loc,
-            &entry.content_hash, path,
+            &entry.content_hash, path, Some(reused_idx),
         )?;
         if let Some(drop_tail) = pending_drop {
             self.reclaim(&drop_tail, &[]);
@@ -1079,7 +1096,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         leaves.resize(new_chunks.max(1), [0u8; 32]);
         let tree = MerkleTree::build_from_chunk_hashes(&leaves, &self.hasher);
 
-        let new_index_extents = self.write_index_blocks(&tree)?;
+        let (new_index_extents, reused_idx) = self.write_index_blocks_delta(&idx, &tree)?;
         let loc =
             self.build_table(&extents, &new_index_extents, tree.root_hash(), new_chunks as u32)?;
         self.dev.flush()?;
@@ -1091,6 +1108,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             loc,
             &entry.content_hash,
             path,
+            Some(reused_idx),
         )?;
         Ok(new_len as u64)
     }
@@ -1107,6 +1125,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         loc: TableLoc,
         old_key: &[u8; 32],
         path: &str,
+        reused_idx: Option<Vec<u64>>,
     ) -> Result<(), KosError> {
         let mut hdr = old.header.clone();
         let secs = (self.clock / 1_000_000) as u32;
@@ -1128,16 +1147,41 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             }
         }
         hdr.version += 1;
-        let new_block = self.alloc_blocks(1)?[0];
-        let new_key = record_key(&self.hasher, &root, new_block);
+        // 免 manifest 追加：记录键在创建时冻结（跨代稳定）——条目永不
+        // 换哈希，追加不再触发目录链 CoW / manifest 换代。崩溃歧义
+        // （新旧头同键并存）由扫描侧取最高 version 消解。
+        let new_key = *old_key;
         hdr.content_hash = new_key;
+        let new_block = self.alloc_blocks(1)?[0];
         self.write_header_block_inline(new_block, &hdr, inline.as_ref())?;
         let new_idx = load_object(&self.dev, new_block, hdr, self.pool_end())
             .ok_or(KosError::ExtentTableCorrupt)?;
-        self.objects.remove(old_key);
+        // 新头落盘后清零旧头（同键取 version 高者；清零让扫描无歧义，
+        // 也防旧头块泄漏）。断电窗口内两键并存 → version 裁决。
+        let zero = [0u8; BLK];
+        self.write_blk(old.header_block, &zero)?;
         self.objects.insert(new_key, new_idx);
-        self.reclaim(&old.index_extents, &old.table_blocks);
-        self.update_entry_hash(path, new_key, ObjectType::File)?;
+        // 回收旧索引块——增量复用的块跳过（仍被新头引用）。
+        match &reused_idx {
+            Some(reused) => {
+                let kept: Vec<u64> = old
+                    .index_extents
+                    .iter()
+                    .flat_map(|e| e.start..e.start + e.count as u64)
+                    .filter(|b| !reused.contains(b))
+                    .collect();
+                self.reclaim(&runs_of(&kept, KIND_INDEX), &old.table_blocks);
+            }
+            None => self.reclaim(&old.index_extents, &old.table_blocks),
+        }
+        // 稳定记录键：条目哈希未变——无需目录链 CoW / manifest 换代，
+        // 但分配状态（位图/索引链）仍须持久化，否则快速挂载会因链指向
+        // 已清零的旧头块而回退扫描。seq 不变无妨：位图块自带 CRC。
+        self.persist_alloc_state()?;
+        self.sb.free_blocks = self.free_cnt;
+        self.write_blk(0, &self.sb.to_bytes())?;
+        self.maybe_flush()?;
+        let _ = path;
         Ok(())
     }
 
@@ -1777,7 +1821,16 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             if first >= last {
                 break;
             }
-            let bits = &self.free[first..last];
+            // 懒加载：未加载尾区按空闲写盘（位图权威覆盖全池）。
+            let owned_last = core::cmp::min(last, self.free.len());
+            let mut bits_v: Vec<bool>;
+            let bits: &[bool] = if owned_last >= last {
+                &self.free[first..last]
+            } else {
+                bits_v = self.free[first..owned_last].to_vec();
+                bits_v.resize(last - first, true);
+                &bits_v
+            };
             let bytes = p::bitmap_block_bytes(first as u32, bits);
             self.write_blk(bmp_base + i as u64, &bytes)?;
             if i < self.bitmap_dirty.len() {
@@ -1810,7 +1863,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             bitmap_blocks: bmp_blocks as u32,
             index_head: idx_base,
             index_blocks: idx_blocks.max(1) as u32,
-            reserved: 0,
+            free_cnt: self.free_cnt.min(u32::MAX as u64) as u32,
         };
         hint.write_to_sb(&mut self.sb);
         // 持久化状态已是最新：后续 commit 只需写脏块。
@@ -1902,6 +1955,19 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         Ok(())
     }
 
+    /// 懒加载位图：越界（未加载区）视为空闲。
+    fn is_free(&self, i: usize) -> bool {
+        i >= self.free.len() || self.free[i]
+    }
+
+    /// 把位图扩展到覆盖下标 `i`（新区域全空闲）。
+    fn free_ensure(&mut self, i: usize) {
+        if i >= self.free.len() {
+            let add = i + 1 - self.free.len();
+            self.free.extend(core::iter::repeat(true).take(add));
+        }
+    }
+
     fn pool_end(&self) -> u64 {
         self.sb.obj_pool_start + self.sb.obj_pool_blocks
     }
@@ -1926,10 +1992,14 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let per = crate::store::persist::BITS_PER_BMP_BLOCK;
         let mut runs: Vec<(u64, u32)> = Vec::new();
         let mut got = 0u64;
-        // F3 局部性：分配提示点起恰好有连续 need 空闲块 → 直接取用
-        // （append 流的块物理连续：区段少、顺序 IO 友好）。
+        // F3 局部性：分配提示点起恰好有连续 need 空闲块 → 直接取用。
+        // total 是已加载前缀；越过前缀即未加载空闲区（懒加载）。
+        let pool_total = self.sb.obj_pool_blocks as usize;
         let h = self.alloc_hint;
-        if h + (need as usize) <= total && (h..h + need as usize).all(|k| self.free[k]) {
+        if h + (need as usize) <= pool_total
+            && (h..h + need as usize).all(|k| self.is_free(k))
+        {
+            self.free_ensure(h + need as usize - 1);
             for k in h..h + need as usize {
                 self.free[k] = false;
                 self.bitmap_dirty[k / per] = true;
@@ -1945,25 +2015,25 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let mut steps = total * 2;
         while steps > 0 && got < need {
             steps -= 1;
-            if !self.free[i] {
+            if !self.is_free(i) {
                 i = (i + 1) % total;
                 continue;
             }
-            // 从 i 起收集连续空闲段（截到 need）。
+            // 从 i 起收集连续空闲段（截到 need；越过已加载前缀即空闲）。
             let start = i;
             let mut end = i;
-            while end < total
-                && self.free[end]
+            while end < pool_total
+                && self.is_free(end)
                 && got + (end - start + 1) as u64 <= need
             {
                 end += 1;
             }
             let cnt = (end - start) as u64;
             if cnt == 0 {
-                // need 已被前一段满足的边界情形由循环条件处理。
                 i = (i + 1) % total;
                 continue;
             }
+            self.free_ensure(end - 1);
             for k in start..end {
                 self.free[k] = false;
                 self.bitmap_dirty[k / per] = true;
@@ -2013,6 +2083,45 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             self.write_blk(block, &blk.to_bytes())?;
         }
         Ok(runs_of(&blocks, KIND_INDEX))
+    }
+
+    /// 增量索引写（大文件追加优化）：与旧索引逐块比对，**字节相同的
+    /// 块直接复用**（不分配不写），只写差异块（追加场景 = 每层右侧
+    /// 路径块，O(树深)）。复用安全：复用块与旧头引用内容逐字节一致，
+    /// 断电后旧世界完整可读。返回 (新区段, 复用块集合)。
+    fn write_index_blocks_delta(
+        &mut self,
+        idx: &ObjIndex,
+        tree: &MerkleTree,
+    ) -> Result<(Vec<Extent>, Vec<u64>), KosError> {
+        let old_blocks: Vec<u64> = idx
+            .index_extents
+            .iter()
+            .flat_map(|e| e.start..e.start + e.count as u64)
+            .collect();
+        let mut out_blocks: Vec<u64> = Vec::new();
+        let mut reused: Vec<u64> = Vec::new();
+        let mut blk_buf = [0u8; BLK];
+        for (pos, nb) in tree.index_blocks().enumerate() {
+            let nb_bytes = nb.to_bytes();
+            let mut placed = false;
+            if pos < old_blocks.len() {
+                let oldb = old_blocks[pos];
+                if self.read_blk(oldb, &mut blk_buf).is_ok()
+                    && blk_buf[..MERKLE_INDEX_BLOCK_SIZE] == nb_bytes[..]
+                {
+                    out_blocks.push(oldb);
+                    reused.push(oldb);
+                    placed = true;
+                }
+            }
+            if !placed {
+                let nb2 = self.alloc_blocks(1)?[0];
+                self.write_blk(nb2, &nb_bytes)?;
+                out_blocks.push(nb2);
+            }
+        }
+        Ok((runs_of(&out_blocks, KIND_INDEX), reused))
     }
 
     fn build_table(
@@ -2152,6 +2261,18 @@ enum TableLoc {
     Inline([u8; 3904]),
     /// 链首块号（写入 hdr.indirect）。
     Chain(u64),
+}
+
+/// 对象占用的最高绝对块号（头/表/区段全算）。
+fn obj_max_block(idx: &ObjIndex) -> u64 {
+    let mut m = idx.header_block;
+    for &t in &idx.table_blocks {
+        m = m.max(t);
+    }
+    for e in idx.data_extents.iter().chain(idx.index_extents.iter()) {
+        m = m.max(e.start + e.count as u64 - 1);
+    }
+    m
 }
 
 /// 把（升序）块号列表组织为 `kind` 类型的连续区段。
@@ -2303,12 +2424,13 @@ fn mark_obj(free: &mut [bool], pool_start: u64, idx: &ObjIndex, is_free: bool) {
 
 /// 快速挂载：hint 合法且 seq 与活动 manifest 一致 → 读位图 + 索引链 +
 /// 逐对象头/区段表。任一环节失败返回 None（调用方回退全池扫描）。
+#[allow(clippy::type_complexity)]
 fn fast_mount<B: crate::block::BlockDevice>(
     dev: &B,
     sb: &KosSuperblock,
     manifest: &KosRootManifest,
     pool_end: u64,
-) -> Option<(BTreeMap<[u8; 32], ObjIndex>, Vec<bool>)> {
+) -> Option<(BTreeMap<[u8; 32], ObjIndex>, Vec<bool>, u64)> {
     use crate::store::persist as p;
     let hint = p::MountHint::from_sb(sb)?;
     if hint.seq != manifest.generation {
@@ -2375,7 +2497,7 @@ fn fast_mount<B: crate::block::BlockDevice>(
         let idx = load_object(dev, id, hdr, pool_end)?;
         objects.insert(idx.header.content_hash, idx);
     }
-    Some((objects, free))
+    Some((objects, free, hint.free_cnt as u64))
 }
 
 fn split_path(p: &str) -> impl Iterator<Item = &str> {
