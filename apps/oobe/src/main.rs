@@ -591,6 +591,24 @@ fn print_dec(mut v: usize) {
     unsafe { write_fd(1, &buf[i..]); }
 }
 
+/// 动画期间的输入泵：非阻塞消费输入事件，指针移动照常更新光标并重画
+/// overlay（用户要求：动画没播完时指针也要可见、可动）；点击/回车动作
+/// 在动画期吞掉（动画 <400ms）。
+fn pump_input_during_anim() {
+    let mut ev = InputEvent { x: 0, y: 0, enter: false, back: false, ch: None, backspace: false };
+    let mut any = false;
+    while read_input_event(&mut ev) {
+        any = true;
+        ev.enter = false;
+        ev.back = false;
+        ev.ch = None;
+        ev.backspace = false;
+    }
+    if any && unsafe { CURSOR_DIRTY } {
+        move_cursor_fb();
+    }
+}
+
 /// 单调时钟（µs，CLOCK_MONOTONIC）：动画进度判定一律用它，帧率拉满时
 /// 每帧按真实时间推进（与帧率解耦，时长恒定不随机器快慢变化）。
 fn mono_us() -> u64 {
@@ -1862,6 +1880,7 @@ fn play_icon_cone(cp: u32) {
         restore_icon_bg();
         blit_icon_gradient(cx, cy, &g, Some((s, fade)));
         flip();
+        pump_input_during_anim();
         if p >= 1.0 {
             break;
         }
@@ -2788,6 +2807,7 @@ fn pulse_selection() {
                 }
             }
             present_rect(sx, sy, sw, sh);
+            pump_input_during_anim();
             if t >= 1.0 {
                 break;
             }
@@ -2856,6 +2876,10 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             }
         }
         present_fb();
+        // ★ 退出条件（此前改真实时间推进时漏加 → 转场死循环：OOBE 卡死、输入停摆指针消失）
+        if t >= 1.0 {
+            break;
+        }
     }
     render_and_flip();
 }
@@ -2943,6 +2967,7 @@ fn animate_welcome() {
                 HERO_CY + HERO_R + 50,
             );
             let _ = (tA, tB, tC);
+            pump_input_during_anim();
             frames += 1;
             if t >= 1.0 {
                 print("[anim] hero frames=");
@@ -2972,6 +2997,7 @@ fn animate_welcome() {
         draw_nav();
         // 文字区错峰淡入：区域拷贝+脏矩形呈现
         present_region(0, WEL_TITLE_Y - 30, DISPLAY_W as i32, WEL_DESC_Y + GAP_AFTER_BODY + 40);
+        pump_input_during_anim();
         if p >= 1.0 {
             break;
         }
