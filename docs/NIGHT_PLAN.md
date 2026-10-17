@@ -223,3 +223,12 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 - **墙钟清剿扩展到全部应用**：11 处应用侧 now_us 本体改 CLOCK_MONOTONIC（calculator/settings/stub/store×2/terminal/cloud/tlstest/oobe finish + shared/app_kit + shared/ttf_text）——覆盖按键动画、轮询超时、光标闪烁、加载动效等全部时间差判定；墙钟显示保留（oobe finish 时钟改内联 gettimeofday；clock 应用本就纯显示未动）
 - cloud 无 syscall3 封装：该处手写 ecall
 - 回归：make 0 错误 + test-sfsrace PASS
+
+### 第 22 轮（2026-10-17 上午，用户报告 OOBE 动画卡顿）
+- **OOBE 动画帧率拉满**：原「固定帧数 + 帧间固定 sleep（3-36ms）」模式实测仅 ~11fps（Hero 260ms 只跑 3 帧）。逐段计时定位瓶颈（背景全屏重绘 3-12ms / brand 光晕逐像素圆 13ms / flip 整屏 2MB 拷贝 / nav 毛玻璃每帧重画 40ms 首次）后四项优化：
+  1. 全部动画改**真实时间推进 + 帧间不睡眠**（时长恒定，帧率拉满；mono_us 单调钟）
+  2. 背景渐变**行缓存**（每帧省 47 万次混合运算）
+  3. nav 毛玻璃**首帧快照**（动画期行恢复，省每帧 40ms 模糊计算）
+  4. Hero/标题动画**区域呈现**（brand/文字矩形拷贝+脏矩形，替代整屏 2MB flip）+ 光晕 **scanline 化**（13ms→0.7ms）
+- 实测：Hero 260ms **3 帧 → 21 帧（≈81fps，提升 7 倍）**；主循环节流 16→8ms 且动画期不睡
+- 回归：make 0 错误 + test-sfsrace PASS

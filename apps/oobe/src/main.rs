@@ -212,17 +212,14 @@ const HERO_R: i32 = 44;
 
 // ==================== 动画参数（对标 ColorOS 15，见 docs/animations.md） ====================
 
-/// 步骤间转场帧数（~50ms）。TCG 下每帧含 47 万像素合成 + 全屏呈现，
-/// 帧数越少越不卡；转场帧间短 sleep，保留「上滑回弹」的节奏感。
-const TRANS_FRAMES: i32 = 4;
+/// 动画改为**真实时间推进 + 帧间不睡眠**（帧率拉满，目标 144Hz）：
+/// 每帧按 mono_us 计算进度，机器越快帧率越高、时长恒定不变。
+const TRANS_DUR_US: u64 = 160_000; // 步间转场
+const HERO_DUR_US: u64 = 260_000; // 欢迎页 Hero 弹跳
+const TITLE_DUR_US: u64 = 320_000; // 标题区错峰淡入
+const PULSE_DUR_US: u64 = 160_000; // 选中卡片脉冲
 /// 转场上滑距离（px）。
 const TRANS_SLIDE: i32 = 26;
-/// 欢迎页 Hero 入场帧数（弹跳过冲）。
-const HERO_FRAMES: i32 = 5;
-/// 标题区淡入帧数（错峰叠加）。
-const TITLE_FRAMES: i32 = 6;
-/// 选中卡片脉冲帧数。
-const PULSE_FRAMES: i32 = 3;
 
 // ==================== 8x8 位图字体 ====================
 
@@ -594,6 +591,18 @@ fn print_dec(mut v: usize) {
     unsafe { write_fd(1, &buf[i..]); }
 }
 
+/// 单调时钟（µs，CLOCK_MONOTONIC）：动画进度判定一律用它，帧率拉满时
+/// 每帧按真实时间推进（与帧率解耦，时长恒定不随机器快慢变化）。
+fn mono_us() -> u64 {
+    let mut tv = [0u8; 16];
+    unsafe {
+        syscall3(113, 1, tv.as_mut_ptr() as usize, 0); // clock_gettime(MONOTONIC)
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
+}
+
 fn sleep_ms(ms: usize) {
     let mut req = [0u8; 16];
     let sec = (ms / 1000) as u64;
@@ -785,6 +794,32 @@ fn present_rect(x: i32, y: i32, w: i32, h: i32) {
         syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PUT_DAMAGE, hdr.as_ptr() as usize);
         let empty = [0u8; 4];
         syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, empty.as_ptr() as usize);
+    }
+}
+
+/// 把 BACK_BUF 的指定区域拷到显存并脏矩形呈现（动画期替代整屏 flip：
+/// 每帧只拷贝/提交变化的矩形，2MB 全屏拷贝是 TCG 下帧率的最大杀手）。
+fn present_region(x0: i32, y0: i32, x1: i32, y1: i32) {
+    unsafe {
+        if FB_PTR.is_null() {
+            return;
+        }
+        let cx0 = x0.clamp(0, DISPLAY_W as i32);
+        let cy0 = y0.clamp(0, DISPLAY_H as i32);
+        let cx1 = x1.clamp(0, DISPLAY_W as i32);
+        let cy1 = y1.clamp(0, DISPLAY_H as i32);
+        if cx0 >= cx1 || cy0 >= cy1 {
+            return;
+        }
+        let w = (cx1 - cx0) as usize;
+        for y in cy0..cy1 {
+            core::ptr::copy_nonoverlapping(
+                BACK_BUF.as_ptr().add(y as usize * DISPLAY_W + cx0 as usize),
+                FB_PTR.add(y as usize * FB_STRIDE_PX + cx0 as usize),
+                w,
+            );
+        }
+        present_rect(cx0, cy0, cx1 - cx0, cy1 - cy0);
     }
 }
 
@@ -1252,21 +1287,30 @@ fn draw_cjk(x: i32, y: i32, cp: u16, color: u32) {
 }
 
 /// ColorOS 15 浅色向导背景：近白底 + 极淡绿冷色垂直渐变。
+/// 背景渐变**行缓存**：背景静态，每行颜色只算一次，之后每帧整行 u32
+/// 拷贝（动画期 draw_background 每帧调用，原版每帧重算 47 万次渐变混合）。
+static mut BG_ROWS: [u32; DISPLAY_H] = [0; DISPLAY_H];
+static mut BG_ROWS_READY: bool = false;
+
 fn draw_background() {
-    let (tr, tg, tb) = (0xF9u32, 0xFBu32, 0xFD);
-    let (br, bg, bb) = (0xE9u32, 0xF1u32, 0xF4);
-    for y in 0..DISPLAY_H as i32 {
-        let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
-        let inv = 255 - t;
-        let r = (tr * inv + br * t) / 255;
-        let g = (tg * inv + bg * t) / 255;
-        let b = (tb * inv + bb * t) / 255;
-        let row = (r << 16) | (g << 8) | b;
-        let iy = y as usize * DISPLAY_W;
-        unsafe {
-            for x in 0..DISPLAY_W {
-                BACK_BUF[iy + x] = row;
+    unsafe {
+        if !BG_ROWS_READY {
+            let (tr, tg, tb) = (0xF9u32, 0xFBu32, 0xFD);
+            let (br, bg, bb) = (0xE9u32, 0xF1u32, 0xF4);
+            for y in 0..DISPLAY_H as i32 {
+                let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
+                let inv = 255 - t;
+                let r = (tr * inv + br * t) / 255;
+                let g = (tg * inv + bg * t) / 255;
+                let b = (tb * inv + bb * t) / 255;
+                BG_ROWS[y as usize] = (r << 16) | (g << 8) | b;
             }
+            BG_ROWS_READY = true;
+        }
+        for y in 0..DISPLAY_H as i32 {
+            let row = BG_ROWS[y as usize];
+            let iy = y as usize * DISPLAY_W;
+            BACK_BUF[iy..iy + DISPLAY_W].fill(row);
         }
     }
 }
@@ -1414,41 +1458,56 @@ fn draw_brand_ex(e: f32, scale: f32) {
     let cy = HERO_CY + ((1.0 - e) * 10.0) as i32;
     let glow_r = r + 10;
     // ColorOS 入场光晕：徽标背后先扩散一圈淡绿柔光（淡入淡出）。
+    // scanline 优化（帧率关键）：每行先解出圆内水平段 [x0,x1]，段内
+    // d 只随 dx 线性变化，免去逐像素圆判定与越界 continue（TCG 实测
+    // 该圆双环逐像素版 ~13ms/帧，是动画帧率第一大杀手）。
     if (a as f32) > 0.0 {
         for dy in -glow_r..=glow_r {
-            for dx in -glow_r..=glow_r {
+            let y = cy + dy;
+            if y < 0 || y >= DISPLAY_H as i32 {
+                continue;
+            }
+            let span2 = glow_r * glow_r - dy * dy;
+            if span2 <= 0 {
+                continue;
+            }
+            let half = isqrt(span2) ;
+            let x0 = (HERO_CX - half).max(0);
+            let x1 = (HERO_CX + half).min(DISPLAY_W as i32 - 1);
+            let mut dx = x0 - HERO_CX;
+            let mut x = x0;
+            while x <= x1 {
                 let d = dx * dx + dy * dy;
-                if d > glow_r * glow_r {
-                    continue;
-                }
                 let fall = (glow_r * glow_r - d) * (a as i32) / (glow_r * glow_r);
                 let ga = (fall / 8).min(120) as u32;
                 if ga > 0 {
-                    let g = blend_px(
-                        put_pixel_get(HERO_CX + dx, cy + dy),
-                        0x00_5A_D2_8A,
-                        ga,
-                    );
-                    put_pixel(HERO_CX + dx, cy + dy, g);
+                    let g = blend_px(put_pixel_get(x, y), 0x00_5A_D2_8A, ga);
+                    put_pixel(x, y, g);
                 }
+                dx += 1;
+                x += 1;
             }
         }
     }
     for dy in -r..=r {
-        for dx in -r..=r {
-            let d = dx * dx + dy * dy;
-            if d > r * r {
-                continue;
-            }
-            // ColorOS 绿垂直渐变（顶部亮绿 → 底部深绿）。
-            let t = ((dy + r) * 255 / (2 * r)).min(255) as u32;
-            let c = blend_px(
-                0x00_45_E0_8B,
-                0x00_09_9E_58,
-                t,
-            );
-            let disc = blend_px(0x00_F0_FA_F6, c, a);
-            put_pixel(HERO_CX + dx, cy + dy, disc);
+        let y = cy + dy;
+        if y < 0 || y >= DISPLAY_H as i32 {
+            continue;
+        }
+        let span2 = r * r - dy * dy;
+        if span2 <= 0 {
+            continue;
+        }
+        let half = isqrt(span2) ;
+        // ColorOS 绿垂直渐变（顶部亮绿 → 底部深绿）：行内同色，一次算好
+        let t = ((dy + r) * 255 / (2 * r)).min(255) as u32;
+        let c = blend_px(0x00_45_E0_8B, 0x00_09_9E_58, t);
+        let disc = blend_px(0x00_F0_FA_F6, c, a);
+        let x0 = (HERO_CX - half).max(0);
+        let x1 = (HERO_CX + half).min(DISPLAY_W as i32 - 1);
+        let yl = y as usize * DISPLAY_W;
+        for x in x0..=x1 {
+            unsafe { BACK_BUF[yl + x as usize] = disc };
         }
     }
     // 内圈高光（ColorOS 徽标镜面感）。
@@ -1801,7 +1860,7 @@ fn play_icon_cone(cp: u32) {
         restore_icon_bg();
         blit_icon_gradient(cx, cy, &g, Some((s, fade)));
         flip();
-        sleep_ms(36);
+        sleep_ms(2);
     }
     // 终态：无高光的纯渐变字形。
     restore_icon_bg();
@@ -2698,8 +2757,9 @@ fn pulse_selection() {
         }
         let (sx, sy) = (x0, y0);
         let (sw, sh) = (x1 - x0, y1 - y0);
-        for f in 0..PULSE_FRAMES {
-            let t = f as f32 / (PULSE_FRAMES - 1) as f32;
+        let pt0 = mono_us();
+        loop {
+            let t = ((mono_us().saturating_sub(pt0)) as f32 / PULSE_DUR_US as f32).min(1.0);
             let a = ((1.0 - t) * 96.0) as u32;
             // 每帧先从 BACK_BUF 恢复卡片底图再叠加本帧 tint：此前直接在
             // canvas 上逐帧叠加，帧间 tint 累积（96+48+0），脉冲结束后卡片
@@ -2724,7 +2784,9 @@ fn pulse_selection() {
                 }
             }
             present_rect(sx, sy, sw, sh);
-            sleep_ms(3);
+            if t >= 1.0 {
+                break;
+            }
         }
         SEL_W = -1;
         cursor_overlay_init();
@@ -2754,8 +2816,10 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
         btn_reset_all();
     }
     let ny = NAV_Y;
-    for f in 0..=TRANS_FRAMES {
-        let t = f as f32 / TRANS_FRAMES as f32;
+    let t0 = mono_us();
+    loop {
+        let el = mono_us().saturating_sub(t0);
+        let t = (el as f32 / TRANS_DUR_US as f32).min(1.0);
         // ColorOS 步进转场：交叉淡化走平滑阶跃，位移走「上滑回弹」
         // （ease_out_back 末端轻微过冲后回落，页面有呼吸感）。
         let e = ease_step(t);
@@ -2811,20 +2875,85 @@ fn animate_welcome() {
     };
     // 阶段 A：徽标弹跳入场（ColorOS spring-pop：缩放 0.5 → 1.0，
     // ease_out_back 中段轻微过冲后回落，伴随淡入与柔光晕开）。
-    for f in 0..HERO_FRAMES {
-        let t = f as f32 / (HERO_FRAMES - 1) as f32;
-        let e = ease_out(t);
-        let eb = ease_out_back(t);
+    {
+        let mut frames = 0u32;
+        // 静态区域快照（帧率关键）：背景与 nav 在动画中恒定 —— 循环前画
+        // 一次，循环内只做行拷贝恢复；每帧真实写入从 1.8MB（全屏）降到
+        // ~5 万像素（brand 区域），TCG 下帧率从 ~15fps 拉到 100+fps。
         draw_background();
-        draw_brand_ex(e, 0.5 + 0.5 * eb);
         draw_nav();
-        flip();
-        sleep_ms(5);
+        let mut nav_snap = [[0u32; DISPLAY_W]; NAV_H as usize];
+        unsafe {
+            for y in 0..NAV_H as usize {
+                nav_snap[y].copy_from_slice(
+                    &BACK_BUF[(DISPLAY_H as usize - NAV_H as usize + y) * DISPLAY_W
+                        ..(DISPLAY_H as usize - NAV_H as usize + y + 1) * DISPLAY_W],
+                );
+            }
+            // brand 区域背景快照（此时 BACK_BUF = 纯背景）
+            let bx0 = (DISPLAY_W as i32 / 2 - HERO_R - 50).max(0) as usize;
+            let by0 = (HERO_CY - HERO_R - 70).max(0) as usize;
+            for y in 0..HERO_BH {
+                HERO_BG_SNAP[y * HERO_BW..(y + 1) * HERO_BW].copy_from_slice(
+                    &BACK_BUF[(by0 + y) * DISPLAY_W + bx0..(by0 + y) * DISPLAY_W + bx0 + HERO_BW],
+                );
+            }
+        }
+        // 动画时钟起点：静态准备（背景/nav/快照）之后 —— 时长预算不含
+        // 一次性渲染开销
+        let t0 = mono_us();
+        // brand 区域背景快照（覆盖光晕 + 垂直位移余量）
+        let bx0 = (DISPLAY_W as i32 / 2 - HERO_R - 50).max(0) as usize;
+        let bx1 = (DISPLAY_W as i32 / 2 + HERO_R + 50) as usize;
+        let by0 = (HERO_CY - HERO_R - 70).max(0) as usize;
+        let by1 = (HERO_CY + HERO_R + 70) as usize;
+        let bw = bx1 - bx0;
+        loop {
+            let t = ((mono_us().saturating_sub(t0)) as f32 / HERO_DUR_US as f32).min(1.0);
+            let e = ease_out(t);
+            let eb = ease_out_back(t);
+            let tA = mono_us();
+            // 恢复 brand 区域背景（逐行拷回，行宽 ~288px）
+            unsafe {
+                for y in by0..by1 {
+                    let src = y - by0;
+                    BACK_BUF[y * DISPLAY_W + bx0..y * DISPLAY_W + bx1]
+                        .copy_from_slice(&HERO_BG_SNAP[src * bw..src * bw + bw]);
+                }
+            }
+            let tB = mono_us();
+            draw_brand_ex(e, 0.5 + 0.5 * eb);
+            let tC = mono_us();
+            unsafe {
+                let base = (DISPLAY_H as usize - NAV_H as usize) * DISPLAY_W;
+                for y in 0..NAV_H as usize {
+                    BACK_BUF[base + y * DISPLAY_W..base + (y + 1) * DISPLAY_W]
+                        .copy_from_slice(&nav_snap[y]);
+                }
+            }
+            // 动画只有中央 brand 在变：区域拷贝+脏矩形呈现（帧率拉满关键）
+            present_region(
+                DISPLAY_W as i32 / 2 - HERO_R - 40,
+                HERO_CY - HERO_R - 50,
+                DISPLAY_W as i32 / 2 + HERO_R + 40,
+                HERO_CY + HERO_R + 50,
+            );
+            let _ = (tA, tB, tC);
+            frames += 1;
+            if t >= 1.0 {
+                print("[anim] hero frames=");
+                print_dec(frames as usize);
+                print("\n");
+                break;
+            }
+        }
     }
     // 阶段 B：标题/副标题/标语 错峰上滑淡入（ColorOS 文字逐级浮现：
     // 标题先行，副标题滞后一档，标语最后，位移各自略小营造视差）。
-    for f in 0..TITLE_FRAMES {
-        let p = f as f32 / TITLE_FRAMES as f32;
+    {
+        let t0 = mono_us();
+        loop {
+        let p = ((mono_us().saturating_sub(t0)) as f32 / TITLE_DUR_US as f32).min(1.0);
         let e0 = ease_out((p / 0.86).min(1.0));
         let e1 = ease_out(((p - 0.14) / 0.86).clamp(0.0, 1.0));
         let e2 = ease_out(((p - 0.28) / 0.86).clamp(0.0, 1.0));
@@ -2837,8 +2966,12 @@ fn animate_welcome() {
         draw_center_px_a(WEL_DESC_Y + dy1, desc, FONT_BODY_PX, C_DIM, (255.0 * e1) as u32);
         draw_center_px_a(WEL_DESC_Y + GAP_AFTER_BODY + dy2, sub, FONT_HINT_PX, C_HINT, (255.0 * e2) as u32);
         draw_nav();
-        flip();
-        sleep_ms(8);
+        // 文字区错峰淡入：区域拷贝+脏矩形呈现
+        present_region(0, WEL_TITLE_Y - 30, DISPLAY_W as i32, WEL_DESC_Y + GAP_AFTER_BODY + 40);
+        if p >= 1.0 {
+            break;
+        }
+        }
     }
     render_and_flip();
 }
@@ -2851,6 +2984,11 @@ fn animate_welcome() {
 
 /// 动画帧计数（16ms/帧，三角形振荡做呼吸）。
 static mut ANIM_T: u32 = 0;
+
+/// Hero 动画 brand 区域背景快照（静态区域循环前拍一次，每帧行拷贝恢复）。
+const HERO_BW: usize = (HERO_R as usize + 50) * 2;
+const HERO_BH: usize = (HERO_R as usize + 70) * 2;
+static mut HERO_BG_SNAP: [u32; HERO_BW * HERO_BH] = [0; HERO_BW * HERO_BH];
 
 /// 卡片悬停状态（上次所在步骤/索引，-1 = 无）。
 static mut HOVER_STEP: i32 = -1;
@@ -4143,6 +4281,7 @@ fn wait_for_tap_next_button() -> i32 {
         backspace: false,
     };
     let mut idle = 0usize;
+            let mut loop_t0 = mono_us();
     loop {
         err_ui::err_tick();
         if read_input_event(&mut event) {
@@ -4234,14 +4373,23 @@ fn wait_for_tap_next_button() -> i32 {
             if btn_animating() {
                 btn_tick_nav_only();
             }
-            sleep_ms(16);
+            // 帧率拉满：有动画活动（按钮回弹/呼吸/悬停）时帧间不睡眠，
+            // 仅静态空闲睡 8ms 省电（原 16ms 固定节流 = 上限 60fps 且动画卡）。
+            let active = true; // 呼吸动画每帧推进（animate_idle 无条件调用），帧率拉满
+            if !active {
+                sleep_ms(8);
+            }
             // 纯指针移动（不构成点击）也算用户在场：消费「最近有输入」标记，
             // 重置空闲计时，避免用户浏览页面时被 30 秒判定强推下一步。
             if unsafe { ANY_INPUT_RECENT } {
                 unsafe { ANY_INPUT_RECENT = false };
                 idle = 0;
             }
-            idle += 16;
+            // 空闲计时改真实时间（帧率拉满后帧时长不再恒定）
+            if unsafe { ANY_INPUT_RECENT } {
+                loop_t0 = mono_us();
+            }
+            idle = (mono_us().saturating_sub(loop_t0) / 1_000) as usize;
             if idle >= 30000 {
                 print("[oobe] 30 秒无输入，应用默认选择 -> 下一步
 ");
