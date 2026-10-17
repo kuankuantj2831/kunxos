@@ -291,6 +291,8 @@ const SYS_KOS_UP_BEGIN: usize = 476;
 const SYS_KOS_UP_PUSH: usize = 477;
 const SYS_KOS_UP_STATUS: usize = 478;
 const SYS_KOS_UP_FINISH: usize = 479;
+/// KOS I/O 故障注入开关（root 专用，E2 稳定性验证）。
+const SYS_KOS_FAULT: usize = 480;
 
 // ==================== Linux 常量 ====================
 
@@ -730,6 +732,7 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_KOS_UP_PUSH => kos_up_push(f),
         SYS_KOS_UP_STATUS => kos_up_status(f),
         SYS_KOS_UP_FINISH => kos_up_finish(f),
+        SYS_KOS_FAULT => kos_fault(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -3824,6 +3827,10 @@ fn kos_up_status(f: &mut TrapFrame) -> i64 {
 fn kos_up_finish(f: &mut TrapFrame) -> i64 {
     let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
     crate::kos_vfs::sys_upload_finish(&path)
+}
+
+fn kos_fault(f: &mut TrapFrame) -> i64 {
+    crate::kos_vfs::sys_fault(f.x[10] as usize)
 }
 
 fn kos_stat(f: &mut TrapFrame) -> i64 {

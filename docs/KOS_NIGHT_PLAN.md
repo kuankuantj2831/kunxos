@@ -158,3 +158,18 @@
   防护点清单（grep 'return None;' 计数对不上就是丢了）。**
 - 验证：kos 全套 12 套件 0 失败（+fault 6）；make 0 错误；加固门
   test-sfsrace PASS（SFS-RACE + MAILBOX 双绿）。
+
+### 第 4 轮（2026-10-18 02:0x，定时轮）
+
+- **E2 内核 I/O 故障降级落地**：syscall 480（root 专用）切换 KOS 块设备
+  故障注入；降级状态机（首个 I/O 失败 health 报 CRITICAL、恢复报 INFO，
+  边沿触发不刷屏）内建在 KosBlkDev 三原语里。用户核心诉求「报错了还能
+  继续维持运行」的内核侧闭环。
+- **kostest 新增 fault-degrade 阶段**：注入 → write_mutable/append/mkdir
+  全部精确 -5（EIO）→ 解除 → 旧数据逐字节完好 + 新写成功 + mkdir 成功
+  （幂等容 -17 残留）。
+- **QEMU 带盘实证**（持久卷 major=8 挂载）：health 先后打出「卷已降级
+  （读写返回 EIO，系统继续运行）」与「I/O 恢复，卷重回正常服务」，
+  KOSTEST FAULT-DEGRADE PASS + KOSTEST PASS，全程系统存活可关机。
+- 验证：kos 全套 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS；
+  动了内核数据面 → mailbox ×3 PASS。

@@ -71,6 +71,60 @@ pub const SYS_KOS_UP_PUSH: usize = 477;
 pub const SYS_KOS_UP_STATUS: usize = 478;
 pub const SYS_KOS_UP_FINISH: usize = 479;
 
+// ==================== I/O 故障注入与降级（E2） ====================
+//
+// 「报错了还能继续维持运行」的内核侧落地：
+// - 故障注入（root 专用 syscall 480）：KosBlkDev 一切读/写/冲刷返回
+//   Io 错误——所有 kos syscall 转为 EIO，内核不 panic 不死锁；
+// - 降级上报：首个 I/O 失败经 health 报 CRITICAL（边沿触发一次），
+//   恢复后报 INFO；系统全程继续运行，注入/故障解除即自动恢复服务。
+
+/// 故障注入开关（true = 一切块设备 IO 返回 Io(5)）。
+static KOS_FAULT_INJECT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// 降级状态（health 边沿触发用）。
+static KOS_DEGRADED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn kos_io_fail() -> bool {
+    KOS_FAULT_INJECT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_io_fail() {
+    if !KOS_DEGRADED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::health::report(
+            crate::health::SEV_CRITICAL,
+            "storage",
+            "KOS 对象存储 I/O 故障，卷已降级（读写返回 EIO，系统继续运行）",
+            "检查存储设备连接；故障解除后自动恢复，无需重启",
+        );
+    }
+}
+
+fn note_io_ok() {
+    if KOS_DEGRADED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        crate::health::report(
+            crate::health::SEV_INFO,
+            "storage",
+            "KOS 对象存储 I/O 恢复，卷重回正常服务",
+            "",
+        );
+    }
+}
+
+/// syscall 480（root 专用）：x0=1 打开故障注入、x0=0 解除。返回旧状态。
+pub fn sys_fault(on: usize) -> i64 {
+    if crate::process::current_uid() != 0 {
+        return -13; // EACCES
+    }
+    let prev = KOS_FAULT_INJECT.swap(on != 0, core::sync::atomic::Ordering::Relaxed);
+    if on == 0 && prev {
+        // 注入解除视为设备恢复：立即兑现恢复上报（下一轮成功 IO 亦会清）。
+        note_io_ok();
+    }
+    prev as i64
+}
+
 // ==================== 块设备适配 ====================
 
 /// 内核块设备适配器：`major` 设备按 4KB 块读写。
@@ -89,26 +143,44 @@ impl BlockDevice for KosBlkDev {
     }
 
     fn read_block(&self, lba: u64, buf: &mut [u8]) -> Result<(), KosError> {
+        if kos_io_fail() {
+            note_io_fail();
+            return Err(KosError::Io(5));
+        }
         // blk_read 成功返回拷贝字节数（正数），失败返回负数。
         if blkdev::blk_read(self.major, lba as usize, buf) >= 0 {
+            note_io_ok();
             Ok(())
         } else {
+            note_io_fail();
             Err(KosError::Io(5))
         }
     }
 
     fn write_block(&mut self, lba: u64, data: &[u8]) -> Result<(), KosError> {
+        if kos_io_fail() {
+            note_io_fail();
+            return Err(KosError::Io(5));
+        }
         if blkdev::blk_write(self.major, lba as usize, data) >= 0 {
+            note_io_ok();
             Ok(())
         } else {
+            note_io_fail();
             Err(KosError::Io(5))
         }
     }
 
     fn flush(&mut self) -> Result<(), KosError> {
+        if kos_io_fail() {
+            note_io_fail();
+            return Err(KosError::Io(5));
+        }
         if blkdev::blk_flush(self.major) >= 0 {
+            note_io_ok();
             Ok(())
         } else {
+            note_io_fail();
             Err(KosError::Io(5))
         }
     }

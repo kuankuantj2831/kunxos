@@ -29,6 +29,7 @@ const SYS_KOS_UP_PUSH: usize = 477;
 const SYS_KOS_UP_STATUS: usize = 478;
 const SYS_KOS_UP_FINISH: usize = 479;
 const SYS_KOS_APPEND: usize = 467;
+const SYS_KOS_FAULT: usize = 480;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     let ret: usize;
@@ -265,6 +266,54 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     if unsafe { kos_read("/msg.txt", &mut zb) } >= 0 {
         return fail("unlink-effective");
     }
+
+    // 6) I/O 故障降级（E2，syscall 480）：注入 → 写路径全 EIO 且系统
+    //    存活 → 解除 → 旧数据完好 + 新写成功。幂等：/faultdir 先清。
+    unsafe fn kos_fault_toggle(on: usize) -> i64 {
+        let ret: usize;
+        asm!(
+            "ecall",
+            in("a7") SYS_KOS_FAULT,
+            in("a0") on,
+            lateout("a0") ret,
+            options(nostack),
+        );
+        ret as i64
+    }
+    let _ = unsafe { kos_simple(SYS_KOS_UNLINK, "/faultdir", 0) };
+    if unsafe { kos_write_mutable("/faultrec", b"before-fault") } < 0 {
+        return fail("fault-setup");
+    }
+    if unsafe { kos_fault_toggle(1) } != 0 {
+        return fail("fault-on");
+    }
+    // 写路径必须 EIO（写总需落盘，不受缓存影响）。
+    if unsafe { kos_write_mutable("/faultrec", b"during-fault") } != -5 {
+        return fail("fault-write-eio");
+    }
+    if unsafe { kos_append("/journal", b"x") } != -5 {
+        return fail("fault-append-eio");
+    }
+    if unsafe { kos_simple(SYS_KOS_MKDIR, "/faultdir", 0) } != -5 {
+        return fail("fault-mkdir-eio");
+    }
+    if unsafe { kos_fault_toggle(0) } != 1 {
+        return fail("fault-off");
+    }
+    // 恢复：旧数据完好 + 新写成功 + mkdir 成功（残留幽灵则 -17 亦可）。
+    let mut fb = [0u8; 32];
+    let n = unsafe { kos_read("/faultrec", &mut fb) };
+    if n < 0 || !fb[..n as usize].starts_with(b"before-fault") {
+        return fail("fault-recover-data");
+    }
+    if unsafe { kos_write_mutable("/faultrec", b"after-fault") } < 0 {
+        return fail("fault-recover-write");
+    }
+    let mk = unsafe { kos_simple(SYS_KOS_MKDIR, "/faultdir", 0) };
+    if mk != 0 && mk != -17 {
+        return fail("fault-recover-mkdir");
+    }
+    print("KOSTEST FAULT-DEGRADE PASS\n");
 
     print("KOSTEST PASS\n");
     0
