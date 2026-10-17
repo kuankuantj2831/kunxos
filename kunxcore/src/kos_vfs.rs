@@ -482,6 +482,12 @@ pub fn sys_rename(from: &str, to: &str) -> i64 {
 // 应用用普通 open/read/write/close/lseek 访问 `/kos/<对象路径>`，
 // 内核在此路由到 KOS 引擎——零改造接入。KOS fd 号从 1000 起，
 // 避开进程 fd 表（FD_MAX 远小于 1000）。
+//
+// 稳定性纪律（P 稳定性轮加固）：
+// - 表项按 (pid, fd) 归属：进程退出统一回收（close_pid_fds），不再
+//   泄漏，也不会被 pid 复用后的新进程捡到他人 fd；
+// - 全部表操作持 fs_lock（与 KOS_FDS/引擎同一锁序，SMP 安全）；
+// - 每进程 fd 上限 POSIX_FD_MAX，防单进程耗尽全局表。
 
 /// KOS POSIX fd 起点。
 pub const KOS_FD_BASE: u32 = 1000;
@@ -489,7 +495,12 @@ pub const KOS_FD_BASE: u32 = 1000;
 /// `/kos/` 前缀长度。
 pub const KOS_PREFIX: &str = "/kos/";
 
+/// 每进程 POSIX 桥接 fd 上限。
+const POSIX_FD_MAX: usize = 64;
+
 struct PosixFd {
+    /// 归属进程。
+    pid: u32,
     /// 命名空间内路径（去掉 /kos/ 前缀）。
     path: alloc::string::String,
     key: [u8; 32],
@@ -500,7 +511,9 @@ struct PosixFd {
 static mut POSIX_FDS: Option<alloc::collections::BTreeMap<u32, PosixFd>> = None;
 static mut POSIX_FD_NEXT: u32 = KOS_FD_BASE;
 
-fn posix_table() -> &'static mut alloc::collections::BTreeMap<u32, PosixFd> {
+/// fs_lock 临界区内访问 POSIX fd 表。
+fn posix_table_locked() -> &'static mut alloc::collections::BTreeMap<u32, PosixFd> {
+    // SAFETY：仅在各入口先 fs_lock 的路径调用（与 with_store 同一锁序）。
     unsafe { POSIX_FDS.get_or_insert_with(alloc::collections::BTreeMap::new) }
 }
 
@@ -509,11 +522,28 @@ pub fn is_kos_path(p: &str) -> bool {
     p.starts_with(KOS_PREFIX)
 }
 
+/// 进程退出清理：回收其全部 POSIX 桥接 fd 与 KOS fd 表项。
+/// 在进程仍处普通任务上下文时调用（exit 顶部 / 强杀自杀分支）。
+pub fn close_pid_fds(pid: u32) {
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    unsafe {
+        if let Some(t) = POSIX_FDS.as_mut() {
+            t.retain(|_, e| e.pid != pid);
+        }
+        if let Some(t) = KOS_FDS.as_mut() {
+            t.retain(|(p, _), _| *p != pid);
+        }
+    }
+    crate::fs_simple::fs_unlock();
+}
+
 /// POSIX open：flags 支持 O_CREAT/O_TRUNC/O_APPEND/O_RDONLY/O_WRONLY。
 pub fn posix_open(rel: &str, flags: u32, uid: u32) -> i64 {
     const O_CREAT: u32 = 0x40;
     const O_TRUNC: u32 = 0x200;
     const O_APPEND: u32 = 0x400;
+    let pid = crate::process::current_pid();
     let path = if rel.starts_with('/') { rel } else { &alloc::format!("/{rel}") };
     // 已存在 → 直接打开；带 O_CREAT 且不存在 → 建可变记录。
     let exists = matches!(
@@ -536,44 +566,82 @@ pub fn posix_open(rel: &str, flags: u32, uid: u32) -> i64 {
         Some(Ok(Some(e))) => e.content_hash,
         _ => return kos_errno(KosError::PathNotFound),
     };
-    let table = posix_table();
-    let fd = unsafe { POSIX_FD_NEXT };
-    unsafe { POSIX_FD_NEXT += 1; }
-    table.insert(
-        fd,
-        PosixFd {
-            path: path.into(),
-            key,
-            pos: 0,
-            append_mode: flags & O_APPEND != 0,
-        },
-    );
-    fd as i64
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let r = unsafe {
+        let table = posix_table_locked();
+        let used = table.values().filter(|e| e.pid == pid).count();
+        if used >= POSIX_FD_MAX {
+            core::mem::drop(table);
+            crate::fs_simple::fs_unlock();
+            return kos_errno(KosError::PermissionDenied); // fd 耗尽：EACCES 语义（无 EMFILE 映射）
+        }
+        // 环绕安全：4G 次 open 后回卷到基点，跳过仍存活的号。
+        let mut fd = POSIX_FD_NEXT;
+        loop {
+            if !table.contains_key(&fd) {
+                break;
+            }
+            fd = fd.wrapping_add(1);
+            if fd < KOS_FD_BASE {
+                fd = KOS_FD_BASE;
+            }
+        }
+        POSIX_FD_NEXT = fd.wrapping_add(1).max(KOS_FD_BASE);
+        table.insert(
+            fd,
+            PosixFd {
+                pid,
+                path: path.into(),
+                key,
+                pos: 0,
+                append_mode: flags & O_APPEND != 0,
+            },
+        );
+        fd
+    };
+    crate::fs_simple::fs_unlock();
+    r as i64
 }
 
 /// POSIX read（fd >= 1000）。
 pub fn posix_read(fd: u32, buf: &mut [u8]) -> i64 {
-    let (key, pos) = match posix_table().get(&fd) {
-        Some(e) => (e.key, e.pos),
-        None => return kos_errno(KosError::ObjectNotFound),
-    };
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let entry = unsafe { posix_table_locked().get(&fd).filter(|e| e.pid == pid).map(|e| (e.key, e.pos)) };
+    crate::fs_simple::fs_unlock();
+    let Some((key, pos)) = entry else { return kos_errno(KosError::ObjectNotFound) };
     let n = match with_store(|s| s.read_range_hash(&key, pos, buf)) {
         Some(Ok(n)) => n,
         Some(Err(e)) => return kos_errno(e),
         None => return -1,
     };
-    if let Some(e) = posix_table().get_mut(&fd) {
-        e.pos += n as u64;
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    unsafe {
+        if let Some(e) = posix_table_locked().get_mut(&fd) {
+            if e.pid == pid {
+                e.pos += n as u64;
+            }
+        }
     }
+    crate::fs_simple::fs_unlock();
     n as i64
 }
 
 /// POSIX write：追加模式走 append（顺序高效），否则 write_range @ pos。
 pub fn posix_write(fd: u32, data: &[u8], uid: u32) -> i64 {
-    let (path, key, pos, append) = match posix_table().get(&fd) {
-        Some(e) => (e.path.clone(), e.key, e.pos, e.append_mode),
-        None => return kos_errno(KosError::ObjectNotFound),
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let owned = unsafe {
+        posix_table_locked().get(&fd).filter(|e| e.pid == pid).map(|e| {
+            (e.path.clone(), e.key, e.pos, e.append_mode)
+        })
     };
+    crate::fs_simple::fs_unlock();
+    let Some((path, key, pos, append)) = owned else { return kos_errno(KosError::ObjectNotFound) };
     let r = if append {
         with_store(|s| s.append(&path, data, uid)).map(|v| v.map(|len| len as usize))
     } else {
@@ -588,10 +656,17 @@ pub fn posix_write(fd: u32, data: &[u8], uid: u32) -> i64 {
                 Some(Ok(Some(e))) => e.content_hash,
                 _ => key,
             };
-            if let Some(e) = posix_table().get_mut(&fd) {
-                e.key = new_key;
-                e.pos = new_len as u64;
+            crate::fs_simple::fs_lock();
+            // SAFETY：fs_lock 临界区内。
+            unsafe {
+                if let Some(e) = posix_table_locked().get_mut(&fd) {
+                    if e.pid == pid {
+                        e.key = new_key;
+                        e.pos = new_len as u64;
+                    }
+                }
             }
+            crate::fs_simple::fs_unlock();
             data.len() as i64
         }
         Some(Err(e)) => kos_errno(e),
@@ -601,19 +676,29 @@ pub fn posix_write(fd: u32, data: &[u8], uid: u32) -> i64 {
 
 /// POSIX lseek。
 pub fn posix_lseek(fd: u32, off: i64, whence: u32) -> i64 {
+    let pid = crate::process::current_pid();
     // whence: 0=SEEK_SET 1=SEEK_CUR 2=SEEK_END
-    let table = posix_table();
-    let e = match table.get_mut(&fd) {
-        Some(e) => e,
-        None => return kos_errno(KosError::ObjectNotFound),
+    let (key, pos) = {
+        crate::fs_simple::fs_lock();
+        // SAFETY：fs_lock 临界区内。
+        let e = unsafe { posix_table_locked().get(&fd).filter(|e| e.pid == pid) };
+        let r = match e {
+            Some(e) => Some((e.key, e.pos)),
+            None => None,
+        };
+        crate::fs_simple::fs_unlock();
+        match r {
+            Some(v) => v,
+            None => return kos_errno(KosError::ObjectNotFound),
+        }
     };
-    let end = match with_store(|s| s.stat(&e.key)) {
+    let end = match with_store(|s| s.stat(&key)) {
         Some(Ok(h)) => h.content_len as i64,
         _ => -1,
     };
     let base = match whence {
         0 => 0,
-        1 => e.pos as i64,
+        1 => pos as i64,
         2 => end,
         _ => return -22, // EINVAL
     };
@@ -621,13 +706,36 @@ pub fn posix_lseek(fd: u32, off: i64, whence: u32) -> i64 {
     if np < 0 {
         return -22;
     }
-    e.pos = np as u64;
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    unsafe {
+        if let Some(e) = posix_table_locked().get_mut(&fd) {
+            if e.pid == pid {
+                e.pos = np as u64;
+            }
+        }
+    }
+    crate::fs_simple::fs_unlock();
     np
 }
 
-/// POSIX close。
+/// POSIX close（仅本进程的 fd 可关）。
 pub fn posix_close(fd: u32) -> i64 {
-    if posix_table().remove(&fd).is_some() { 0 } else { kos_errno(KosError::ObjectNotFound) }
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let r = unsafe {
+        let table = posix_table_locked();
+        match table.get(&fd) {
+            Some(e) if e.pid == pid => {
+                table.remove(&fd);
+                0
+            }
+            _ => kos_errno(KosError::ObjectNotFound),
+        }
+    };
+    crate::fs_simple::fs_unlock();
+    r
 }
 
 /// fd 是否属于 POSIX 桥接（供 read/write/close/lseek 分发）。

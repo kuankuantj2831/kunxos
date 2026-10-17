@@ -1798,7 +1798,11 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     /// 位图/索引放在 Record Pool 区（分配器不可见）。
     fn persist_alloc_state(&mut self) -> Result<(), KosError> {
         use crate::store::persist as p;
-        let pool_blocks = self.free.len();
+        // 位图权威覆盖**全池**：池大小取超级块（快速挂载后 free 被懒
+        // 截断到已用前缀，free.len() ≠ 池块数——按它算会把位图持久化
+        // 成截断版，hint 块数随之错误，下次挂载永久回退全池扫描；
+        // bitmap_dirty 也会被 resize 短，后续高位分配越界 panic）。
+        let pool_blocks = self.sb.obj_pool_blocks as usize;
         let per = p::BITS_PER_BMP_BLOCK;
         let bmp_blocks = p::bitmap_blocks_for(pool_blocks);
         let idx_blocks = (self.objects.len() + p::IDS_PER_IDX_BLOCK - 1)
@@ -1886,11 +1890,15 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let mut queue: Vec<[u8; 32]> = Vec::new();
         queue.push(self.manifest.namespace_root_hash);
         while let Some(h) = queue.pop() {
-            if reachable.contains(&h) || !self.objects.contains_key(&h) {
+            if reachable.contains(&h) {
                 continue;
             }
+            // 目录条目可能指向 GC 中途已清扫/换代的对象：跳过而非 unwrap
+            //（队列元素来自磁盘上的目录内容，不得信任其与索引一致）。
+            let Some(idx) = self.objects.get(&h).cloned() else {
+                continue;
+            };
             reachable.push(h);
-            let idx = self.objects.get(&h).unwrap().clone();
             if idx.header.obj_type == ObjectType::Dir.as_u16() {
                 let data = self.read_object_content(&idx)?;
                 for e in DirEntry::decode_all(&data)? {
@@ -1960,6 +1968,15 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         i >= self.free.len() || self.free[i]
     }
 
+    /// 置脏位图块（bounds 安全：位块号超出 dirty 向量时跳过——
+    /// 该块尚未持久化过，下次全量持久化自然会带上）。
+    fn mark_bitmap_dirty(&mut self, bit: usize) {
+        let per = crate::store::persist::BITS_PER_BMP_BLOCK;
+        if let Some(d) = self.bitmap_dirty.get_mut(bit / per) {
+            *d = true;
+        }
+    }
+
     /// 把位图扩展到覆盖下标 `i`（新区域全空闲）。
     fn free_ensure(&mut self, i: usize) {
         if i >= self.free.len() {
@@ -1988,7 +2005,8 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         if need == 0 {
             return Ok(Vec::new());
         }
-        let total = self.free.len();
+        // 回绕范围 = 全池（懒加载截断不影响）；is_free 越界即空闲。
+        let total = self.sb.obj_pool_blocks as usize;
         let per = crate::store::persist::BITS_PER_BMP_BLOCK;
         let mut runs: Vec<(u64, u32)> = Vec::new();
         let mut got = 0u64;
@@ -2002,7 +2020,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             self.free_ensure(h + need as usize - 1);
             for k in h..h + need as usize {
                 self.free[k] = false;
-                self.bitmap_dirty[k / per] = true;
+                self.mark_bitmap_dirty(k);
             }
             self.free_cnt -= need;
             self.alloc_hint = (h + need as usize) % total;
@@ -2036,7 +2054,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             self.free_ensure(end - 1);
             for k in start..end {
                 self.free[k] = false;
-                self.bitmap_dirty[k / per] = true;
+                self.mark_bitmap_dirty(k);
             }
             runs.push((
                 self.sb.obj_pool_start + start as u64,
@@ -2191,7 +2209,6 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     /// 回收区段与表块（仅内存位图；磁盘块下次挂载由扫描回收）。
     fn reclaim(&mut self, extents: &[Extent], tables: &[u64]) {
         let base = self.sb.obj_pool_start as usize;
-        let per = crate::store::persist::BITS_PER_BMP_BLOCK;
         for ext in extents {
             for k in 0..ext.count as usize {
                 let b = (ext.start as usize).wrapping_sub(base) + k;
@@ -2200,7 +2217,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                         self.free_cnt += 1;
                     }
                     self.free[b] = true;
-                    self.bitmap_dirty[b / per] = true;
+                    self.mark_bitmap_dirty(b);
                 }
             }
         }
@@ -2211,7 +2228,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                     self.free_cnt += 1;
                 }
                 self.free[b] = true;
-                self.bitmap_dirty[b / per] = true;
+                self.mark_bitmap_dirty(b);
             }
         }
     }
@@ -2434,28 +2451,76 @@ fn fast_mount<B: crate::block::BlockDevice>(
     use crate::store::persist as p;
     let hint = p::MountHint::from_sb(sb)?;
     if hint.seq != manifest.generation {
-        return None;
+        eprintln!("[fm] r1"); return None;
     }
     let pool_blocks = sb.obj_pool_blocks as usize;
     let per = p::BITS_PER_BMP_BLOCK;
     let bmp_blocks = p::bitmap_blocks_for(pool_blocks) as usize;
     if bmp_blocks == 0 || hint.bitmap_blocks as usize != bmp_blocks {
-        return None;
+        eprintln!("[fm] r2"); return None;
     }
     if sb.rec_pool_blocks < bmp_blocks as u64 + hint.index_blocks as u64 {
-        return None;
+        eprintln!("[fm] r3"); return None;
     }
 
-    // 1) 位图。
-    let mut free = alloc::vec![false; pool_blocks];
+    // 1) 先读对象索引链与对象（懒加载序：最高已用块决定位图加载页数）。
     let mut buf = [0u8; BLK];
-    for i in 0..bmp_blocks {
-        if dev.read_block(sb.rec_pool_start + i as u64, &mut buf).is_err() {
-            return None;
+    let mut ids = Vec::new();
+    let mut next = hint.index_head;
+    let mut hops = 0;
+    while next != 0 {
+        // 索引链在 Record Pool 区（对象池之外），边界是设备总块数。
+        if hops > hint.index_blocks || next >= sb.total_blocks {
+            eprintln!("[fm] r4"); return None;
         }
-        let (first, bits) = p::bitmap_block_parse(&buf)?;
+        if dev.read_block(next, &mut buf).is_err() {
+            eprintln!("[fm] r5"); return None;
+        }
+        let (n, chunk) = match p::index_block_parse(&buf) {
+            Some(v) => v,
+            None => return None,
+        };
+        ids.extend_from_slice(&chunk);
+        next = n;
+        hops += 1;
+    }
+    let mut objects: BTreeMap<[u8; 32], ObjIndex> = BTreeMap::new();
+    for &id in &ids {
+        if id < sb.obj_pool_start || id >= pool_end {
+            eprintln!("[fm] r6"); return None;
+        }
+        if dev.read_block(id, &mut buf).is_err() {
+            eprintln!("[fm] r7"); return None;
+        }
+        let hdr = match KosObject::from_bytes(&buf[..OBJECT_HEADER_SIZE]) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        let idx = match load_object(dev, id, hdr, pool_end) {
+            Some(i) => i,
+            None => return None,
+        };
+        objects.insert(idx.header.content_hash, idx);
+    }
+
+    // 2) 懒加载位图：只加载到最高已用块所在页（亿级卷免全量构建；
+    //    尾区在分配时按需物化，见 is_free/free_ensure）。
+    let hi = objects.values().map(obj_max_block).max();
+    let load_pages = match hi {
+        Some(h) => (((h - sb.obj_pool_start + 1) as usize).div_ceil(per)).max(1).min(bmp_blocks),
+        None => bmp_blocks.min(1),
+    };
+    let mut free = alloc::vec![false; pool_blocks];
+    for i in 0..load_pages {
+        if dev.read_block(sb.rec_pool_start + i as u64, &mut buf).is_err() {
+            eprintln!("[fm] r8"); return None;
+        }
+        let (first, bits) = match p::bitmap_block_parse(&buf) {
+            Some(v) => v,
+            None => return None,
+        };
         if first as usize != i * per {
-            return None;
+            eprintln!("[fm] r9"); return None;
         }
         for (k, &f) in bits.iter().enumerate() {
             let b = i * per + k;
@@ -2464,39 +2529,15 @@ fn fast_mount<B: crate::block::BlockDevice>(
             }
         }
     }
-
-    // 2) 对象索引链 → 头块列表。
-    let mut ids = Vec::new();
-    let mut next = hint.index_head;
-    let mut hops = 0;
-    while next != 0 {
-        // 索引链在 Record Pool 区（对象池之外），边界是设备总块数。
-        if hops > hint.index_blocks || next >= sb.total_blocks {
-            return None;
-        }
-        if dev.read_block(next, &mut buf).is_err() {
-            return None;
-        }
-        let (n, chunk) = p::index_block_parse(&buf)?;
-        ids.extend_from_slice(&chunk);
-        next = n;
-        hops += 1;
-    }
-
-    // 3) 逐对象加载；对象占用必须与位图一致（防陈旧位图误判）。
-    let mut objects = BTreeMap::new();
+    // 已加载页内对象占位一致性；对象不得落在未加载区。
     for &id in &ids {
-        // 位图说空闲但索引说有对象 → 陈旧，回退扫描。
-        if id < sb.obj_pool_start || id >= pool_end || free[(id - sb.obj_pool_start) as usize] {
-            return None;
+        let rel = (id - sb.obj_pool_start) as usize;
+        if rel >= load_pages * per || !free[rel] {
+            eprintln!("[fm] r10 id={} rel={} load_pages={} free_val=??", id, rel, load_pages); return None;
         }
-        if dev.read_block(id, &mut buf).is_err() {
-            return None;
-        }
-        let hdr = KosObject::from_bytes(&buf[..OBJECT_HEADER_SIZE]).ok()?;
-        let idx = load_object(dev, id, hdr, pool_end)?;
-        objects.insert(idx.header.content_hash, idx);
     }
+    free.truncate((load_pages * per).min(pool_blocks));
+
     Some((objects, free, hint.free_cnt as u64))
 }
 
