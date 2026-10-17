@@ -214,3 +214,7 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
   2. 代码层：**B8 渐亮依赖墙钟（gettimeofday）**，RTC 就绪前后墙钟跳变 → flip 的 now 落到 T0 之前 → progress 的 now<=t0 → α 永久 0 → 每次 flip 经全 0 LUT 上屏 → 整屏黑（探针实证：BACK_BUF 均值 210 内容正常、lvl=0、T0 恒等于当前墙钟）
 - **修复**：① 内核 sys_clock_gettime 补 CLOCK_MONOTONIC 支持（原忽略 clk 恒回墙钟）；② launcher 新增 mono_us() 并全动画链改用；③ boot_fade_alpha 加 fail-bright 防御（now<=t0 视为播完返回 1.0，绝不 fail-black）
 - **验证**：修复后 GUI 全链路 screendump 实拍——桌面完整渲染（时钟小组件/图标/dock/状态栏），亮度 0.1 → 226.7；test-sfsrace PASS
+
+### 第 20 轮（2026-10-17 10:5x，定时轮）
+- **墙钟跳变隐患系统性清剿**（黑屏根因的泛化修复）：launcher `now_us()` 本体改为单调钟（CLOCK_MONOTONIC）——全部 80+ 动画 T0/超时/时长判定一次性治好（转场/横幅/锁屏/编辑/最近任务/控制中心/翻页等，含 app_launch/app_life/control_center 经 use super::* 自动受益）；新增 `wall_us()` 仅供时钟/日历等真实时间显示（time_hhmm/表盘指针/日历小组件/锁屏日期/控制中心日期 5 处）
+- 验证：GUI 全链路 launcher 正常拉起 0 PANIC、亮度 226.7 正常；make 0 错误 + test-sfsrace PASS

@@ -1384,7 +1384,7 @@ fn cc_draw_status(oy: i32) {
 }
 
 fn cc_date(buf: &mut [u8]) -> usize {
-    let us = now_us();
+    let us = wall_us();
     let secs = (us / 1_000_000) as i64;
     let days = secs / 86400;
     let (y, mo, d) = civil_from_days(days);

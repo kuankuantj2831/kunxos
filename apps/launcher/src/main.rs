@@ -88,13 +88,7 @@ const CLOCK_MONOTONIC: i32 = 1;
 /// 墙钟在 RTC 就绪前后会跳变（GUI 实测：渐亮 T0 记跳变后墙钟、flip 的
 /// now 仍是旧值 → progress 的 now<=t0 → α 永久 0 → 整屏黑）。
 fn mono_us() -> u64 {
-    let mut tv = [0u8; 16];
-    unsafe {
-        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
-    }
-    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-    sec * 1_000_000 + nsec / 1_000
+    now_us()
 }
 const SYS_MMAP: usize = 222;
 const SYS_WAIT4: usize = 260;
@@ -1443,15 +1437,29 @@ unsafe fn exit(code: usize) -> ! {
 }
 
 /// 当前时间（微秒，自启动）。
+/// 计时/动画时钟（µs）：**单调钟**。全 launcher 的动画 T0/超时/时长判定
+/// 一律用它 —— 墙钟在 RTC 就绪前后会跳变（GUI 实测曾致渐亮把「时间倒流」
+/// 判成永久 0 进度 → 整屏黑）。墙钟显示（时钟/日历）用 [`wall_us`]。
 fn now_us() -> u64 {
     let mut tv = [0u8; 16];
     unsafe {
-        syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec =
-            u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
+}
+
+/// 墙钟（µs）：仅用于时钟/日历等真实时间**显示**，绝不做时间差判定。
+fn wall_us() -> u64 {
+    let mut tv = [0u8; 16];
+    unsafe {
+        syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let usec =
+        u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + usec
 }
 
 // ==================== 文件操作 ====================
@@ -3775,7 +3783,7 @@ fn draw_app_icon(app: &App, x: i32, y: i32, size: i32) {
 }
 
 fn time_hhmm(buf: &mut [u8; 5]) {
-    let us = now_us();
+    let us = wall_us();
     let secs = (us / 1_000_000) as u32;
     let total_min = secs / 60;
     let h = (total_min / 60) % 24;
@@ -4995,7 +5003,7 @@ fn draw_widget_clock(x: i32, y: i32, _w: i32, h: i32) {
         let y2 = cy - (c * r as f32) as i32;
         draw_line(x1, y1, x2, y2, COLOR_TEXT_DIM);
     }
-    let us = now_us();
+    let us = wall_us();
     let secs = (us / 1_000_000) as u32;
     let total_min = secs / 60;
     let hh = (total_min / 60) % 24;
@@ -5199,7 +5207,7 @@ static mut WGT_EVENT_LEN: usize = 0;
 static mut WGT_EVENT_EXP: u64 = 0;
 
 fn draw_widget_calendar(x: i32, y: i32, w: i32, h: i32) {
-    let us = now_us();
+    let us = wall_us();
     let secs = (us / 1_000_000) as i64;
     let days = secs / 86400;
     let (_, mo, dd) = civil_from_days(days);
@@ -6540,7 +6548,7 @@ fn draw_lock_content(off: i32) {
             LOCK_SHOWN_HHMM = hhmm;
         }
         // 日期行（YYYY-MM-DD，8x8 字形 1 倍）。
-        let us = now_us();
+        let us = wall_us();
         let secs = (us / 1_000_000) as i64;
         let (y, mo, d) = civil_from_days(secs / 86400);
         let mut date = [0u8; 11];
