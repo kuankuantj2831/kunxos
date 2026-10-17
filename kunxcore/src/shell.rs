@@ -3661,13 +3661,26 @@ fn run_builtin(cmd: &Command, input: &[u8], sink: &mut Sink) {
 /// - `kos stat`：卷状态
 /// - `kos append <path> <text>`：追加写（可变记录）
 /// - `kos write <path> <text>`：写可变记录
+/// - `kos mkdir <path>`：建目录
 fn cmd_kos(cmd: &Command, sink: &mut Sink) {
     if cmd.argc < 2 {
-        sink.emit_str("用法：kos <ls|cat|stat|append|write> [参数...]\n");
+        sink.emit_str("用法：kos <ls|cat|stat|append|write|mkdir> [参数...]\n");
         return;
     }
     let sub = word_str(&cmd.argv[1]);
     match sub {
+        "mkdir" => {
+            if cmd.argc < 3 {
+                sink.emit_str("kos mkdir <path>\n");
+                return;
+            }
+            let path = word_str(&cmd.argv[2]);
+            match crate::kos_vfs::sys_mkdir(path, 0) {
+                0 => sink.emit_str("kos: 目录已建\n"),
+                -17 => sink.emit_str("kos: 目录已存在\n"),
+                _ => sink.emit_str("kos: 建目录失败\n"),
+            }
+        }
         "ls" => {
             let path = if cmd.argc >= 3 {
                 word_str(&cmd.argv[2])

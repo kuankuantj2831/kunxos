@@ -173,3 +173,14 @@
   KOSTEST FAULT-DEGRADE PASS + KOSTEST PASS，全程系统存活可关机。
 - 验证：kos 全套 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS；
   动了内核数据面 → mailbox ×3 PASS。
+
+### 第 5 轮（2026-10-18 03:0x，定时轮）
+
+- **C1 无缝复制三向实证 + 固化**：shell `cp` 经第 1 轮的 vfs 路由零改造
+  打通 /kos/——QEMU 持久卷上 SFS→KOS / KOS→SFS / KOS→KOS 三向复制
+  sha1 全一致（/bin/hello 6829afd8…，wc 16384 字节整）。新增
+  `make test-kos-copy` 回归（tools/koscp_check.py 四哈希判定），连续
+  两轮 PASS（幂等：固定目标名 + write_mutable 原地换代）。
+- **shell `kos mkdir`**（C5 顺带）：复制进 /kos 子目录的前提；幂等输出
+  （已存在 → 提示不报错）。注：/tmp 在 SFS 根卷不存在，跨池目标用 /bin。
+- 验证：kos 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS。

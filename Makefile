@@ -623,6 +623,29 @@ test-modem: $(RILD_ELF) $(MODEMTEST_ELF)
 # 断言串口日志含 "SFS-RACE PASS"。
 TEST_SFSRACE_LOG := /tmp/kunxos-sfsrace.log
 
+# ---- KOS 无缝复制回归（/kos/ POSIX 桥 × shell cp，三向 sha1 比对） ----
+# 带持久 KOS 卷启动，shell 里 cp 三个方向（SFS→KOS / KOS→SFS / KOS→KOS），
+# tools/koscp_check.py 判定四份 sha1 一致。幂等：目标名固定，write_mutable
+# 原地换代，重复运行不受磁盘残留影响。
+TEST_KOSCP_LOG := /tmp/kunxos-koscp.log
+
+.PHONY: test-kos-copy
+test-kos-copy: kernel $(KOS_DISK_IMG)
+	@rm -f $(TEST_KOSCP_LOG)
+	@echo "== running kos seamless-copy test in QEMU (headless) =="
+	@-(sleep 12; \
+		echo "kos mkdir /data"; sleep 1; \
+		echo "cp /bin/hello /kos/data/from-sfs.txt"; sleep 2; \
+		echo "sha1sum /bin/hello"; sleep 1; \
+		echo "sha1sum /kos/data/from-sfs.txt"; sleep 1; \
+		echo "cp /kos/data/from-sfs.txt /bin/back.txt"; sleep 2; \
+		echo "sha1sum /bin/back.txt"; sleep 1; \
+		echo "cp /kos/data/from-sfs.txt /kos/data/copy2.txt"; sleep 2; \
+		echo "sha1sum /kos/data/copy2.txt"; sleep 1; \
+		echo "poweroff"; sleep 4) | timeout 120 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+		-device virtio-rng-device $(KOS_DRV) | tee $(TEST_KOSCP_LOG)
+	@python3 tools/koscp_check.py $(TEST_KOSCP_LOG)
+
 test-sfsrace: $(SFSRACE_ELF)
 	@touch $(ROOTFS)/sfsrace-test
 	@python3 $(TOOLS)/mkfs_sfs.py $(ROOTFS) $(RAMDISK) $(RAMDISK_BLOCKS)
