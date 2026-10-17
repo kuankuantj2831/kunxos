@@ -364,8 +364,13 @@ dependencies = [
  "blake3",
  "crc32fast",
  "criterion",
+ "kunxsec",
  "sha2",
 ]
+
+[[package]]
+name = "kunxsec"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

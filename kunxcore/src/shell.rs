@@ -1966,7 +1966,7 @@ fn sha1_block(h: &mut [u32; 5], w: &mut [u32; 80]) {
 
 fn cmd_help(_cmd: &Command, sink: &mut Sink) {
     sink.emit_str(
-        "builtins: cd echo export exit pwd ls cat run busybox pkg ps uname clear mkdir rm touch cp mv wc head tail grep df history uptime ping sysinfo calc sort netstat tcp_echo udp_echo http_serve http_get gdb nslookup poweroff reboot power sleep kill date which uniq sha1sum stat dmesg od tee verbose true false basename dirname help\n",
+        "builtins: cd echo export exit pwd ls cat run busybox pkg ps uname clear mkdir rm touch cp mv wc head tail grep df history uptime ping sysinfo calc sort netstat tcp_echo udp_echo http_serve http_get gdb nslookup poweroff reboot power sleep kill date which uniq sha1sum stat dmesg od tee verbose true false basename dirname kos help\n",
     );
     sink.emit_str(
         "debug: top mount ifconfig log crash perf irqstat netdiag (see docs/DEBUGGING.md)\n",
@@ -3645,12 +3645,127 @@ fn run_builtin(cmd: &Command, input: &[u8], sink: &mut Sink) {
         "false" => cmd_false(cmd, sink),
         "basename" => cmd_basename(cmd, sink),
         "dirname" => cmd_dirname(cmd, sink),
+        "kos" => cmd_kos(cmd, sink),
         "" => {}
         _ => {
             sink.emit_str("kunxos: 未找到命令：");
             sink.emit_str(name);
             sink.emit_str("\n");
         }
+    }
+}
+
+/// `kos` 内置命令：KOS 对象存储的 shell 侧入口。
+/// - `kos ls [path]`：列目录
+/// - `kos cat <path>`：读对象（≤4KB 摘要展示）
+/// - `kos stat`：卷状态
+/// - `kos append <path> <text>`：追加写（可变记录）
+/// - `kos write <path> <text>`：写可变记录
+fn cmd_kos(cmd: &Command, sink: &mut Sink) {
+    if cmd.argc < 2 {
+        sink.emit_str("用法：kos <ls|cat|stat|append|write> [参数...]\n");
+        return;
+    }
+    let sub = word_str(&cmd.argv[1]);
+    match sub {
+        "ls" => {
+            let path = if cmd.argc >= 3 {
+                word_str(&cmd.argv[2])
+            } else {
+                "/"
+            };
+            let mut buf = [0u8; 2048];
+            let n = crate::kos_vfs::sys_list(path, &mut buf);
+            if n < 0 {
+                sink.emit_str("kos: 列目录失败\n");
+            } else {
+                sink.emit(&buf[..n as usize]);
+            }
+        }
+        "cat" => {
+            if cmd.argc < 3 {
+                sink.emit_str("kos cat <path>\n");
+                return;
+            }
+            let path = word_str(&cmd.argv[2]);
+            let mut buf = [0u8; 4096];
+            let n = crate::kos_vfs::sys_read(path, &mut buf);
+            if n < 0 {
+                sink.emit_str("kos: 读取失败\n");
+            } else {
+                sink.emit(&buf[..n as usize]);
+                sink.emit_str("\n");
+            }
+        }
+        "stat" => {
+            let (gen, objs, free, pool) = crate::kos_vfs::sys_stat();
+            sink.emit_str("generation=");
+            emit_u64(sink, gen);
+            sink.emit_str(" objects=");
+            emit_u64(sink, objs as u64);
+            sink.emit_str(" free=");
+            emit_u64(sink, free);
+            sink.emit_str("/");
+            emit_u64(sink, pool);
+            sink.emit_str(" 块\n");
+        }
+        "mv" => {
+            if cmd.argc < 4 {
+                sink.emit_str("kos mv <from> <to>\n");
+                return;
+            }
+            let from = word_str(&cmd.argv[2]);
+            let to = word_str(&cmd.argv[3]);
+            if crate::kos_vfs::sys_rename(from, to) == 0 {
+                sink.emit_str("ok\n");
+            } else {
+                sink.emit_str("kos: 改名失败\n");
+            }
+        }
+        "head" => {
+            // 随机读演示：kos head <path> [offset] —— 读 64 字节。
+            if cmd.argc < 3 {
+                sink.emit_str("kos head <path> [offset]（读 64 字节）\n");
+                return;
+            }
+            let path = word_str(&cmd.argv[2]);
+            let offset: u64 = if cmd.argc >= 4 {
+                word_str(&cmd.argv[3]).parse().unwrap_or(0)
+            } else {
+                0
+            };
+            let mut buf = [0u8; 64];
+            let n = crate::kos_vfs::sys_read_range(path, offset, &mut buf);
+            if n < 0 {
+                sink.emit_str("kos: 读取失败\n");
+            } else {
+                sink.emit(&buf[..n as usize]);
+                sink.emit_str("\n");
+            }
+        }
+        "append" | "write" => {
+            if cmd.argc < 4 {
+                sink.emit_str("kos ");
+            sink.emit_str(sub);
+            sink.emit_str(" <path> <text>\n");
+                return;
+            }
+            let path = word_str(&cmd.argv[2]);
+            let text = word_str(&cmd.argv[3]);
+            let r = if sub == "append" {
+                crate::kos_vfs::sys_append(path, text.as_bytes())
+            } else {
+                crate::kos_vfs::sys_write(path, text.as_bytes(), 0o644, true)
+            };
+            if r < 0 {
+                sink.emit_str("kos: 写入失败（记录不可变或不存在？append 需先 kos write）\n");
+            } else {
+                sink.emit_str("ok（长度 ");
+                emit_u64(sink, r as u64);
+                sink.emit_str("）\n");
+            }
+        }
+        _ => sink.emit_str("kos: 未知子命令\n"),
     }
 }
 

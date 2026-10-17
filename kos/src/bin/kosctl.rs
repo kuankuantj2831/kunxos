@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! kosctl mkfs   <img> <blocks>                 建盘
+//! kosctl mkdir  <img> <path>                   建目录
 //! kosctl import <img> <dir> [prefix]           导入目录树（迁移入口）
 //! kosctl export <img> <dir> [prefix]           导出目录树
 //! kosctl ls     <img> <path>                   列目录
@@ -11,7 +12,12 @@
 //! kosctl get    <img> <path> [file]            读出一个对象
 //! kosctl unlink <img> <path>                   删除条目
 //! kosctl verify <img>                          全树严格验证（重建 Merkle）
+//! kosctl check  <img>                          fsck：全树 Full 验证 + 孤儿报告
+//! kosctl keygen                               生成 Ed25519 种子（hex）
+//! kosctl sign   <img> <seed-hex>               签名活动 manifest（打印公钥）
+//! kosctl bench  <img>                           性能护栏（append/write_range/mount/GC 计时）
 //! kosctl gc     <img>                          回收不可达孤儿对象
+//! kosctl trunc  <img> <path> <len>             截断/扩展（可变记录）
 //! kosctl stat   <img>                          卷状态
 //! ```
 
@@ -90,6 +96,39 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
             }
             Ok(out.trim_end().to_string())
         }
+        "keygen" => {
+            #[cfg(feature = "sign")]
+            {
+                let mut seed = [0u8; 32];
+                use std::io::Read;
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut seed)?;
+                Ok(format!("seed: {}", hex_str(&seed)))
+            }
+            #[cfg(not(feature = "sign"))]
+            Err("kosctl 需要 sign feature".into())
+        }
+        "sign" => {
+            #[cfg(feature = "sign")]
+            {
+                let img = arg(args, 2)?;
+                let seed = parse_hex32(arg(args, 3)?)?;
+                let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+                let pk = kunxsec::ed25519::public_key(&seed);
+                let payload = s.manifest_payload();
+                let sig = kunxsec::ed25519::sign(&seed, &pk, &payload);
+                s.resign(pk, sig)?;
+                Ok(format!("manifest 已签名\ntrust-pk: {}", hex_str(&pk)))
+            }
+            #[cfg(not(feature = "sign"))]
+            Err("kosctl 需要 sign feature".into())
+        }
+        "mkdir" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            s.mkdir(path, 0, 0o755)?;
+            Ok(format!("已创建目录 {path}"))
+        }
         "putm" => {
             let img = arg(args, 2)?;
             let path = arg(args, 3)?;
@@ -145,6 +184,84 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
                 "验证通过：{files} 个对象共 {bytes} 字节，Merkle 全量比对无一失配"
             ))
         }
+        "bench" => {
+            let img = arg(args, 2)?;
+            // 建新卷跑基准，不动用户数据。
+            let img = format!("{img}.bench.tmp");
+            let dev = FileBlockDevice::open(Path::new(&img), Some(8192))?;
+            let mut s = KosStore::mkfs(dev)?;
+            let t = std::time::Instant::now();
+            s.write_mutable("/bench", &[0u8; 4096], 0, perm::DEFAULT)?;
+            let create = t.elapsed();
+            let t = std::time::Instant::now();
+            for i in 0..200 {
+                let line = format!("bench-line-{i:04}\n");
+                s.append("/bench", line.as_bytes(), 0)?;
+            }
+            let appends = t.elapsed();
+            let per_append = appends.as_micros() as f64 / 200.0;
+            let t = std::time::Instant::now();
+            for i in 0..100 {
+                s.write_range("/bench", 4096 + i * 100, b"PATCHPAD!", 0)?;
+            }
+            let ranges = t.elapsed();
+            let per_range = ranges.as_micros() as f64 / 100.0;
+            let t = std::time::Instant::now();
+            let _ = s.open_path("/bench", 0)?;
+            let read1 = t.elapsed();
+            let d = s.take_device();
+            let t = std::time::Instant::now();
+            let mut s2 = KosStore::open(d, VerifyLevel::HashOnly)?;
+            let mount = t.elapsed();
+            let fast = s2.was_fast_mounted();
+            let t = std::time::Instant::now();
+            let (dead, freed) = s2.gc()?;
+            let gc = t.elapsed();
+            std::fs::remove_file(&img)?;
+            Ok(format!(
+                "bench（8192 块卷）：建记录 {:?}；append {} 次 {}µs（{per_append:.0}µs/次）；\nwrite_range 100 次 {}µs（{per_range:.0}µs/次）；整读 {:?}；挂载 {:?}（快速路径={fast}）；GC {dead} 对象 {freed} 块 {:?}",
+                create, 200, appends.as_micros(), ranges.as_micros(), read1, mount, gc
+            ))
+        }
+        "check" => {
+            let img = arg(args, 2)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::Full)?;
+            // 全树 Full 验证（复用 walk_verify；任一对象损坏即报错）。
+            let (files, bytes) = walk_verify(&mut s, "")?;
+            // 孤儿统计：可达闭包之外即孤儿。
+            let mut reachable = std::collections::HashSet::new();
+            reachable.insert(s.root_hash()); // 根目录对象本身可达
+            fn walk(s: &mut KosStore<FileBlockDevice>, path: &str, set: &mut std::collections::HashSet<[u8; 32]>) {
+                if let Ok(entries) = s.list(path) {
+                    for e in entries {
+                        set.insert(e.content_hash);
+                        if e.entry_type == ObjectType::Dir {
+                            let sub = if path.is_empty() {
+                                e.name.clone()
+                            } else {
+                                format!("{path}/{}", e.name)
+                            };
+                            walk(s, &sub, set);
+                        }
+                    }
+                }
+            }
+            walk(&mut s, "", &mut reachable);
+            let orphans = s.object_count() - reachable.len();
+            let (dead, freed) = s.gc()?;
+            Ok(format!(
+                "卷健康：{files} 个对象 {bytes} 字节 Full 验证通过；发现孤儿 {orphans} 个，已回收 {dead} 个（{} 块）",
+                freed
+            ))
+        }
+        "trunc" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let len: u64 = arg(args, 4)?.parse()?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            s.truncate(path, len, 0)?;
+            Ok(format!("{path} 已截断/扩展至 {len} 字节"))
+        }
         "gc" => {
             let img = arg(args, 2)?;
             let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
@@ -167,6 +284,22 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
         }
         _ => Err("用法：kosctl <mkfs|import|export|ls|put|get|unlink|verify|stat> …".into()),
     }
+}
+
+fn hex_str(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn parse_hex32(s: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let s: String = s.chars().filter(|c| *c != ' ' && *c != '\n').collect();
+    if s.len() != 64 {
+        return Err("种子必须是 64 个十六进制字符".into());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(out)
 }
 
 fn arg(args: &[String], i: usize) -> Result<&str, Box<dyn std::error::Error>> {

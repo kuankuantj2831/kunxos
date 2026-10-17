@@ -279,6 +279,13 @@ const SYS_KOS_UNLINK: usize = 464;
 const SYS_KOS_LIST: usize = 465;
 const SYS_KOS_STAT: usize = 466;
 const SYS_KOS_APPEND: usize = 467;
+const SYS_KOS_TRUNCATE: usize = 468;
+const SYS_KOS_LIST2: usize = 469;
+const SYS_KOS_READ_RANGE: usize = 470;
+const SYS_KOS_RENAME: usize = 471;
+const SYS_KOS_OPEN: usize = 472;
+const SYS_KOS_READ_FD: usize = 473;
+const SYS_KOS_CLOSE_FD: usize = 474;
 
 // ==================== Linux 常量 ====================
 
@@ -706,6 +713,13 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_KOS_LIST => kos_list(f),
         SYS_KOS_STAT => kos_stat(f),
         SYS_KOS_APPEND => kos_append(f),
+        SYS_KOS_TRUNCATE => kos_truncate(f),
+        SYS_KOS_LIST2 => kos_list2(f),
+        SYS_KOS_READ_RANGE => kos_read_range(f),
+        SYS_KOS_RENAME => kos_rename(f),
+        SYS_KOS_OPEN => kos_open(f),
+        SYS_KOS_READ_FD => kos_read_fd(f),
+        SYS_KOS_CLOSE_FD => kos_close_fd(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -3620,6 +3634,87 @@ fn kos_append(f: &mut TrapFrame) -> i64 {
         return EFAULT;
     }
     crate::kos_vfs::sys_append(&path, &data)
+}
+
+fn kos_truncate(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_truncate(&path, f.x[11])
+}
+
+/// 分页 list：a0=path a1=buf a2=len a3=skip。
+fn kos_list2(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    let skip = f.x[13] as usize;
+    if len == 0 || len > 1 << 16 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::sys_list_paged(&path, skip, &mut out);
+    if r < 0 {
+        return r;
+    }
+    if unsafe { copy_to_user(buf_ptr, &out[..r as usize]) } != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+/// 随机读：a0=path a1=buf a2=len a3=offset。
+fn kos_read_range(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    let offset = f.x[13];
+    if len == 0 || len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::sys_read_range(&path, offset, &mut out);
+    if r < 0 {
+        return r;
+    }
+    if unsafe { copy_to_user(buf_ptr, &out[..r as usize]) } != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+/// rename：a0=from a1=to。
+fn kos_rename(f: &mut TrapFrame) -> i64 {
+    let Some(from) = kos_path_arg(f, 10) else { return EFAULT; };
+    let Some(to) = kos_path_arg(f, 11) else { return EFAULT; };
+    crate::kos_vfs::sys_rename(&from, &to)
+}
+
+fn kos_open(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    crate::kos_vfs::sys_kos_open(&path)
+}
+
+fn kos_read_fd(f: &mut TrapFrame) -> i64 {
+    let fd = f.x[10] as u32;
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    if len == 0 || len > 1 << 20 {
+        return EINVAL;
+    }
+    let mut out = alloc::vec![0u8; len];
+    let r = crate::kos_vfs::sys_kos_read_fd(fd, &mut out);
+    if r < 0 {
+        return r;
+    }
+    // EOF（r=0）也走 copy_to_user 但 0 字节拷贝返回 0：一并视为成功。
+    let copied = unsafe { copy_to_user(buf_ptr, &out[..r as usize]) };
+    if r == 0 || copied != 0 {
+        return r;
+    }
+    EFAULT
+}
+
+fn kos_close_fd(f: &mut TrapFrame) -> i64 {
+    crate::kos_vfs::sys_kos_close_fd(f.x[10] as u32)
 }
 
 fn kos_stat(f: &mut TrapFrame) -> i64 {

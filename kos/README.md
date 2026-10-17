@@ -41,8 +41,60 @@ KUNXOS 的对象存储层。设计文档见 [DESIGN.md](DESIGN.md)。
   时与旧镜像字节兼容）；`free_blocks()` 改增量计数（2TB 全量遍历
   每次提交数秒，曾致 append 挂死）。
 
-不包含：GC / compaction（CoW 孤儿目前靠大卷缓冲）、kunxpkg 对象模型
-迁移、Ed25519 验签集成、块缓存 + 惰性 Merkle（P3）。
+### P1..P6 全量落地（2026-10-17 晚）
+
+- **P1 持久化**：virtio-blk 多设备（sda..sdd，blk_lock 串行下的上下文
+  槽切换）；`kos_vfs::boot_mount` 优先挂载持久磁盘（KOS 超级块探测），
+  无盘回退内嵌 RAM 卷。`make kos-disk` 生成 256MB 持久卷并挂入
+  `make run`。**QEMU 双启动实测：journal 跨重启逐字节保留**。
+- **P2 GC**：`KosStore::gc()` 从活动 manifest 根标记-清扫（可达闭包
+  之外全回收），清扫后提交持久索引。kosctl `gc`。
+- **P3 读路径**：256 块缓存（写路径同步更新，块复用无脏读——曾因
+  写路径绕过缓存翻车，已全量统一走 `read_blk/write_blk`）；Full 校验
+  已验证集（同版本不重复重建树）；`write_range` 快速路径只读写受
+  影响 chunk（窗口 ≤64 chunk、空隙 ≤1 chunk），免全量内容拼接。
+- **P4 POSIX 补齐**：`truncate`（收缩清零尾 chunk 防残留、扩展补零）；
+  mtime 记于头块 `reserved[0..4]`（秒）；`list_skip` 分页（readdir
+  cookie）。系统调用 **460..=469**（468=truncate、469=分页 list）。
+- **P5 加固**：损坏注入模糊测试（200 轮随机翻转，挂载/读/GC 零 panic
+  零挂死）；kosctl `check`（fsck：全树 Full 验证 + 孤儿报告 + 顺手
+  GC）；`ManifestVerifier` 验签钩子（签名覆盖 manifest[8..120)，
+  伪签名槽被拒后回退另一槽——测试覆盖；kunxsec Ed25519 签入待
+  kunxpkg 提供签名工具链）。
+- **P6 打磨**：目录条目写入维持有序 + resolve 二分查找。
+
+### 自动增强轮（2026-10-17 深夜）
+
+- **Ed25519 签名链闭环**：kunxsec 补齐 `public_key` / `sign`
+  （RFC 8032 确定性 nonce，**测试向量 1/2 全过**）；引擎 `set_signer`
+  提交期自动签名 + `resign` 重签；内核嵌入信任公钥与开发种子
+  （`kos_trust_pk.rs`，`make kos-disk` 自动生成），挂载走
+  `open_with_verifier` **严格模式**（信任锚配置后未签名槽一律拒绝）。
+  kosctl 新增 `keygen` / `sign`。**坑：签名载荷不能含 signer_pk 自身**
+  （自指签名验必挂），现覆盖 manifest[8..88)。
+  QEMU 实证：写入 → 重启 → 严格验签挂载 → 数据逐字节读回。
+- **shell 内置 `kos` 命令**：`kos ls/cat/stat/write/append`，系统内
+  直接操作对象存储（QEMU 实测）。
+- **kosctl `bench`**：性能护栏（append/write_range/挂载/GC 计时）。
+  基线（宿主 debug）：append 761µs/次、write_range 795µs/次、
+  快速挂载 12ms、GC 301 对象 1.5ms。
+
+### FAT32 缺口补齐轮（2026-10-17 深夜二）
+
+- **pread 随机读**（`read_range`）：按区段定位 chunk，只读受影响块
+  ——读 1 字节不再整读全对象。syscall 470。
+- **rename / move**：CAS 对象不动，只 CoW 目录链（同目录单链快路径、
+  跨目录双链）。syscall 471。
+- **fd 层**：`kos_open/read_fd/close_fd`（472..=474）——pid 绑定的
+  fd 表 + 读位置记忆，顺序读到 EOF 返回 0。
+- **小文件内联区段表**（v3 布局）：区段表并入头块偏移 96（表序列化
+  3904B，尾部本为零，CRC 兼容）——**每对象省 1 块**（空间断言测试：
+  20 个小对象 ≤63 块）。表膨胀越界自动回退链式块。
+- shell `kos` 新增 `mv` / `head`（随机读演示）。
+- 修 EOF 读被误判 EFAULT（0 字节 copy_to_user 返回 0）。
+
+不包含：块缓存的 SMP 并发细化（现与 fs_lock 大锁绑定）、mmap、
+多卷同时挂载、kunxpkg .kunx 包对象模型迁移、Pack 小对象合并。
 
 磁盘格式与 CPU 架构解耦：多字节字段一律小端（RISC-V RV64 / ARM64 均为小端）。
 KUNXOS 已决策切换 RISC-V 目标架构，本 crate 无需任何改动。

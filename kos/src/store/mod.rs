@@ -121,6 +121,11 @@ pub struct DirEntry {
 /// 名字最大长度（字节）。
 pub const MAX_NAME: usize = 255;
 
+/// 区段表内联标志（引擎 v3 小对象布局）：头块 96B 之后直接放区段表
+/// （表序列化 3904B，头块剩余 4000B 装得下）→ 每对象省 1 块。
+/// `KosObject.indirect == 0` 表示内联。
+pub const OBJECT_FLAG_INLINE_TABLE: u16 = 0x0010;
+
 impl DirEntry {
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.name.len() as u8);
@@ -213,6 +218,44 @@ fn index_block_count(total_chunks: usize) -> usize {
     level_block_counts(total_chunks.max(1)).iter().sum()
 }
 
+/// Manifest 验签钩子（P5：Ed25519 接入点）。
+///
+/// 签名覆盖 manifest 映像 `[8..120)`（generation + timestamp +
+/// namespace_root_hash + parent_manifest_hash），即 `signer_pk` 之前的
+/// 全部受信字段。挂载时对带签名（`signer_pk` 非零）的槽校验，失败槽
+/// 视为无效。默认 [`AcceptAllSignatures`]（不验签，兼容创世代）。
+pub trait ManifestVerifier {
+    /// 校验已签名槽（`signer_pk` 非零）；返回 false 该槽被拒。
+    fn verify_manifest(&self, m: &KosRootManifest) -> bool;
+    /// 严格模式：未签名槽也拒绝（部署方配置了信任锚时启用）。
+    fn strict(&self) -> bool {
+        false
+    }
+}
+
+/// 接受一切签名（无信任锚的缺省）。
+pub struct AcceptAllSignatures;
+impl ManifestVerifier for AcceptAllSignatures {
+    fn verify_manifest(&self, _m: &KosRootManifest) -> bool {
+        true
+    }
+}
+
+/// Manifest 签名回调：输入待签载荷（受信字段区），返回
+/// (签名者公钥, 签名)。每次 manifest 提交时调用——部署方持有私钥
+/// 时可保证所有代都有签名（严格验签模式即持续可用）。
+pub type ManifestSignerFn = fn([u8; 80]) -> ([u8; 32], [u8; 64]);
+
+/// 签名的规范消息：manifest[8..88)——generation + timestamp +
+/// namespace_root_hash + parent_manifest_hash。**不含** signer_pk /
+/// signature / CRC（签名不能覆盖自身所在的公钥字段）。
+pub fn manifest_sign_payload(m: &KosRootManifest) -> [u8; 80] {
+    let b = m.to_bytes();
+    let mut out = [0u8; 80];
+    out.copy_from_slice(&b[8..88]);
+    out
+}
+
 // ==================== 存储引擎 ====================
 
 /// KOS 卷句柄。一个设备同时只应有一个活跃实例。
@@ -241,6 +284,8 @@ pub struct KosStore<B: crate::block::BlockDevice> {
     cache_cap: usize,
     /// 已通过 Full 校验的对象键（重复读免重建树）。
     verified: BTreeSet<[u8; 32]>,
+    /// Manifest 签名回调（None = 不签名）。
+    signer: Option<ManifestSignerFn>,
     verify: VerifyLevel,
     /// 提交时间戳来源。
     clock: u64,
@@ -271,6 +316,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             cache: BTreeMap::new(),
             cache_cap: 256,
             verified: BTreeSet::new(),
+            signer: None,
             verify: VerifyLevel::HashOnly,
             clock: 0,
             dev,
@@ -287,14 +333,32 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
 
     /// 挂载：超级块 → 双槽择优 → 扫描对象池建索引。
     pub fn open(dev: B, verify: VerifyLevel) -> Result<Self, KosError> {
+        Self::open_with_verifier(dev, verify, &AcceptAllSignatures)
+    }
+
+    /// 带验签挂载：`signer_pk` 非零的槽必须通过 `verifier`，否则该槽
+    /// 视为无效（双槽择优时跳过）。验签器由部署方注入（内核侧接
+    /// kunxsec Ed25519；宿主缺省接受一切）。
+    pub fn open_with_verifier(
+        dev: B,
+        verify: VerifyLevel,
+        verifier: &dyn ManifestVerifier,
+    ) -> Result<Self, KosError> {
         check_blk(dev.block_size())?;
         let mut buf = [0u8; BLK];
         dev_read(&dev, 0, &mut buf)?;
         let sb = KosSuperblock::from_bytes(&buf)?;
 
         let (manifest, active_slot_a) = {
-            let ma = read_manifest_slot(&dev, sb.root_slot_a)?;
-            let mb = read_manifest_slot(&dev, sb.root_slot_b)?;
+            let ok_slot = |m: Option<KosRootManifest>| m.filter(|m| {
+                if m.signer_pk == [0u8; 32] {
+                    !verifier.strict()
+                } else {
+                    verifier.verify_manifest(m)
+                }
+            });
+            let ma = ok_slot(read_manifest_slot(&dev, sb.root_slot_a)?);
+            let mb = ok_slot(read_manifest_slot(&dev, sb.root_slot_b)?);
             match (ma, mb) {
                 (Some(a), Some(b)) => {
                     if a.generation >= b.generation {
@@ -333,6 +397,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                 cache: BTreeMap::new(),
                 cache_cap: 256,
                 verified: BTreeSet::new(),
+                signer: None,
                 verify,
                 clock: 0,
             });
@@ -372,9 +437,38 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             cache: BTreeMap::new(),
             cache_cap: 256,
             verified: BTreeSet::new(),
+            signer: None,
             verify,
             clock: 0,
         })
+    }
+
+    /// 重签当前活动 manifest（把 `signer_pk`/`signature` 写入活动槽，
+    /// CRC 重算）。签名内容由调用方（宿主 kunxsec）计算。
+    pub fn resign(
+        &mut self,
+        signer_pk: [u8; 32],
+        signature: [u8; 64],
+    ) -> Result<(), KosError> {
+        self.manifest.signer_pk = signer_pk;
+        self.manifest.signature = signature;
+        let slot = if self.active_slot_a {
+            self.sb.root_slot_a
+        } else {
+            self.sb.root_slot_b
+        };
+        write_manifest_slot(&mut self.dev, slot, &self.manifest)?;
+        self.dev.flush()
+    }
+
+    /// 当前活动 manifest 的签名载荷（受信字段区）。
+    pub fn manifest_payload(&self) -> [u8; 80] {
+        manifest_sign_payload(&self.manifest)
+    }
+
+    /// 设置 manifest 签名回调（每次提交自动签名）。
+    pub fn set_signer(&mut self, f: ManifestSignerFn) {
+        self.signer = Some(f);
     }
 
     /// 注入提交时间戳（单调微秒；由调用环境提供）。
@@ -439,19 +533,22 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let tree = MerkleTree::build(data, &self.hasher);
         let nchunks = tree.chunk_count();
 
-        // 1) 数据块 → 2) 索引块 → 3) 区段表 → flush → 4) 头块（提交点）。
+        // 1) 数据块 → 2) 索引块 → 3) 区段表（可内联）→ 4) 头块（提交点）。
         let data_extents = self.write_chunk_extents(data)?;
         let index_extents = self.write_index_blocks(&tree)?;
-        let table_first = self.write_extent_tables(
-            &data_extents,
-            &index_extents,
-            tree.root_hash(),
-            nchunks as u32,
-        )?;
+        let loc = self.build_table(&data_extents, &index_extents, tree.root_hash(), nchunks as u32)?;
         self.dev.flush()?;
-        let hdr = self.make_header(obj_type, 0, &hash, data.len() as u64, nchunks as u32, table_first, owner_uid, capability);
+        let mut flags = 0u16;
+        let (indirect, inline) = match &loc {
+            TableLoc::Inline(b) => {
+                flags |= OBJECT_FLAG_INLINE_TABLE;
+                (0u64, Some(*b))
+            }
+            TableLoc::Chain(f) => (*f, None),
+        };
+        let hdr = self.make_header(obj_type, flags, &hash, data.len() as u64, nchunks as u32, indirect, owner_uid, capability);
         let header_block = self.alloc_blocks(1)?[0];
-        self.write_header_block(header_block, &hdr)?;
+        self.write_header_block_inline(header_block, &hdr, inline.as_ref())?;
         let idx = load_object(&self.dev, header_block, hdr, self.pool_end())
             .ok_or(KosError::ExtentTableCorrupt)?;
         self.objects.insert(hash, idx);
@@ -489,8 +586,21 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     }
 
     fn write_header_block(&mut self, block: u64, hdr: &KosObject) -> Result<(), KosError> {
+        self.write_header_block_inline(block, hdr, None)
+    }
+
+    /// 写头块；`inline` 为内联区段表字节（置于偏移 96）。
+    fn write_header_block_inline(
+        &mut self,
+        block: u64,
+        hdr: &KosObject,
+        inline: Option<&[u8; 3904]>,
+    ) -> Result<(), KosError> {
         let mut hblock = [0u8; BLK];
         hblock[..OBJECT_HEADER_SIZE].copy_from_slice(&hdr.to_bytes());
+        if let Some(t) = inline {
+            hblock[96..96 + 3904].copy_from_slice(t);
+        }
         self.write_blk(block, &hblock)?;
         self.dev.flush()
     }
@@ -641,6 +751,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                     owner_uid: uid,
                     content_hash: root,
                 });
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
                 self.replace_dir_and_commit(parent, &entries)?;
                 Ok(root)
             }
@@ -658,22 +769,25 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let nchunks = tree.chunk_count();
         let data_extents = self.write_chunk_extents(data)?;
         let index_extents = self.write_index_blocks(&tree)?;
-        let table_first =
-            self.write_extent_tables(&data_extents, &index_extents, root, nchunks as u32)?;
+        let loc = self.build_table(&data_extents, &index_extents, root, nchunks as u32)?;
         self.dev.flush()?;
         let header_block = self.alloc_blocks(1)?[0];
         let key = record_key(&self.hasher, &root, header_block);
+        let (indirect, inline, flags) = match &loc {
+            TableLoc::Inline(b) => (0u64, Some(*b), crate::format::object::object_flags::MUTABLE | OBJECT_FLAG_INLINE_TABLE),
+            TableLoc::Chain(f) => (*f, None, crate::format::object::object_flags::MUTABLE),
+        };
         let hdr = self.make_header(
             ObjectType::File,
-            crate::format::object::object_flags::MUTABLE,
+            flags,
             &key,
             data.len() as u64,
             nchunks as u32,
-            table_first,
+            indirect,
             uid,
             capability,
         );
-        self.write_header_block(header_block, &hdr)?;
+        self.write_header_block_inline(header_block, &hdr, inline.as_ref())?;
         let idx = load_object(&self.dev, header_block, hdr, self.pool_end())
             .ok_or(KosError::ExtentTableCorrupt)?;
         self.objects.insert(key, idx);
@@ -747,7 +861,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         // 4) 数据区段 = 旧 ∪ 新；新区段表。
         let mut data_extents = old_idx.data_extents.clone();
         data_extents.extend_from_slice(&new_extents);
-        let table_first = self.write_extent_tables(
+        let loc = self.build_table(
             &data_extents,
             &new_index_extents,
             tree.root_hash(),
@@ -756,7 +870,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         self.dev.flush()?;
         // 5) 头块切换（提交点）。
         let new_key = record_key(&self.hasher, &tree.root_hash(), old_idx.header_block);
-        let hdr = self.commit_record_header(&old_idx, new_key, new_len, total_chunks, table_first);
+        let hdr = self.commit_record_header(&old_idx, new_key, new_len, total_chunks, loc);
         let new_idx = load_object(&self.dev, old_idx.header_block, hdr, self.pool_end())
             .ok_or(KosError::ExtentTableCorrupt)?;
         self.objects.remove(&entry.content_hash);
@@ -765,6 +879,72 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         // 6) 命名空间条目换键。
         self.update_entry_hash(path, new_key, ObjectType::File)?;
         Ok(new_len)
+    }
+
+    /// 截断/扩展（仅可变记录）：shrink 回收尾部 chunk；扩展补零 chunk。
+    /// 语义对齐 ftruncate。返回新长度。
+    pub fn truncate(&mut self, path: &str, len: u64, uid: u32) -> Result<u64, KosError> {
+        let entry = self.lookup_entry(path)?.ok_or(KosError::PathNotFound)?;
+        if !check_access(uid, entry.owner_uid, entry.capability, perm::OWNER_W | perm::OTHER_W) {
+            return Err(KosError::PermissionDenied);
+        }
+        let idx = self.objects.get(&entry.content_hash).ok_or(KosError::ObjectNotFound)?.clone();
+        if idx.header.flags & crate::format::object::object_flags::MUTABLE == 0 {
+            return Err(KosError::NotMutable);
+        }
+        let old_chunks = idx.header.block_count as usize;
+        let new_chunks = ((len as usize) + DATA_CHUNK_SIZE - 1) / DATA_CHUNK_SIZE;
+
+        let (root, data_extents, tree) = if new_chunks == old_chunks {
+            (idx.merkle_root, idx.data_extents.clone(),
+             MerkleTree::build(&[0u8; 0], &self.hasher))
+        } else if new_chunks < old_chunks {
+            // 收缩：清零新末尾 chunk 的尾部（防扩容后读回残留），保留
+            // 前 new_chunks 个叶子，回收尾部数据区段。
+            let mut leaves = self.read_leaf_hashes(&idx, old_chunks)?;
+            let tail_in_chunk = (len as usize) % DATA_CHUNK_SIZE;
+            if tail_in_chunk != 0 && new_chunks > 0 {
+                let last = new_chunks - 1;
+                let block = Self::chunk_block_no(&idx, last as u32)?;
+                let mut buf = [0u8; BLK];
+                self.read_blk(block, &mut buf)?;
+                for b in buf[tail_in_chunk..].iter_mut() {
+                    *b = 0;
+                }
+                self.write_blk(block, &buf)?;
+                leaves[last] = self.hasher.hash32(&buf[..tail_in_chunk]);
+            }
+            let tree = MerkleTree::build_from_chunk_hashes(&leaves[..new_chunks], &self.hasher);
+            let (keep, tail) = split_extents_at(&idx.data_extents, new_chunks);
+            self.reclaim(&tail, &[]);
+            (tree.root_hash(), keep, tree)
+        } else {
+            // 扩展：零 chunk 挂新区段，叶子哈希 = 对应长度零块。
+            let mut leaves = self.read_leaf_hashes(&idx, old_chunks)?;
+            let zero = alloc::vec![0u8; (new_chunks - old_chunks) * DATA_CHUNK_SIZE];
+            let mut extents = idx.data_extents.clone();
+            let new_extents = self.write_chunk_extents(&zero)?;
+            extents.extend_from_slice(&new_extents);
+            for c in old_chunks..new_chunks {
+                let clen = core::cmp::min(DATA_CHUNK_SIZE, len as usize - c * DATA_CHUNK_SIZE);
+                let b = [0u8; BLK];
+                leaves.push(self.hasher.hash32(&b[..clen]));
+            }
+            let tree = MerkleTree::build_from_chunk_hashes(&leaves[..new_chunks], &self.hasher);
+            (tree.root_hash(), extents, tree)
+        };
+        let new_index_extents = self.write_index_blocks(&tree)?;
+        let loc = self.build_table(&data_extents, &new_index_extents, root, new_chunks as u32)?;
+        self.dev.flush()?;
+        let new_key = record_key(&self.hasher, &root, idx.header_block);
+        let hdr = self.commit_record_header(&idx, new_key, len, new_chunks as u32, loc);
+        let new_idx = load_object(&self.dev, idx.header_block, hdr, self.pool_end())
+            .ok_or(KosError::ExtentTableCorrupt)?;
+        self.objects.remove(&entry.content_hash);
+        self.objects.insert(new_key, new_idx);
+        self.reclaim(&idx.index_extents, &idx.table_blocks);
+        self.update_entry_hash(path, new_key, ObjectType::File)?;
+        Ok(len)
     }
 
     /// 原地范围写（仅可变记录）：`offset..offset+data.len()`。
@@ -828,11 +1008,11 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let _ = &tree;
 
         let new_index_extents = self.write_index_blocks(&tree)?;
-        let table_first =
-            self.write_extent_tables(&data_extents, &new_index_extents, root, new_chunks as u32)?;
+        let loc =
+            self.build_table(&data_extents, &new_index_extents, root, new_chunks as u32)?;
         self.dev.flush()?;
         let new_key = record_key(&self.hasher, &root, idx.header_block);
-        let hdr = self.commit_record_header(&idx, new_key, new_len, new_chunks as u32, table_first);
+        let hdr = self.commit_record_header(&idx, new_key, new_len, new_chunks as u32, loc);
         let new_idx = load_object(&self.dev, idx.header_block, hdr, self.pool_end())
             .ok_or(KosError::ExtentTableCorrupt)?;
         self.objects.remove(&entry.content_hash);
@@ -902,21 +1082,37 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     }
 
     /// 提交可变记录头（原地重写头块；version+1）。
+    #[allow(clippy::too_many_arguments)]
     fn commit_record_header(
         &mut self,
         old: &ObjIndex,
         root: [u8; 32],
         new_len: u64,
         total_chunks: u32,
-        table_first: u64,
+        loc: TableLoc,
     ) -> KosObject {
         let mut hdr = old.header.clone();
+        // mtime：reserved[0..4] 记秒（u32 LE；2038 问题留给格式 v2）。
+        let secs = (self.clock / 1_000_000) as u32;
+        hdr.reserved[0..4].copy_from_slice(&secs.to_le_bytes());
         hdr.content_len = new_len;
         hdr.content_hash = root;
         hdr.block_count = total_chunks;
-        hdr.indirect = table_first;
+        let inline;
+        match &loc {
+            TableLoc::Inline(b) => {
+                hdr.flags |= OBJECT_FLAG_INLINE_TABLE;
+                hdr.indirect = 0;
+                inline = Some(*b);
+            }
+            TableLoc::Chain(f) => {
+                hdr.flags &= !OBJECT_FLAG_INLINE_TABLE;
+                hdr.indirect = *f;
+                inline = None;
+            }
+        }
         hdr.version += 1;
-        self.write_header_block(old.header_block, &hdr)
+        self.write_header_block_inline(old.header_block, &hdr, inline.as_ref())
             .expect("KOS：头块重写失败（介质错误）");
         hdr
     }
@@ -1017,9 +1213,11 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                 return Err(KosError::NameTooLong);
             }
             let entries = self.read_dir_hash(&cur_hash)?;
+            // 目录条目按名字有序（写入路径维持不变量）：二分定位。
             let e = entries
-                .into_iter()
-                .find(|e| e.name == seg)
+                .get(entries.partition_point(|e| e.name.as_str() < seg))
+                .filter(|e| e.name == seg)
+                .cloned()
                 .ok_or(KosError::PathNotFound)?;
             if e.entry_type != ObjectType::Dir && i + 1 < n {
                 return Err(KosError::NotADirectory);
@@ -1032,6 +1230,11 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         Ok(entry)
     }
 
+    /// 解析路径 → 条目（公开；内核 fd 层用）。
+    pub fn resolve_pub(&mut self, path: &str) -> Result<Option<DirEntry>, KosError> {
+        self.resolve(path)
+    }
+
     fn lookup_entry(&mut self, path: &str) -> Result<Option<DirEntry>, KosError> {
         // 路径不存在 = 无条目（新建路径）；中间目录缺失由后续 list 报错。
         match self.resolve(path) {
@@ -1039,6 +1242,17 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             Err(KosError::PathNotFound) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// 分页列目录：跳过前 `skip` 条（readdir cookie 语义）。
+    pub fn list_skip(&mut self, path: &str, skip: usize) -> Result<Vec<DirEntry>, KosError> {
+        let mut all = self.list(path)?;
+        if skip >= all.len() {
+            all.clear();
+        } else {
+            all.drain(0..skip);
+        }
+        Ok(all)
     }
 
     /// 列目录。
@@ -1098,13 +1312,16 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                 entries[i].capability = capability;
                 entries[i].owner_uid = uid;
             }
-            None => entries.push(DirEntry {
-                name: name.into(),
-                entry_type: ObjectType::File,
-                capability,
-                owner_uid: uid,
-                content_hash: hash,
-            }),
+            None => {
+                entries.push(DirEntry {
+                    name: name.into(),
+                    entry_type: ObjectType::File,
+                    capability,
+                    owner_uid: uid,
+                    content_hash: hash,
+                });
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+            }
         }
         self.replace_dir_and_commit(parent, &entries)
     }
@@ -1150,6 +1367,125 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             self.reclaim(&idx.index_extents, &idx.table_blocks);
         }
         Ok(())
+    }
+
+    /// 随机读（pread 语义）：`offset..offset+buf.len()`，只读受影响
+    /// chunk 块（读 1 字节不再整读全对象）。返回实际读到的字节数
+    /// （末尾截断）。权限与 Full 校验同 open_path。
+    pub fn read_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        buf: &mut [u8],
+        uid: u32,
+    ) -> Result<usize, KosError> {
+        let entry = self.resolve(path)?.ok_or(KosError::PathNotFound)?;
+        if !check_access(uid, entry.owner_uid, entry.capability, perm::OWNER_R | perm::OTHER_R) {
+            return Err(KosError::PermissionDenied);
+        }
+        self.read_range_hash(&entry.content_hash, offset, buf)
+    }
+
+    /// 按哈希随机读（fd 层用：条目已解析、权限已查）。
+    pub fn read_range_hash(
+        &mut self,
+        hash: &[u8; 32],
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KosError> {
+        let idx = self
+            .objects
+            .get(hash)
+            .ok_or(KosError::ObjectNotFound)?
+            .clone();
+        let len = idx.header.content_len;
+        if offset >= len {
+            return Ok(0);
+        }
+        let want = core::cmp::min(buf.len() as u64, len - offset) as usize;
+        let c0 = offset as usize / DATA_CHUNK_SIZE;
+        let c1 = ((offset as usize) + want + DATA_CHUNK_SIZE - 1) / DATA_CHUNK_SIZE;
+        let mut out = 0usize;
+        let mut blk = [0u8; BLK];
+        for c in c0..c1.max(c0 + 1) {
+            if c >= idx.header.block_count as usize {
+                break;
+            }
+            let block = Self::chunk_block_no(&idx, c as u32)?;
+            self.read_blk(block, &mut blk)?;
+            let chunk_off = c * DATA_CHUNK_SIZE;
+            let start = if offset as usize > chunk_off {
+                offset as usize - chunk_off
+            } else {
+                0
+            };
+            let end = core::cmp::min(DATA_CHUNK_SIZE, offset as usize + want - chunk_off);
+            if start < end {
+                let take = core::cmp::min(end - start, want - out);
+                buf[out..out + take].copy_from_slice(&blk[start..start + take]);
+                out += take;
+            }
+        }
+        Ok(out)
+    }
+
+    /// rename / move：`from` → `to`（`to` 已存在则替换）。对象本身不动
+    /// （CAS），只 CoW 目录链：删旧条目 + 加新条目 + 提交。跨目录移动
+    /// 需要两条链都重建。
+    pub fn rename(&mut self, from: &str, to: &str, uid: u32) -> Result<(), KosError> {
+        let entry = self.resolve(from)?.ok_or(KosError::PathNotFound)?;
+        if !check_access(
+            uid,
+            entry.owner_uid,
+            entry.capability,
+            perm::OWNER_W | perm::OTHER_W,
+        ) {
+            return Err(KosError::PermissionDenied);
+        }
+        let (old_parent, old_name) = split_parent(from)?;
+        let (new_parent, new_name) = split_parent(to)?;
+        if new_name.len() > MAX_NAME {
+            return Err(KosError::NameTooLong);
+        }
+        // 目标父目录必须存在（list 报错即不存在）。
+        let mut np_entries = self.list(new_parent)?;
+        // 同目录快路径：一条链。
+        if old_parent == new_parent {
+            let mut entries = np_entries;
+            let i = entries
+                .iter()
+                .position(|e| e.name == old_name)
+                .ok_or(KosError::PathNotFound)?;
+            let mut e = entries.remove(i);
+            e.name = new_name.into();
+            // 目标已存在则替换（删除其条目）。
+            if let Some(j) = entries.iter().position(|x| x.name == new_name) {
+                entries.remove(j);
+            }
+            entries.push(e);
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            return self.replace_dir_and_commit(new_parent, &entries);
+        }
+        // 跨目录：先在新父目录加条目，再在旧父目录删条目。
+        if let Some(j) = np_entries.iter().position(|x| x.name == new_name) {
+            np_entries.remove(j);
+        }
+        np_entries.push(DirEntry {
+            name: new_name.into(),
+            entry_type: entry.entry_type,
+            capability: entry.capability,
+            owner_uid: entry.owner_uid,
+            content_hash: entry.content_hash,
+        });
+        np_entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.replace_dir_and_commit(new_parent, &np_entries)?;
+        let mut op_entries = self.list(old_parent)?;
+        let i = op_entries
+            .iter()
+            .position(|e| e.name == old_name)
+            .ok_or(KosError::PathNotFound)?;
+        op_entries.remove(i);
+        self.replace_dir_and_commit(old_parent, &op_entries)
     }
 
     /// 打开并读取：对目标做读权限检查。
@@ -1230,7 +1566,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         }
 
         let parent_manifest = self.hasher.hash32(&self.manifest.to_bytes());
-        let m = KosRootManifest {
+        let mut m = KosRootManifest {
             magic: MANIFEST_MAGIC,
             generation: self.manifest.generation + 1,
             timestamp: self.clock,
@@ -1241,6 +1577,12 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             crc32: 0,
             reserved: [0u8; 4],
         };
+        if let Some(sign) = self.signer {
+            let payload = manifest_sign_payload(&m);
+            let (pk, sig) = sign(payload);
+            m.signer_pk = pk;
+            m.signature = sig;
+        }
         let slot = if self.active_slot_a {
             self.sb.root_slot_b
         } else {
@@ -1389,7 +1731,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             buf.copy_from_slice(c);
             return Ok(());
         }
-        self.read_blk(lba, buf)?;
+        dev_read(&self.dev, lba, buf)?;
         if self.cache.len() >= self.cache_cap {
             self.cache.clear();
         }
@@ -1509,6 +1851,35 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         Ok(runs_of(&blocks, KIND_INDEX))
     }
 
+    fn build_table(
+        &mut self,
+        data_extents: &[Extent],
+        index_extents: &[Extent],
+        merkle_root: [u8; 32],
+        total_chunks: u32,
+    ) -> Result<TableLoc, KosError> {
+        let all: Vec<Extent> = data_extents
+            .iter()
+            .chain(index_extents.iter())
+            .cloned()
+            .collect();
+        if all.len() <= crate::format::extent::EXTENTS_PER_TABLE {
+            let mut table = ExtentTable::empty(merkle_root, total_chunks);
+            table.entry_count = all.len() as u32;
+            table.entries[..all.len()].copy_from_slice(&all);
+            let full = table.to_bytes();
+            let mut inline = [0u8; 3904];
+            inline.copy_from_slice(&full[..3904]);
+            return Ok(TableLoc::Inline(inline));
+        }
+        Ok(TableLoc::Chain(self.write_extent_tables(
+            data_extents,
+            index_extents,
+            merkle_root,
+            total_chunks,
+        )?))
+    }
+
     /// 写区段表链（可能多块），返回链首块号。
     fn write_extent_tables(
         &mut self,
@@ -1575,6 +1946,27 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
 
 // ==================== 辅助（自由函数） ====================
 
+/// 把数据区段在第 `chunk` 个 chunk 处切成两段（前者恰好覆盖前
+/// `chunk` 个 chunk）。
+fn split_extents_at(extents: &[Extent], chunk: usize) -> (Vec<Extent>, Vec<Extent>) {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut c = chunk as u64;
+    for e in extents {
+        if c == 0 {
+            tail.push(*e);
+        } else if c >= e.count as u64 {
+            head.push(*e);
+            c -= e.count as u64;
+        } else {
+            head.push(Extent { start: e.start, count: c as u32, kind: e.kind });
+            tail.push(Extent { start: e.start + c, count: e.count - c as u32, kind: e.kind });
+            c = 0;
+        }
+    }
+    (head, tail)
+}
+
 /// 按区段列表定位第 `chunk` 个数据块的绝对块号。
 fn extents_block_no(extents: &[Extent], chunk: u32) -> Result<u64, KosError> {
     let mut c = chunk as u64;
@@ -1588,6 +1980,14 @@ fn extents_block_no(extents: &[Extent], chunk: u32) -> Result<u64, KosError> {
         index: chunk as usize,
         total_chunks: 0,
     })
+}
+
+/// 区段表落点：单表可容纳时内联进头块（省 1 块），否则链式块。
+enum TableLoc {
+    /// 表字节（3904B，写入头块偏移 96）。
+    Inline([u8; 3904]),
+    /// 链首块号（写入 hdr.indirect）。
+    Chain(u64),
 }
 
 /// 把（升序）块号列表组织为 `kind` 类型的连续区段。
@@ -1645,6 +2045,38 @@ fn load_object<B: crate::block::BlockDevice>(
     let mut index_extents = Vec::new();
     let mut table_blocks = Vec::new();
     let mut merkle_root = [0u8; 32];
+    // 内联表（v3 小对象）：区段表就在头块偏移 96 处。
+    if hdr.flags & OBJECT_FLAG_INLINE_TABLE != 0 {
+        let mut buf = [0u8; BLK];
+        dev.read_block(header_block, &mut buf).ok()?;
+        let mut tbl = [0u8; BLK];
+        tbl[..3904].copy_from_slice(&buf[96..96 + 3904]);
+        let t = ExtentTable::from_bytes(&tbl).ok()?;
+        merkle_root = t.merkle_root;
+        for i in 0..t.entry_count as usize {
+            let e = t.entries[i];
+            if e.start >= pool_end || e.start + e.count as u64 > pool_end {
+                return None;
+            }
+            match e.kind {
+                KIND_DATA => data_extents.push(e),
+                KIND_INDEX => index_extents.push(e),
+                _ => return None,
+            }
+        }
+        let data_chunks: u64 = data_extents.iter().map(|e| e.count as u64).sum();
+        if data_chunks != hdr.block_count as u64 {
+            return None;
+        }
+        return Some(ObjIndex {
+            header_block,
+            header: hdr,
+            data_extents,
+            index_extents,
+            table_blocks: Vec::new(),
+            merkle_root,
+        });
+    }
     let mut next = hdr.indirect;
     let mut hops = 0;
     while next != 0 {

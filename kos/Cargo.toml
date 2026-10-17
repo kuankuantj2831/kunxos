@@ -5,11 +5,15 @@ edition = "2021"
 description = "KOS: KunxOS Object Storage — 磁盘格式 / 哈希 / Merkle 树 / 块设备抽象（Phase 1 Step 1，宿主可测）"
 
 [features]
-default = ["std"]
+default = ["std", "sign"]
 std = []
+# kosctl 签名支持（复用 kunxseC Ed25519；仅宿主工具用，内核构建
+# default-features=false 不含此项）。
+sign = ["dep:kunxsec"]
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
+kunxsec = { path = "../kunxsec", optional = true }
 sha2 = { version = "0.10", default-features = false }
 crc32fast = { version = "1", default-features = false }
 

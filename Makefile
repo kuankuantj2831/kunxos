@@ -491,13 +491,28 @@ kosctl:
 # 持久 KOS 卷（QEMU 第二磁盘；重启数据保留）。256MB 稀疏文件。
 KOS_DISK_IMG := $(TOPDIR)/kos-disk.img
 
+KOS_SEED := $(TOOLS)/.kos-seed
+KOS_TRUST := $(KUNXCORE)/src/kos_trust_pk.rs
+
 kos-disk: kosctl
+	@if [ ! -f $(KOS_SEED) ]; then \
+		$(KOSCTL) keygen | awk '{print $$2}' > $(KOS_SEED); \
+		echo "已生成 KOS 签名种子 $(KOS_SEED)（开发密钥，随仓库走）"; \
+	fi
 	$(KOSCTL) mkfs $(KOS_DISK_IMG).tmp 65536
 	echo "persistent kos volume" > /tmp/kos-seed.txt
 	$(KOSCTL) putm $(KOS_DISK_IMG).tmp /seed.txt /tmp/kos-seed.txt
 	$(KOSCTL) append $(KOS_DISK_IMG).tmp /seed.txt /tmp/kos-seed.txt
+	$(KOSCTL) sign $(KOS_DISK_IMG).tmp $$(cat $(KOS_SEED)) | awk '/trust-pk/{print $$2}' > /tmp/kos-pk.hex
 	mv $(KOS_DISK_IMG).tmp $(KOS_DISK_IMG)
-	@echo "kos-disk.img 已生成（65536 块 = 256MB 持久卷）"
+	@python3 -c "pk=open('/tmp/kos-pk.hex').read().strip(); \
+	seed=open('$(KOS_SEED)').read().strip(); \
+	pkb=', '.join('0x'+pk[i:i+2] for i in range(0,64,2)); \
+	sdb=', '.join('0x'+seed[i:i+2] for i in range(0,64,2)); \
+	open('$(KOS_TRUST)','w').write('// 由 make kos-disk 生成（tools/.kos-seed 派生）。勿手改。\n'+\
+	'pub const KOS_TRUST_PK: [u8; 32] = ['+pkb+'];\n'+\
+	'pub const KOS_SIGN_SEED: [u8; 32] = ['+sdb+'];\n')"
+	@echo "kos-disk.img 已生成（256MB 持久卷，manifest 已签名，信任公钥已写入内核）"
 
 kosdisk: kosctl
 	$(KOSCTL) mkfs $(KOSDISK).tmp 1024

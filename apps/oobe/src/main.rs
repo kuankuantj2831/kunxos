@@ -2842,6 +2842,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
     }
     let ny = NAV_Y;
     let t0 = mono_us();
+    let mut nav_snap_ok = false;
     loop {
         let el = mono_us().saturating_sub(t0);
         let t = (el as f32 / TRANS_DUR_US as f32).min(1.0);
@@ -2856,21 +2857,73 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             (TRANS_SLIDE as f32 * (1.0 - eb)) as i32
         };
         // 内容区：旧页淡出、新页淡入并滑入就位。
-        for y in 0..ny {
-            let sy = y + off;
-            for x in 0..DISPLAY_W as i32 {
-                let i = y as usize * DISPLAY_W + x as usize;
-                let oldc = unsafe { PREV_BUF[i] };
-                let newc = if sy >= 0 && sy < ny {
-                    unsafe { BACK_BUF[sy as usize * DISPLAY_W + x as usize] }
-                } else {
-                    oldc
-                };
-                fb_set_px(x, y, blend_px(oldc, newc, ea));
+        // 帧率优化（R8）：① 混合换乘移——原 blend_px 每像素 3 次除法
+        // （47 万像素×3 div 是 TCG 下转场帧率第一大开销），ea 帧内恒定，
+        // 预乘 257 后 >>16 近似 /255（误差 ≤1）；② 末帧 ea=255 直写新页
+        // 免混合；③ sy 越界行 oldc==newc 也免混合直写。
+        if ea >= 255 {
+            for y in 0..ny {
+                let sy = y + off;
+                if sy < 0 || sy >= ny {
+                    continue;
+                }
+                let src = sy as usize * DISPLAY_W;
+                let dst = unsafe { FB_PTR as usize + y as usize * FB_STRIDE_PX * 4 };
+                let dst = dst as *mut u32;
+                for x in 0..DISPLAY_W {
+                    unsafe { *dst.add(x) = BACK_BUF[src + x] };
+                }
+            }
+        } else {
+            for y in 0..ny {
+                let sy = y + off;
+                let in_range = sy >= 0 && sy < ny;
+                for x in 0..DISPLAY_W as i32 {
+                    let i = y as usize * DISPLAY_W + x as usize;
+                    let oldc = unsafe { PREV_BUF[i] };
+                    let newc = if in_range {
+                        unsafe { BACK_BUF[sy as usize * DISPLAY_W + x as usize] }
+                    } else {
+                        oldc
+                    };
+                    if oldc == newc || ea == 0 {
+                        fb_set_px(x, y, oldc);
+                        continue;
+                    }
+                    // 近似混合：((v*t + n*inv) * 257) >> 16 ≈ /255
+                    let (ar, br_, ab) = (oldc >> 16 & 0xFF, oldc >> 8 & 0xFF, oldc & 0xFF);
+                    let (cr, cg, cb) = (newc >> 16 & 0xFF, newc >> 8 & 0xFF, newc & 0xFF);
+                    let inv = 255 - ea;
+                    let r = ((ar * inv + cr * ea) * 257) >> 16;
+                    let g = ((br_ * inv + cg * ea) * 257) >> 16;
+                    let b = ((ab * inv + cb * ea) * 257) >> 16;
+                    fb_set_px(x, y, (r << 16) | (g << 8) | b);
+                }
             }
         }
-        // 导航区整行重绘后刷到显存，并呈现本帧（合成器提交 + 翻页）。
-        draw_nav_anim(to, e);
+        // 导航区：帧 0 全量画（玻璃+按钮），其后快照恢复 + 仅重画进度点
+        // （毛玻璃降采样+盒式模糊每帧重画是转场第二大开销）。
+        if !nav_snap_ok {
+            draw_nav_anim(to, e);
+            unsafe {
+                for y in 0..NAV_H as usize {
+                    TRANS_NAV_SNAP[y].copy_from_slice(
+                        &BACK_BUF[(DISPLAY_H as usize - NAV_H as usize + y) * DISPLAY_W
+                            ..(DISPLAY_H as usize - NAV_H as usize + y + 1) * DISPLAY_W],
+                    );
+                }
+            }
+            nav_snap_ok = true;
+        } else {
+            unsafe {
+                let base = (DISPLAY_H as usize - NAV_H as usize) * DISPLAY_W;
+                for y in 0..NAV_H as usize {
+                    BACK_BUF[base + y * DISPLAY_W..base + (y + 1) * DISPLAY_W]
+                        .copy_from_slice(&TRANS_NAV_SNAP[y]);
+                }
+            }
+            draw_progress_anim(to, e);
+        }
         for y in ny..DISPLAY_H as i32 {
             for x in 0..DISPLAY_W as i32 {
                 fb_set_px(x, y, unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] });
@@ -3191,6 +3244,10 @@ fn animate_idle(step: usize) {
 }
 
 static mut ANIM_IDLE_SKIP: bool = false;
+
+/// 转场期 nav 区快照（帧 0 画一次玻璃+按钮，其后恢复 + 仅重画进度点）。
+static mut TRANS_NAV_SNAP: [[u32; DISPLAY_W]; NAV_H as usize] =
+    [[0; DISPLAY_W]; NAV_H as usize];
 
 /// 卡片页命中检测（语言/时区/锁屏/胁迫动作）。
 fn hover_card_at(step: usize, x: i32, y: i32) -> Option<usize> {

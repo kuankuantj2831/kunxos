@@ -17,6 +17,37 @@ use kos::block::BlockDevice;
 use kos::error::KosError;
 use kos::store::{KosStore, VerifyLevel};
 
+// ==================== Manifest 验签（kunxsec Ed25519） ====================
+
+/// 信任公钥（32 字节；全零 = 未配置 → 不验签）。由 `make kos-disk`
+/// 生成（tools/.kos-seed 派生），写入 kunxcore/src/kos_trust_pk.rs。
+include!("kos_trust_pk.rs");
+
+/// 提交期签名回调：用开发种子（make kos-disk 生成，随仓库走）给
+/// 每一代 manifest 签名——严格验签模式下系统可持续写入。
+fn kos_commit_signer(payload: [u8; 80]) -> ([u8; 32], [u8; 64]) {
+    let seed = KOS_SIGN_SEED;
+    let pk = kunxsec::ed25519::public_key(&seed);
+    let sig = kunxsec::ed25519::sign(&seed, &pk, &payload);
+    (pk, sig)
+}
+
+/// kunxsec Ed25519 验签器：签名覆盖 manifest[8..120)（受信字段区）。
+pub struct KunxsecVerifier {
+    pk: [u8; 32],
+}
+
+impl kos::store::ManifestVerifier for KunxsecVerifier {
+    fn verify_manifest(&self, m: &kos::format::manifest::KosRootManifest) -> bool {
+        let payload = kos::store::manifest_sign_payload(m);
+        kunxsec::ed25519::verify(&self.pk, &payload, &m.signature)
+    }
+    fn strict(&self) -> bool {
+        // 配置了信任锚即严格：未签名槽一律拒绝。
+        self.pk != [0u8; 32]
+    }
+}
+
 // ==================== 系统调用号（私有号段） ====================
 
 pub const SYS_KOS_MOUNT: usize = 460;
@@ -27,6 +58,13 @@ pub const SYS_KOS_UNLINK: usize = 464;
 pub const SYS_KOS_LIST: usize = 465;
 pub const SYS_KOS_STAT: usize = 466;
 pub const SYS_KOS_APPEND: usize = 467;
+pub const SYS_KOS_TRUNCATE: usize = 468;
+pub const SYS_KOS_LIST2: usize = 469;
+pub const SYS_KOS_READ_RANGE: usize = 470;
+pub const SYS_KOS_RENAME: usize = 471;
+pub const SYS_KOS_OPEN: usize = 472;
+pub const SYS_KOS_READ_FD: usize = 473;
+pub const SYS_KOS_CLOSE_FD: usize = 474;
 
 // ==================== 块设备适配 ====================
 
@@ -138,8 +176,13 @@ pub fn mount(major: u32) -> bool {
         return false;
     }
     let dev = KosBlkDev { major, blocks };
-    match KosStore::open(dev, VerifyLevel::HashOnly) {
-        Ok(s) => {
+    let verifier = KunxsecVerifier { pk: KOS_TRUST_PK };
+    match KosStore::open_with_verifier(dev, VerifyLevel::HashOnly, &verifier) {
+        Ok(mut s) => {
+            // 信任锚已配置（种子非零）时，后续提交全部自动签名。
+            if KOS_SIGN_SEED != [0u8; 32] {
+                s.set_signer(kos_commit_signer);
+            }
             crate::fs_simple::fs_lock();
             // SAFETY：fs_lock 临界区内（见 with_store）。
             unsafe {
@@ -190,8 +233,13 @@ pub fn sys_mount(major: u32) -> i64 {
         return -1;
     }
     let dev = KosBlkDev { major, blocks };
-    match KosStore::open(dev, VerifyLevel::HashOnly) {
-        Ok(s) => {
+    let verifier = KunxsecVerifier { pk: KOS_TRUST_PK };
+    match KosStore::open_with_verifier(dev, VerifyLevel::HashOnly, &verifier) {
+        Ok(mut s) => {
+            // 信任锚已配置（种子非零）时，后续提交全部自动签名。
+            if KOS_SIGN_SEED != [0u8; 32] {
+                s.set_signer(kos_commit_signer);
+            }
             crate::fs_simple::fs_lock();
             // SAFETY：同上，fs_lock 临界区内。
             unsafe {
@@ -306,6 +354,39 @@ pub fn sys_list(path: &str, buf: &mut [u8]) -> i64 {
     n as i64
 }
 
+/// 截断/扩展（仅可变记录）。
+pub fn sys_truncate(path: &str, len: u64) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.truncate(path, len, uid)) {
+        Some(Ok(n)) => n as i64,
+        _ => -1,
+    }
+}
+
+/// 分页列目录：跳过前 `skip` 条。
+pub fn sys_list_paged(path: &str, skip: usize, buf: &mut [u8]) -> i64 {
+    let lines = match with_store(|s| s.list_skip(path, skip)) {
+        Some(Ok(entries)) => {
+            let mut out = alloc::string::String::new();
+            use core::fmt::Write;
+            for e in entries {
+                let t = match e.entry_type {
+                    kos::format::object::ObjectType::Dir => 'd',
+                    kos::format::object::ObjectType::Symlink => 'l',
+                    _ => '-',
+                };
+                let _ = write!(&mut out, "{t} {:o} {} {}\n", e.capability, e.owner_uid, e.name);
+            }
+            out
+        }
+        _ => return -1,
+    };
+    let b = lines.as_bytes();
+    let n = core::cmp::min(b.len(), buf.len());
+    buf[..n].copy_from_slice(&b[..n]);
+    n as i64
+}
+
 /// 追加写（仅可变记录）：返回新长度。
 pub fn sys_append(path: &str, data: &[u8]) -> i64 {
     let uid = crate::process::current_uid();
@@ -313,6 +394,111 @@ pub fn sys_append(path: &str, data: &[u8]) -> i64 {
         Some(Ok(len)) => len as i64,
         _ => -1,
     }
+}
+
+/// 随机读（pread）：`offset..offset+len`。返回读取字节数。
+pub fn sys_read_range(path: &str, offset: u64, buf: &mut [u8]) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.read_range(path, offset, buf, uid)) {
+        Some(Ok(n)) => n as i64,
+        _ => -1,
+    }
+}
+
+/// rename / move。
+pub fn sys_rename(from: &str, to: &str) -> i64 {
+    let uid = crate::process::current_uid();
+    match with_store(|s| s.rename(from, to, uid)) {
+        Some(Ok(())) => 0,
+        _ => -1,
+    }
+}
+
+// ==================== KOS fd 层（470..=474 的 472..474） ====================
+
+/// 每进程 KOS fd 表：fd → (对象键, 读位置)。上限 64/进程。
+const KOS_FD_MAX: usize = 64;
+
+struct KosFd {
+    key: [u8; 32],
+    pos: u64,
+}
+
+static mut KOS_FDS: Option<alloc::collections::BTreeMap<(u32, u32), KosFd>> = None;
+static mut KOS_FD_NEXT: u32 = 3;
+
+/// kos_open(path) → fd（权限检查同 read；pid 绑定）。
+pub fn sys_kos_open(path: &str) -> i64 {
+    let uid = crate::process::current_uid();
+    let pid = crate::process::current_pid();
+    let key = match with_store(|s| {
+        s.resolve_pub(path).map(|e| {
+            e.filter(|e| {
+                kos::store::check_access(
+                    uid,
+                    e.owner_uid,
+                    e.capability,
+                    kos::store::perm::OWNER_R | kos::store::perm::OTHER_R,
+                )
+            })
+            .map(|e| e.content_hash)
+        })
+    }) {
+        Some(Ok(Some(k))) => k,
+        _ => return -1,
+    };
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内（与 with_store 同一锁序）。
+    unsafe {
+        let table = KOS_FDS.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let used = table.keys().filter(|(p, _)| *p == pid).count();
+        if used >= KOS_FD_MAX {
+            crate::fs_simple::fs_unlock();
+            return -1;
+        }
+        let fd = KOS_FD_NEXT;
+        KOS_FD_NEXT += 1;
+        table.insert((pid, fd), KosFd { key, pos: 0 });
+        crate::fs_simple::fs_unlock();
+        fd as i64
+    }
+}
+
+/// kos_read(fd, buf)：顺序读（位置记忆），返回本读取到的字节数，EOF=0。
+pub fn sys_kos_read_fd(fd: u32, buf: &mut [u8]) -> i64 {
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let entry = unsafe {
+        KOS_FDS.as_ref().and_then(|t| t.get(&(pid, fd)).map(|f| (f.key, f.pos)))
+    };
+    crate::fs_simple::fs_unlock();
+    let Some((key, pos)) = entry else { return -1 };
+    let n = match with_store(|s| s.read_range_hash(&key, pos, buf)) {
+        Some(Ok(n)) => n,
+        _ => return -1,
+    };
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    unsafe {
+        if let Some(f) = KOS_FDS.as_mut().and_then(|t| t.get_mut(&(pid, fd))) {
+            f.pos += n as u64;
+        }
+    }
+    crate::fs_simple::fs_unlock();
+    n as i64
+}
+
+/// kos_close(fd)。
+pub fn sys_kos_close_fd(fd: u32) -> i64 {
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let r = unsafe {
+        KOS_FDS.as_mut().map(|t| t.remove(&(pid, fd)).is_some()).unwrap_or(false) as i64
+    };
+    crate::fs_simple::fs_unlock();
+    r
 }
 
 /// 卷状态：返回 (generation, objects, free_blocks, pool_blocks)。

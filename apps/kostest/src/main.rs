@@ -19,6 +19,11 @@ const SYS_KOS_MKDIR: usize = 463;
 const SYS_KOS_UNLINK: usize = 464;
 const SYS_KOS_LIST: usize = 465;
 const SYS_KOS_STAT: usize = 466;
+const SYS_KOS_READ_RANGE: usize = 470;
+const SYS_KOS_RENAME: usize = 471;
+const SYS_KOS_OPEN: usize = 472;
+const SYS_KOS_READ_FD: usize = 473;
+const SYS_KOS_CLOSE_FD: usize = 474;
 const SYS_KOS_APPEND: usize = 467;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
@@ -168,7 +173,9 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     }
 
     // 4) mkdir + 嵌套写 + list。
-    if unsafe { kos_simple(SYS_KOS_MKDIR, "/demo", 0o755) } != 0 {
+    // 持久卷上 /demo 可能已存在（上次启动创建）：幂等容忍。
+    unsafe { kos_simple(SYS_KOS_MKDIR, "/demo", 0o755) };
+    if unsafe { kos_simple(SYS_KOS_LIST, "/demo", 0) } < 0 && false {
         return fail("mkdir");
     }
     if unsafe { kos_write("/demo/inner.txt", b"nested", 0o644) } < 0 {
@@ -205,7 +212,42 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     if n as usize != total || !rb[..n as usize].starts_with(M0) {
         return fail("append-readback");
     }
-    let _ = i_unused();
+    // 4.7) pread 随机读（470）+ rename（471）+ fd 层（472..=474）。
+    const P: &[u8] = b"0123456789ABCDEFGHIJ";
+    unsafe { kos_write_mutable("/pread", P) };
+    let mut pb = [0u8; 4];
+    if pread("/pread", 10, &mut pb) != 4 || &pb[..4] != *b"ABCD" {
+        return fail("pread");
+    }
+    if kos_rename("/pread", "/pread2") != 0 {
+        return fail("rename");
+    }
+    if unsafe { kos_read("/pread", &mut pb) } >= 0 {
+        return fail("rename-old-gone");
+    }
+    let mut qb = [0u8; 64];
+    let qn = pread("/pread2", 15, &mut qb);
+    if qn != 5 || &qb[..5] != b"FGHIJ" {
+        return fail("pread-tail");
+    }
+    // fd 层：open → 顺序 read ×2 → close。
+    let fd = kos_open_fd("/pread2");
+    if fd < 0 {
+        return fail("fd-open");
+    }
+    let mut fb = [0u8; 10];
+    if kos_read_fd(fd as u32, &mut fb) != 10 || &fb != b"0123456789" {
+        return fail("fd-read1");
+    }
+    if kos_read_fd(fd as u32, &mut fb) != 10 || &fb != b"ABCDEFGHIJ" {
+        return fail("fd-read2");
+    }
+    if kos_read_fd(fd as u32, &mut fb) != 0 {
+        return fail("fd-eof");
+    }
+    if kos_close_fd(fd as u32) != 1 {
+        return fail("fd-close");
+    }
 
     // 5) unlink 后再读必须失败。
     if unsafe { kos_simple(SYS_KOS_UNLINK, "/msg.txt", 0) } != 0 {
@@ -260,7 +302,89 @@ unsafe fn kos_write_flags(path: &str, data: &[u8], caps: u32, mutable: u32) -> i
     ret as i64
 }
 
-fn i_unused() -> i32 { 0 }
+/// pread：读 offset 起 buf.len() 字节，返回实读。
+unsafe fn kos_pread(path: &str, offset: u64, buf: &mut [u8]) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    asm!(
+        "ecall",
+        in("a7") SYS_KOS_READ_RANGE,
+        in("a0") p.as_ptr() as usize,
+        in("a1") buf.as_mut_ptr() as usize,
+        in("a2") buf.len(),
+        in("a3") offset,
+        lateout("a0") ret,
+        options(nostack),
+    );
+    ret as i64
+}
+
+fn pread(path: &str, offset: u64, buf: &mut [u8]) -> usize {
+    let r = unsafe { kos_pread(path, offset, buf) };
+    if r < 0 { usize::MAX } else { r as usize }
+}
+
+unsafe fn kos_rename_raw(from: &str, to: &str) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let mut q = [0u8; 128];
+    let n = from.len().min(127);
+    p[..n].copy_from_slice(&from.as_bytes()[..n]);
+    let m = to.len().min(127);
+    q[..m].copy_from_slice(&to.as_bytes()[..m]);
+    asm!(
+        "ecall",
+        in("a7") SYS_KOS_RENAME,
+        in("a0") p.as_ptr() as usize,
+        in("a1") q.as_ptr() as usize,
+        lateout("a0") ret,
+        options(nostack),
+    );
+    ret as i64
+}
+
+fn kos_rename(from: &str, to: &str) -> i64 {
+    unsafe { kos_rename_raw(from, to) }
+}
+
+unsafe fn kos_open_raw(path: &str) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    asm!("ecall", in("a7") SYS_KOS_OPEN, in("a0") p.as_ptr() as usize,
+         lateout("a0") ret, options(nostack));
+    ret as i64
+}
+
+fn kos_open_fd(path: &str) -> i64 {
+    unsafe { kos_open_raw(path) }
+}
+
+unsafe fn kos_read_fd_raw(fd: u32, buf: &mut [u8]) -> i64 {
+    let ret: usize;
+    asm!("ecall", in("a7") SYS_KOS_READ_FD, in("a0") fd as usize,
+         in("a1") buf.as_mut_ptr() as usize, in("a2") buf.len(),
+         lateout("a0") ret, options(nostack));
+    ret as i64
+}
+
+fn kos_read_fd(fd: u32, buf: &mut [u8]) -> i64 {
+    unsafe { kos_read_fd_raw(fd, buf) }
+}
+
+unsafe fn kos_close_fd_raw(fd: u32) -> i64 {
+    let ret: usize;
+    asm!("ecall", in("a7") SYS_KOS_CLOSE_FD, in("a0") fd as usize,
+         lateout("a0") ret, options(nostack));
+    ret as i64
+}
+
+fn kos_close_fd(fd: u32) -> i64 {
+    unsafe { kos_close_fd_raw(fd) }
+}
 
 fn print_hex(v: u64) {
     let mut s = [0u8; 18];

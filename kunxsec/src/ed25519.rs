@@ -479,6 +479,105 @@ fn limbs_from_bytes_le(b: &[u8; 32]) -> [u64; 4] {
 ///
 /// 返回 `true` 当且仅当：A、R 可解码（在曲线上）、S < L，
 /// 且群方程 [S]B = R + [h]A 成立（h = SHA-512(R ‖ A ‖ M) mod L）。
+/// 4×4 limbs 小端乘法 → 8 limbs（无符号）。
+fn mul_limbs(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+    let mut r = [0u64; 8];
+    for i in 0..4 {
+        let mut carry: u128 = 0;
+        for j in 0..4 {
+            let t = (a[i] as u128) * (b[j] as u128) + (r[i + j] as u128) + carry;
+            r[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        let mut k = i + 4;
+        while carry != 0 {
+            let t = (r[k] as u128) + carry;
+            r[k] = t as u64;
+            carry = t >> 64;
+            k += 1;
+        }
+    }
+    r
+}
+
+/// 种子 → 私钥摘要的 clamp（RFC 8032 §5.1.5）。
+fn clamp_seed(h: &[u8; 64]) -> [u64; 4] {
+    let mut a = *h;
+    a[0] &= 248;
+    a[31] &= 127;
+    a[31] |= 64;
+    let mut out = [0u64; 4];
+    for i in 0..4 {
+        for j in 0..8 {
+            out[i] |= (a[i * 8 + j] as u64) << (8 * j);
+        }
+    }
+    out
+}
+
+fn sha512_bytes(parts: &[&[u8]]) -> [u8; 64] {
+    let mut sha = Sha512::new();
+    for p in parts {
+        sha.update(p);
+    }
+    sha.finalize()
+}
+
+/// 从 32 字节种子派生 Ed25519 公钥。
+pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
+    let h = sha512_bytes(&[seed]);
+    let a = clamp_seed(&h);
+    point_encode(&scalarmult(&base_point(), &a))
+}
+
+/// Ed25519 签名（RFC 8032 确定性 nonce）。`seed` 为私钥种子，`pk` 为
+/// 对应公钥（可用 [`public_key`] 派生）。
+pub fn sign(seed: &[u8; 32], pk: &[u8; 32], msg: &[u8]) -> [u8; 64] {
+    let h = sha512_bytes(&[seed]);
+    let a = clamp_seed(&h);
+    let prefix = &h[32..64];
+    // r = SHA-512(prefix ‖ M) mod L
+    let mut dlimbs = [0u64; 8];
+    let rd = sha512_bytes(&[prefix, msg]);
+    for i in 0..8 {
+        for j in 0..8 {
+            dlimbs[i] |= (rd[i * 8 + j] as u64) << (8 * j);
+        }
+    }
+    let r = mod_l(&dlimbs);
+    let r_point = scalarmult(&base_point(), &r);
+    let r_enc = point_encode(&r_point);
+    // k = SHA-512(R ‖ A ‖ M) mod L；S = (r + k·a) mod L
+    let kd = sha512_bytes(&[&r_enc, pk, msg]);
+    for i in 0..8 {
+        let mut v = 0u64;
+        for j in 0..8 {
+            v |= (kd[i * 8 + j] as u64) << (8 * j);
+        }
+        dlimbs[i] = v;
+    }
+    let k = mod_l(&dlimbs);
+    let ka = mod_l(&mul_limbs(&k, &a));
+    // r + ka（< 2L，进位至第 5 limb）
+    let mut sum = [0u64; 8];
+    let mut carry: u128 = 0;
+    for i in 0..4 {
+        let t = (r[i] as u128) + (ka[i] as u128) + carry;
+        sum[i] = t as u64;
+        carry = t >> 64;
+    }
+    sum[4] = carry as u64;
+    let s = mod_l(&sum);
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(&r_enc);
+    for i in 0..4 {
+        for j in 0..8 {
+            sig[32 + i * 8 + j] = (s[i] >> (8 * j)) as u8;
+        }
+    }
+    sig
+}
+
 pub fn verify(pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     let a = match point_decode(pk) {
         Some(p) => p,
@@ -525,6 +624,42 @@ mod tests {
     use std::println;
     use std::string::String;
     use std::vec::Vec;
+
+    #[test]
+    fn rfc8032_vector1_sign() {
+        let seed = hex("9d61b19deffd5a60ba844af492ec2cc4 4449c5697b326919703bac031cae7f60");
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&seed);
+        let pk = public_key(&sk);
+        assert_eq!(
+            hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+            pk.to_vec(),
+            "公钥与 RFC 8032 TEST 1 不符"
+        );
+        let sig = sign(&sk, &pk, b"");
+        assert_eq!(
+            hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+            sig.to_vec(),
+            "签名与 RFC 8032 TEST 1 不符"
+        );
+        assert!(verify(&pk, b"", &sig));
+    }
+
+    #[test]
+    fn rfc8032_vector2_sign() {
+        let seed = hex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&seed);
+        let pk = public_key(&sk);
+        let msg: &[u8] = &[0x72];
+        let sig = sign(&sk, &pk, msg);
+        assert_eq!(
+            hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+            sig.to_vec(),
+            "签名与 RFC 8032 TEST 2 不符"
+        );
+        assert!(verify(&pk, msg, &sig));
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
