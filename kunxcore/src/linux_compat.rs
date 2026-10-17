@@ -2809,13 +2809,21 @@ fn sys_gettimeofday(f: &mut TrapFrame) -> i64 {
 }
 
 fn sys_clock_gettime(f: &mut TrapFrame) -> i64 {
-    let _clk = f.x[10] as i32;
+    let clk = f.x[10] as i32;
     let tp = f.x[11];
     if tp != 0 {
         if !user_ok_writable(tp, 16) {
             return EFAULT;
         }
-        let us = now_usec();
+        // CLOCK_MONOTONIC(1)：单调钟（timer 计数器），不受 RTC 就绪/跳变
+        // 影响 —— 墙钟在 RTC 就绪前后会跳变（GUI 实测导致依赖时间差的
+        // 应用动画把「时间倒流」判成永久 0 进度）。CLOCK_REALTIME 系
+        // （0/2 等）维持墙钟语义。
+        let us = if clk == 1 {
+            crate::timer::now_us()
+        } else {
+            now_usec()
+        };
         // PAN 放行（同 sys_gettimeofday）
         unsafe {
             write_u64_to_user(tp, (us / 1_000_000) as u64);

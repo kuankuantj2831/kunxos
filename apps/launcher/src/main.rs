@@ -81,6 +81,21 @@ const SYS_NANOSLEEP: usize = 101;
 const SYS_CLONE: usize = 220;
 const SYS_EXECVE: usize = 221;
 const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
+
+/// 单调时钟（µs）：不受 RTC 就绪/墙钟跳变影响。动画/超时一律用它 ——
+/// 墙钟在 RTC 就绪前后会跳变（GUI 实测：渐亮 T0 记跳变后墙钟、flip 的
+/// now 仍是旧值 → progress 的 now<=t0 → α 永久 0 → 整屏黑）。
+fn mono_us() -> u64 {
+    let mut tv = [0u8; 16];
+    unsafe {
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
+}
 const SYS_MMAP: usize = 222;
 const SYS_WAIT4: usize = 260;
 const SYS_SETUID: usize = 146;
@@ -2529,7 +2544,7 @@ const BOOT_FADE_US: u64 = 520_000;
 /// 启动一次渐亮（开机 flip 施加 / 解锁烘焙，重新触发则重置计时）。
 fn boot_fade_start(bake: bool) {
     unsafe {
-        BOOT_FADE_T0 = now_us();
+        BOOT_FADE_T0 = mono_us();
         BOOT_FADE_BAKE = bake;
     }
 }
@@ -2546,6 +2561,13 @@ fn boot_fade_alpha(now: u64) -> f32 {
         if t0 == 0 {
             return 1.0;
         }
+        // 时钟异常防御（fail-bright）：now 落到 T0 之前（墙钟跳变残留）
+        // 视为渐亮已完成，绝不返回 0 把整屏压成永久黑屏。
+        if now <= t0 {
+            BOOT_FADE_T0 = 0;
+            BOOT_FADE_BAKE = false;
+            return 1.0;
+        }
         let p = motion::progress(t0, BOOT_FADE_US, now);
         if p >= 1.0 {
             BOOT_FADE_T0 = 0;
@@ -2558,12 +2580,12 @@ fn boot_fade_alpha(now: u64) -> f32 {
 
 /// flip 的有效亮度级别（0..=100）：仅 flip 施加模式参与渐亮；烘焙模式的
 /// 渐亮已写进 BACK_BUF，flip 再降会双重压暗，故返回用户亮度原值。
-fn boot_fade_flip_level(now: u64) -> u32 {
+fn boot_fade_flip_level(_now: u64) -> u32 {
     unsafe {
         if BOOT_FADE_T0 == 0 || BOOT_FADE_BAKE {
             return BRIGHTNESS;
         }
-        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(now) + 0.5) as u32;
+        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(mono_us()) + 0.5) as u32;
         if lvl > BRIGHTNESS {
             BRIGHTNESS
         } else {
@@ -2580,7 +2602,7 @@ fn boot_fade_bake_back_buf() {
         if BOOT_FADE_T0 == 0 || !BOOT_FADE_BAKE {
             return;
         }
-        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(now_us()) + 0.5) as u32;
+        let lvl = (BRIGHTNESS as f32 * boot_fade_alpha(mono_us()) + 0.5) as u32;
         if lvl >= BRIGHTNESS || BRIGHTNESS == 0 {
             return;
         }
@@ -2699,7 +2721,7 @@ fn flip() {
         }
         // 有效亮度 = 用户亮度 × 渐亮 α（flip 施加模式）；非渐亮期恒等于
         // BRIGHTNESS，与既有行为一致。
-        let lvl = boot_fade_flip_level(now_us());
+        let lvl = boot_fade_flip_level(mono_us());
         if BRIGHTNESS_LUT_LEVEL != lvl {
             rebuild_brightness_lut(lvl);
         }
@@ -8640,9 +8662,14 @@ fn boot_begin() {
         BOOT_TOTAL = PAGES[0].count + DOCK_COUNT;
         BOOT_BUILT = 0;
     }
-    // 开机渐亮（B8）：首帧以 α≈0 上屏（首个 flip 走 LUT 通道），桌面/锁屏
-    // 在 ~520ms 内点亮；与内核启动画面 150ms 淡出自然交叠。
-    boot_fade_start(false);
+    // 开机渐亮（B8）：首帧以 α≈0 上屏（首个 flip 走 LUT 通道），桌面在
+    // ~520ms 内点亮；与内核启动画面 150ms 淡出自然交叠。
+    // 锁屏启动（OOBE 设了 PIN/图案/密码）不得开启：锁屏是静态页，主循环
+    // 无逐帧 flip 驱动，渐亮 α 永远停在 ≈0 → 整屏黑（GUI 冒烟实拍确认）。
+    // 锁屏亮度语义由锁屏自身渲染承担。
+    if !unsafe { LOCKED } {
+        boot_fade_start(false);
+    }
     render_frame();
     flip();
     // 桌面首帧已渲染：触发内核侧启动画面 150ms 线性淡出（无启动画面时无操作）。
@@ -9086,7 +9113,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         //     / 文件夹打开关闭 / 控制中心展开收起与按压回弹 / 通知中心 /
         //     编辑模式图标抖动（~30fps 节流）/ 桌面翻页吸附 / 最近任务动效 /
         //     锁屏转场 / Toast 入退场动画窗口 / 编辑条与选择卡入场）。
-        if motion_advance(now)
+        if boot_fade_active()
+            || motion_advance(now)
             || folder_advance(now)
             || control_center::cc_advance(now)
             || page_advance(now)

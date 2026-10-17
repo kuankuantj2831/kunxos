@@ -206,3 +206,11 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 - **GUI 全链路冒烟抓到真 bug 并修复**：OOBE 自动推进（13 步 × 30s）→ launcher 拉起后 `PANIC main.rs:910` panic 循环——health_load 的 read_file 失败返回 -1 经 `as usize` 变巨大正数穿透 n==0 守卫 → 切片越界（历史第 12/13 轮 usize 清剿族漏网，因 /var/run/health.log 打开失败路径此前从未在 GUI 真机走到）。改按 isize 判负
 - 修复后复跑完整 GUI 冒烟：OOBE→launcher 桌面（tile/dock 全部就位）稳定运行 3.5 分钟 **0 PANIC / 0 fault**
 - 回归：make 0 错误 + test-sfsrace PASS
+
+### 第 19 轮（2026-10-17 08:4x，用户报告黑屏 → 根因修复）
+- **用户实测报告：OOBE 进系统后整屏黑**。经 QEMU monitor screendump + 像素亮度统计定位（黑屏实锤 avg=0.1，仅底部导航条可见）
+- **根因（两层）**：
+  1. 工具链层：`make kernel` 不重嵌更新的 ramdisk（cargo mtime 误判，Makefile 已知坑）——前两次修复「无效」是跑了旧二进制；修复流程补 `touch ramdisk.img`
+  2. 代码层：**B8 渐亮依赖墙钟（gettimeofday）**，RTC 就绪前后墙钟跳变 → flip 的 now 落到 T0 之前 → progress 的 now<=t0 → α 永久 0 → 每次 flip 经全 0 LUT 上屏 → 整屏黑（探针实证：BACK_BUF 均值 210 内容正常、lvl=0、T0 恒等于当前墙钟）
+- **修复**：① 内核 sys_clock_gettime 补 CLOCK_MONOTONIC 支持（原忽略 clk 恒回墙钟）；② launcher 新增 mono_us() 并全动画链改用；③ boot_fade_alpha 加 fail-bright 防御（now<=t0 视为播完返回 1.0，绝不 fail-black）
+- **验证**：修复后 GUI 全链路 screendump 实拍——桌面完整渲染（时钟小组件/图标/dock/状态栏），亮度 0.1 → 226.7；test-sfsrace PASS
