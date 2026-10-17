@@ -238,3 +238,14 @@
   make 0 错误；sfsrace 含新门 PASS；mailbox PASS。
 - 坑再证：make kernel 后测试标记若在内嵌 ramdisk 里，须重打包 ramdisk
   再 touch + make kernel（否则干净验证跑的是带标记内核）。
+
+### 第 9 轮（2026-10-18 07:0x，定时轮）
+
+- **C4 完成**：kosdemo 新增 fd 上限/释放阶段（开 64 → 第 65 起拒绝且不
+  panic → 全关 → 可再开）——第 1 轮 POSIX fd 表加固的 QEMU 级回归闭环。
+  **KOSDEMO FD-CAP PASS + PASS**（持久卷实跑）。
+- **C6 完成**：`docs/kos.md` 总文档——快速使用（/kos 零改造、shell 命令
+  族、三向无缝复制、构建）、syscall 460..=480 表、故障模型五条（降级/
+  断电/快速挂载回退/自愈/全 CRC 含第 8 轮教训）、与 SFS 关系、测试地图
+  （含 rustup PATH 坑）。
+- 验证：kos 全套 13 套件 0 失败；make 0 错误；sfsrace（含新门）PASS。

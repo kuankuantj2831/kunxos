@@ -118,6 +118,40 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     }
     unsafe { sc1(SYS_CLOSE, fd as usize) };
 
+    // 5) POSIX 桥 fd 上限与释放回归（C4）：每进程 64 上限——第 65 个
+    //    open 必须失败（负 errno，不得 panic），全关后可再开。
+    let mut fds = [0i64; 70];
+    let mut opened = 0usize;
+    for i in 0..70 {
+        let fd = unsafe {
+            sc3(SYS_OPENAT, AT_FDCWD, b"/kos/demo.txt\0".as_ptr() as usize, O_RDONLY) as i64
+        };
+        fds[i] = fd;
+        if fd >= 0 {
+            opened += 1;
+        } else if i < 64 {
+            // 第 65 个之前就失败 = 上限异常（表残留泄漏）。
+            return fail("fd-cap-early");
+        }
+    }
+    if opened != 64 {
+        return fail("fd-cap");
+    }
+    for &fd in fds.iter() {
+        if fd >= 0 {
+            unsafe { sc1(SYS_CLOSE, fd as usize) };
+        }
+    }
+    // 释放后可再开。
+    let fd = unsafe {
+        sc3(SYS_OPENAT, AT_FDCWD, b"/kos/demo.txt\0".as_ptr() as usize, O_RDONLY) as i64
+    };
+    if fd < 0 {
+        return fail("fd-reopen-after-close");
+    }
+    unsafe { sc1(SYS_CLOSE, fd as usize) };
+    print("KOSDEMO FD-CAP PASS\n");
+
     print("KOSDEMO PASS\n");
     0
 }
