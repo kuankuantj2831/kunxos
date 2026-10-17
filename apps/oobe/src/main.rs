@@ -2940,7 +2940,6 @@ fn animate_welcome() {
             let t = ((mono_us().saturating_sub(t0)) as f32 / HERO_DUR_US as f32).min(1.0);
             let e = ease_out(t);
             let eb = ease_out_back(t);
-            let tA = mono_us();
             // 恢复 brand 区域背景（逐行拷回，行宽 ~288px）
             unsafe {
                 for y in by0..by1 {
@@ -2949,9 +2948,7 @@ fn animate_welcome() {
                         .copy_from_slice(&HERO_BG_SNAP[src * bw..src * bw + bw]);
                 }
             }
-            let tB = mono_us();
             draw_brand_ex(e, 0.5 + 0.5 * eb);
-            let tC = mono_us();
             unsafe {
                 let base = (DISPLAY_H as usize - NAV_H as usize) * DISPLAY_W;
                 for y in 0..NAV_H as usize {
@@ -2966,13 +2963,10 @@ fn animate_welcome() {
                 DISPLAY_W as i32 / 2 + HERO_R + 40,
                 HERO_CY + HERO_R + 50,
             );
-            let _ = (tA, tB, tC);
             pump_input_during_anim();
             frames += 1;
+            let _ = frames;
             if t >= 1.0 {
-                print("[anim] hero frames=");
-                print_dec(frames as usize);
-                print("\n");
                 break;
             }
         }
@@ -4310,12 +4304,12 @@ fn wait_for_tap_next_button() -> i32 {
         ch: None,
         backspace: false,
     };
-    let mut idle = 0usize;
+    let mut idle; // 空闲毫秒（真实时间，每帧由 loop_t0 重算）
             let mut loop_t0 = mono_us();
     loop {
         err_ui::err_tick();
         if read_input_event(&mut event) {
-            idle = 0;
+            loop_t0 = mono_us(); // 有输入：重置真实时间空闲计时的锚点
             if event.enter {
                 // 输入框步骤：回车推进焦点；最后一个输入框回车 = 下一步。
                 if step_has_fields(unsafe { STEP }) {
@@ -4405,18 +4399,16 @@ fn wait_for_tap_next_button() -> i32 {
             }
             // 帧率拉满：有动画活动（按钮回弹/呼吸/悬停）时帧间不睡眠，
             // 仅静态空闲睡 8ms 省电（原 16ms 固定节流 = 上限 60fps 且动画卡）。
-            let active = true; // 呼吸动画每帧推进（animate_idle 无条件调用），帧率拉满
-            if !active {
+            // 按钮回弹等主动画帧率拉满；仅有呼吸动画的空闲态 8ms 让出
+            // （呼吸 ≤30fps 足够，满速空转烧 CPU）。
+            if !btn_animating() {
                 sleep_ms(8);
             }
-            // 纯指针移动（不构成点击）也算用户在场：消费「最近有输入」标记，
-            // 重置空闲计时，避免用户浏览页面时被 30 秒判定强推下一步。
+            // 纯指针移动（不构成点击）也算用户在场：消费标记并重置真实
+            // 时间空闲计时（★ 先重置再消费——此前消费在前、判读在后，
+            // 移动鼠标时 loop_t0 永不重置，30 秒自动推进误触发）。
             if unsafe { ANY_INPUT_RECENT } {
                 unsafe { ANY_INPUT_RECENT = false };
-                idle = 0;
-            }
-            // 空闲计时改真实时间（帧率拉满后帧时长不再恒定）
-            if unsafe { ANY_INPUT_RECENT } {
                 loop_t0 = mono_us();
             }
             idle = (mono_us().saturating_sub(loop_t0) / 1_000) as usize;

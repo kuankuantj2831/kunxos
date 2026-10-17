@@ -241,3 +241,10 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 - **根因**：第 22 轮转场改真实时间推进时只换了循环头、**漏加退出条件** → `transition_pages` 死循环，OOBE 卡死在转场、输入处理停摆（指针不显示不可点）
 - **修复**：① 转场循环补 `t >= 1.0 break`；② 按用户要求新增 `pump_input_during_anim`——全部 5 个动画循环（转场/Hero/标题/脉冲/光锥）每帧泵入非阻塞输入：指针移动照常更新光标位置并重画 overlay（动画中指针可见可动），点击/回车在动画期吞掉（<400ms）
 - **GUI 实证**：OOBE 连续推进到「选择应用」页（多转场全走完），动画期间注入的鼠标移动正常跟手显示；test-sfsrace PASS
+
+### 第 25 轮（2026-10-17 午后，定时轮）
+- **第 22-24 轮 OOBE 改造自查**，修两处遗留：
+  1. 空闲计时序 bug：`ANY_INPUT_RECENT` 消费在前、判读在后 → 移动鼠标时 loop_t0 永不重置，30s 自动推进误触发（消费与重置合并到同分支，read_input_event 命中分支同步重置锚点）
+  2. `active=true` 使空闲期满速空转烧 CPU → 改回按 `btn_animating()` 判定，呼吸动画空闲态 8ms 让出
+- 清理残留诊断（hero frames 计数/分段计时变量）与「value assigned never read」警告
+- 回归：make 0 错误 0 警告 + test-sfsrace PASS
