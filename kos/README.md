@@ -2,7 +2,7 @@
 
 KUNXOS 的对象存储层。设计文档见 [DESIGN.md](DESIGN.md)。
 
-**当前状态：Phase 1 Step 2**（存储引擎 + 宿主工具 + 内核集成）。
+**当前状态：Phase 1 Step 2 + P1/P2 强化**（v2 引擎：可变记录 + 快速挂载）。
 
 - `src/store/`：**读写引擎**。Object Pool 连续布局（头块 + 数据 + Merkle
   索引块）、CAS 去重（SHA-256 内容寻址）、目录即对象的无上限命名空间
@@ -19,7 +19,30 @@ KUNXOS 的对象存储层。设计文档见 [DESIGN.md](DESIGN.md)。
   与 SFS 双跑（Phase 1 计划）。用户态验收：`/bin/kostest`（QEMU 实跑
   KOSTEST PASS）。
 
-不包含：GC / compaction、kunxpkg 对象模型迁移、Ed25519 验签集成。
+### v2 引擎强化（2026-10-17，P1/P2）
+
+- **区段化布局**：对象 = 头块 + 区段表链 + 任意位置的数据/索引区段
+  （`format/extent.rs`）。分配 first-fit 任意区段 → **无碎片化死区**
+  （碎片池上放大对象测试通过）。
+- **可变记录**（`object_flags::MUTABLE`）：`write_mutable` / `append` /
+  `write_range`。append 成本 O(索引块数)——旧叶子哈希来自磁盘索引块，
+  不重读不重哈希旧内容；先填满旧尾块再开新 chunk。可变记录键 =
+  SHA-256(Merkle 根 ‖ 头块号)，同内容记录互不别名。
+- **快速挂载（P2）**：持久空闲位图 + 对象索引链 + 超级块 hint
+  （`store/persist.rs`，置于 Record Pool 区）。hint seq == 活动
+  manifest generation 才走快速路径，否则回退权威全池扫描。
+  **2TB 稀疏卷实测：快速挂载 16s（debug），回退路径是小时级**。
+- **容量/久用压测**（`tests/capacity.rs`）：2TB 卷挂载+读写+重挂载
+  全链路；churn 压测 200 次追加 245ms、全量内容逐字节一致、碎片池
+  放大对象成功。
+- 系统调用号段扩至 **460..=467**（467 = append；462 的 a3 位 16 =
+  可变记录标志）。QEMU 实跑 `run /bin/kostest` PASS（含 append）。
+- 坑位记录：超级块 CRC 现覆盖 reserved 区（hint 所在；reserved 全零
+  时与旧镜像字节兼容）；`free_blocks()` 改增量计数（2TB 全量遍历
+  每次提交数秒，曾致 append 挂死）。
+
+不包含：GC / compaction（CoW 孤儿目前靠大卷缓冲）、kunxpkg 对象模型
+迁移、Ed25519 验签集成、块缓存 + 惰性 Merkle（P3）。
 
 磁盘格式与 CPU 架构解耦：多字节字段一律小端（RISC-V RV64 / ARM64 均为小端）。
 KUNXOS 已决策切换 RISC-V 目标架构，本 crate 无需任何改动。

@@ -278,6 +278,7 @@ const SYS_KOS_MKDIR: usize = 463;
 const SYS_KOS_UNLINK: usize = 464;
 const SYS_KOS_LIST: usize = 465;
 const SYS_KOS_STAT: usize = 466;
+const SYS_KOS_APPEND: usize = 467;
 
 // ==================== Linux 常量 ====================
 
@@ -704,6 +705,7 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_KOS_UNLINK => kos_unlink(f),
         SYS_KOS_LIST => kos_list(f),
         SYS_KOS_STAT => kos_stat(f),
+        SYS_KOS_APPEND => kos_append(f),
         // 其余未实现系统调用：统一返回 ENOSYS（此前误路由到 sys_statx，
         // 会向调用方提供的地址写入垃圾并返回误导性 errno）。
         // 临时诊断：打印未实现调用号（帮助移植 musl 程序定位缺口）
@@ -3564,7 +3566,10 @@ fn kos_write(f: &mut TrapFrame) -> i64 {
     let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
     let buf_ptr = f.x[11];
     let len = f.x[12] as usize;
-    let caps = f.x[13] as u32;
+    // a3：低 16 位权限位；位 16 = 可变记录（支持 append）。
+    let raw = f.x[13] as u32;
+    let caps = raw & 0xFFFF;
+    let mutable = raw & 0x1_0000 != 0;
     if len > 8 << 20 {
         return EINVAL;
     }
@@ -3572,7 +3577,7 @@ fn kos_write(f: &mut TrapFrame) -> i64 {
     if len > 0 && unsafe { copy_from_user(buf_ptr, &mut data) } == 0 {
         return EFAULT;
     }
-    crate::kos_vfs::sys_write(&path, &data, caps)
+    crate::kos_vfs::sys_write(&path, &data, caps, mutable)
 }
 
 fn kos_mkdir(f: &mut TrapFrame) -> i64 {
@@ -3601,6 +3606,20 @@ fn kos_list(f: &mut TrapFrame) -> i64 {
         return r;
     }
     EFAULT
+}
+
+fn kos_append(f: &mut TrapFrame) -> i64 {
+    let Some(path) = kos_path_arg(f, 10) else { return EFAULT; };
+    let buf_ptr = f.x[11];
+    let len = f.x[12] as usize;
+    if len > 8 << 20 {
+        return EINVAL;
+    }
+    let mut data = alloc::vec![0u8; len];
+    if len > 0 && unsafe { copy_from_user(buf_ptr, &mut data) } == 0 {
+        return EFAULT;
+    }
+    crate::kos_vfs::sys_append(&path, &data)
 }
 
 fn kos_stat(f: &mut TrapFrame) -> i64 {

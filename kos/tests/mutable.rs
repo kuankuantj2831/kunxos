@@ -108,3 +108,31 @@ fn mutable_record_rejects_hash_collision_semantics() {
     assert_eq!(s.open_path("/a", 0).unwrap(), b"same1");
     assert_eq!(s.open_path("/b", 0).unwrap(), b"same");
 }
+
+#[test]
+fn gc_reclaims_orphans() {
+    let mut s = KosStore::mkfs(dev(8192)).unwrap();
+    s.write_mutable("/log", b"v0", 0, perm::DEFAULT).unwrap();
+    for i in 0..30 {
+        s.append("/log", format!("chunk-{i} ").as_bytes(), 0).unwrap();
+    }
+    let objs_before = s.object_count();
+    let free_before = s.free_blocks();
+    let (dead, freed) = s.gc().unwrap();
+    assert!(dead >= 30, "至少 30 代孤儿目录+索引应被清扫（实际 {dead}）");
+    assert!(freed > 0);
+    assert_eq!(s.object_count(), objs_before - dead);
+    assert_eq!(s.free_blocks(), free_before + freed);
+    // 活数据完好。
+    let d = s.open_path("/log", 0).unwrap();
+    assert!(d.starts_with(b"v0chunk-0 "));
+    assert!(d.ends_with(b"chunk-29 "));
+    // 重挂载后状态一致（持久索引反映 GC 后世界）。
+    let dev = s.take_device();
+    let mut s2 = KosStore::open(dev, VerifyLevel::Full).unwrap();
+    assert_eq!(s2.object_count(), objs_before - dead);
+    assert_eq!(s2.open_path("/log", 0).unwrap(), d);
+    // GC 后继续写入分配正常。
+    s2.append("/log", b"post-gc", 0).unwrap();
+    assert!(s2.open_path("/log", 0).unwrap().ends_with(b"post-gc"));
+}

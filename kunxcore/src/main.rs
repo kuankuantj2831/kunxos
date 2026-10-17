@@ -1658,26 +1658,11 @@ fn fs_boot() {
         kinfo! { uart_send_str("[sec] ramdisk 自检通过（sha256 与 bootloader 一致）\n"); }
     }
 
-    // 3.2 KOS 对象存储卷：包装为第二 RAM 磁盘并挂载（Phase 1 双跑）。
-    // 镜像 4KB 对齐；ramdisk_read/write 直接按物理地址访问 .rodata 区。
+    // 3.2 KOS 对象存储卷镜像注册为 RAM 磁盘（major 254）。真正挂载推迟到
+    // virtio-blk 初始化之后（boot_mount 优先持久磁盘，无盘才回退本卷）。
     if KOSDISK_IMG.len() % blkdev::BLK_SIZE == 0 && KOSDISK_IMG.len() > 0 {
         let base = KOSDISK_IMG.as_ptr() as usize;
-        if blkdev::ramdisk_wrap("kosrd", KOSDISK_MAJOR, base, KOSDISK_IMG.len()) >= 0 {
-            if kos_vfs::mount(KOSDISK_MAJOR) {
-                let (gen, objs, free, pool) = kos_vfs::sys_stat();
-                uart_send_str("[kos] 对象存储卷已挂载：pool ");
-                uart_hex(pool);
-                uart_send_str(" gen ");
-                uart_hex(gen);
-                uart_send_str(" objects ");
-                uart_hex(objs as u64);
-                uart_send_str(" free ");
-                uart_hex(free);
-                uart_send_str("\n");
-            } else {
-                uart_send_str("[kos] 对象存储卷挂载失败（镜像损坏？）\n");
-            }
-        }
+        blkdev::ramdisk_wrap("kosrd", KOSDISK_MAJOR, base, KOSDISK_IMG.len());
     }
 
     // 4. 挂载到 "/"（镜像含超级块，无需再 mkfs）
@@ -1735,8 +1720,12 @@ fn data_boot(devs: &[net_virtio::MmioDev]) {
     // 1. 探测 virtio-blk（找不到则 /data 退回 ramdisk，不持久化）
     if !virtio_blk::init(devs) {
         kinfo! { uart_send_str("[blk] 无 virtio-blk 设备，/data 未持久化\n"); }
+        // 无 virtio 磁盘：KOS 回退内嵌 RAM 卷。
+        kos_vfs::boot_mount();
         return;
     }
+    // KOS 持久卷优先（sdb+ 上的 KOS 超级块），无则回退内嵌卷。
+    kos_vfs::boot_mount();
 
     // 2. 读取 MBR（扇区 0）
     let mut mbr = [0u8; 512];

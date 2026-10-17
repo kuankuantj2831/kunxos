@@ -130,6 +130,49 @@ const DESC_F_WRITE: u16 = 2;
 /// 此前是 100M 次无时钟自旋（数十秒级挂起系统），改用单调时钟 deadline。
 const VBLK_TIMEOUT_US: u64 = 1_000_000;
 
+/// 多设备表：每个 virtio-blk 设备一份上下文。blk_lock 大锁保证
+/// 请求串行，故请求前后按 BlkOps.base（槽号）切换全局上下文即可。
+pub const MAX_VBLK: usize = 4;
+#[derive(Clone, Copy)]
+struct VblkDevCtx {
+    base: usize,
+    ring: usize,
+    modern: bool,
+    last_used: u16,
+}
+static mut DEV_CTX: [VblkDevCtx; MAX_VBLK] = [VblkDevCtx {
+    base: 0,
+    ring: 0,
+    modern: false,
+    last_used: 0,
+}; MAX_VBLK];
+static mut DEV_COUNT: usize = 0;
+
+/// 把槽位上下文装入全局（请求前调用；blk_lock 内串行安全）。
+unsafe fn set_ctx(slot: usize) -> bool {
+    if slot >= DEV_COUNT {
+        return false;
+    }
+    let c = &DEV_CTX[slot];
+    BASE = c.base;
+    RING = c.ring;
+    MODERN = c.modern;
+    LAST_USED = c.last_used;
+    true
+}
+
+/// 把全局游标存回槽位（请求后调用）。
+unsafe fn save_ctx(slot: usize) {
+    if slot < MAX_VBLK {
+        DEV_CTX[slot].last_used = LAST_USED;
+    }
+}
+
+/// 已注册的 virtio-blk 设备数。
+pub fn dev_count() -> usize {
+    unsafe { DEV_COUNT }
+}
+
 /// 设备 MMIO 基地址（0 表示未初始化）。
 static mut BASE: usize = 0;
 /// 是否为 modern 接口（Version=2）。
@@ -218,10 +261,11 @@ unsafe fn used_idx() -> u16 {
 
 // ==================== 初始化 ====================
 
-/// 初始化块设备：从 `devs` 中探测 `DeviceID == 2` 的设备并注册为 `sda`。
-///
-/// 成功返回 `true`；找不到 virtio-blk 返回 `false`。
+/// 初始化块设备：探测**所有** `DeviceID == 2` 的 MMIO 设备，依次注册为
+/// `sda`/`sdb`/`sdc`/`sdd`（major 8..12；`BlkOps.base` 携带槽号）。
+/// 找到至少一个返回 `true`。
 pub fn init(devs: &[MmioDev]) -> bool {
+    let mut found = false;
     for d in devs {
         unsafe {
             if read_volatile((d.base + REG_MAGIC) as *const u32) != VIRTIO_MAGIC {
@@ -230,68 +274,81 @@ pub fn init(devs: &[MmioDev]) -> bool {
             if read_volatile((d.base + REG_DEVICE_ID) as *const u32) != DEV_ID_BLOCK {
                 continue;
             }
-            BASE = d.base;
-            MODERN = read_volatile((d.base + REG_VERSION) as *const u32) == 2;
+            if DEV_COUNT >= MAX_VBLK {
+                break;
+            }
+            if !init_one(d.base) {
+                continue;
+            }
+            found = true;
         }
-        break;
     }
-    if unsafe { BASE == 0 } {
+    found
+}
+
+/// 初始化单个设备并注册。成功时全局上下文指向该设备。
+unsafe fn init_one(mmio_base: usize) -> bool {
+    let slot = DEV_COUNT;
+    BASE = mmio_base;
+    MODERN = read_volatile((mmio_base + REG_VERSION) as *const u32) == 2;
+
+    // 复位 + ACK + DRIVER
+    w32(reg_status(), 0);
+    w32(reg_status(), ST_ACK);
+    w32(reg_status(), ST_ACK | ST_DRIVER);
+
+    // 特性协商（不启用任何特性）
+    w32(reg_drv_features_sel(), 0);
+    w32(reg_drv_features(), 0);
+    // QEMU virtio-mmio legacy 设备（version=1）必须显式写 GuestPageSize，
+    // 否则队列设置（QueuePFN 以页为单位）无效 → 请求超时。
+    if !MODERN {
+        w32(reg_guest_page_size(), allocator::PAGE_SIZE as u32);
+    }
+    w32(
+        reg_status(),
+        ST_ACK | ST_DRIVER | if MODERN { ST_FEATURES_OK } else { 0 },
+    );
+
+    // 分配并清零环内存（2 个连续页：desc/avail 在第一页，used 按
+    // QueueAlign=4096 对齐到第二页）
+    let Some(ring) = allocator::alloc_pages_contig(2) else {
+        crate::health::report(
+            crate::health::SEV_CRITICAL,
+            "storage",
+            "virtio-blk 环内存不足，该磁盘设备已禁用",
+            "对应持久存储不可用；请重启设备，若反复出现请增加内存",
+        );
+        return false;
+    };
+    RING = ring;
+    for i in 0..(allocator::PAGE_SIZE * 2) / 8 {
+        *((RING + i * 8) as *mut u64) = 0;
+    }
+
+    // 建立队列 0
+    if !setup_queue() {
+        crate::uart_send_str("[vblk] virtio-blk: 队列深度 < 8 不支持\n");
         return false;
     }
 
-    unsafe {
-        // 复位 + ACK + DRIVER
-        w32(reg_status(), 0);
-        w32(reg_status(), ST_ACK);
-        w32(reg_status(), ST_ACK | ST_DRIVER);
-
-        // 特性协商（不启用任何特性）
-        w32(reg_drv_features_sel(), 0);
-        w32(reg_drv_features(), 0);
-        // QEMU virtio-mmio legacy 设备（version=1）必须显式写 GuestPageSize，
-        // 否则队列设置（QueuePFN 以页为单位）无效 → 请求超时。
-        if !MODERN {
-            w32(reg_guest_page_size(), allocator::PAGE_SIZE as u32);
-        }
-        w32(
-            reg_status(),
-            ST_ACK | ST_DRIVER | if MODERN { ST_FEATURES_OK } else { 0 },
-        );
-
-        // 分配并清零环内存（2 个连续页：desc/avail 在第一页，used 按
-        // QueueAlign=4096 对齐到第二页）
-        // 启动期降级：环内存不足返回 false（块设备缺席，SFS/数据分区不可用）
-        let Some(ring) = allocator::alloc_pages_contig(2) else {
-            crate::health::report(
-                crate::health::SEV_CRITICAL,
-                "storage",
-                "virtio-blk 环内存不足，磁盘设备已禁用",
-                "持久存储将不可用；请重启设备，若反复出现请增加内存",
-            );
-            return false;
-        };
-        RING = ring;
-        for i in 0..(allocator::PAGE_SIZE * 2) / 8 {
-            *((RING + i * 8) as *mut u64) = 0;
-        }
-
-        // 建立队列 0
-        if !setup_queue() {
-            crate::uart_send_str("[vblk] virtio-blk: 队列深度 < 8 不支持\n");
-            return false;
-        }
-
-        // DRIVER_OK
-        w32(reg_status(), ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
-        LAST_USED = used_idx();
-    }
+    // DRIVER_OK
+    w32(reg_status(), ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
+    LAST_USED = used_idx();
 
     let cap = capacity();
-    blkdev::register_blkdev(
-        MAJOR,
-        "sda",
+    let name: &'static str = match slot {
+        0 => "sda",
+        1 => "sdb",
+        2 => "sdc",
+        _ => "sdd",
+    };
+    let major = MAJOR + slot as u32;
+    let ok = blkdev::register_blkdev(
+        major,
+        name,
         blkdev::BlkOps {
-            base: 0,
+            base: slot, // BlkOps.base 语义：vblk 槽号（blk_lock 串行下作上下文）
             num_sectors: cap as usize,
             parent: 0,
             start_lba: 0,
@@ -300,6 +357,19 @@ pub fn init(devs: &[MmioDev]) -> bool {
             flush: Some(vblk_flush),
         },
     );
+    if ok != 0 {
+        return false;
+    }
+    DEV_CTX[slot] = VblkDevCtx {
+        base: mmio_base,
+        ring,
+        modern: MODERN,
+        last_used: LAST_USED,
+    };
+    DEV_COUNT += 1;
+    crate::uart_send_str("[vblk] ");
+    crate::uart_send_str(name);
+    crate::uart_send_str(" 就绪\n");
     true
 }
 
@@ -376,17 +446,36 @@ unsafe fn reset_ring() {
 
 // ==================== 读写接口 ====================
 
-fn vblk_read(_base: usize, sector: usize, count: usize, buf: &mut [u8]) -> i32 {
-    blk_io(false, sector, count, buf.as_mut_ptr())
+fn vblk_read(base: usize, sector: usize, count: usize, buf: &mut [u8]) -> i32 {
+    unsafe {
+        if !set_ctx(base) {
+            return -1;
+        }
+        let r = blk_io(false, sector, count, buf.as_mut_ptr());
+        save_ctx(base);
+        r
+    }
 }
 
-fn vblk_write(_base: usize, sector: usize, count: usize, buf: &[u8]) -> i32 {
-    blk_io(true, sector, count, buf.as_ptr() as *mut u8)
+fn vblk_write(base: usize, sector: usize, count: usize, buf: &[u8]) -> i32 {
+    unsafe {
+        if !set_ctx(base) {
+            return -1;
+        }
+        let r = blk_io(true, sector, count, buf.as_ptr() as *mut u8);
+        save_ctx(base);
+        r
+    }
 }
 
 /// 冲刷设备写缓冲（VIRTIO_BLK_T_FLUSH）：无数据区，头 + 状态两个描述符。
 /// 返回 0 成功；失败 -1（设备不支持时也按成功处理，冲刷为尽力而为）。
-fn vblk_flush(_major: u32) -> i32 {
+fn vblk_flush(major: u32) -> i32 {
+    unsafe {
+        if !set_ctx((major - MAJOR) as usize) {
+            return 0;
+        }
+    }
     if unsafe { BASE == 0 } {
         return 0;
     }
@@ -470,12 +559,14 @@ fn vblk_flush(_major: u32) -> i32 {
         let status = *hdr.add(16);
         heap::kfree(req as *mut u8);
 
-        if status != 0 {
+        let r = if status != 0 {
             // 设备不支持/失败：降级为成功（冲刷尽力而为）
             0
         } else {
             0
-        }
+        };
+        save_ctx((major - MAJOR) as usize);
+        r
     }
 }
 

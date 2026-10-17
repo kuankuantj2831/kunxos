@@ -5,10 +5,13 @@
 //! kosctl import <img> <dir> [prefix]           导入目录树（迁移入口）
 //! kosctl export <img> <dir> [prefix]           导出目录树
 //! kosctl ls     <img> <path>                   列目录
-//! kosctl put    <img> <path> <file>            写入一个文件
+//! kosctl put    <img> <path> <file>            写入一个文件（不可变）
+//! kosctl putm   <img> <path> <file>            写入可变记录
+//! kosctl append <img> <path> <file>            追加写（可变记录）
 //! kosctl get    <img> <path> [file]            读出一个对象
 //! kosctl unlink <img> <path>                   删除条目
 //! kosctl verify <img>                          全树严格验证（重建 Merkle）
+//! kosctl gc     <img>                          回收不可达孤儿对象
 //! kosctl stat   <img>                          卷状态
 //! ```
 
@@ -87,6 +90,24 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
             }
             Ok(out.trim_end().to_string())
         }
+        "putm" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let file = arg(args, 4)?;
+            let data = std::fs::read(&file)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            s.write_mutable(path, &data, 0, perm::DEFAULT)?;
+            Ok(format!("已写入可变记录 {path}（{} 字节）", data.len()))
+        }
+        "append" => {
+            let img = arg(args, 2)?;
+            let path = arg(args, 3)?;
+            let file = arg(args, 4)?;
+            let data = std::fs::read(&file)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            let len = s.append(path, &data, 0)?;
+            Ok(format!("已追加 {} 字节，{path} 现长 {len} 字节", data.len()))
+        }
         "put" => {
             let img = arg(args, 2)?;
             let path = arg(args, 3)?;
@@ -122,6 +143,15 @@ fn run(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
             let (files, bytes) = walk_verify(&mut s, "")?;
             Ok(format!(
                 "验证通过：{files} 个对象共 {bytes} 字节，Merkle 全量比对无一失配"
+            ))
+        }
+        "gc" => {
+            let img = arg(args, 2)?;
+            let mut s = KosStore::open(open_rw(img, None)?, VerifyLevel::HashOnly)?;
+            let (dead, freed) = s.gc()?;
+            Ok(format!(
+                "GC 完成：清扫 {dead} 个孤儿对象，回收 {freed} 块（{} KB）",
+                freed * 4
             ))
         }
         "stat" => {

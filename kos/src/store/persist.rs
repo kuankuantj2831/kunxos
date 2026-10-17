@@ -17,6 +17,7 @@
 //! 影响，只损失一次快速挂载。
 
 use crate::error::KosError;
+use alloc::vec::Vec;
 use crate::format::superblock::KosSuperblock;
 
 /// 位图块 magic。

@@ -17,7 +17,9 @@
 # 控制台安静模式（默认开启）：启动/运行期信息日志不上串口，CLI 只保留错误与
 # 交互输出。需要完整日志：make run-gui QEMU_APPEND="verbose"（或运行时 shell
 # `verbose on`；结构化日志始终可用 shell `log` / `dmesg` 查看）。
-# 运行加速：QEMU_ACCEL 默认 "kvm:tcg"（有 /dev/kvm 的平台优先 KVM，否则回退 TCG）。
+# 运行加速：QEMU_ACCEL 默认 "tcg"。注意：x86_64 宿主上的 qemu-system-riscv64
+# 只支持 TCG（KVM 需同架构宿主 + 内核支持）——模拟器内帧率上限由 TCG 决定
+# （GUI 动画实测 ~81fps），144Hz 需真机或同架构 KVM 宿主。
 # 覆盖示例：make run-gui QEMU_ACCEL=tcg；内核 `-append "perftest"` 可手动复跑
 # 启动期动画管线性能基线（默认跳过，见 kunxcore/src/anim.rs）。
 
@@ -182,7 +184,7 @@ else
   CARGO_FEATURES := --features qemu
 endif
 
-.PHONY: all kernel pi4 init networkd kosdisk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
+.PHONY: all kernel pi4 init networkd kosdisk kos-disk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
 
 all: kernel
 
@@ -486,6 +488,17 @@ KOSDISK   := $(KUNXCORE)/kosdisk.img
 kosctl:
 	cd $(TOPDIR)/kos && CARGO_TARGET_DIR=$(TOPDIR)/kos/target cargo build --bin kosctl
 
+# 持久 KOS 卷（QEMU 第二磁盘；重启数据保留）。256MB 稀疏文件。
+KOS_DISK_IMG := $(TOPDIR)/kos-disk.img
+
+kos-disk: kosctl
+	$(KOSCTL) mkfs $(KOS_DISK_IMG).tmp 65536
+	echo "persistent kos volume" > /tmp/kos-seed.txt
+	$(KOSCTL) putm $(KOS_DISK_IMG).tmp /seed.txt /tmp/kos-seed.txt
+	$(KOSCTL) append $(KOS_DISK_IMG).tmp /seed.txt /tmp/kos-seed.txt
+	mv $(KOS_DISK_IMG).tmp $(KOS_DISK_IMG)
+	@echo "kos-disk.img 已生成（65536 块 = 256MB 持久卷）"
+
 kosdisk: kosctl
 	$(KOSCTL) mkfs $(KOSDISK).tmp 1024
 	echo "KOS volume seeded by make kosdisk" > /tmp/kos-seed.txt
@@ -503,10 +516,13 @@ pi4: $(RAMDISK)
 		--no-default-features --features pi4
 
 # ---- 运行 ----
-run: kernel
+KOS_DRV := -drive file=$(KOS_DISK_IMG),format=raw,if=none,id=kosdisk -device virtio-blk-device,drive=kosdisk
+
+run: kernel $(KOS_DISK_IMG)
 	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -nographic -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-rng-device \
+		$(KOS_DRV) \
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 run-gui: kernel

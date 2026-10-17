@@ -19,6 +19,7 @@ const SYS_KOS_MKDIR: usize = 463;
 const SYS_KOS_UNLINK: usize = 464;
 const SYS_KOS_LIST: usize = 465;
 const SYS_KOS_STAT: usize = 466;
+const SYS_KOS_APPEND: usize = 467;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     let ret: usize;
@@ -96,8 +97,39 @@ fn fail(step: &str) -> usize {
     1
 }
 
+/// argv[1] == "-r" 时只读校验（持久性验收）：打印 /journal 与 /seed.txt。
 #[no_mangle]
-pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
+pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
+    if argc >= 2 {
+        let mut p = [0u8; 8];
+        let mut n = 0;
+        unsafe {
+            let s = *argv.add(1) as *const u8;
+            while n < 8 && *s.add(n) != 0 {
+                p[n] = *s.add(n);
+                n += 1;
+            }
+        }
+        if &p[..n] == b"-r" {
+            print("[kostest -r] /seed.txt: ");
+            let mut b = [0u8; 128];
+            let n = unsafe { kos_read("/seed.txt", &mut b) };
+            if n < 0 {
+                print("READ FAIL\n");
+                return 1;
+            }
+            unsafe { write_fd(1, &b[..n as usize]); };
+            print("\n[kostest -r] /journal: ");
+            let n = unsafe { kos_read("/journal", &mut b) };
+            if n < 0 {
+                print("READ FAIL\n");
+                return 1;
+            }
+            unsafe { write_fd(1, &b[..n as usize]); };
+            print("\nKOSTEST READBACK OK\n");
+            return 0;
+        }
+    }
     // 1) 卷状态（466）：8×u64 小端 [gen, objects, free, pool]。
     let mut st = [0u64; 4];
     unsafe {
@@ -156,6 +188,25 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     print("[kostest] /demo 列表：\n");
     unsafe { write_fd(1, &lb[..ln as usize]); };
 
+    // 4.5) 可变记录：write_mutable + append + 再读回。
+    const M0: &[u8] = b"mutable-v0|";
+    if unsafe { kos_write_mutable("/journal", M0) } < 0 {
+        return fail("write-mutable");
+    }
+    let mut total = M0.len();
+    for i in 0..5 {
+        let line = b"log-line;"; // 9 字节，跨次追加
+        if unsafe { kos_append("/journal", line) } < 0 {
+            return fail("append");
+        }
+        total += line.len();
+    }
+    let n = unsafe { kos_read("/journal", &mut rb) };
+    if n as usize != total || !rb[..n as usize].starts_with(M0) {
+        return fail("append-readback");
+    }
+    let _ = i_unused();
+
     // 5) unlink 后再读必须失败。
     if unsafe { kos_simple(SYS_KOS_UNLINK, "/msg.txt", 0) } != 0 {
         return fail("unlink");
@@ -168,6 +219,48 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     print("KOSTEST PASS\n");
     0
 }
+
+unsafe fn kos_write_mutable(path: &str, data: &[u8]) -> i64 {
+    kos_write_flags(path, data, 0o644, 1)
+}
+
+unsafe fn kos_append(path: &str, data: &[u8]) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    asm!(
+        "ecall",
+        in("a7") SYS_KOS_APPEND,
+        in("a0") p.as_ptr() as usize,
+        in("a1") data.as_ptr() as usize,
+        in("a2") data.len(),
+        lateout("a0") ret,
+        options(nostack),
+    );
+    ret as i64
+}
+
+/// kos_write 的可变版：a3 低 16 位为权限，a3 位 16 = MUTABLE。
+unsafe fn kos_write_flags(path: &str, data: &[u8], caps: u32, mutable: u32) -> i64 {
+    let ret: usize;
+    let mut p = [0u8; 128];
+    let n = path.len().min(127);
+    p[..n].copy_from_slice(&path.as_bytes()[..n]);
+    asm!(
+        "ecall",
+        in("a7") SYS_KOS_WRITE,
+        in("a0") p.as_ptr() as usize,
+        in("a1") data.as_ptr() as usize,
+        in("a2") data.len(),
+        in("a3") caps | (mutable << 16),
+        lateout("a0") ret,
+        options(nostack),
+    );
+    ret as i64
+}
+
+fn i_unused() -> i32 { 0 }
 
 fn print_hex(v: u64) {
     let mut s = [0u8; 18];
