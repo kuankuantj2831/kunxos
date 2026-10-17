@@ -202,3 +202,25 @@
   防御行为顺带实证。
 - 验证：kos 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS；
   动了内核数据面 → mailbox ×3 PASS。
+
+### 第 7 轮（2026-10-18 05:0x，定时轮）
+
+- **E3 上传会话生命周期落地**：①meta v2 增 last_active_us（push/begin
+  刷新；旧格式视为永不超时防误杀）；②unlink 主路径联动清 part/meta，
+  **主路径不存在但会话残留 = 取消上传语义**（清会话返回成功）；③gc()
+  前置 sweep_stale_uploads（60s 空闲自动回收，迭代遍历防深目录递归）。
+  测试 tests/upload_gc.rs：联动清理/超时回收/活跃会话存活 3 场景。
+- **E4 顺带**：posix_lseek SEEK_END 取大小失败改报 EIO（原 -1 基准 +
+  正偏移可把 pos 拨到 EOF 外垃圾位置）。
+- **🔴 P0 新发现（第 8 轮优先领）**：`upload_finish` 后重挂载**丢已发布
+  对象**（条目在、objects 无、open 报 ObjectNotFound）。**HEAD 既有 bug**
+  （stash 本轮改动后同样复现实锤，非 E3 引入）。已定位到：盘上该对象
+  头块存在且表区（KXT）完好，但头部 CRC 自矛盾；设备写日志显示该块
+  仅被写一次且写入时刻解析通过——单次写 + 写时有效 + 事后失效的矛盾
+  未解（疑探针间块号漂移或 CRC 覆盖区不一致）。复现：3 push + finish +
+  重挂载（tests/upload_gc.rs 第 3 测已标 #[ignore] 留作回归）。**数据
+  丢失级**：断点续传成功后一重启成果就丢。排查方向：write_header_
+  block_inline 的 CRC 覆盖区 vs from_bytes 校验区、finish 链路
+  （rename+unlink）与稳定记录键/索引增量重写的交互。
+- 验证：kos 全套 13 套件 0 失败（+upload_gc）；make 0 错误；sfsrace
+  （含新门）PASS；mailbox PASS。

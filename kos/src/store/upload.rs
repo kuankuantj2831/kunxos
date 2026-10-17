@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 
 /// 进度 sidecar magic。
 const META_MAGIC: &[u8; 4] = b"KUP1";
+/// 会话空闲超时（µs）：超过后 gc() 前置清扫自动回收（part+meta 连删）。
+pub const SESSION_TIMEOUT_US: u64 = 60_000_000;
 /// part 后缀。
 pub const PART_EXT: &str = ".kosup.part";
 /// meta 后缀。
@@ -51,7 +53,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         self.write_mutable(&part, &[], uid, caps)?;
         self.truncate(&part, total_len, uid)?;
         let bitmap = alloc::vec![0u8; bitmap_bytes(chunks)];
-        self.write_meta(&meta, total_len, &bitmap, uid)
+        self.write_meta(&meta, total_len, self.clock, &bitmap, uid)
     }
 
     /// 推送一块数据（任意偏移；建议按 chunk 对齐以最大化记账）。
@@ -67,8 +69,8 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         let meta = meta_path(path);
         // 1) 数据先落（CoW + 原子提交）。
         self.write_range(&part, offset, data, uid)?;
-        // 2) 更新位图（后写：断电只欠记不超记）。
-        let (total_len, mut bitmap) = self.read_meta(&meta, uid)?;
+        // 2) 更新位图（后写：断电只欠记不超记）；刷新活跃时钟。
+        let (total_len, _last, mut bitmap) = self.read_meta(&meta, uid)?;
         let total = total_len.div_ceil(super::DATA_CHUNK_SIZE as u64) as u32;
         let lo = offset as usize / super::DATA_CHUNK_SIZE;
         let hi = ((offset as usize) + data.len()).div_ceil(super::DATA_CHUNK_SIZE);
@@ -80,14 +82,14 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
                 bitmap[c / 8] |= 1 << (c % 8);
             }
         }
-        self.write_meta(&meta, total_len, &bitmap, uid)?;
+        self.write_meta(&meta, total_len, self.clock, &bitmap, uid)?;
         let received = bitmap.iter().map(|b| b.count_ones()).sum::<u32>();
         Ok((received, total))
     }
 
     /// 会话状态：(total_len, 已收块, 连续前缀块)。
     pub fn upload_status(&mut self, path: &str, uid: u32) -> Result<(u64, u32, u32), KosError> {
-        let (total_len, bitmap) = self.read_meta(&meta_path(path), uid)?;
+        let (total_len, _last, bitmap) = self.read_meta(&meta_path(path), uid)?;
         let total = total_len.div_ceil(super::DATA_CHUNK_SIZE as u64) as u32;
         let received = bitmap.iter().map(|b| b.count_ones()).sum::<u32>();
         let mut contiguous = 0u32;
@@ -115,25 +117,35 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
 
     // ---------- meta 编解码 ----------
 
-    fn read_meta(&mut self, meta: &str, uid: u32) -> Result<(u64, Vec<u8>), KosError> {
+    /// v2 格式：MAGIC(4) + total(8) + last_active_us(8) + bitmap。
+    /// 旧格式（无时间戳）last 返回 `u64::MAX`（视为永不超时，防误杀）。
+    fn read_meta(&mut self, meta: &str, uid: u32) -> Result<(u64, u64, Vec<u8>), KosError> {
         let data = self.open_path(meta, uid)?;
         if data.len() < 12 || &data[..4] != META_MAGIC {
             return Err(KosError::ExtentTableCorrupt);
         }
         let total = u64::from_le_bytes(data[4..12].try_into().unwrap());
-        Ok((total, data[12..].to_vec()))
+        let (last, skip) = if data.len() >= 20 {
+            (u64::from_le_bytes(data[12..20].try_into().unwrap()), 20)
+        } else {
+            (u64::MAX, 12)
+        };
+        Ok((total, last, data[skip..].to_vec()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_meta(
         &mut self,
         meta: &str,
         total_len: u64,
+        last_active_us: u64,
         bitmap: &[u8],
         uid: u32,
     ) -> Result<(), KosError> {
-        let mut content = Vec::with_capacity(12 + bitmap.len());
+        let mut content = Vec::with_capacity(20 + bitmap.len());
         content.extend_from_slice(META_MAGIC);
         content.extend_from_slice(&total_len.to_le_bytes());
+        content.extend_from_slice(&last_active_us.to_le_bytes());
         content.extend_from_slice(bitmap);
         self.write_mutable(meta, &content, uid, super::perm::DEFAULT)
             .map(|_| ())

@@ -1503,8 +1503,32 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         self.replace_dir_and_commit(parent, &entries)
     }
 
-    /// unlink：删除条目并提交；随后回收对象全部块。
+    /// unlink：删除条目并提交；随后回收对象全部块。主路径不存在但
+    /// 残留上传会话时，视作「取消上传」——清会话并返回成功。
     pub fn unlink(&mut self, path: &str, uid: u32) -> Result<(), KosError> {
+        let core = self.unlink_core(path, uid);
+        // E3：联动清上传会话残留（part/meta，best-effort；会话对象自身
+        // 的删除不级联，防递归）。
+        if !path.ends_with(upload::PART_EXT) && !path.ends_with(upload::META_EXT) {
+            let mut cleaned = false;
+            for ext in [upload::PART_EXT, upload::META_EXT] {
+                let sib = alloc::format!("{path}{ext}");
+                if self.lookup_entry_pub(&sib).unwrap_or(None).is_some() {
+                    if self.unlink_core(&sib, uid).is_ok() {
+                        cleaned = true;
+                    }
+                }
+            }
+            if core.is_err() && cleaned {
+                // 主路径本就无对象，但清掉了会话 = 取消上传成功。
+                return Ok(());
+            }
+        }
+        core
+    }
+
+    /// unlink 本体（无会话联动）。
+    fn unlink_core(&mut self, path: &str, uid: u32) -> Result<(), KosError> {
         let (parent, name) = split_parent(path)?;
         let mut entries = self.list(parent)?;
         let i = entries
@@ -1885,6 +1909,8 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     /// 一切都是垃圾（旧目录版本、append 换代的旧索引/表、unlink 残留）。
     /// 清扫后提交持久索引，使快速挂载立即可用回收空间。
     pub fn gc(&mut self) -> Result<(usize, u64), KosError> {
+        // 0) 超时上传会话回收（E3）：先清陈旧 part/meta，再做可达性标记。
+        let _swept = self.sweep_stale_uploads();
         // 1) 标记：根目录闭包。
         let mut reachable: Vec<[u8; 32]> = Vec::new();
         let mut queue: Vec<[u8; 32]> = Vec::new();
@@ -1930,6 +1956,55 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         self.write_blk(0, &self.sb.to_bytes())?;
         self.dev.flush()?;
         Ok((dead.len(), freed_blocks))
+    }
+
+    /// 清扫超时上传会话（E3）：迭代遍历命名空间找 `*.kosup.meta`，
+    /// last_active 距当前时钟超过 [`upload::SESSION_TIMEOUT_US`] 则连同
+    /// part 一起删除。返回清除的会话数。gc() 前置调用。
+    fn sweep_stale_uploads(&mut self) -> usize {
+        let mut metas: Vec<alloc::string::String> = Vec::new();
+        let mut stack: Vec<alloc::string::String> = alloc::vec!["/".into()];
+        while let Some(d) = stack.pop() {
+            let entries = match self.list(&d) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for e in entries {
+                let child = if d == "/" {
+                    alloc::format!("/{}", e.name)
+                } else {
+                    alloc::format!("{}/{}", d, e.name)
+                };
+                if e.entry_type == ObjectType::Dir {
+                    stack.push(child);
+                } else if e.name.ends_with(upload::META_EXT) {
+                    metas.push(child);
+                }
+            }
+        }
+        let mut swept = 0usize;
+        for meta in metas {
+            // 时钟不可回退地落后 last_active 视为未超时（防时钟重置误杀）。
+            let stale = match self.open_path(&meta, 0) {
+                Ok(data) if data.len() >= 20 && &data[..4] == b"KUP1" => {
+                    let last = u64::from_le_bytes(data[12..20].try_into().unwrap());
+                    self.clock > last
+                        && self.clock - last > upload::SESSION_TIMEOUT_US
+                }
+                _ => false,
+            };
+            if stale {
+                let part = alloc::format!(
+                    "{}{}",
+                    &meta[..meta.len() - upload::META_EXT.len()],
+                    upload::PART_EXT
+                );
+                let _ = self.unlink(&meta, 0);
+                let _ = self.unlink(&part, 0);
+                swept += 1;
+            }
+        }
+        swept
     }
 
     // ---------- 分配与底层写入 ----------

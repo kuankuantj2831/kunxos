@@ -765,7 +765,9 @@ pub fn posix_lseek(fd: u32, off: i64, whence: u32) -> i64 {
     };
     let end = match with_store(|s| s.stat(&key)) {
         Some(Ok(h)) => h.content_len as i64,
-        _ => -1,
+        // E4：SEEK_END 依赖取大小——取不到必须报 EIO，不能拿 -1 当基准
+        //（-1+off 可为正，pos 被拨到 EOF 之外的垃圾位置）。
+        _ => return -5, // EIO
     };
     let base = match whence {
         0 => 0,
