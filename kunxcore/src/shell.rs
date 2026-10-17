@@ -3681,6 +3681,47 @@ fn cmd_kos(cmd: &Command, sink: &mut Sink) {
                 _ => sink.emit_str("kos: 建目录失败\n"),
             }
         }
+        // 引擎级复制（单锁零拷贝往返）：记录流式 / 不可变对象内容寻址去重。
+        "cp" => {
+            if cmd.argc < 4 {
+                sink.emit_str("kos cp <src> <dst>\n");
+                return;
+            }
+            let r = crate::kos_vfs::sys_copy(word_str(&cmd.argv[2]), word_str(&cmd.argv[3]));
+            if r >= 0 {
+                sink.emit_str("kos: 已复制 ");
+                emit_u64(sink, r as u64);
+                sink.emit_str(" 字节\n");
+            } else {
+                sink.emit_str("kos: 复制失败 errno=");
+                emit_u64(sink, (-(r)) as u64);
+                sink.emit_str("\n");
+            }
+        }
+        // 对象大小（含类型符）。
+        "du" => {
+            if cmd.argc < 3 {
+                sink.emit_str("kos du <path>\n");
+                return;
+            }
+            match crate::kos_vfs::sys_stat_path(word_str(&cmd.argv[2])) {
+                Some((t, sz)) => {
+                    let c = if t == crate::fs_simple::T_DIR {
+                        'd'
+                    } else if t == crate::fs_simple::T_SYM {
+                        'l'
+                    } else {
+                        '-'
+                    };
+                    sink.emit_str("kos: ");
+                    emit_u64(sink, sz);
+                    sink.emit_str(" 字节，类型 ");
+                    sink.emit(&[c as u8]);
+                    sink.emit_str("\n");
+                }
+                None => sink.emit_str("kos: 路径不存在\n"),
+            }
+        }
         "ls" => {
             let path = if cmd.argc >= 3 {
                 word_str(&cmd.argv[2])

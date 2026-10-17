@@ -184,3 +184,21 @@
 - **shell `kos mkdir`**（C5 顺带）：复制进 /kos 子目录的前提；幂等输出
   （已存在 → 提示不报错）。注：/tmp 在 SFS 根卷不存在，跨池目标用 /bin。
 - 验证：kos 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS。
+
+### 第 6 轮（2026-10-18 04:0x，定时轮）
+
+- **C2 引擎级 `kos cp`**：sys_copy 单次 fs_lock 内「读源→写目标」——可变
+  记录分块流式（16KB 缓冲任意大小）、不可变对象整读整写（put 内容寻址
+  **天然去重**）；shell `kos cp/df(=stat)/du` 子命令。QEMU 实证：142552
+  字节记录复制 sha1 与源一致。
+- **C5 stat 路由收口**：vfs::stat_path / lstat_path 均路由 /kos/（`stat
+  /kos/data` → 目录 164 字节）；cp 复制进目录的 basename 拼接打通
+  （`cp /bin/hello /kos/data/` → /kos/data/hello）。**两个坑**：① 剥
+  /kos/ 前缀后须补前导斜杠（resolve 只认 "/data" 形式）；② 尾斜杠须
+  归一。期间一度误判修复无效（测试跑在旧内核上）——改 vfs 后必须
+  touch ramdisk + 确认 kernel 确实重编。
+- **test-kos-copy 扩到六哈希**：三向 cp + 引擎级 kos cp + 目录拼接，
+  连续两轮 PASS（幂等）。引擎对「截断目录」正确拒绝（EACCES）——
+  防御行为顺带实证。
+- 验证：kos 12 套件 0 失败；make 0 错误；sfsrace（含新门）PASS；
+  动了内核数据面 → mailbox ×3 PASS。

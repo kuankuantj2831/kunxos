@@ -943,6 +943,13 @@ pub fn fstat(fd: i32) -> Option<(u16, u64)> {
 ///
 /// 供 `newfstatat` 翻译使用（无需真正 open/close）。
 pub fn stat_path(path: &str) -> Option<(u16, u64)> {
+    // /kos/ 前缀路由到 KOS（类型映射见 kos_vfs::sys_stat_path）：
+    // cp/mv 的「目标是目录则拼 basename」等语义对对象卷同样生效。
+    // 注意剥前缀 + 去尾斜杠：引擎解析的是命名空间路径（"data"）。
+    if crate::kos_vfs::is_kos_path(path) {
+        let rel = path[crate::kos_vfs::KOS_PREFIX.len()..].trim_end_matches('/');
+        return crate::kos_vfs::sys_stat_path(rel);
+    }
     let mut dev = 0u32;
     let mut ino = 0u32;
     if resolve(path, &mut dev, &mut ino) != 0 {
@@ -955,6 +962,12 @@ pub fn stat_path(path: &str) -> Option<(u16, u64)> {
 ///
 /// 供 `ls -l` 显示符号链接自身及其目标。
 pub fn lstat_path(path: &str) -> Option<(u16, u64)> {
+    // /kos/ 前缀同走 KOS（与 stat_path 一致；KOS 无 inode 概念，
+    // lstat 与 stat 等价——符号链接条目类型由 sys_stat_path 映射）。
+    if crate::kos_vfs::is_kos_path(path) {
+        let rel = path[crate::kos_vfs::KOS_PREFIX.len()..].trim_end_matches('/');
+        return crate::kos_vfs::sys_stat_path(rel);
+    }
     let Some((d, pino, name)) = resolve_parent(path) else {
         // 纯 "/"（或全斜杠路径）没有"父目录 + 名字"拆分：直接解析到挂载
         // 根 inode —— 此前返回 None，shell `ls /` 报"无法访问"。

@@ -642,7 +642,11 @@ test-kos-copy: kernel $(KOS_DISK_IMG)
 		echo "sha1sum /bin/back.txt"; sleep 1; \
 		echo "cp /kos/data/from-sfs.txt /kos/data/copy2.txt"; sleep 2; \
 		echo "sha1sum /kos/data/copy2.txt"; sleep 1; \
-		echo "poweroff"; sleep 4) | timeout 120 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
+		echo "kos cp /data/from-sfs.txt /data/kos-cp.txt"; sleep 2; \
+		echo "sha1sum /kos/data/kos-cp.txt"; sleep 1; \
+		echo "cp /bin/hello /kos/data/"; sleep 2; \
+		echo "sha1sum /kos/data/hello"; sleep 1; \
+		echo "poweroff"; sleep 4) | timeout 150 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-device virtio-rng-device $(KOS_DRV) | tee $(TEST_KOSCP_LOG)
 	@python3 tools/koscp_check.py $(TEST_KOSCP_LOG)
 

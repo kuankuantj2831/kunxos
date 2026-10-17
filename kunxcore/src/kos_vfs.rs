@@ -957,3 +957,89 @@ pub fn sys_stat() -> (u64, usize, u64, u64) {
     with_store(|s| (s.generation(), s.object_count(), s.free_blocks(), s.pool_blocks()))
         .unwrap_or((0, 0, 0, 0))
 }
+
+/// 引擎级复制（C2 无缝复制系列）：单次 fs_lock 内完成「读源 → 写目标」，
+/// 不经用户态两跳。类型保留：
+/// - 可变记录 → 分块流式（write_mutable 建槽/截断 + append 链，内存
+///   峰值 16KB 缓冲，任意大小可复制）；
+/// - 不可变对象 → 整读整写（put 按内容哈希寻址：**同内容天然去重**，
+///   复制系统镜像/包内共享块只存一份）。
+/// 返回复制字节数；失败为 errno（源读权限 + 目标写权限都在引擎侧检查）。
+pub fn sys_copy(src: &str, dst: &str) -> i64 {
+    let uid = crate::process::current_uid();
+    let r = with_store(|s| {
+        let Some(entry) = s.resolve_pub(src)? else {
+            return Err(KosError::PathNotFound);
+        };
+        if !kos::store::check_access(
+            uid,
+            entry.owner_uid,
+            entry.capability,
+            kos::store::perm::OWNER_R | kos::store::perm::OTHER_R,
+        ) {
+            return Err(KosError::PermissionDenied);
+        }
+        let hdr = s.stat(&entry.content_hash)?;
+        if s.is_mutable(&entry.content_hash) {
+            // 记录 → 流式：建空记录（已有则截断），append 链逐块搬运。
+            s.write_mutable(dst, &[], uid, kos::store::perm::DEFAULT)?;
+            let len = hdr.content_len;
+            let mut off = 0u64;
+            let mut buf = [0u8; 16384];
+            while off < len {
+                let n = s.read_range(src, off, &mut buf, uid)?;
+                if n == 0 {
+                    break;
+                }
+                s.append(dst, &buf[..n], uid)?;
+                off += n as u64;
+            }
+            Ok(off)
+        } else {
+            // 不可变 → 整读整写（put 内容寻址去重）。
+            let data = s.open_path(src, uid)?;
+            let n = data.len() as u64;
+            s.write(dst, &data, uid, entry.capability)?;
+            Ok(n)
+        }
+    });
+    match r {
+        Some(Ok(n)) => n as i64,
+        Some(Err(e)) => kos_errno(e),
+        None => -1,
+    }
+}
+
+/// `/kos/` 路径的 (类型码, 大小)：映射到 fs_simple 的 T_*，供
+/// vfs::stat_path / lstat_path 路由（cp 复制进目录的 basename 拼接等）。
+pub fn sys_stat_path(path: &str) -> Option<(u16, u64)> {
+    // 尾斜杠归一 + 前导斜杠补齐（调用方可能传剥掉 /kos/ 前缀的 "data"
+    // 或带尾斜杠的 "/data/"；resolve 只认 "/data" 形式）。根路径特判
+    // 为目录（引擎 resolve("/") 不认零分量路径）。
+    let p = path.trim_end_matches('/');
+    if p.is_empty() {
+        return Some((crate::fs_simple::T_DIR, 0));
+    }
+    let owned;
+    let p: &str = if p.starts_with('/') {
+        p
+    } else {
+        owned = alloc::format!("/{p}");
+        &owned
+    };
+    // with_store 返回 Option<Result<...>>（未挂载 / 引擎错），两层都摊平。
+    let entry = match with_store(|s| s.resolve_pub(p)) {
+        Some(Ok(Some(e))) => e,
+        _ => return None,
+    };
+    let hdr = match with_store(|s| s.stat(&entry.content_hash)) {
+        Some(Ok(h)) => h,
+        _ => return None,
+    };
+    let t = match entry.entry_type {
+        kos::format::object::ObjectType::Dir => crate::fs_simple::T_DIR,
+        kos::format::object::ObjectType::Symlink => crate::fs_simple::T_SYM,
+        _ => crate::fs_simple::T_REG,
+    };
+    Some((t, hdr.content_len))
+}

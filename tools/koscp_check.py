@@ -6,7 +6,14 @@ import sys
 
 log = open(sys.argv[1], errors="replace").read()
 hashes = dict((p, h) for h, p in re.findall(r"^([0-9a-f]{40})\s+(\S+)$", log, re.M))
-need = ["/bin/hello", "/kos/data/from-sfs.txt", "/bin/back.txt", "/kos/data/copy2.txt"]
+need = [
+    "/bin/hello",
+    "/kos/data/from-sfs.txt",   # SFS→KOS
+    "/bin/back.txt",            # KOS→SFS
+    "/kos/data/copy2.txt",      # KOS→KOS
+    "/kos/data/kos-cp.txt",     # 引擎级 kos cp
+    "/kos/data/hello",          # 复制进 /kos 目录（stat 路由 + basename 拼接）
+]
 missing = [p for p in need if p not in hashes]
 if missing:
     print(f"KOS COPY TEST: FAIL（缺 sha1：{missing}；日志里只找到 {list(hashes)}）")
