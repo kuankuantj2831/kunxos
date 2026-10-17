@@ -248,3 +248,7 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
   2. `active=true` 使空闲期满速空转烧 CPU → 改回按 `btn_animating()` 判定，呼吸动画空闲态 8ms 让出
 - 清理残留诊断（hero frames 计数/分段计时变量）与「value assigned never read」警告
 - 回归：make 0 错误 0 警告 + test-sfsrace PASS
+
+### 第 26 轮（2026-10-17 午后，用户报告 OOBE 光标移动卡）
+- **主循环节流改造（光标流畅优先）**：有输入待处理/光标待更新时帧间不睡眠（原固定 8ms 睡眠叠加在光标路径上）；呼吸动画降到 ~30fps（隔帧推进——每帧 13K 像素快照恢复+brand 重绘+区域呈现是空闲循环大头，让出一半循环给光标）
+- GUI 验证：快速扫动后光标正常显示跟随；test-sfsrace PASS

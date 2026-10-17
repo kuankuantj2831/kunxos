@@ -3171,13 +3171,24 @@ fn hero_breathe() {
 
 /// 每帧闲置推进：Hero（第 0 步）/ 进度点（其余步）呼吸。
 fn animate_idle(step: usize) {
-    unsafe { ANIM_T = ANIM_T.wrapping_add(1); }
+    // 呼吸 ≤30fps 足够（ANIM_T 每 2 循环推进一次）：每帧呼吸都要恢复
+    // 13K 像素快照 + 重绘 brand + 区域呈现，是空闲循环的大头 —— 让出
+    // 一半循环给光标移动（用户实测移动卡）。
+    unsafe {
+        ANIM_IDLE_SKIP = !ANIM_IDLE_SKIP;
+        if ANIM_IDLE_SKIP {
+            return;
+        }
+        ANIM_T = ANIM_T.wrapping_add(1);
+    }
     if step == 0 {
         hero_breathe();
     } else {
         dot_breathe(step);
     }
 }
+
+static mut ANIM_IDLE_SKIP: bool = false;
 
 /// 卡片页命中检测（语言/时区/锁屏/胁迫动作）。
 fn hover_card_at(step: usize, x: i32, y: i32) -> Option<usize> {
@@ -4397,16 +4408,12 @@ fn wait_for_tap_next_button() -> i32 {
             if btn_animating() {
                 btn_tick_nav_only();
             }
-            // 帧率拉满：有动画活动（按钮回弹/呼吸/悬停）时帧间不睡眠，
-            // 仅静态空闲睡 8ms 省电（原 16ms 固定节流 = 上限 60fps 且动画卡）。
-            // 按钮回弹等主动画帧率拉满；仅有呼吸动画的空闲态 8ms 让出
-            // （呼吸 ≤30fps 足够，满速空转烧 CPU）。
-            if !btn_animating() {
+            // 光标流畅优先（用户实测移动卡）：有输入待处理/光标待更新时
+            // 帧间不睡眠；静态空闲 8ms 让出。
+            if !unsafe { CURSOR_DIRTY } && !unsafe { ANY_INPUT_RECENT } && !btn_animating() {
                 sleep_ms(8);
             }
-            // 纯指针移动（不构成点击）也算用户在场：消费标记并重置真实
-            // 时间空闲计时（★ 先重置再消费——此前消费在前、判读在后，
-            // 移动鼠标时 loop_t0 永不重置，30 秒自动推进误触发）。
+            // 纯指针移动（不构成点击）也算用户在场：重置真实时间空闲计时
             if unsafe { ANY_INPUT_RECENT } {
                 unsafe { ANY_INPUT_RECENT = false };
                 loop_t0 = mono_us();
