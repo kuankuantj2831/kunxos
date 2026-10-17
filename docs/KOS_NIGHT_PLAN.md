@@ -139,3 +139,22 @@
 - 保留 sfsrace 心跳诊断打印（每 6000 轮一行 + 超限时 dones 值）。
 - 验证：test-mailbox ×3 PASS（含 144 条无丢失/无重复 + 无撕裂断言）；
   加固门 test-sfsrace PASS；kos 全套 11 套件 0 失败；make 0 错误 0 新警告。
+
+### 第 3 轮（2026-10-18 01:0x，定时轮）
+
+- **E1 引擎故障注入测试落地（kos/tests/fault.rs，6 测试）**：FaultDev
+  （Cell 内部可变）注入一次性读/写/flush 故障 + 永久死盘，断言全 API 零
+  panic、Err 全为 Io、故障后服务连续（恢复即可写）、内容旧或新无脏第三态、
+  Full Merkle 重挂载与内存视图一致、死盘拒绝一切写且热恢复回最近完好代、
+  gc 故障下存活对象不丢。
+- **E1 抓到真引擎缺陷并修复（本轮核心战果）**：读故障矩阵在 lba 级审计
+  （FaultDev 记录读序列）下现形——**fast_mount 重写时九处防护的
+  `return None;` 全部丢失**（空 if 体；即并行会话记忆里警告过的「python
+  补丁锚点静默跳过」事故现场）：hint 过期/位图块数不符/容量不足/索引链
+  越界/索引块/头块/位图读失败/first_bit 不符全部被静默吞掉——头块读失败
+  后拿**上一个对象的残 buffer** 解析出新对象（症状：HashMismatch content
+  持续复现）。平时读全成功所以常规测试全绿；故障注入一跑就现形。九处
+  防护体全部恢复，fault 6/6 过。**教训沉淀：重写/大补丁后必须 diff 老的
+  防护点清单（grep 'return None;' 计数对不上就是丢了）。**
+- 验证：kos 全套 12 套件 0 失败（+fault 6）；make 0 错误；加固门
+  test-sfsrace PASS（SFS-RACE + MAILBOX 双绿）。

@@ -2451,13 +2451,16 @@ fn fast_mount<B: crate::block::BlockDevice>(
     use crate::store::persist as p;
     let hint = p::MountHint::from_sb(sb)?;
     if hint.seq != manifest.generation {
+        return None;
     }
     let pool_blocks = sb.obj_pool_blocks as usize;
     let per = p::BITS_PER_BMP_BLOCK;
     let bmp_blocks = p::bitmap_blocks_for(pool_blocks) as usize;
     if bmp_blocks == 0 || hint.bitmap_blocks as usize != bmp_blocks {
+        return None;
     }
     if sb.rec_pool_blocks < bmp_blocks as u64 + hint.index_blocks as u64 {
+        return None;
     }
 
     // 1) 先读对象索引链与对象（懒加载序：最高已用块决定位图加载页数）。
@@ -2468,8 +2471,10 @@ fn fast_mount<B: crate::block::BlockDevice>(
     while next != 0 {
         // 索引链在 Record Pool 区（对象池之外），边界是设备总块数。
         if hops > hint.index_blocks || next >= sb.total_blocks {
+            return None;
         }
         if dev.read_block(next, &mut buf).is_err() {
+            return None;
         }
         let (n, chunk) = match p::index_block_parse(&buf) {
             Some(v) => v,
@@ -2482,8 +2487,10 @@ fn fast_mount<B: crate::block::BlockDevice>(
     let mut objects: BTreeMap<[u8; 32], ObjIndex> = BTreeMap::new();
     for &id in &ids {
         if id < sb.obj_pool_start || id >= pool_end {
+            return None;
         }
         if dev.read_block(id, &mut buf).is_err() {
+            return None;
         }
         let hdr = match KosObject::from_bytes(&buf[..OBJECT_HEADER_SIZE]) {
             Ok(h) => h,
@@ -2506,12 +2513,14 @@ fn fast_mount<B: crate::block::BlockDevice>(
     let mut free = alloc::vec![false; pool_blocks];
     for i in 0..load_pages {
         if dev.read_block(sb.rec_pool_start + i as u64, &mut buf).is_err() {
+            return None;
         }
         let (first, bits) = match p::bitmap_block_parse(&buf) {
             Some(v) => v,
             None => return None,
         };
         if first as usize != i * per {
+            return None;
         }
         for (k, &f) in bits.iter().enumerate() {
             let b = i * per + k;
