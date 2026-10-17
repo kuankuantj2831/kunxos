@@ -2451,16 +2451,13 @@ fn fast_mount<B: crate::block::BlockDevice>(
     use crate::store::persist as p;
     let hint = p::MountHint::from_sb(sb)?;
     if hint.seq != manifest.generation {
-        eprintln!("[fm] r1"); return None;
     }
     let pool_blocks = sb.obj_pool_blocks as usize;
     let per = p::BITS_PER_BMP_BLOCK;
     let bmp_blocks = p::bitmap_blocks_for(pool_blocks) as usize;
     if bmp_blocks == 0 || hint.bitmap_blocks as usize != bmp_blocks {
-        eprintln!("[fm] r2"); return None;
     }
     if sb.rec_pool_blocks < bmp_blocks as u64 + hint.index_blocks as u64 {
-        eprintln!("[fm] r3"); return None;
     }
 
     // 1) 先读对象索引链与对象（懒加载序：最高已用块决定位图加载页数）。
@@ -2471,10 +2468,8 @@ fn fast_mount<B: crate::block::BlockDevice>(
     while next != 0 {
         // 索引链在 Record Pool 区（对象池之外），边界是设备总块数。
         if hops > hint.index_blocks || next >= sb.total_blocks {
-            eprintln!("[fm] r4"); return None;
         }
         if dev.read_block(next, &mut buf).is_err() {
-            eprintln!("[fm] r5"); return None;
         }
         let (n, chunk) = match p::index_block_parse(&buf) {
             Some(v) => v,
@@ -2487,10 +2482,8 @@ fn fast_mount<B: crate::block::BlockDevice>(
     let mut objects: BTreeMap<[u8; 32], ObjIndex> = BTreeMap::new();
     for &id in &ids {
         if id < sb.obj_pool_start || id >= pool_end {
-            eprintln!("[fm] r6"); return None;
         }
         if dev.read_block(id, &mut buf).is_err() {
-            eprintln!("[fm] r7"); return None;
         }
         let hdr = match KosObject::from_bytes(&buf[..OBJECT_HEADER_SIZE]) {
             Ok(h) => h,
@@ -2513,14 +2506,12 @@ fn fast_mount<B: crate::block::BlockDevice>(
     let mut free = alloc::vec![false; pool_blocks];
     for i in 0..load_pages {
         if dev.read_block(sb.rec_pool_start + i as u64, &mut buf).is_err() {
-            eprintln!("[fm] r8"); return None;
         }
         let (first, bits) = match p::bitmap_block_parse(&buf) {
             Some(v) => v,
             None => return None,
         };
         if first as usize != i * per {
-            eprintln!("[fm] r9"); return None;
         }
         for (k, &f) in bits.iter().enumerate() {
             let b = i * per + k;
@@ -2529,12 +2520,18 @@ fn fast_mount<B: crate::block::BlockDevice>(
             }
         }
     }
-    // 已加载页内对象占位一致性；对象不得落在未加载区。
+    // 一致性：对象所在位必须被位图标为**占用**（free=false）；对象
+    // 不得落在未加载区。
     for &id in &ids {
         let rel = (id - sb.obj_pool_start) as usize;
-        if rel >= load_pages * per || !free[rel] {
-            eprintln!("[fm] r10 id={} rel={} load_pages={} free_val=??", id, rel, load_pages); return None;
+        if rel >= load_pages * per || free[rel] {
+            return None;
         }
+    }
+    // 根可达性防线：活动 manifest 的根目录对象必须在索引链内
+    // （防「manifest 已换代、链滞后」的崩溃窗口静默穿过快速路径）。
+    if !objects.contains_key(&manifest.namespace_root_hash) {
+        return None;
     }
     free.truncate((load_pages * per).min(pool_blocks));
 

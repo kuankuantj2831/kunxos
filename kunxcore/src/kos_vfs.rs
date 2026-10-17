@@ -19,8 +19,8 @@ use kos::store::{KosStore, VerifyLevel};
 
 // ==================== Manifest 验签（kunxsec Ed25519） ====================
 
-/// 信任公钥（32 字节；全零 = 未配置 → 不验签）。由 `make kos-disk`
-/// 生成（tools/.kos-seed 派生），写入 kunxcore/src/kos_trust_pk.rs。
+// 信任公钥（32 字节；全零 = 未配置 → 不验签）。由 `make kos-disk`
+// 生成（tools/.kos-seed 派生），写入 kunxcore/src/kos_trust_pk.rs。
 include!("kos_trust_pk.rs");
 
 /// 提交期签名回调：用开发种子（make kos-disk 生成，随仓库走）给
@@ -572,7 +572,6 @@ pub fn posix_open(rel: &str, flags: u32, uid: u32) -> i64 {
         let table = posix_table_locked();
         let used = table.values().filter(|e| e.pid == pid).count();
         if used >= POSIX_FD_MAX {
-            core::mem::drop(table);
             crate::fs_simple::fs_unlock();
             return kos_errno(KosError::PermissionDenied); // fd 耗尽：EACCES 语义（无 EMFILE 映射）
         }

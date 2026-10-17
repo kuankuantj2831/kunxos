@@ -1273,6 +1273,10 @@ pub fn reap_forced(pid: u32) {
                 _ => {}
             }
         }
+        // KOS fd 兜底回收：exit() 顶部清过一次；terminate（发送方上下文
+        // 关中断，不能碰 fs_lock）杀掉的进程在此补清。必须在槽位清零
+        // 复用前完成——否则 pid 复用后新进程可读到死者的 KOS fd。
+        crate::kos_vfs::close_pid_fds(pid);
         PROCESSES[pid as usize].pt.free_user_pages();
         vm::free_process_tables(ttbr0);
         // 复位该 pid 槽位的用户堆断点/mmap 游标：槽位会被复用（如 OOBE 退出后

@@ -501,6 +501,11 @@ pub fn open_files_used() -> usize {
 
 // ==================== 系统调用 ====================
 
+/// KOS POSIX 桥接的 i64 返回值 → i32（errno 负值钳制，防 as 截断）。
+fn kos64_as_i32(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 /// 打开文件，返回 fd；失败 -1。
 ///
 /// 不存在且带 `O_CREAT` 时创建普通文件；带 `O_TRUNC` 时先截断。
@@ -535,6 +540,12 @@ pub fn open(path: &str, flags: u32) -> i32 {
 
 /// `open` 的实现体（失败由 [`open`] 统一记日志）。
 fn open_impl(path: &str, flags: u32) -> i32 {
+    // /kos/ 前缀路由到 KOS 对象存储（POSIX 桥接）：内核侧调用方
+    //（shell cp/cat、内核服务等）零改造即可读写对象卷。
+    if crate::kos_vfs::is_kos_path(path) {
+        let rel = &path[crate::kos_vfs::KOS_PREFIX.len()..];
+        return kos64_as_i32(crate::kos_vfs::posix_open(rel, flags, process::current_uid()));
+    }
     let mut dev = 0u32;
     let mut ino = 0u32;
     if resolve(path, &mut dev, &mut ino) == 0 {
@@ -581,6 +592,9 @@ fn open_impl(path: &str, flags: u32) -> i32 {
 
 /// 读取文件，返回字节数；失败 -1。
 pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return kos64_as_i32(crate::kos_vfs::posix_read(fd as u32, buf));
+    }
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::File => e,
         _ => return -1,
@@ -613,6 +627,9 @@ pub fn read(fd: i32, buf: &mut [u8]) -> i32 {
 
 /// 写入文件，返回字节数；失败 -1。
 pub fn write(fd: i32, buf: &[u8]) -> i32 {
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return kos64_as_i32(crate::kos_vfs::posix_write(fd as u32, buf, process::current_uid()));
+    }
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::File => e,
         _ => return -1,
@@ -656,6 +673,9 @@ pub fn write(fd: i32, buf: &[u8]) -> i32 {
 
 /// 关闭文件，返回 0；失败 -1。
 pub fn close(fd: i32) -> i32 {
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return kos64_as_i32(crate::kos_vfs::posix_close(fd as u32));
+    }
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::File => e,
         _ => return -1,
@@ -697,6 +717,9 @@ pub fn truncate(fd: i32) -> i32 {
 ///
 /// `offset` 为 64 位有符号（Linux 语义）：不再截断为 i32，支持大文件定位。
 pub fn seek(fd: i32, offset: i64, whence: u32) -> i64 {
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return crate::kos_vfs::posix_lseek(fd as u32, offset, whence);
+    }
     let entry = match process::get_fd(fd) {
         Some(e) if e.kind == FdKind::File => e,
         _ => return -1,
