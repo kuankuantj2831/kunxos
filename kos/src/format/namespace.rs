@@ -211,9 +211,10 @@ impl NamespaceNode {
         for (i, e) in self.entries.iter().enumerate() {
             e.write_to(&mut b, 8 + i * NAMESPACE_ENTRY_SIZE);
         }
+        b[OFF_CRC + 4..NAMESPACE_NODE_SIZE].copy_from_slice(&self.reserved);
+        // reserved 先于 CRC（同 object.rs 顺序 bug 预防性修正）。
         let crc = crc32_skip_field(&b, OFF_CRC, 4);
         put_u32(&mut b, OFF_CRC, crc);
-        b[OFF_CRC + 4..NAMESPACE_NODE_SIZE].copy_from_slice(&self.reserved);
         b
     }
 

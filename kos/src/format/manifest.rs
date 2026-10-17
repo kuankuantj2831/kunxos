@@ -71,9 +71,11 @@ impl KosRootManifest {
         put_array(&mut b, 56, &self.parent_manifest_hash);
         put_array(&mut b, 88, &self.signer_pk);
         put_array(&mut b, 120, &self.signature);
+        b[188..192].copy_from_slice(&self.reserved);
+        // reserved 必须先于 CRC 写入（from_bytes 校验全映像；与 object.rs
+        // 同款顺序 bug 的预防性修正）。
         let crc = crc32_skip_field(&b, OFF_CRC, 4);
         put_u32(&mut b, OFF_CRC, crc);
-        b[188..192].copy_from_slice(&self.reserved);
         b
     }
 

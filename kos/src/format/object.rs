@@ -135,9 +135,13 @@ impl KosObject {
         b[72..76].copy_from_slice(&self.block_count.to_le_bytes());
         b[76..80].copy_from_slice(&self._pad.to_le_bytes());
         put_u64(&mut b, 80, self.indirect);
+        b[92..96].copy_from_slice(&self.reserved);
+        // CRC 必须在 reserved 写入**之后**计算：from_bytes 对全 96 字节
+        // 校验（含 reserved[0..4]=mtime）。原实现先算 CRC 后写 reserved，
+        // 任何 mtime≠0 的对象头重挂载必 CrcMismatch（P0：上传会话首个
+        // set_clock 测试踩响；此前所有测试时钟为 0 恰好掩盖）。
         let crc = crc32_skip_field(&b, OFF_CRC, 4);
         put_u32(&mut b, OFF_CRC, crc);
-        b[92..96].copy_from_slice(&self.reserved);
         b
     }
 

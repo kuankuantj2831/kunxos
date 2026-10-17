@@ -47,11 +47,7 @@ fn stale_session_swept_by_gc() {
     assert_eq!(s.open_path("/keep", 0).unwrap(), b"data");
 }
 
-// P0 未决（工单第 7 轮发现）：upload_finish 后重挂载丢对象（盘上头块
-// 在、CRC 自矛盾）——HEAD 既有 bug，与本轮 E3 改动无关（stash 对照实锤）。
-// 复现现场见 docs/KOS_NIGHT_PLAN.md 第 7 轮记录。修复后去 #[ignore]。
 #[test]
-#[ignore = "P0: upload_finish 后重挂载丢对象（数据丢失级，第 8 轮领）"]
 fn active_session_survives_gc_and_finishes() {
     // push 会刷新活跃时钟：长时间总时长但持续有 push 的会话不被误杀。
     let mut s = fresh();

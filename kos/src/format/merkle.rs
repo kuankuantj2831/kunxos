@@ -120,9 +120,10 @@ impl MerkleIndexBlock {
         for (i, h) in self.hashes.iter().enumerate() {
             put_array(&mut b, 12 + i * HASH_LEN, h);
         }
+        b[OFF_CRC + 4..MERKLE_INDEX_BLOCK_SIZE].copy_from_slice(&self.reserved);
+        // reserved 先于 CRC（同 object.rs 顺序 bug 预防性修正）。
         let crc = crc32_skip_field(&b, OFF_CRC, 4);
         put_u32(&mut b, OFF_CRC, crc);
-        b[OFF_CRC + 4..MERKLE_INDEX_BLOCK_SIZE].copy_from_slice(&self.reserved);
         b
     }
 

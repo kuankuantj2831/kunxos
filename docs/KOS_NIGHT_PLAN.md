@@ -212,15 +212,29 @@
   测试 tests/upload_gc.rs：联动清理/超时回收/活跃会话存活 3 场景。
 - **E4 顺带**：posix_lseek SEEK_END 取大小失败改报 EIO（原 -1 基准 +
   正偏移可把 pos 拨到 EOF 外垃圾位置）。
-- **🔴 P0 新发现（第 8 轮优先领）**：`upload_finish` 后重挂载**丢已发布
-  对象**（条目在、objects 无、open 报 ObjectNotFound）。**HEAD 既有 bug**
-  （stash 本轮改动后同样复现实锤，非 E3 引入）。已定位到：盘上该对象
-  头块存在且表区（KXT）完好，但头部 CRC 自矛盾；设备写日志显示该块
-  仅被写一次且写入时刻解析通过——单次写 + 写时有效 + 事后失效的矛盾
-  未解（疑探针间块号漂移或 CRC 覆盖区不一致）。复现：3 push + finish +
-  重挂载（tests/upload_gc.rs 第 3 测已标 #[ignore] 留作回归）。**数据
-  丢失级**：断点续传成功后一重启成果就丢。排查方向：write_header_
-  block_inline 的 CRC 覆盖区 vs from_bytes 校验区、finish 链路
-  （rename+unlink）与稳定记录键/索引增量重写的交互。
+- **🔴 P0 新发现（第 8 轮已修复 ✅）**：`upload_finish` 后重挂载丢已发布
+  对象。**根因：`KosObject::to_bytes` 先算 CRC 后写 reserved[92..96]，
+  而 from_bytes 对全 96 字节校验——reserved[0..4]=mtime 非零的对象头
+  重挂载必 CrcMismatch**（load_object 收内存 hdr 从不回读校验，提交期
+  无感）。此前所有测试时钟为 0 恰好掩盖；upload_gc 首个 set_clock(非
+  零) 测试踩响。修复：reserved 先写再算 CRC（对零 reserved 数据 CRC
+  不变，旧盘兼容）；**同款潜伏雷一并清剿**：manifest/namespace/merkle
+  三处 to_bytes 同顺序问题（reserved 恒零暂未爆）预防性修正。回归：
+  upload_gc 3/3（含 finish+重挂载丢对象场景，已去 #[ignore]）。
 - 验证：kos 全套 13 套件 0 失败（+upload_gc）；make 0 错误；sfsrace
   （含新门）PASS；mailbox PASS。
+
+### 第 8 轮（2026-10-18 06:0x，定时轮）
+
+- **P0 修复（本轮主战）**：`upload_finish` 后重挂载丢对象——根因为
+  `KosObject::to_bytes` 的 **CRC 计算先于 reserved[92..96] 写入**，而
+  from_bytes 全 96 字节校验。reserved[0..4] 存 mtime → set_clock 非零后
+  一切可变记录提交的头块重挂载必败；提交期无感的原因：load_object 拿
+  内存 hdr，从不回读块上头部。**数据丢失级**（重启丢上传成果/记录换代）。
+  此前全测试时钟为 0 恰好掩盖。修复 = 字段写入全部先于 CRC；manifest/
+  namespace/merkle 三处同款潜伏顺序（reserved 恒零未爆）一并清剿。
+- 回归：upload_gc 3/3（重挂载场景去 ignore）；kos 全套 13 套件 0 失败；
+  QEMU 持久卷 KOSTEST PASS（352 对象在卷、fault-degrade 阶段绿）；
+  make 0 错误；sfsrace 含新门 PASS；mailbox PASS。
+- 坑再证：make kernel 后测试标记若在内嵌 ramdisk 里，须重打包 ramdisk
+  再 touch + make kernel（否则干净验证跑的是带标记内核）。
