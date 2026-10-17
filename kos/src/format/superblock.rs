@@ -109,10 +109,11 @@ impl KosSuperblock {
         put_u32(&mut b, 76, self.rec_inode_free);
         put_u64(&mut b, 80, self.root_slot_a);
         put_u64(&mut b, 88, self.root_slot_b);
-        // OFF_CRC 处保持 0 参与计算，随后写入真实值
+        // reserved（含 P2 挂载 hint）先写入再算 CRC：from_bytes 对全块
+        // 计算，两者必须覆盖同一字节集。reserved 全零时与旧版字节兼容。
+        put_array(&mut b, OFF_CRC + 4, &self.reserved);
         let crc = crc32_skip_field(&b, OFF_CRC, 4);
         put_u32(&mut b, OFF_CRC, crc);
-        put_array(&mut b, OFF_CRC + 4, &self.reserved);
         b
     }
 

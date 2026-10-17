@@ -54,6 +54,36 @@ impl MerkleTree {
         }
     }
 
+    /// 从既有叶子哈希列表构建（追加写路径：旧 chunk 哈希来自磁盘上的
+    /// 第 0 层索引块，新 chunk 哈希现算，合流后重建整棵树）。
+    pub fn build_from_chunk_hashes(chunk_hashes: &[[u8; 32]], hasher: &dyn Hasher) -> Self {
+        let chunk_count = chunk_hashes.len();
+        let mut cur: Vec<[u8; 32]> = chunk_hashes.to_vec();
+        let mut levels: Vec<Vec<MerkleIndexBlock>> = Vec::new();
+        loop {
+            let level = levels.len() as u16;
+            let mut blocks = Vec::new();
+            if cur.is_empty() {
+                blocks.push(MerkleIndexBlock::new(level, 0, &[]));
+            } else {
+                for (bi, group) in cur.chunks(MERKLE_FANOUT).enumerate() {
+                    blocks.push(MerkleIndexBlock::new(level, bi as u32, group));
+                }
+            }
+            cur = blocks.iter().map(|b| hasher.hash32(&b.to_bytes())).collect();
+            levels.push(blocks);
+            if cur.len() == 1 {
+                break;
+            }
+        }
+        let root = cur[0];
+        MerkleTree {
+            root,
+            chunk_count,
+            levels,
+        }
+    }
+
     /// 根哈希（顶层索引块序列化字节的哈希）。
     pub fn root_hash(&self) -> [u8; 32] {
         self.root

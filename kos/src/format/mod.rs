@@ -9,6 +9,7 @@
 //!   因此 `repr(C)` 只用于把内存布局声明为文档，字节布局完全由本
 //!   模块的偏移常量决定。
 
+pub mod extent;
 pub mod manifest;
 pub mod merkle;
 pub mod namespace;

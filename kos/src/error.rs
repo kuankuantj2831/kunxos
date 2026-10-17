@@ -133,6 +133,12 @@ pub enum KosError {
     NoSpace,
     /// 底层 I/O 错误（宿主 std 路径；值为 errno）。
     Io(i32),
+    /// 区段表解析失败（magic/CRC/长度）。
+    ExtentTableCorrupt,
+    /// 追加/原地写的目标不是可变记录。
+    NotMutable,
+    /// write_range 的偏移/长度非法（如负溢出、超上限）。
+    OffsetInvalid,
 }
 
 impl fmt::Display for KosError {
@@ -187,6 +193,9 @@ impl fmt::Display for KosError {
             KosError::NameTooLong => write!(f, "名字过长"),
             KosError::NoSpace => write!(f, "对象池空间不足"),
             KosError::Io(e) => write!(f, "I/O 错误 errno {e}"),
+            KosError::ExtentTableCorrupt => write!(f, "区段表损坏"),
+            KosError::NotMutable => write!(f, "目标不是可变记录"),
+            KosError::OffsetInvalid => write!(f, "偏移/长度非法"),
             KosError::RootMismatch => write!(f, "顶层索引块哈希与 root 不符"),
         }
     }

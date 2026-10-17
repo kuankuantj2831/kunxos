@@ -56,6 +56,10 @@ pub mod object_flags {
     pub const PACKED: u16 = 0x0002;
     /// 内容已加密。
     pub const ENCRYPTED: u16 = 0x0004;
+    /// 可变记录（引擎 v2）：支持 append / write_range 原地更新；
+    /// `content_hash` 存 Merkle 树根（非 SHA-256 内容哈希），不参与
+    /// CAS 去重。
+    pub const MUTABLE: u16 = 0x0008;
 }
 
 /// 对象头（96 字节）。
