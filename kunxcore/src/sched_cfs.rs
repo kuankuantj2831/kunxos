@@ -255,6 +255,27 @@ fn sched_unlock() {
     SCHED_LOCK.store(false, Ordering::Release);
 }
 
+/// 待唤醒登记位：wake 到达时目标尚未进入 `Blocked`（「检查条件 → 登记
+/// 等待者 → block_current」与他核的「产生条件 → 清登记 → wake」在 SMP 下
+/// 可交错，本核 IRQ 屏蔽挡不住他核），把该次唤醒暂存于此位，由
+/// `block_current` 在持锁置 `Blocked` 前消费——唤醒不再丢失。
+/// 操作方 `wake*` 与 `block_current` 均持调度锁，SMP 安全。
+static PENDING_WAKE: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+
+/// wake 侧共用：目标未在阻塞时暂存待唤醒位（仅 Ready/Running——它们随后
+/// 才可能进入 block_current；Stopped 只能由 SIGCONT 恢复，不适用）。
+/// 目标已是 Blocked（本次直接唤醒成功）则清掉陈旧位。
+unsafe fn pending_wake_note(tid: usize, woke: bool) {
+    if woke {
+        PENDING_WAKE[tid].store(false, Ordering::Release);
+    } else if matches!(
+        TASKS[tid].state,
+        TaskState::Ready | TaskState::Running
+    ) {
+        PENDING_WAKE[tid].store(true, Ordering::Release);
+    }
+}
+
 /// 故障遏制出口专用：若当前任务正持有调度锁（panic/S 态异常发生在
 /// TASKS/SLEEPERS 临界区内），强制放锁后返回 true —— 遏制路径
 /// （kill_pid/exit_current）随后重取 sched_lock 才不会在自己持有的锁上
@@ -292,6 +313,10 @@ pub fn rename_task(tid: u32, name: &str) {
         n -= 1; // 回退连续的 UTF-8 续字节（10xxxxxx）
     }
     let saved = unsafe { read_daif() };
+    // 任务上下文取调度锁前必须先关本核中断：IRQ 上下文的 wake_irq /
+    // set_tid_deadline 会自旋等 SCHED_LOCK，若持锁者被 IRQ 打断，唯一
+    // 能放锁的任务无法继续运行 → 中断处理在锁上永久自旋（整机冻结）。
+    unsafe { asm!("csrci sstatus, 2") };
     sched_lock();
     unsafe {
         let slot = &mut NAME_ARENA[tid as usize];
@@ -606,6 +631,9 @@ fn alloc_tid() -> Option<usize> {
     for i in 0..MAX_TASKS {
         unsafe {
             if TASKS[i].state == TaskState::Empty {
+                // 清掉上一任持有者的陈旧待唤醒位，防 tid 复用后新任务
+                // 首次 block 被无关唤醒错误跳过。
+                PENDING_WAKE[i].store(false, Ordering::Release);
                 return Some(i);
             }
         }
@@ -1288,6 +1316,10 @@ pub fn wake_sleeper_irq(tid: u32) {
                 // 同 tick：仅真正唤醒才消费槽位（防「登记后、阻塞前」窗口丢唤醒），
                 // 未阻塞时保留槽位，由 sleep_until 醒来后自清或到期 tick 消费。
                 s.active = false;
+            } else if idx < MAX_TASKS {
+                // 目标尚未置 Blocked：把提前唤醒暂存为待唤醒位，sleep_until
+                // 持锁置 Blocked 前消费——不再退化为睡满全部超时。
+                pending_wake_note(idx, false);
             }
             break;
         }
@@ -1438,6 +1470,14 @@ pub fn block_current() {
         return;
     }
     unsafe {
+        // 待唤醒位已在「登记等待者之后、置 Blocked 之前」的窗口内被
+        // wake* 落下（SMP 丢唤醒根治）：消费之，本次不阻塞——等待条件
+        // 已满足，调用方的重查循环会直接推进。
+        if PENDING_WAKE[cur].swap(false, Ordering::AcqRel) {
+            sched_unlock();
+            unsafe { write_daif(saved) };
+            return;
+        }
         // 调度决策点：清除累积的唤醒抢占请求（同 yield_now）。
         NEED_RESCHED[cpu] = false;
         TASKS[cur].state = TaskState::Blocked;
@@ -1617,11 +1657,13 @@ pub fn wake(tid: u32) {
         unsafe { asm!("csrci sstatus, 2") };
         sched_lock();
         unsafe {
-            if TASKS[tid as usize].state == TaskState::Blocked {
+            let woke = TASKS[tid as usize].state == TaskState::Blocked;
+            if woke {
                 TASKS[tid as usize].state = TaskState::Ready;
                 // 唤醒抢占检查：交互/实时任务唤醒后不必等当前任务用完时间片
                 wakeup_preempt(tid as usize);
             }
+            pending_wake_note(tid as usize, woke);
         }
         sched_unlock();
         unsafe { write_daif(saved) };
@@ -1636,10 +1678,12 @@ pub fn wake_irq(tid: u32) {
     if (tid as usize) < MAX_TASKS {
         sched_lock();
         unsafe {
-            if TASKS[tid as usize].state == TaskState::Blocked {
+            let woke = TASKS[tid as usize].state == TaskState::Blocked;
+            if woke {
                 TASKS[tid as usize].state = TaskState::Ready;
                 NEED_RESCHED[current_cpu()] = true;
             }
+            pending_wake_note(tid as usize, woke);
         }
         sched_unlock();
     }
@@ -1672,10 +1716,14 @@ pub fn wake_pid(pid: u32) {
     sched_lock();
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASKS[i].pid == pid && TASKS[i].state == TaskState::Blocked {
-                TASKS[i].state = TaskState::Ready;
-                // 唤醒抢占检查（同 wake）
-                wakeup_preempt(i);
+            if TASKS[i].pid == pid {
+                let woke = TASKS[i].state == TaskState::Blocked;
+                if woke {
+                    TASKS[i].state = TaskState::Ready;
+                    // 唤醒抢占检查（同 wake）
+                    wakeup_preempt(i);
+                }
+                pending_wake_note(i, woke);
             }
         }
     }
@@ -1704,6 +1752,9 @@ pub fn kill_pid(pid: u32) {
             // 同理：清掉其持有的全局网络锁，否则持锁任务死亡后所有联网
             // 操作在锁退避中无限等待。
             crate::net_stack::net_cleanup_tid(TASKS[i].tid);
+            // 同理：清掉其持有的 SFS 全局锁——否则「持锁死亡 + tid 复用前
+            // 无人触发懒自愈」窗口下，全系统文件操作永久关闭。
+            crate::fs_simple::fs_cleanup_tid(TASKS[i].tid);
             // 同理：清掉其睡眠/超时登记（nanosleep / 定时 futex_wait）。
             sleepers_clear_tid(TASKS[i].tid);
             // 同理：清 CLONE_CHILD_CLEARTID 登记（tid 复用后新任务退出会向
@@ -1746,6 +1797,7 @@ pub fn kill_siblings_of(pid: u32) {
             }
             crate::bionic_shim::futex_cleanup_tid(TASKS[i].tid);
             crate::net_stack::net_cleanup_tid(TASKS[i].tid);
+            crate::fs_simple::fs_cleanup_tid(TASKS[i].tid);
             sleepers_clear_tid(TASKS[i].tid);
             crate::bionic_shim::clear_tid_slot(TASKS[i].tid);
             if TASKS[i].state == TaskState::Running {
@@ -1974,6 +2026,7 @@ pub fn exit_thread_current() -> bool {
         let tid = TASKS[cur].tid;
         crate::bionic_shim::futex_cleanup_tid(tid);
         crate::net_stack::net_cleanup_tid(tid);
+        crate::fs_simple::fs_cleanup_tid(tid);
         sleepers_clear_tid(tid);
         crate::bionic_shim::clear_tid_slot(tid);
         TASKS[cur].kill_req = false;

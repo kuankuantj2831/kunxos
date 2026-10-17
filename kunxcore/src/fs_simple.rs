@@ -483,6 +483,36 @@ pub fn fs_unlock() {
     }
 }
 
+/// 任务死亡时若其持有 FS_LOCKED 则强制放锁（含把事务状态复位到干净基线）。
+///
+/// 供调度器遏制/kill 路径调用（与 net_cleanup_tid 同源）：仅清「确实属于
+/// 死亡 tid」的持有——否则不动，避免撕开对存活持有者的互斥。若只靠
+/// fs_lock 的懒自愈，存在「死亡后、槽位 tid 复用前无人来抢锁」的窗口：
+/// 新任务复用 tid 后持有者看似存活，全系统 SFS 操作永久关闭。
+///
+/// 调用方须已屏蔽 IRQ 且不持 FS_LOCKED（kill 路径天然满足）。
+pub fn fs_cleanup_tid(tid: u32) {
+    let t = tid as u64;
+    loop {
+        let w = FS_LOCKED.load(Ordering::Acquire);
+        if w == 0 {
+            return;
+        }
+        let holder = (w >> 16) & 0xFFFF;
+        if holder != t {
+            return;
+        }
+        // 归零即释放。深度/事务状态（PENDING_N/TXN_*）一并丢弃：死者
+        // 半截事务不提交，等待者的 txn_begin 以 major 不匹配走回滚。
+        if FS_LOCKED
+            .compare_exchange(w, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
 // ==================== 布局计算 ====================
 
 /// 按分区块数求布局：(数据位图块数, inode 表起始, 日志起始, 日志块数, 数据起始)。

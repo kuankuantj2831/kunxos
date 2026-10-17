@@ -726,27 +726,33 @@ pub fn submit(data: &[u8]) -> i32 {
         return -1;
     }
     unsafe {
-        asm!("csrci sstatus, 2");
+        // 保存-恢复（而非出口无条件 csrsi 重开）：本函数也被 IRQ 路径共享
+        // （irq_handler → reclaim → hw_consumed → refill → submit）。中断处理
+        // 中途重开 SIE 会允许嵌套中断，reclaim 与嵌套 IRQ 重入 TX 环撕裂
+        // TX_USED_SEEN/TX_FREE_HEAD，音频流可能永久停摆。
+        let saved: u64;
+        core::arch::asm!("csrr {}, sstatus", out(reg) saved);
+        core::arch::asm!("csrci sstatus, 2");
         if TX_INFLIGHT >= TX_SLOTS {
-            asm!("csrsi sstatus, 2");
+            core::arch::asm!("csrw sstatus, {}", in(reg) saved);
             return -1;
         }
         let h = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if h == 0xFFFF {
-            asm!("csrsi sstatus, 2");
+            core::arch::asm!("csrw sstatus, {}", in(reg) saved);
             return -1;
         }
         let d = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if d == 0xFFFF {
             free_desc(&mut TX_FREE_HEAD, TX_RING, h);
-            asm!("csrsi sstatus, 2");
+            core::arch::asm!("csrw sstatus, {}", in(reg) saved);
             return -1;
         }
         let s = alloc_desc(&mut TX_FREE_HEAD, TX_RING);
         if s == 0xFFFF {
             free_desc(&mut TX_FREE_HEAD, TX_RING, d);
             free_desc(&mut TX_FREE_HEAD, TX_RING, h);
-            asm!("csrsi sstatus, 2");
+            core::arch::asm!("csrw sstatus, {}", in(reg) saved);
             return -1;
         }
         let buf = allocator::alloc_page();
@@ -756,7 +762,7 @@ pub fn submit(data: &[u8]) -> i32 {
                 free_desc(&mut TX_FREE_HEAD, TX_RING, s);
                 free_desc(&mut TX_FREE_HEAD, TX_RING, d);
 free_desc(&mut TX_FREE_HEAD, TX_RING, h as u16);
-                asm!("csrsi sstatus, 2");
+                core::arch::asm!("csrw sstatus, {}", in(reg) saved);
                 return -1;
             }
         };
@@ -795,7 +801,7 @@ free_desc(&mut TX_FREE_HEAD, TX_RING, h as u16);
         TX_INFLIGHT += 1;
         dsb();
         w32(REG_QUEUE_NOTIFY, 2); // kick tx 队列
-        asm!("csrsi sstatus, 2");
+        core::arch::asm!("csrw sstatus, {}", in(reg) saved);
         0
     }
 }
