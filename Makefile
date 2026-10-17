@@ -637,7 +637,9 @@ test-sfsrace: $(SFSRACE_ELF)
 	# 无论 QEMU 退出码（测试失败时内核自动关机使 QEMU 非零退出），都必须移除标记，
 	# 否则 rootfs 遗留 /sfsrace-test → 下次 make run-gui 一启动就进测试模式并关机。
 	@rm -f $(ROOTFS)/sfsrace-test
-	@grep -q "SFS-RACE PASS" $(TEST_SFSRACE_LOG) && echo "SFS RACE TEST: PASS" \
+	# 判定门必须同时含 SFS-RACE 与 MAILBOX：同一二进制本就两阶段都跑，
+	# 只查前者曾让信箱阶段确定性假失败漏网一整晚（M1 教训）。
+	@grep -q "SFS-RACE PASS" $(TEST_SFSRACE_LOG) && grep -q "MAILBOX PASS" $(TEST_SFSRACE_LOG) && echo "SFS RACE TEST: PASS" \
 		|| (echo "SFS RACE TEST: FAIL (see $(TEST_SFSRACE_LOG))"; exit 1)
 
 # ---- 并发信箱压测（rename 原子提交/认领） ----

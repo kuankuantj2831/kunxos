@@ -626,7 +626,18 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
         *polls += 1;
         if *polls > MBX_POLLS_MAX {
             print("[sfsrace] MAILBOX FAIL: 认领轮询超限（疑似死锁/活锁）\n");
+            print("[mbx-dbg] 超限时 dones=");
+            print_dec(*dones);
+            print("\n");
             return 1;
+        }
+        // 心跳：每 6000 轮汇报一次进度（诊断慢/卡）
+        if *polls % 6000 == 0 {
+            print("[mbx-dbg] polls=");
+            print_dec(*polls);
+            print(" dones=");
+            print_dec(*dones);
+            print("\n");
         }
         // 残留认领文件：上一轮 rename 后写者迟到 append 落在其上（写者持
         // fd 期间 unlink 失败）——先排干再删。盲删会把迟到消息销毁，
@@ -664,6 +675,15 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
             close(fd2);
         }
         if n == 0 {
+            // 取空确认：三个 DONE 哨兵已收齐 + 本轮认领为空 → 管道再无
+            // 新写入（DONE 是各写者最后一条，其被消费即此前全部消息已
+            // 计入；迟到追加只可能发生在哨兵之前）。管道由本方重建、
+            // rename 恒成功，退出检查必须在认领成功路径也可达——原实现
+            // 只查 rename 失败分支，dones=3 后仍无限认领空管道直到轮询
+            // 上限（MAILBOX 确定性假失败）。
+            if *dones >= MBX_WRITERS {
+                return 0;
+            }
             continue;
         }
         if mbx_parse_batch(buf, n, dones) != 0 {

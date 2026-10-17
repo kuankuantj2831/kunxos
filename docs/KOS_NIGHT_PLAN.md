@@ -42,12 +42,15 @@
 
 ### P0 既有回归（本轮基线发现，优先修）
 
-- [ ] **M1 MAILBOX 认领轮询超限**：HEAD 基线（不含任何本工单改动）即 3/3 确定性失败
-  （`make test-mailbox`，串口见 `MAILBOX FAIL: 认领轮询超限（疑似死锁/活锁）`）。
-  上轮工单收官只跑 test-sfsrace（其判定门不含 MAILBOX PASS），漏网。排查方向：
-  `git log --oneline 49877c0~5..def9387` 期间 oobe 转场重写/调度改动；二分构建
-  定位首个失败提交；修复后 test-mailbox ×3 全过，并把 MAILBOX PASS 加进
-  test-sfsrace 判定门（防再漏）。
+- [x] **M1 MAILBOX 认领轮询超限（第 2 轮修复）**：根因**不是内核回归**——
+  sfsrace 认领读者的退出检查（`dones >= WRITERS`）只挂在 rename 失败分支，
+  而 4845a51 为修迟到写入窗口加了「认领后重建空管道」，管道恒存在 →
+  rename 恒成功 → dones=3 后仍无限认领空管道直到 3 万轮上限（确定性假
+  失败；心跳实证 dones=3 @poll 6000 后空转 24000 轮）。数据完整性断言
+  从未触发（无丢失/重复/撕裂），内核无辜。修复：取空认领（n==0）+
+  哨兵收齐即退出（协议注释「再取空确认」的本意）。**test-mailbox ×3
+  全过**；MAILBOX PASS 已纳入 test-sfsrace 判定门（防再漏，M1 教训
+  写入 Makefile 注释）。
 
 ### P1 错误处理/容错（用户核心诉求：报错了还能继续运行）
 
@@ -124,3 +127,15 @@
 - 发现并交接：M1 mailbox 既有回归（基线 3/3 失败，非本轮引入）。
 - 验证：kos 全套 0 失败；make 0 错误 0 kos 新警告；test-sfsrace PASS；
   mailbox 3/3 FAIL（既有，转 M1）。
+
+### 第 2 轮（2026-10-18 00:0x，定时轮）
+
+- **M1 修复**：MAILBOX 假失败根因 = sfsrace 测试自身退出逻辑自 4845a51 起
+  不可达（认领后重建管道 → rename 恒成功 → dones 检查只在 rename 失败分支）。
+  心跳诊断实证：dones=3 @poll 6000，其后空转 24000 轮到上限。修复 = 取空
+  认领 + 哨兵收齐即退出。内核无回归（阶段 A/B 完整性断言从未触发）。
+- **判定门加固**：test-sfsrace 现要求 SFS-RACE PASS **和** MAILBOX PASS
+  （同一二进制两阶段都跑，此前只查前者致信箱假失败漏网一整晚）。
+- 保留 sfsrace 心跳诊断打印（每 6000 轮一行 + 超限时 dones 值）。
+- 验证：test-mailbox ×3 PASS（含 144 条无丢失/无重复 + 无撕裂断言）；
+  加固门 test-sfsrace PASS；kos 全套 11 套件 0 失败；make 0 错误 0 新警告。
