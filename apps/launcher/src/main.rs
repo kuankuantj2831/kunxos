@@ -9203,7 +9203,9 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 跟手/吸附中的翻页也走高刷新率（拖动流畅度优先）。
         let high_refresh = unsafe { control_center::cc_high_refresh() || PAGE_ANIM || PAGE_DRAG };
         let budget = if high_refresh { 8_000 } else { 16_000 };
-        if elapsed < budget {
+        // 光标流畅优先（与 OOBE 同款）：有光标更新/输入待处理时跳过帧
+        // 预算睡眠 —— 固定 16ms 预算叠加在光标路径上会让指针移动发涩。
+        if elapsed < budget && !unsafe { CURSOR_DIRTY } {
             let rem = (budget - elapsed) / 1000;
             if rem > 0 {
                 sleep_ms(rem as usize);
