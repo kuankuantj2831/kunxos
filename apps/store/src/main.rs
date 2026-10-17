@@ -101,6 +101,8 @@ const SYS_RENAMEAT: usize = 38;
 const SYS_EXIT: usize = 93;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
 const SYS_MMAP: usize = 222;
 const SYS_IOCTL: usize = 29;
 const SYS_CLONE: usize = 220;
@@ -404,19 +406,16 @@ fn sleep_ms(ms: usize) {
 
 /// 当前时间（微秒，UTC epoch；不可用返回 0）。
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
     unsafe {
-        let r = syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
-        if (r as isize) < 0 {
-            return 0;
-        }
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec =
-            u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 unsafe fn open(path: &str, flags: usize) -> isize {
     let n = path.len().min(PATH_BUF.len() - 1);
     PATH_BUF[..n].copy_from_slice(&path.as_bytes()[..n]);

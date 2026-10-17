@@ -61,6 +61,8 @@ const SYS_SENDTO: usize = 206;
 const SYS_RECVFROM: usize = 207;
 const SYS_SHUTDOWN: usize = 210;
 const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
 const SYS_DNS_RESOLVE: usize = 403;
 const SYS_GETRANDOM: usize = 278;
 
@@ -210,16 +212,16 @@ impl tls::Rng for SysRng {
 
 /// RTC 墙钟（微秒，epoch）。
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
-    let r = unsafe { syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0) };
-    if (r as isize) < 0 {
-        return 0;
+    unsafe {
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
     }
-    let sec = u64::from_le_bytes(tv[0..8].try_into().unwrap_or([0; 8]));
-    let usec = u64::from_le_bytes(tv[8..16].try_into().unwrap_or([0; 8]));
-    sec * 1_000_000 + usec
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 /// RTC 墙钟（秒，epoch）；不可用返回 0。
 fn now_sec() -> i64 {
     let mut tv = [0u8; 16];

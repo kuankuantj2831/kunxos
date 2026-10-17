@@ -218,3 +218,8 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
 ### 第 20 轮（2026-10-17 10:5x，定时轮）
 - **墙钟跳变隐患系统性清剿**（黑屏根因的泛化修复）：launcher `now_us()` 本体改为单调钟（CLOCK_MONOTONIC）——全部 80+ 动画 T0/超时/时长判定一次性治好（转场/横幅/锁屏/编辑/最近任务/控制中心/翻页等，含 app_launch/app_life/control_center 经 use super::* 自动受益）；新增 `wall_us()` 仅供时钟/日历等真实时间显示（time_hhmm/表盘指针/日历小组件/锁屏日期/控制中心日期 5 处）
 - 验证：GUI 全链路 launcher 正常拉起 0 PANIC、亮度 226.7 正常；make 0 错误 + test-sfsrace PASS
+
+### 第 21 轮（2026-10-17 11:1x，定时轮）
+- **墙钟清剿扩展到全部应用**：11 处应用侧 now_us 本体改 CLOCK_MONOTONIC（calculator/settings/stub/store×2/terminal/cloud/tlstest/oobe finish + shared/app_kit + shared/ttf_text）——覆盖按键动画、轮询超时、光标闪烁、加载动效等全部时间差判定；墙钟显示保留（oobe finish 时钟改内联 gettimeofday；clock 应用本就纯显示未动）
+- cloud 无 syscall3 封装：该处手写 ecall
+- 回归：make 0 错误 + test-sfsrace PASS

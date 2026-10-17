@@ -297,19 +297,16 @@ fn sleep_ms(ms: usize) {
 
 /// 当前时间（微秒，自启动）。
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
     unsafe {
-        syscall2(169, tv.as_mut_ptr() as usize, 0); // SYS_GETTIMEOFDAY
-        let sec = u64::from_le_bytes([
-            tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7],
-        ]);
-        let usec = u64::from_le_bytes([
-            tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
-        ]);
-        sec * 1_000_000 + usec
+        syscall3(113, 1, tv.as_mut_ptr() as usize, 0); // CLOCK_GETTIME, MONOTONIC
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 unsafe fn exit(code: usize) -> ! {
     syscall1(SYS_EXIT, code);
     loop {}

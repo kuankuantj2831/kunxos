@@ -10,6 +10,8 @@
 //   5. 最后写 /data/oobe/.done 并返回，k_main 随即 exit(0)。
 
 const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
 const SYS_READ: usize = 63;
 const O_RDONLY: usize = 0;
 
@@ -26,17 +28,24 @@ const C_PANEL: u32 = 0x00_F7_F8_FA;  // 面板浅色底（备用）
 const C_PANEL_BORDER: u32 = 0x00_00_B9_6B;
 
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
+    let mut tv = [0u8; 16];
+    unsafe {
+        crate::syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
+}
+fn time_hhmm(buf: &mut [u8; 5]) {
+    // 墙钟显示（now_us 已改单调钟）
     let mut tv = [0u8; 16];
     unsafe {
         crate::syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
     }
-}
-
-fn time_hhmm(buf: &mut [u8; 5]) {
-    let us = now_us();
+    let us = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]) * 1_000_000
+        + u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
     let secs = (us / 1_000_000) as u32;
     let total_min = secs / 60;
     let h = (total_min / 60) % 24;

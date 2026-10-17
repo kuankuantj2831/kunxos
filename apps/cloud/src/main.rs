@@ -1519,16 +1519,24 @@ fn unlock_hold_check() {
 
 /// 墙钟微秒（失败返回 0，长按计时退化为不可用即不可解锁 —— 安全方向）。
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
-    let r = unsafe { syscall3(169, tv.as_mut_ptr() as usize, 0, 0) } as isize;
-    if r < 0 {
-        return 0;
+    unsafe {
+        // cloud 无 syscall3 封装：手写 ecall（a7=113 CLOCK_GETTIME, a0=1 MONOTONIC）
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") 1usize => _,
+            in("a1") tv.as_mut_ptr() as usize,
+            in("a2") 0usize,
+            in("a7") 113usize,
+            options(nostack)
+        );
     }
-    let sec = u64::from_le_bytes(tv[0..8].try_into().unwrap_or([0; 8]));
-    let usec = u64::from_le_bytes(tv[8..16].try_into().unwrap_or([0; 8])) as u64;
-    sec * 1_000_000 + usec
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 /// 追加写（审计日志）。目录不存在时先建。
 fn append_file(path: &str, data: &[u8]) -> bool {
     unsafe {

@@ -173,6 +173,8 @@ pub const SYS_EXIT: usize = 93;
 pub const SYS_NANOSLEEP: usize = 101;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
 pub const SYS_GETUID: usize = 174;
 pub const SYS_SOCKET: usize = 198;
 pub const SYS_CONNECT: usize = 203;
@@ -616,19 +618,16 @@ pub unsafe fn open(path: &str, flags: usize) -> isize {
 /// 墙钟不可用（gettimeofday 失败）时返回 0——调用方按"未知时间"处理，
 /// 而不是读到未初始化的栈垃圾。
 pub fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
     unsafe {
-        let r = syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
-        if (r as isize) < 0 {
-            return 0;
-        }
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec =
-            u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 // ==================== 公历换算（Howard Hinnant 算法） ====================
 
 /// epoch 天数 → 公历 (年, 月, 日)，月/日 1 基。

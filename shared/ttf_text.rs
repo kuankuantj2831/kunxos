@@ -135,6 +135,8 @@ const SYS_WRITE: usize = 64;
 const SYS_LSEEK: usize = 62;
 const SYS_NANOSLEEP: usize = 101;
 const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: i32 = 1;
 const SYS_EXIT: usize = 93;
 
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
@@ -280,16 +282,16 @@ fn sleep_ms(ms: usize) {
 }
 
 fn now_us() -> u64 {
+    // 单调钟：RTC 就绪前后墙钟会跳变，时间差判定（动画/超时）必须用
+    // CLOCK_MONOTONIC（黑屏事故同族防御）。
     let mut tv = [0u8; 16];
     unsafe {
-        syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec =
-            u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
+        syscall3(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC as usize, tv.as_mut_ptr() as usize, 0);
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
-
 /// 等待 launcher 启动动画完成（门控放行）。文件不存在或内容为 "1" 立即返回；
 /// 内容为 "2" 表示 launcher 取消了本次启动（上划打断），应用应直接退出。
 pub fn wait_launch_gate() {
