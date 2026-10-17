@@ -1327,15 +1327,19 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
             }
         }
-        // 动画推进：闪光/结果弹出期间逐帧重绘（主循环节奏 16ms ≈ 60fps）
-        if advance_anim() {
+        // 动画推进：闪光/结果弹出期间逐帧重绘（动画期不睡眠，帧率拉满；
+        // 空闲时 8ms 让出）
+        let animating = advance_anim();
+        if animating {
             redraw();
         }
         if poll_key() {
             print("[calculator] ESC -> 退出\n");
             break;
         }
-        sleep_ms(16);
+        if !animating {
+            sleep_ms(8);
+        }
     }
 
     print("[calculator] 正在退出\n");

@@ -1846,11 +1846,13 @@ fn play_icon_cone(cp: u32) {
     let Some(g) = ttf_text::font_render::rasterize_icon_thick(false, cp, ICON_GLYPH_PX) else {
         return;
     };
-    let frames = 13;
+    // 真实时间推进（帧率拉满，时长恒定）：光锥扫描 ~500ms
+    const CONE_DUR_US: u64 = 500_000;
     let span = 2 * CONE_AREA_HALF; // 对角坐标 s=gx+gy 在区域内的变化范围
     let base = cx + cy;
-    for f in 0..=frames {
-        let p = f as f32 / frames as f32;
+    let t0 = mono_us();
+    loop {
+        let p = ((mono_us().saturating_sub(t0)) as f32 / CONE_DUR_US as f32).min(1.0);
         // 光带中心从区域左上外扫到右下外。
         let s = base - span - CONE_BAND
             + ((2.0 * (span + CONE_BAND) as f32) * p) as i32;
@@ -1860,7 +1862,9 @@ fn play_icon_cone(cp: u32) {
         restore_icon_bg();
         blit_icon_gradient(cx, cy, &g, Some((s, fade)));
         flip();
-        sleep_ms(2);
+        if p >= 1.0 {
+            break;
+        }
     }
     // 终态：无高光的纯渐变字形。
     restore_icon_bg();

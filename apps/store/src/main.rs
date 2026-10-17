@@ -2654,13 +2654,16 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             print("[store] ESC → 退出\n");
             break;
         }
-        // 页面转场进行中：逐帧重绘推进（240ms）。
-        if transition_active() {
+        // 页面转场进行中：逐帧重绘推进（240ms；动画期不睡眠，帧率拉满）。
+        let animating = transition_active();
+        if animating {
             store_redraw();
             store_flip();
             cursor_overlay_redraw();
         }
-        sleep_ms(16);
+        if !animating {
+            sleep_ms(8);
+        }
     }
 
     print("[store] 正在退出\n");

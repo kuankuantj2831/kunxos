@@ -1541,7 +1541,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 ");
             break;
         }
-        sleep_ms(16);
+        sleep_ms(8); // 无逐帧动画（页面切换为整页重绘），空闲让出即可
     }
 
     print("[settings] 正在退出

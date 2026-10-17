@@ -232,3 +232,7 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
   4. Hero/标题动画**区域呈现**（brand/文字矩形拷贝+脏矩形，替代整屏 2MB flip）+ 光晕 **scanline 化**（13ms→0.7ms）
 - 实测：Hero 260ms **3 帧 → 21 帧（≈81fps，提升 7 倍）**；主循环节流 16→8ms 且动画期不睡
 - 回归：make 0 错误 + test-sfsrace PASS
+
+### 第 23 轮（2026-10-17 午间，定时轮）
+- **帧率拉满清剿延续**：OOBE 光锥扫描（icon cone）改真实时间推进（原 13 帧固定 + sleep）；calculator 闪光/结果弹出、store 页面转场的主循环改「动画期不睡眠、空闲 8ms 让出」（原固定 16ms = 60fps 上限）；settings 主循环 16→8ms
+- 回归：make 0 错误 + test-sfsrace PASS
