@@ -266,3 +266,4 @@ alarmd 贪睡闹钟秒停+一次性闹钟静默禁用、sms 首启判定反（�
   - D(P3) launcher 光标优先是死条件（CURSOR_DIRTY 帧内已被消费）→ 改 FRAME_INPUT 标志（handle_input 置位、睡眠判定后消费）
   - 复核通过：五循环退出/终态齐备、nav_snap 181KB 栈安全（2MB 栈 8.7%）、HERO 快照坐标对齐、idle 时序修复正确、无忙转
 - 回归：make 0 错误 + test-sfsrace PASS
+- 注：本轮提交顺带收录并行产生的 rootfs/bin/kostest（kos 存储测试二进制，非本工单产物，保护性入库）
