@@ -85,6 +85,7 @@ const QUEUE_SIZE: usize = 64;
 const DESC_OFF: usize = 0;
 const AVAIL_OFF: usize = QUEUE_SIZE * 16; // 1024
 const USED_OFF: usize = (AVAIL_OFF + 4 + 2 * QUEUE_SIZE + 3) & !3; // 1156
+const DESC_F_NEXT: u16 = 1;
 const DESC_F_WRITE: u16 = 2;
 
 // ---- virtio-sound 控制消息码（规范 virtio-snd：PCM 段 0x0100+） ----
@@ -267,6 +268,10 @@ unsafe fn avail_ring(page: usize, i: usize) -> *mut u16 {
     (page + AVAIL_OFF + 4 + i * 2) as *mut u16
 }
 #[inline]
+unsafe fn used_len(page: usize, slot: usize) -> u32 {
+    read_volatile((page + USED_OFF + 4 + slot * 8 + 4) as *const u32)
+}
+
 unsafe fn used_idx(page: usize) -> u16 {
     read_volatile((page + USED_OFF + 2) as *const u16)
 }
@@ -361,7 +366,7 @@ fn ctl_send(req: &[u8], resp_len: usize) -> Option<u32> {
         // 描述符链：rq（设备读，请求）→ rs（设备写，响应）
         *desc_addr(req_page, rq as usize) = CTRL_REQ.as_ptr() as usize as u64;
         *desc_len(req_page, rq as usize) = req.len() as u32;
-        *desc_flags(req_page, rq as usize) = 0;
+        *desc_flags(req_page, rq as usize) = DESC_F_NEXT;
         *desc_next(req_page, rq as usize) = rs;
         *desc_addr(req_page, rs as usize) = CTRL_RESP.as_ptr() as usize as u64;
         *desc_len(req_page, rs as usize) = resp_len as u32;
@@ -393,8 +398,26 @@ fn ctl_send(req: &[u8], resp_len: usize) -> Option<u32> {
                     free_desc(&mut CTRL_FREE_HEAD, req_page, rs);
                     // 设备写入的响应：作废缓存后读取
                     dcache_invalidate(CTRL_RESP.as_ptr() as usize, resp_len);
+                    // [debug] used ring 完成项转储（优化轮 021：响应全零
+                    // 根因定位——len=0 ⇒ 设备未写响应；resp 首字同打）。
+                    crate::kinfo! {
+                        crate::uart_send_str("[vsnd] ctl 完成: id=");
+                        crate::print_dec(id as u64);
+                        crate::uart_send_str(" len=");
+                        crate::print_dec(used_len(req_page, (CTRL_USED_SEEN.wrapping_sub(1) % QUEUE_SIZE as u16) as usize) as u64);
+                        crate::uart_send_str(" resp0=");
+                        crate::print_hex(u32::from_le_bytes([
+                            CTRL_RESP[0], CTRL_RESP[1], CTRL_RESP[2], CTRL_RESP[3],
+                        ]) as u64);
+                        crate::uart_send_str("\n");
+                    }
+                    // 响应头（规范 virtio_snd_hdr）：code(4，OK 响应置
+                    // 0x8000_0000 高位) + status(4)。状态取 [4..8]。
+                    if resp_len < 8 {
+                        return None;
+                    }
                     let st = u32::from_le_bytes([
-                        CTRL_RESP[0], CTRL_RESP[1], CTRL_RESP[2], CTRL_RESP[3],
+                        CTRL_RESP[4], CTRL_RESP[5], CTRL_RESP[6], CTRL_RESP[7],
                     ]);
                     return Some(st);
                 }
@@ -418,7 +441,7 @@ fn ctl_simple(code: u32) -> Option<u32> {
     let mut req = [0u8; 8];
     req[..4].copy_from_slice(&code.to_le_bytes());
     req[4..8].copy_from_slice(&STREAM_ID.to_le_bytes());
-    ctl_send(&req, 4)
+    ctl_send(&req, 8)
 }
 
 // ==================== 控制消息构造 ====================
@@ -434,7 +457,7 @@ fn pcm_info(id: u32, info: &mut [u8; 32]) -> Option<u32> {
         (req.add(12) as *mut u32).write_volatile(32u32.to_le());
     }
     // 响应 = 状态头(4B) + 32B pcm_info 负载；设备校验 in_sg ≥ 4 + 32 = 36。
-    let st = ctl_send(&unsafe { CTRL_REQ }[..16], 36)?;
+    let st = ctl_send(&unsafe { CTRL_REQ }[..16], 40)?;
     // [debug] PCM_INFO 原始响应前 40 字节（优化轮 020：修码后告警归零
     // 但负载仍全零，dump 定位响应头布局/描述符管道）。
     crate::kinfo! {
@@ -446,7 +469,7 @@ fn pcm_info(id: u32, info: &mut [u8; 32]) -> Option<u32> {
         crate::uart_send_str("\n");
     }
     unsafe {
-        info.copy_from_slice(&CTRL_RESP[4..36]);
+        info.copy_from_slice(&CTRL_RESP[8..40]);
     }
     Some(st)
 }
@@ -481,7 +504,7 @@ fn pcm_set_params(
             *req.add(i) = 0;
         }
     }
-    ctl_send(&unsafe { CTRL_REQ }[..32], 4)
+    ctl_send(&unsafe { CTRL_REQ }[..32], 8)
 }
 
 // ==================== 设备初始化 ====================
@@ -794,11 +817,11 @@ free_desc(&mut TX_FREE_HEAD, TX_RING, h as u16);
         // ---- 三描述符链 ----
         *desc_addr(TX_RING, h as usize) = buf as u64;
         *desc_len(TX_RING, h as usize) = TX_HDR_BYTES as u32;
-        *desc_flags(TX_RING, h as usize) = 0;
+        *desc_flags(TX_RING, h as usize) = DESC_F_NEXT;
         *desc_next(TX_RING, h as usize) = d;
         *desc_addr(TX_RING, d as usize) = (buf + TX_HDR_BYTES) as u64;
         *desc_len(TX_RING, d as usize) = CHUNK_BYTES as u32;
-        *desc_flags(TX_RING, d as usize) = 0;
+        *desc_flags(TX_RING, d as usize) = DESC_F_NEXT;
         *desc_next(TX_RING, d as usize) = s;
         *desc_addr(TX_RING, s as usize) = (buf + TX_HDR_BYTES + CHUNK_BYTES) as u64;
         *desc_len(TX_RING, s as usize) = TX_STATUS_BYTES as u32;
