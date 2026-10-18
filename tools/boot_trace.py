@@ -119,7 +119,7 @@ def frame(kind, x=0, y=0):
     return bytes((0xAA, kind, x & 0xFF, x >> 8, y & 0xFF, y >> 8))
 
 
-def tap(x, y, hold=0.12):
+def tap(x, y, hold=0.06):
     infd = os.open(PIPE + ".in", os.O_WRONLY)
     os.write(infd, frame(0x01, x, y))
     time.sleep(hold)
@@ -187,9 +187,9 @@ def main():
                 if cur != last_step:
                     last_step = cur
                     step_t = time.time()
-                if time.time() - step_t < 7:
+                if time.time() - step_t < 8:
                     tap(465, 925)
-                    time.sleep(1.8)
+                    time.sleep(0.8)
                 else:
                     time.sleep(1.0)
         # 桌面 [perf] 采集窗口

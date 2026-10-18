@@ -4184,6 +4184,19 @@ static mut ANY_INPUT_RECENT: bool = false;
 /// 回车键或返回按钮按下时返回 true，并把动作写入 ev。无论结果如何都消费该事件
 /// （剩余字节前移，EV_LEN -= 24），保证连续事件流不被重复解析。
 unsafe fn consume_input_event(ev: &mut InputEvent) -> bool {
+    // 纵深防御（优化轮 017，点击风暴 PANIC 根治）：调用方门控 EV_LEN>=24
+    // 数学上恒成立（读侧按 24 倍数增减、缓冲 64B），但实测风暴下 EV_LEN
+    // 仍出现越界（污染源待证——疑似旁路 .bss 写坏）。入口再门控 + 越界
+    // 自愈复位，把崩溃降级为可自愈的丢事件；触发时打印标记保留可观测性。
+    if EV_LEN < 24 {
+        print("[oobe] EV 防护: EV_LEN 下溢复位\n");
+        EV_LEN = 0;
+        return false;
+    }
+    if EV_LEN > EV_BUF.len() {
+        print("[oobe] EV 防护: EV_LEN 越界复位\n");
+        EV_LEN = EV_BUF.len() - (EV_BUF.len() % 24);
+    }
     let buf = &EV_BUF[..24];
     let etype = u16::from_le_bytes([buf[16], buf[17]]) as usize;
     let code = u16::from_le_bytes([buf[18], buf[19]]) as usize;
@@ -4290,8 +4303,8 @@ unsafe fn consume_input_event(ev: &mut InputEvent) -> bool {
         }
     }
 
-    // 消费已解析的 24 字节，剩余字节前移。
-    let rest = EV_LEN - 24;
+    // 消费已解析的 24 字节，剩余字节前移（钳制到缓冲界内，防御性）。
+    let rest = (EV_LEN - 24).min(EV_BUF.len() - 24);
     for i in 0..rest {
         EV_BUF[i] = EV_BUF[24 + i];
     }
@@ -4336,7 +4349,8 @@ fn read_input_event(ev: &mut InputEvent) -> bool {
             if (n as isize) <= 0 {
                 return false; // 无数据（非阻塞 EAGAIN）或读失败
             }
-            EV_LEN += n;
+            // 防御性钳制：内核返回受 space 约束，此处再钳一层防旁路污染。
+            EV_LEN = (EV_LEN + n as usize).min(EV_BUF.len());
             unsafe { ANY_INPUT_RECENT = true; }
         }
     }
