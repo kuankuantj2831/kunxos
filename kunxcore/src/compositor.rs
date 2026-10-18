@@ -615,6 +615,16 @@ pub fn fb_damage(rects: &[Rect]) {
     }
 }
 
+/// [perf] 最近一次 fb_present 各阶段耗时（µs）：元数据+stage2 拷贝 /
+/// 阶段3 补拷+覆盖窗口合成 / present（overlay+缓存行 clean+页翻转）。
+/// anim::perf_test 读取做耗时分解，定位与脏区面积无关的整屏级成本。
+pub static mut STAGE_US: (u64, u64, u64) = (0, 0, 0);
+
+/// 读取最近一次 fb_present 的阶段耗时分解（µs）。
+pub fn last_stage_us() -> (u64, u64, u64) {
+    unsafe { STAGE_US }
+}
+
 /// 应用请求呈现（`FBIO_PRESENT`）：脏区拷贝 + 覆盖窗口合成 + 页翻转。
 ///
 /// 三阶段结构（关中断窗口只覆盖元数据与提交，像素搬运在开放 IRQ 下进行）：
@@ -666,14 +676,22 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         // 加深），窗口移走后旧位置残留到应用恰好重绘该区域为止。
         let mut copy: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
         let mut copy_count = 0usize;
+        // 本帧新变更集（应用脏区 ∪ 本帧内核失效区）：下一帧的 prev_app 取
+        // 此快照而非历史拷贝并集——累积并集只增不减，一次整屏事件（窗口
+        // 销毁/页面切换）后每帧都被锁死为整屏拷贝（perftest 实测局部脏区
+        // 与整屏 meta+copy 同为 ~827µs 的根因）。
+        let mut newd: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
+        let mut newd_count = 0usize;
         for i in 0..C.prev_app_count {
             merge_rect(&mut copy, &mut copy_count, C.prev_app[i]);
         }
         for i in 0..C.app_dirty_count {
             merge_rect(&mut copy, &mut copy_count, C.app_dirty[i]);
+            merge_rect(&mut newd, &mut newd_count, C.app_dirty[i]);
         }
         for i in 0..C.dirty_count {
             merge_rect(&mut copy, &mut copy_count, C.dirty[i]);
+            merge_rect(&mut newd, &mut newd_count, C.dirty[i]);
         }
         // 合成区 = 拷贝区 ∪ 内核失效区（窗口动画等）
         let mut comp: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
@@ -710,6 +728,7 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         for i in 0..C.dirty_count {
             copy_rect_pixels(canvas, back, C.dirty[i], cw);
             merge_rect(&mut copy, &mut copy_count, C.dirty[i]);
+            merge_rect(&mut newd, &mut newd_count, C.dirty[i]);
         }
         for i in 0..copy_count {
             merge_rect(&mut comp, &mut comp_count, copy[i]);
@@ -718,14 +737,17 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         C.dirty_count = comp_count;
         C.dirty[..comp_count].copy_from_slice(&comp[..comp_count]);
         composite_locked();
-        // ★ prev_app 必须覆盖本帧实际写入 back 的全部区域（拷贝区 ∪ 阶段 2
-        // 新增失效区）：present() 交换 front/back 后，下一次呈现写入的 back
-        // 是 2 帧前的旧缓冲，2 帧并集负责补齐这两帧间的全部变化。清空
-        // prev_app 会让 back 的陈旧区域被整缓冲翻转到扫描输出（ramfb 指向
-        // 整个 back），表现为全屏闪烁/光标周围残影。
-        C.prev_app_count = copy_count;
-        C.prev_app[..copy_count].copy_from_slice(&copy[..copy_count]);
+        // ★ prev_app 只取「本帧新变更」（上面维护的 newd = 应用脏区 ∪ 本帧
+        // 内核失效区），维持 2 帧并集语义：present() 交换后下一次呈现写入的
+        // back 是 2 帧前的旧缓冲，dirty_{N-1} ∪ dirty_N 恰好补齐这两帧间的
+        // 全部变化；更早的变更已存在于该缓冲（清空 prev_app 才会全屏闪烁/
+        // 光标残影）。累积历史并集则会把一次整屏事件放大为永久整屏拷贝。
+        C.prev_app_count = newd_count;
+        C.prev_app[..newd_count].copy_from_slice(&newd[..newd_count]);
+        let t4 = crate::timer::now_us();
         present();
+        let t5 = crate::timer::now_us();
+        STAGE_US = (t3 - t0, t4 - t3, t5 - t4);
         BUSY_TID = 0;
         // [perf] 总耗时 + 关中断临界区耗时（元数据/提交阶段不含像素搬运，
         // 即 IRQ 被屏蔽的实际时长）

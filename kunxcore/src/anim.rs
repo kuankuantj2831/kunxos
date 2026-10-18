@@ -1040,6 +1040,7 @@ pub fn perf_test() {
 
     // ---- A. 局部脏区（320×200 移动矩形，模拟时钟/通知/拖动） ----
     let mut stats_a = PerfStats::new();
+    let mut st_a = (0u64, 0u64, 0u64);
     let mut x = 30i32;
     for _ in 0..120 {
         let old = compositor::Rect::new(x - 3, 220, 320, 200);
@@ -1051,23 +1052,46 @@ pub fn perf_test() {
         compositor::fb_present(&[old, new]);
         let t1 = timer::now_us();
         stats_a.record(t1, t1 - t0);
+        let (c, k, p) = compositor::last_stage_us();
+        st_a.0 += c;
+        st_a.1 += k;
+        st_a.2 += p;
         x += 3;
         if x as u32 + 320 >= sw {
             x = 30;
         }
     }
     perf_report("A/local-dirty-320x200", &stats_a);
+    uart(" [anim-perf] A/stage-us meta+copy=");
+    crate::print_dec(st_a.0 / 120);
+    uart(" comp=");
+    crate::print_dec(st_a.1 / 120);
+    uart(" present=");
+    crate::print_dec(st_a.2 / 120);
+    uart("us/帧\n");
 
     // ---- B. 整屏脏区（最坏情况：整帧重绘） ----
     let mut stats_b = PerfStats::new();
+    let mut st_b = (0u64, 0u64, 0u64);
     for f in 0..60 {
         fill_canvas_frame(f);
         let t0 = timer::now_us();
         compositor::fb_present(&[compositor::fb_full_rect()]);
         let t1 = timer::now_us();
         stats_b.record(t1, t1 - t0);
+        let (c, k, p) = compositor::last_stage_us();
+        st_b.0 += c;
+        st_b.1 += k;
+        st_b.2 += p;
     }
     perf_report("B/full-screen", &stats_b);
+    uart(" [anim-perf] B/stage-us meta+copy=");
+    crate::print_dec(st_b.0 / 60);
+    uart(" comp=");
+    crate::print_dec(st_b.1 / 60);
+    uart(" present=");
+    crate::print_dec(st_b.2 / 60);
+    uart("us/帧\n");
 
     // ---- C. 内核覆盖窗口 alpha 混合（Home Indicator 式 overlay） ----
     let ov = compositor::create_window(30, 30, 200, 200, i32::MAX, 128);
