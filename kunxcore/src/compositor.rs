@@ -759,6 +759,25 @@ fn copy_rect_pixels(src: *mut u32, dst: *mut u32, r: Rect, width: usize) {
     }
 }
 
+/// [perf] 行拷贝对齐基线（anim::perf_test 场景 D）：同一矩形在指定 x0 下
+/// canvas→back 逐行拷贝 `iters` 次的平均单次耗时（µs）。奇 x0 的行首为
+/// ≡4 (mod 8) 形态：用于监控 memcpy 前置 4 字节对齐宽通道是否生效——生效时
+/// 奇 x0 ≈ 偶 x0；退化字节循环时奇 x0 耗时数倍于偶 x0。
+pub fn bench_row_copy(x0: i32, w: u32, h: u32, iters: u32) -> u64 {
+    unsafe {
+        if C.width == 0 {
+            return 0;
+        }
+        let r = Rect::new(x0, 100, w, h);
+        let t0 = crate::timer::now_us();
+        for _ in 0..iters {
+            copy_rect_pixels(C.canvas, C.back, r, C.width as usize);
+        }
+        let t1 = crate::timer::now_us();
+        (t1 - t0) / iters as u64
+    }
+}
+
 /// 创建窗口，返回窗口 id（失败返回 usize::MAX）。
 pub fn create_window(x: i32, y: i32, w: u32, h: u32, z: i32, alpha: u8) -> usize {
     let id = (0..MAX_WINDOWS).find(|&i| unsafe { !C.windows[i].active });

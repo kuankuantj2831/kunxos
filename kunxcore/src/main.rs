@@ -24,6 +24,14 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
     let mut d = dest as usize;
     let mut s = src as usize;
     let end = d.saturating_add(n);
+    // 前置对齐：两端同为 ≡4 (mod 8)（GUI 脏区行拷贝在奇数 x 像素时的典型形态，
+    // 合成器 copy_rect_pixels 行首 (y*stride+x)*4）时，先按 4 字节字对齐一次，
+    // 两端随即同时 8 对齐，整段行拷贝得以进入宽通道而非退化字节循环。
+    if (d & 7) == 4 && (s & 7) == 4 && end.saturating_sub(d) >= 4 {
+        *((d) as *mut u32) = *((s) as *const u32);
+        d += 4;
+        s += 4;
+    }
     // 两端 8 字节对齐：每迭代 16B（2×ld + 2×sd，减半循环开销；无向量
     // 扩展时这是基础 ISA 的拷贝极限）
     if (d & 7) == 0 && (s & 7) == 0 {

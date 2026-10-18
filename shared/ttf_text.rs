@@ -18,6 +18,13 @@ unsafe fn wide_copy(dest: *mut u8, src: *const u8, n: usize) {
     let mut d = dest as usize;
     let mut s = src as usize;
     let end = d.saturating_add(n);
+    // 前置对齐：两端同为 ≡4 (mod 8)（奇数 x 像素的行段拷贝形态）先拷一个
+    // 4 字节字，两端随即同时 8 对齐进入宽通道（与内核 memcpy 同款）。
+    if (d & 7) == 4 && (s & 7) == 4 && end.saturating_sub(d) >= 4 {
+        (d as *mut u32).write_volatile((s as *const u32).read_volatile());
+        d += 4;
+        s += 4;
+    }
     if (d & 7) == 0 && (s & 7) == 0 {
         while end.saturating_sub(d) >= 16 {
             asm!(

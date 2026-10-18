@@ -1096,6 +1096,20 @@ pub fn perf_test() {
         uart(" [anim-perf] 叠加窗口创建失败，跳过叠加测试\n");
     }
 
+    // ---- D. 行拷贝对齐基线：同一 320×200 矩形在偶/奇 x0 下的纯拷贝耗时 ----
+    // 奇 x0 → 行首 ≡4 (mod 8)：memcpy 前置 4 字节对齐宽通道生效时 D-odd ≈
+    // D-even；若退化为字节循环则 D-odd 数倍于 D-even（脏区 x 为奇数像素的
+    // 光标/局部更新正是此形态）。
+    let d_even = compositor::bench_row_copy(64, 320, 200, 50);
+    let d_odd = compositor::bench_row_copy(65, 320, 200, 50);
+    uart(" [anim-perf] D/row-copy-320x200 even-x0=");
+    crate::print_dec(d_even);
+    uart("us odd-x0=");
+    crate::print_dec(d_odd);
+    uart("us odd/even=");
+    crate::print_dec(if d_even == 0 { 0 } else { d_odd * 100 / d_even });
+    uart("%\n");
+
     // ---- 汇总：1080p 外推 + 判定 ----
     let n_b = stats_b.count.max(1);
     let full_avg = stats_b.render_sum / n_b as u64;
