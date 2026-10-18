@@ -376,10 +376,12 @@ fn user_ok_writable(addr: u64, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if !process::ensure_user_range_writable(addr as usize, len) {
-        return false;
-    }
-    vm::user_range_mapped(process::current_root(), addr as usize, len)
+    // ensure_user_range_writable 内部已按页做 user_range_mapped（含
+    // SHM/共享映射的 PTE 漫游放行）并完成 LAZY 落地/COW break/只读改写，
+    // 成功即保证「已映射且可写」——此处此前再跑一遍全量 user_range_mapped
+    // 是纯冗余的第二轮记录表线性扫描（clock_gettime 实测 ~27µs 的大头，
+    // 记录数大的进程更甚），删。
+    process::ensure_user_range_writable(addr as usize, len)
 }
 
 unsafe fn copy_from_user(src: u64, dst: &mut [u8]) -> usize {
@@ -2885,10 +2887,13 @@ fn sys_clock_gettime(f: &mut TrapFrame) -> i64 {
         } else {
             now_usec()
         };
-        // PAN 放行（同 sys_gettimeofday）
+        // PAN 放行 + 16B 一次直写（原两次 write_u64_to_user 各带一对
+        // uaccess 开关；校验已由 user_ok_writable 完成，这里纯写）。
         unsafe {
-            write_u64_to_user(tp, (us / 1_000_000) as u64);
-            write_u64_to_user(tp + 8, ((us % 1_000_000) * 1000) as u64);
+            crate::mmu::uaccess_begin();
+            *(tp as *mut u64) = (us / 1_000_000) as u64;
+            *((tp + 8) as *mut u64) = ((us % 1_000_000) * 1000) as u64;
+            crate::mmu::uaccess_end();
         }
     }
     0
