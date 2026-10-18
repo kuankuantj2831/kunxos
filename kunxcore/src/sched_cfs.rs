@@ -1277,6 +1277,15 @@ pub fn sleep_until(deadline_us: u64) {
     }
     sched_unlock();
     if registered {
+        // ★ 精确睡眠补全：登记成功后立即把物理定时器重编程到「时间片剩余
+        // 与最近睡眠截止」的较早者。此前只登记不重编程，硬件仍指向旧到期
+        // 点（最远 10ms 外），唤醒只能等下一次定时器中断兑现 → nanosleep
+        // 实际精度被量化到 10ms（全系统帧循环 ~100fps 上限的根源）。
+        // 此处中断仍处于屏蔽态（上方 csrci 尚未恢复），与定时器 IRQ 的
+        // reload 重编程天然互斥；program() 取 ch1/ch2 较早者，不会覆盖
+        // 更早的动画通道到期。tick() 对提前到期的处理已就绪（只唤醒
+        // 任务、不提前累加 vruntime，时间片语义不变）。
+        timer::timer_set_interval(next_timer_interval_us());
         block_current();
         // 醒来后清掉本任务可能残留的睡眠槽位：提前唤醒（IPC/设备）时 tick
         // 不消费槽位（目标非 Blocked），由这里自清，防槽位泄漏或过期唤醒。

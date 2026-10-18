@@ -2843,6 +2843,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
     let ny = NAV_Y;
     let t0 = mono_us();
     let mut nav_snap_ok = false;
+    let mut frames: u32 = 0;
     loop {
         let el = mono_us().saturating_sub(t0);
         let t = (el as f32 / TRANS_DUR_US as f32).min(1.0);
@@ -2862,32 +2863,33 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
         // 预乘 257 后 >>16 近似 /255（误差 ≤1）；② 末帧 ea=255 直写新页
         // 免混合；③ sy 越界行 oldc==newc 也免混合直写。
         if ea >= 255 {
+            // 末帧：新页整行 memcpy 直写（宽通道），免逐像素
             for y in 0..ny {
                 let sy = y + off;
                 if sy < 0 || sy >= ny {
                     continue;
                 }
-                let src = sy as usize * DISPLAY_W;
-                let dst = unsafe { FB_PTR as usize + y as usize * FB_STRIDE_PX * 4 };
-                let dst = dst as *mut u32;
-                for x in 0..DISPLAY_W {
-                    unsafe { *dst.add(x) = BACK_BUF[src + x] };
-                }
+                let src = unsafe { BACK_BUF.as_ptr().add(sy as usize * DISPLAY_W) };
+                let dst = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, DISPLAY_W) };
             }
         } else {
+            // 混合路径：dst 行指针提外（免每像素 fb_set_px 调用与边界检查；
+            // x∈[0,DISPLAY_W)、y∈[0,ny) 循环边界已保证在屏内）
             for y in 0..ny {
                 let sy = y + off;
                 let in_range = sy >= 0 && sy < ny;
-                for x in 0..DISPLAY_W as i32 {
-                    let i = y as usize * DISPLAY_W + x as usize;
+                let dst_row = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
+                for x in 0..DISPLAY_W as usize {
+                    let i = y as usize * DISPLAY_W + x;
                     let oldc = unsafe { PREV_BUF[i] };
                     let newc = if in_range {
-                        unsafe { BACK_BUF[sy as usize * DISPLAY_W + x as usize] }
+                        unsafe { BACK_BUF[sy as usize * DISPLAY_W + x] }
                     } else {
                         oldc
                     };
                     if oldc == newc || ea == 0 {
-                        fb_set_px(x, y, oldc);
+                        unsafe { *dst_row.add(x) = oldc };
                         continue;
                     }
                     // 近似混合：((v*t + n*inv) * 257) >> 16 ≈ /255
@@ -2897,7 +2899,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
                     let r = ((ar * inv + cr * ea) * 257) >> 16;
                     let g = ((br_ * inv + cg * ea) * 257) >> 16;
                     let b = ((ab * inv + cb * ea) * 257) >> 16;
-                    fb_set_px(x, y, (r << 16) | (g << 8) | b);
+                    unsafe { *dst_row.add(x) = (r << 16) | (g << 8) | b };
                 }
             }
         }
@@ -2924,18 +2926,27 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             }
             draw_progress_anim(to, e);
         }
+        // 导航区尾拷贝：整行 memcpy（宽通道），免逐像素 fb_set_px
         for y in ny..DISPLAY_H as i32 {
-            for x in 0..DISPLAY_W as i32 {
-                fb_set_px(x, y, unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] });
-            }
+            let src = unsafe { BACK_BUF.as_ptr().add(y as usize * DISPLAY_W) };
+            let dst = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
+            unsafe { core::ptr::copy_nonoverlapping(src, dst, DISPLAY_W) };
         }
         present_fb();
+        frames += 1;
         pump_input_during_anim();
         // ★ 退出条件（此前改真实时间推进时漏加 → 转场死循环：OOBE 卡死、输入停摆指针消失）
         if t >= 1.0 {
             break;
         }
     }
+    // [perf] 转场帧率诊断（160ms 固定时长 → 帧数即帧率）
+    let el_ms = (mono_us().saturating_sub(t0) / 1_000) as usize;
+    print("[oobe] 转场 ");
+    print_dec(frames as usize);
+    print(" 帧 / ");
+    print_dec(el_ms);
+    print("ms\n");
     render_and_flip();
 }
 
