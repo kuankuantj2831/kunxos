@@ -2142,14 +2142,24 @@ pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
     true
 }
 
-/// 单次线性查找当前进程 `page` 的记录，返回 (下标, 记录)。
+/// 查找当前进程 `page` 的记录，返回 (下标, 记录)。
+///
+/// 单槽位置缓存快路径（优化轮 033）：热模式是同一页反复校验（如
+/// clock_gettime 恒写同一下栈页）——缓存最近命中下标，命中时现读记录
+/// 复核（界内 + vaddr 相等，自证式：换位删除/截断/清表自然失效），
+/// 大进程（500+ 记录）免 O(n) 全表扫描；未命中退全表并回填。
 fn lookup_page_idx(page: usize) -> Option<(usize, vm::UserPage)> {
     let pid = current_pid();
     unsafe {
-        let pt = &PROCESSES[pid as usize].pt;
+        let pt = &mut PROCESSES[pid as usize].pt;
+        let ci = pt.cache_idx;
+        if ci < pt.count && pt.user_pages[ci].vaddr == page {
+            return Some((ci, pt.user_pages[ci]));
+        }
         for i in 0..pt.count {
             let r = pt.user_pages[i];
             if r.vaddr == page {
+                pt.cache_idx = i;
                 return Some((i, r));
             }
         }

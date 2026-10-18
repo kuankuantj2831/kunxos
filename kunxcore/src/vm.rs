@@ -365,6 +365,11 @@ pub struct ProcPageTable {
     pub ttbr0: PhysAddr,
     pub user_pages: Pages,
     pub count: usize,
+    /// 单槽位置缓存（自证式，优化轮 033）：记录表 vaddr→idx 的最近命中。
+    /// 命中时现读记录复核（idx<count 且 vaddr 相等）——追加不迁移既有
+    /// 记录；换位删除/截断/清表破坏复核即自然失效退回全表扫描；
+    /// flags/paddr 每次从记录现读，永不陈旧。usize::MAX = 冷缓存。
+    pub cache_idx: usize,
 }
 
 /// 用户映射记录数组（`[UserPage; MAX_USER_PAGES]`，约 1.5MB）的堆承载。
@@ -442,7 +447,8 @@ impl ProcPageTable {
     pub const fn empty() -> Self {
         ProcPageTable {
             ttbr0: 0,
-            user_pages: Pages::NONE,
+            cache_idx: usize::MAX,
+        user_pages: Pages::NONE,
             count: 0,
         }
     }
