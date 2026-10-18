@@ -539,6 +539,27 @@ impl ProcPageTable {
         true
     }
 
+    /// 查找 vaddr 的既有登记（非 LAZY，已落地映射），返回 (下标, 记录)。
+    ///
+    /// ELF 装载器段边界共享页检测用：LLD 未页对齐的数据段可落进前段页，
+    /// 二次 add_page 会覆盖 PTE 丢执行位并产生同 VA 双记录。
+    pub fn find_mapped_page(&self, vaddr: VirtAddr) -> Option<(usize, UserPage)> {
+        for i in 0..self.count {
+            let r = self.user_pages[i];
+            if r.vaddr == vaddr && r.paddr != LAZY_PAGE {
+                return Some((i, r));
+            }
+        }
+        None
+    }
+
+    /// 原位更新第 idx 条记录的权限（配合 find_mapped_page 的共享页并入）。
+    pub fn set_page_flags(&mut self, idx: usize, flags: MapFlags) {
+        if idx < self.count {
+            self.user_pages[idx].flags = flags;
+        }
+    }
+
     /// 预留 `vaddr` 一页（按需分页）：仅记录地址空间占用，**不分配物理页、
     /// 不建页表映射**，记录 `paddr = LAZY_PAGE` 作标记。
     ///

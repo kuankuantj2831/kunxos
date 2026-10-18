@@ -331,6 +331,40 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
                 let mut va = start;
                 for i in 0..seg_pages {
                     let pa = base + i * vm::PAGE_SIZE;
+                    // ★ 段边界共享页（LLD 未页对齐数据段落进前段页，如
+                    // busybox text 0x400000..0x400876 + data 0x400876）：
+                    // 并入既有帧 + 权限并集 + PTE 重映射。此前二次 add_page
+                    // 用本段 PTE 覆盖前段（丢执行位 → 入口取指失败且
+                    // mapped=1）并追加同 VA 双记录（退出双释放），且新帧
+                    // 清零会抹掉前段已拷内容。
+                    if let Some((j, r)) = pt.find_mapped_page(va) {
+                        let copy_start = p_vaddr.max(va);
+                        let copy_end = file_end.min(va + vm::PAGE_SIZE);
+                        if copy_start < copy_end {
+                            let file_off = p_offset + (copy_start - p_vaddr);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    data.as_ptr().add(file_off),
+                                    (r.paddr + (copy_start - va)) as *mut u8,
+                                    copy_end - copy_start,
+                                );
+                            }
+                        }
+                        // 权限并集：两段各自合法（W^X 校验按段），共享页
+                        // 须同时满足两段访问权（Linux 同款语义）。
+                        let merged = r.flags | flags;
+                        if !vm::map_page_in(pt.ttbr0, va, r.paddr, merged) {
+                            for k in i..seg_pages {
+                                allocator::free_page(base + k * vm::PAGE_SIZE);
+                            }
+                            fail!();
+                        }
+                        pt.set_page_flags(j, merged);
+                        allocator::free_page(pa);
+                        mapped += 1;
+                        va += vm::PAGE_SIZE;
+                        continue;
+                    }
                     if vm::is_user_ro(flags) {
                         allocator::mark_shared_page(pa);
                     }
@@ -351,6 +385,29 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
                 // 回退：逐页分配 + 逐页拷贝（保持原语义）
                 let mut va = start;
                 while va < end {
+                    // ★ 段边界共享页：同块路径（见上），逐页路径无需分配。
+                    if let Some((j, r)) = pt.find_mapped_page(va) {
+                        let copy_start = p_vaddr.max(va);
+                        let copy_end = file_end.min(va + vm::PAGE_SIZE);
+                        if copy_start < copy_end {
+                            let file_off = p_offset + (copy_start - p_vaddr);
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    data.as_ptr().add(file_off),
+                                    (r.paddr + (copy_start - va)) as *mut u8,
+                                    copy_end - copy_start,
+                                );
+                            }
+                        }
+                        let merged = r.flags | flags;
+                        if !vm::map_page_in(pt.ttbr0, va, r.paddr, merged) {
+                            fail!();
+                        }
+                        pt.set_page_flags(j, merged);
+                        mapped += 1;
+                        va += vm::PAGE_SIZE;
+                        continue;
+                    }
                     let pa = match allocator::alloc_page() {
                         Some(p) => p,
                         None => fail!(),
