@@ -164,25 +164,34 @@ def main():
         # 普通步点「下一步」(465,925)；密码/胁迫 PIN 步拒绝空输入，停手
         # 35s 等「30 秒无输入自动下一步」（与 app_open_shots.py 同款）。
         if not wait_for("[launcher] 桌面就绪", 30):
-            deadline = time.time() + 600
-            idle_until = 0.0
+            # 每步混合策略：先密集点「下一步」8s（按钮命中的步 4x 提速）；
+            # 步号未变则停手 ≥30s 让「30 秒无输入自动下一步」兜底——密集
+            # 点击会不断重置该空闲计时器，按钮落空的步会永久卡死（首两跑
+            # 卡在 3/13 的根因；兜底路径 rounds 2-5 已实证全覆盖 13 步）。
+            deadline = time.time() + 700
+            last_step = -1
+            step_t = time.time()
             while time.time() < deadline:
-                if "[launcher] 桌面就绪" in hits:
+                if "桌面就绪" in hits:
                     break
-                now = time.time()
-                if now < idle_until:
-                    time.sleep(1.0)
-                    continue
+                cur = -1
                 try:
                     with open(LOG, "rb") as f:
-                        tail = f.read()[-4000:]
+                        f.seek(-8192, os.SEEK_END)
+                        tail = f.read().decode(errors="replace")
+                    steps = re.findall(r"第 (\d+)/13 步", tail)
+                    if steps:
+                        cur = int(steps[-1])
                 except OSError:
-                    tail = b""
-                if "密码太短".encode() in tail:
-                    idle_until = now + 35
-                    continue
-                tap(465, 925)
-                time.sleep(0.8)
+                    pass
+                if cur != last_step:
+                    last_step = cur
+                    step_t = time.time()
+                if time.time() - step_t < 8:
+                    tap(465, 925)
+                    time.sleep(0.8)
+                else:
+                    time.sleep(1.0)
         # 桌面 [perf] 采集窗口
         t_perf0 = time.time()
         while time.time() - t_perf0 < PERF_SECS:
