@@ -104,29 +104,31 @@ const SND_R_PCM_STOP: u32 = 0x0105;
 #[allow(dead_code)]
 const SND_R_CHMAP_INFO: u32 = 0x0200;
 
-// ---- 响应状态码 ----
-const SND_S_OK: u32 = 0;
+// ---- 响应状态码（规范 virtio-snd：0x8000 段；实测 0x8000=OK 吻合）----
+const SND_S_OK: u32 = 0x8000;
 #[allow(dead_code)]
-const SND_S_BAD_MSG: u32 = 1;
-const SND_S_NOT_SUPP: u32 = 2;
-const SND_S_IO_ERR: u32 = 3;
+const SND_S_BAD_MSG: u32 = 0x8001;
+const SND_S_NOT_SUPP: u32 = 0x8002;
+const SND_S_IO_ERR: u32 = 0x8003;
 
 // ---- PCM 能力位图（formats / rates） ----
-/// S16 格式位（formats 位图 bit2）。
-const FMT_S16: u64 = 1 << 2;
+/// S16 格式位（formats 位图 bit3；枚举：0=IMAP,1=AC3,2=MPEG,3=S16,...
+/// 实测 QEMU 位图 0xe0078 的 bits3-6 连续段起点）。
+const FMT_S16: u64 = 1 << 3;
 /// 32bit 格式位（formats 位图 bit4，96k/24bit 扩展预留）。
 #[allow(dead_code)]
 const FMT_S32: u64 = 1 << 4;
-/// 48kHz 采样率位（rates 位图 bit6）。
-const RATE_48000: u64 = 1 << 6;
+/// 48kHz 采样率位（rates 枚举：5512,8000,11025,16000,22050,32000,44100,
+/// 48000 → index 7）。
+const RATE_48000: u64 = 1 << 7;
 /// 96kHz 采样率位（rates 位图 bit9）。
 #[allow(dead_code)]
 const RATE_96000: u64 = 1 << 9;
 
-/// set_params 中 format 字段的枚举下标（S16 = 2）。
-const FMT_IDX_S16: u8 = 2;
-/// set_params 中 rate 字段的枚举下标（48000 = 6）。
-const RATE_IDX_48000: u8 = 6;
+/// set_params 中 format 字段的枚举下标（S16 = 3）。
+const FMT_IDX_S16: u8 = 3;
+/// set_params 中 rate 字段的枚举下标（48000 = 7）。
+const RATE_IDX_48000: u8 = 7;
 
 // ---- 流参数（与 audio 核心一致） ----
 /// 每周期字节数（10ms @ 48kHz，见 crate::audio）。
@@ -411,13 +413,13 @@ fn ctl_send(req: &[u8], resp_len: usize) -> Option<u32> {
                         ]) as u64);
                         crate::uart_send_str("\n");
                     }
-                    // 响应头（规范 virtio_snd_hdr）：code(4，OK 响应置
-                    // 0x8000_0000 高位) + status(4)。状态取 [4..8]。
-                    if resp_len < 8 {
+                    // 响应头（规范 virtio_snd_hdr，QEMU 实证）：单 le32
+                    // 状态码（0x8000_0000 段），载荷紧随其后从 [4..] 开始。
+                    if resp_len < 4 {
                         return None;
                     }
                     let st = u32::from_le_bytes([
-                        CTRL_RESP[4], CTRL_RESP[5], CTRL_RESP[6], CTRL_RESP[7],
+                        CTRL_RESP[0], CTRL_RESP[1], CTRL_RESP[2], CTRL_RESP[3],
                     ]);
                     return Some(st);
                 }
@@ -457,7 +459,7 @@ fn pcm_info(id: u32, info: &mut [u8; 32]) -> Option<u32> {
         (req.add(12) as *mut u32).write_volatile(32u32.to_le());
     }
     // 响应 = 状态头(4B) + 32B pcm_info 负载；设备校验 in_sg ≥ 4 + 32 = 36。
-    let st = ctl_send(&unsafe { CTRL_REQ }[..16], 40)?;
+    let st = ctl_send(&unsafe { CTRL_REQ }[..16], 36)?;
     // [debug] PCM_INFO 原始响应前 40 字节（优化轮 020：修码后告警归零
     // 但负载仍全零，dump 定位响应头布局/描述符管道）。
     crate::kinfo! {
@@ -469,7 +471,7 @@ fn pcm_info(id: u32, info: &mut [u8; 32]) -> Option<u32> {
         crate::uart_send_str("\n");
     }
     unsafe {
-        info.copy_from_slice(&CTRL_RESP[8..40]);
+        info.copy_from_slice(&CTRL_RESP[4..36]);
     }
     Some(st)
 }
@@ -485,22 +487,19 @@ fn pcm_set_params(
 ) -> Option<u32> {
     unsafe {
         let req = CTRL_REQ.as_mut_ptr();
-        // virtio_snd_pcm_set_params：pcm_hdr{code, stream_id}(8) + buffer(4) +
-        // period(4) + features(4) + channels(1) + padding(5) + format(1) + rate(1)
-        // + padding2(4) = 共 32 字节。code 必须在最前（当前 QEMU 校验消息长度恒为 32）。
+        // virtio_snd_pcm_set_params：pcm_hdr{code, stream_id}(8) + 16B 参数体 =
+        // buffer(4) + period(4) + features(4) + channels(1) + format(1) + rate(1)
+        // + padding(1)。规范三字节连续 @20/21/22——此前误将 format/rate 塞进
+        // padding 区 @26/27，QEMU 读到 format=0(IMAP) 即 NOT_SUPP（实测定位）。
         (req as *mut u32).write_volatile(SND_R_PCM_SET_PARAMS.to_le());
         (req.add(4) as *mut u32).write_volatile(stream_id.to_le());
         (req.add(8) as *mut u32).write_volatile(buffer_bytes.to_le());
         (req.add(12) as *mut u32).write_volatile(period_bytes.to_le());
         (req.add(16) as *mut u32).write_volatile(0u32.to_le()); // features
         *req.add(20) = channels;
-        // padding[5] @21..25（保持零）
-        for i in 21..26 {
-            *req.add(i) = 0;
-        }
-        *req.add(26) = format;
-        *req.add(27) = rate;
-        for i in 28..32 {
+        *req.add(21) = format;
+        *req.add(22) = rate;
+        for i in 23..32 {
             *req.add(i) = 0;
         }
     }
