@@ -239,7 +239,84 @@
 - 坑再证：make kernel 后测试标记若在内嵌 ramdisk 里，须重打包 ramdisk
   再 touch + make kernel（否则干净验证跑的是带标记内核）。
 
-### 第 9 轮（2026-10-18 07:0x，定时轮）
+## 最终交付总结（2026-10-18 08:0x，十小时收官）
+
+**总账**：本地 git 9 个工单提交（a871f8c..f4ab082，未 push）+ 主会话开工轮；
+每轮 kos 宿主全套（13 套件 98+ 测试）0 失败、make 0 错误、加固门 sfsrace
+（SFS-RACE + MAILBOX 双判定）全绿；收官 clean 全量重建 0 错误（36s）。
+
+### 一、修复的 bug（按严重度）
+
+1. **P0 数据丢失（第 7 轮发现/第 8 轮修复）**：`KosObject::to_bytes` 先算
+   CRC 后写 reserved——mtime 非零的对象头重挂载必 CrcMismatch，断点续传
+   完成一重启成果全丢；提交期 load_object 用内存 hdr 无回读校验故无感。
+   此前全测试时钟为 0 恰好掩盖。修复 + manifest/namespace/merkle 三处
+   同款潜伏顺序一并清剿。
+2. **P0 快速挂载九重防护丢失（第 3 轮）**：fast_mount 重写时九处
+   `return None;` 全丢成空 if 体——hint 过期/读失败/越界全被静默吞，头块
+   读失败后拿残 buffer 解析出错误对象。故障注入矩阵一跑现形，九处全恢复。
+3. **capacity 2TB 确定性失败（第 1 轮）**：persist_alloc_state 用懒截断的
+   free.len() 当池大小 → 位图持久化成截断版 + hint 块数错 → 永久回退
+   5 亿块全池扫描；且 bitmap_dirty 被 resize 短后高位分配越界 panic。
+   修复后 305s→7s。
+4. **MAILBOX 假失败（第 2 轮）**：sfsrace 认领退出检查只在 rename 失败
+   分支可达（管道被读者重建后 rename 恒成功）→ 哨兵收齐后空转到上限。
+   非内核回归；判定门补严防再漏。
+5. **内核 POSIX fd 表三重缺陷（第 1 轮）**：无锁（SMP 数据竞态）/无进程
+   归属（pid 复用拾鬼 fd）/退出泄漏。fs_lock + pid 绑定 + 64/进程上限 +
+   reap 兜底回收。
+6. **posix_lseek SEEK_END 失败拨 pos 到 EOF 外**（第 7 轮，E4）。
+
+### 二、错误处理与容错（用户核心诉求「报错了还能继续运行」）
+
+- **E1** `tests/fault.rs`（6 测试）：瞬时读/写/flush 故障全矩阵 + 永久死盘
+  ——全 API 零 panic、Err 全 Io、故障后服务连续、内容旧或新无脏第三态、
+  Full Merkle 重挂载一致、gc 故障存活对象不丢。
+- **E2** 内核降级状态机：syscall 480 注入；首个 I/O 失败 health 报
+  CRITICAL（系统继续运行）、恢复自动报 INFO。QEMU 持久卷实证 +
+  kostest FAULT-DEGRADE 阶段常驻回归。
+- **E3** 上传会话生命周期：60s 空闲自动回收、取消语义（主路径不存在但
+  会话残留 → 清会话返成功）、unlink 联动。`tests/upload_gc.rs` 3 场景。
+- 断电一致性由 crash.rs 全断点矩阵 + fast_mount 九重防护回退扫描背书。
+
+### 三、完全接入 KUNXOS（无缝复制等一系列功能）
+
+- **C1** 三向无缝复制：shell `cp` 零改造 SFS→KOS / KOS→SFS / KOS→KOS，
+  QEMU 实证 sha1 全一致，固化 `make test-kos-copy`（四哈希判定，幂等）。
+- **C2** 引擎级 `kos cp`：单锁零用户态往返；记录 16KB 流式、不可变对象
+  内容寻址天然去重；附 `kos df/du/mkdir`。
+- **C5** vfs stat/lstat 路由 /kos/：复制进目录拼 basename、`stat` 显示
+  类型/大小（坑：剥前缀补前导斜杠、尾斜杠归一）。
+- **C4** kosdemo fd 上限/释放回归（QEMU FD-CAP PASS）。
+- **C6** `docs/kos.md` 总文档：用法/内核接口表/故障模型/SFS 关系/测试地图。
+
+### 四、收官验证
+
+- clean 全量重建 0 错误（bootloader+内核+全部应用+服务+rootfs）
+- kos 13 套件 0 失败；sfsrace（双门）PASS；mailbox PASS；kos-copy PASS
+- GUI 带盘冒烟：见第 10 轮
+
+### 五、遗留（非阻塞，晨间决策）
+
+1. **S2** 断电矩阵扩展（「每代提交后 + 随机偏移」双维度）——crash.rs 已
+   覆盖工作负载断点，增量维度锦上添花。
+2. **S3** NoSpace 行为固化测试（写满卷：部分写无脏态、remount 计数正确）。
+3. **C3** files 应用浏览 /kos/（POSIX 桥就绪，差 readdir 路由验证）。
+4. gdbstub 软件单步仅顺序流（历史遗留）；SMP 实验特性（历史遗留）。
+5. kos 仓库存量 15 条预存警告（missing_docs 族，非本轮引入）。
+
+### 第 10 轮（2026-10-18 08:0x，收官轮）
+
+- **clean 全量重建**：make clean && make 全量（bootloader+内核+全部应用+
+  服务+rootfs 打包）0 错误（36s）。
+- **全测试矩阵**：kos 13 套件 0 失败；sfsrace（双判定门）PASS；mailbox
+  PASS；test-kos-copy 三向四哈希 PASS。
+- **GUI 带盘冒烟（ramfb + kos-disk 持久卷，8 分钟）**：0 PANIC / 0 fault；
+  `[kos] 持久对象存储卷已挂载`；OOBE 13 步 30s 空闲自动推进全走完 →
+  launcher 桌面就绪（21 应用、518400 px 已渲染、稳态 ~26ms/帧 ≈38fps，
+  perf 统计无异常尖峰模式）。
+- 收官状态：任务池 P0/P1（E1-E4）全部完成；C1/C2/C4/C5/C6 完成；M1
+  完成。遗留 S2/S3/C3 记入交付总结第五节。
 
 - **C4 完成**：kosdemo 新增 fd 上限/释放阶段（开 64 → 第 65 起拒绝且不
   panic → 全关 → 可再开）——第 1 轮 POSIX fd 表加固的 QEMU 级回归闭环。
