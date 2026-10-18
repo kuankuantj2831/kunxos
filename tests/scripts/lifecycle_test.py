@@ -5,29 +5,29 @@
 的阶段 A 依次验证（全部经 /data/life 文件信箱 + /proc/pressure 注入，确定性）：
 
   1. lifd/pushd 启动：/data/life 与 /data/push 目录可读
-  2. 应用登记：写 reg_<name> 内容 "<pid> FG" → lifd 日志 "registered ... FG"，
+  2. 应用登记：写 reg_<name> 内容 "<pid> FG" → lifd 日志「已登记 ... FG」，
      最近任务文件出现 "name pid R"
   3. 多应用切换（状态机）：
-     - 应用 A 后台化（SIGSTOP）→ lifd "background appA"、/proc/processes 中 A=T、
-       recents 中 A 状态 B
-     - 应用 B 恢复前台（SIGCONT）→ lifd "foreground appB"、/proc/processes 中 B=R、
-       recents 中 B 状态 R
-     - 再切回 A → "foreground appA"
+     - 应用 A 后台化（SIGSTOP）→ lifd「已转入后台 appA」、/proc/processes
+       中 A=T、recents 中 A 状态 B
+     - 应用 B 恢复前台（SIGCONT）→ lifd「已回前台 appB」、/proc/processes
+       中 B=R、recents 中 B 状态 R
+     - 再切回 A →「已回前台 appA」
   4. 后台任务白名单：
-     - BTASK 类型越界 → "bg task denied: unknown type"
-     - 每应用上限 2 → 第 3 个 "bg task denied: per-app limit"
-     - BTASK 3 300（下载 300ms）→ "bg task granted type=3"；~300ms 后
-       "bg task expired"，事件文件 evt_<pid> 含 BG_TASK_EXPIRED
-  5. 超时挂起：SET_TIMEOUT 800 → 后台且无任务的应用到期待 "suspend"，
+     - BTASK 类型越界 →「后台任务被拒: 未知类型」
+     - 每应用上限 2 → 第 3 个「后台任务被拒: 单应用数量已达上限」
+     - BTASK 3 400（下载）→「后台任务已授予 type=3」；到期
+       「后台任务已到期 pid=」，事件文件 evt_<pid> 含 BG_TASK_EXPIRED
+  5. 超时挂起：SET_TIMEOUT 800 → 后台且无任务的应用到期待「已挂起」，
      recents 中状态 S
   6. 内存压力注入与 LMK：
-     - `echo force 1 > /proc/pressure` → lifd "pressure Moderate"
-     - `echo force 2 > /proc/pressure` → lifd "pressure Critical" + "LMK: killing
-       score="，先杀最低分（Suspended）应用 → "terminated appA"（Running 永不杀）
-     - `echo clear > /proc/pressure` → "pressure Normal"
+     - `echo force 1 > /proc/pressure` → lifd「内存压力中等」
+     - `echo force 2 > /proc/pressure` → lifd「内存压力严重」+「LMK: 正在击杀
+       score=」，先杀最低分（Suspended）应用 →「已终止 appA」（Running 永不杀）
+     - `echo clear > /proc/pressure` →「内存压力正常」
   7. 推送（本地，经 pushd → lifd）：
-     - 对未登记 pid 投递 → lifd "notify dropped: app not registered"
-     - 对后台应用投递 → lifd "notify deferred"，/data/push/pending/<pid>
+     - 对未登记 pid 投递 → lifd「通知已丢弃: 应用未登记 pid=」
+     - 对后台应用投递 → lifd「通知已延迟 pid=」，/data/push/pending/<pid>
        落盘 NOTIFY；恢复前台时随 RESUME 补投 → evt_<pid> 含 "RESUME NOTIFY"
   8. 状态持久化：写 /data/state/sample.bin 再 cat 回读，内容一致
 
@@ -196,64 +196,66 @@ try:
     check("recents A R", cat_check("/data/life/recents", f"appA {pid_a} R", 3.0))
     check("reg B", register("appB", pid_b, "BG"))
 
-    # ---- 3. 多应用切换（状态机） ----
+    # ---- 3. 多应用切换（状态机）----
+    #（2026-10-18 标记刷新：lifd 文案已全面中文化，旧英文标记自架构切换后未跟进而假失败）
     check("BG A", cmd_to(pid_a, "BG"))
-    check("lifd background A", wait_for("lifd] background", 8.0))
+    check("lifd background A", wait_for("已转入后台 appA", 8.0))
     check("recents A B-state", cat_check("/data/life/recents", f"appA {pid_a} B", 3.0))
     check("proc stopped A", cat_until("/proc/processes", f"{pid_a}     T", 8.0))
     check("FG B", cmd_to(pid_a, f"FG {pid_b}"))
-    check("lifd foreground B", wait_for("lifd] foreground", 8.0))
+    check("lifd foreground B", wait_for("已回前台 appB", 8.0))
     check("recents B R-state", cat_check("/data/life/recents", f"appB {pid_b} R", 3.0))
     check("proc running B", cat_until("/proc/processes", f"{pid_b}     R", 8.0))
     check("FG A", cmd_to(pid_a, f"FG {pid_a}"))
-    check("lifd foreground A", wait_for("lifd] foreground", 8.0))
+    check("lifd foreground A", wait_for("已回前台 appA", 8.0))
 
     # ---- 4. 后台任务白名单 ----
-    check("BTASK bad type", cmd_to(pid_c, "BTASK 9 100"))
-    check("deny unknown type", wait_for("bg task denied: unknown type", 6.0))
-    check("BTASK A1", cmd_to(pid_a, "BTASK 1 60000"))
-    check("grant task A1", wait_for("bg task granted", 6.0))
-    check("BTASK A2", cmd_to(pid_a, "BTASK 2 60000"))
-    check("BTASK A3", cmd_to(pid_a, "BTASK 0 60000"))
-    check("deny per-app limit", wait_for("bg task denied: per-app limit", 6.0))
-    # 清空后再测短任务到期（下载 300ms < 白名单上限 1800s）
-    check("BTASK_END A", cmd_to(pid_a, "BTASK_END"))
-    check("BTASK A short", cmd_to(pid_a, "BTASK 3 300"))
-    check("grant short", wait_for("bg task granted type=", 6.0))
-    check("expired event", wait_for("bg task expired", 8.0))
+    # 时长 10s（值按 µs 计）：慢宿主（RISC-V TCG）下命令往返远超 0.6s，短任务
+    # 在下一条提交前到期，凑不满每应用上限（与 lifecycle_core_test 同款修复）。
+    # 每步等 lifd 的处理回执再发下一条：cmd_<pid> 是单文件信箱，连续 echo 会
+    # 覆盖未消费的上一条（旧脚本 A2 被 A3 覆盖丢失 → 上限/到期/挂起连锁假失败）。
+    check("BTASK bad type", run_cmd_and_wait(f"echo BTASK 9 100 > /data/life/cmd_{pid_c}", "后台任务被拒: 未知类型", 6.0))
+    check("BTASK A1", run_cmd_and_wait(f"echo BTASK 1 10000000 > /data/life/cmd_{pid_a}", "后台任务已授予", 6.0))
+    check("BTASK A2", run_cmd_and_wait(f"echo BTASK 2 10000000 > /data/life/cmd_{pid_a}", "后台任务已授予", 6.0))
+    check("deny per-app limit", run_cmd_and_wait(f"echo BTASK 0 10000000 > /data/life/cmd_{pid_a}", "后台任务被拒: 单应用数量已达上限", 6.0))
+    # 显式结束并等回执释放槽位，否则后续 BTASK 仍被上限拒绝
+    check("BTASK_END A", run_cmd_and_wait(f"echo BTASK_END > /data/life/cmd_{pid_a}", "后台任务已结束", 6.0))
+    check("BTASK A short", run_cmd_and_wait(f"echo BTASK 3 400 > /data/life/cmd_{pid_a}", "后台任务已授予 type=", 6.0))
+    check("expired event", wait_for("后台任务已到期 pid=", 8.0))
     check("evt BG_TASK_EXPIRED", cat_check(f"/data/life/evt_{pid_a}", "BG_TASK_EXPIRED", 3.0))
 
     # ---- 5. 超时挂起 ----
-    # appA 后台化（无任务）→ SET_TIMEOUT 800ms 后转 Suspended
-    check("SET_TIMEOUT", cmd_to(pid_c, "SET_TIMEOUT 800"))
+    # appA 后台化（无任务）→ SET_TIMEOUT 800ms 后转 Suspended（lifd now_us 已
+    # 改 CLOCK_MONOTONIC，墙钟回拨不再使超时永久失效）
+    check("SET_TIMEOUT", run_cmd_and_wait(f"echo SET_TIMEOUT 800 > /data/life/cmd_{pid_c}", "bg->suspend 超时已设为 800", 6.0))
     time.sleep(0.3)
     check("BG A", cmd_to(pid_a, "BG"))
-    check("suspend appA", wait_for("[lifd] suspend", 10.0))
+    check("suspend appA", wait_for("已挂起 appA", 15.0))
     check("recents A S-state", cat_check("/data/life/recents", f"appA {pid_a} S", 3.0))
 
     # ---- 6. 内存压力注入与 LMK ----
-    check("force 1", run_cmd_and_wait("echo force 1 > /proc/pressure", "[mem] pressure force 1", 6.0))
-    check("Moderate response", wait_for("pressure Moderate: suspending idle background apps", 8.0))
-    check("force 2", run_cmd_and_wait("echo force 2 > /proc/pressure", "[mem] pressure force 2", 6.0))
-    check("Critical response", wait_for("pressure Critical: running LMK", 8.0))
-    check("LMK killing", wait_for("[lifd] LMK killing", 8.0))
-    check("LMK killed appA", wait_for("[lifd] terminated", 8.0))
-    check("clear", run_cmd_and_wait("echo clear > /proc/pressure", "[mem] pressure clear", 6.0))
-    check("Normal response", wait_for("pressure Normal", 8.0))
+    check("force 1", run_cmd_and_wait("echo force 1 > /proc/pressure", "[mem] 强制压力 1", 6.0))
+    check("Moderate response", wait_for("内存压力中等: 挂起空闲后台应用", 8.0))
+    check("force 2", run_cmd_and_wait("echo force 2 > /proc/pressure", "[mem] 强制压力 2", 6.0))
+    check("Critical response", wait_for("内存压力严重: 正在执行 LMK", 8.0))
+    check("LMK killing", wait_for("LMK: 正在击杀 score=", 8.0))
+    check("LMK killed appA", wait_for("已终止 appA", 8.0))
+    check("clear", run_cmd_and_wait("echo clear > /proc/pressure", "[mem] 已清除强制", 6.0))
+    check("Normal response", wait_for("内存压力正常", 8.0))
 
     # ---- 7. 推送（本地，pushd → lifd） ----
     # 未登记 pid：丢弃
     check("push to unknown", run_cmd_and_wait(f"echo hello world > /data/push/in/{pid_c}_1", "", 3.0))
-    check("notify dropped", wait_for("notify dropped: app not registered", 8.0))
+    check("notify dropped", wait_for("通知已丢弃: 应用未登记 pid=", 8.0))
     # 后台应用：延迟补投 → 恢复时随 RESUME 送达
     pid_d = ps_pid(["rild", "networkd", "sensord"])
     check("reg D", register("appD", pid_d, "BG"))
     check("BG D", cmd_to(pid_d, "BG"))
     check("push to D", run_cmd_and_wait(f"echo hi there > /data/push/in/{pid_d}_2", "", 3.0))
-    check("notify deferred", wait_for("notify deferred pid", 8.0))
+    check("notify deferred", wait_for("通知已延迟 pid=", 8.0))
     check("pending file", cat_check(f"/data/push/pending/{pid_d}", "NOTIFY", 3.0))
     check("FG D", cmd_to(pid_c, f"FG {pid_d}"))
-    check("foreground D", wait_for("lifd] foreground", 8.0))
+    check("foreground D", wait_for("已回前台 appD", 8.0))
     check("evt RESUME+NOTIFY", cat_check(f"/data/life/evt_{pid_d}", "RESUME NOTIFY", 3.0))
 
     # ---- 8. 状态持久化 ----
