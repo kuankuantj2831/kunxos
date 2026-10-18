@@ -2932,10 +2932,9 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
                 unsafe { core::ptr::copy_nonoverlapping(src, dst, DISPLAY_W) };
             }
         } else {
-            // 隔行混合（转场期垂直半分辨率）：只混合偶数行，奇数行由刚写完
-            // 的上一行整行 memcpy 复制——混合量减半，无陈旧数据/撕裂（相邻
-            // 行内容一致，仅垂直清晰度暂降 160ms；运动期降 fidelity 换帧率
-            // 是标准手法）。末帧 ea>=255 路径仍全分辨率整行 memcpy。
+            // 混合路径：全量混合 + 行指针直写（隔行变体经 round-015 同开机
+            // 配对 A/B 实证无增益——中位 4 vs 4 帧、1.00x，混合并非转场
+            // 瓶颈；垂直半分辨率的画质代价不再支付）。
             let mut y = 0i32;
             while y < ny {
                 let sy = y + off;
@@ -2962,12 +2961,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
                     let b = ((ab * inv + cb * ea) * 257) >> 16;
                     unsafe { *dst_row.add(x) = (r << 16) | (g << 8) | b };
                 }
-                if y + 1 < ny {
-                    let src = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
-                    let dst = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX + FB_STRIDE_PX) };
-                    unsafe { core::ptr::copy_nonoverlapping(src, dst, DISPLAY_W) };
-                }
-                y += 2;
+                y += 1;
             }
         }
         // 导航区：帧 0 全量画（玻璃+按钮），其后快照恢复 + 仅重画进度点
@@ -3007,7 +3001,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             break;
         }
     }
-    // [perf] 转场帧率诊断（160ms 固定时长 → 帧数即帧率）
+    // [perf] 转场帧率诊断（160ms 固定时长 → 帧数即帧率；模式标签供 A/B 归因）
     let el_ms = (mono_us().saturating_sub(t0) / 1_000) as usize;
     print("[oobe] 转场 ");
     print_dec(frames as usize);
