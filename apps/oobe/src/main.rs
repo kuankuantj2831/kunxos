@@ -772,6 +772,22 @@ fn load_fonts_sync() {
     } else {
         print("failed，回退点阵兜底\n");
     }
+    // [perf] 大进程（OOBE 页记录多）mono_us 一次性自测（优化轮 032 起）：
+    // 时钟 syscall 在页记录表线性扫描下的真实成本观测点（历史基线
+    // 41-50µs；r30/31 砍扫描轮数后对比）。volatile sink 防优化。
+    unsafe {
+        let t0 = mono_us();
+        let mut sink = 0u64;
+        for _ in 0..1000 {
+            sink = sink.wrapping_add(mono_us());
+        }
+        let dt = mono_us().saturating_sub(t0);
+        print("[oobe] mono_us 自测: ");
+        print_dec((dt / 1000) as usize);
+        print("us/次 (sink=");
+        print_dec(sink as usize);
+        print(")\n");
+    }
 }
 
 /// 呈现当前 canvas 帧：提交整屏脏区并请求合成器翻页（`flip`/转场/脉冲逐帧调用）。
