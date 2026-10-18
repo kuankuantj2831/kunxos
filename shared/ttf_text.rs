@@ -53,6 +53,36 @@ unsafe fn wide_copy(dest: *mut u8, src: *const u8, n: usize) {
                 options(nostack),
             );
         }
+    } else if (d & 3) == 0 && (s & 3) == 0 {
+        // 混合对齐（两端 4 对齐但 8 余数不匹配）：u32 字循环（lw/sw 对
+        // 4 对齐地址均合法），与内核 memcpy 同款；尾部单字 + 字节。
+        while end.saturating_sub(d) >= 8 {
+            asm!(
+                "lw {v0}, 0({s})",
+                "lw {v1}, 4({s})",
+                "addi {s}, {s}, 8",
+                "sw {v0}, 0({d})",
+                "sw {v1}, 4({d})",
+                "addi {d}, {d}, 8",
+                v0 = out(reg) _,
+                v1 = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
+        while end.saturating_sub(d) >= 4 {
+            asm!(
+                "lw {v}, 0({s})",
+                "addi {s}, {s}, 4",
+                "sw {v}, 0({d})",
+                "addi {d}, {d}, 4",
+                v = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
     }
     // volatile：LoopIdiomRecognize 可能把字节循环改写回 `call memset`
     //（无限递归，见 DEBUG_NOTES 第 12 轮排查），volatile 访问免疫该变换。

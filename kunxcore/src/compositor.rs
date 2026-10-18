@@ -839,6 +839,31 @@ pub fn bench_overlap_copy(h: u32, iters: u32) -> u64 {
     }
 }
 
+/// [perf] 跨奇偶行拷贝基线（anim::perf_test 场景 D2）：canvas(x=xs) →
+/// back(x=xd) 的 320×h 块搬移，xs/xd 奇偶不同 → 混合对齐形态（一端
+/// ≡0、一端 ≡4 mod 8）。监控 memcpy 的 u32 字循环分支。
+pub fn bench_row_copy_cross(xs: i32, xd: i32, w: u32, h: u32, iters: u32) -> u64 {
+    unsafe {
+        if C.width == 0 {
+            return 0;
+        }
+        let cw = C.width as usize;
+        let row = w as usize;
+        let t0 = crate::timer::now_us();
+        for _ in 0..iters {
+            for y in 0..h as usize {
+                core::ptr::copy_nonoverlapping(
+                    C.canvas.add(y * cw + xs as usize),
+                    C.back.add(y * cw + xd as usize),
+                    row,
+                );
+            }
+        }
+        let t1 = crate::timer::now_us();
+        (t1 - t0) / iters as u64
+    }
+}
+
 /// 创建窗口，返回窗口 id（失败返回 usize::MAX）。
 pub fn create_window(x: i32, y: i32, w: u32, h: u32, z: i32, alpha: u8) -> usize {
     let id = (0..MAX_WINDOWS).find(|&i| unsafe { !C.windows[i].active });

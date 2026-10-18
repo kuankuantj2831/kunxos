@@ -1133,6 +1133,17 @@ pub fn perf_test() {
     uart("us odd/even=");
     crate::print_dec(if d_even == 0 { 0 } else { d_odd * 100 / d_even });
     uart("%\n");
+    // D2：跨奇偶（混合对齐形态：src ≡0 / dst ≡4 mod 8 及其反向），
+    // 监控 memcpy u32 字循环分支。
+    let d2_eo = compositor::bench_row_copy_cross(64, 65, 320, 200, 50);
+    let d2_oe = compositor::bench_row_copy_cross(65, 64, 320, 200, 50);
+    uart(" [anim-perf] D2/cross-parity-320x200 even→odd=");
+    crate::print_dec(d2_eo);
+    uart("us odd→even=");
+    crate::print_dec(d2_oe);
+    uart("us （对照 D 同奇偶=");
+    crate::print_dec(d_even);
+    uart("us）\n");
 
     // ---- E. 重叠拷贝基线：memmove 反向路径（滚动/同缓冲平移形态） ----
     // 同缓冲 320×200 块下移 16 字节（dst>src 全程重叠）；附单次语义正确性

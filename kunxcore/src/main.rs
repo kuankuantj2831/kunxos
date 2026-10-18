@@ -62,6 +62,37 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
                 options(nostack),
             );
         }
+    } else if (d & 3) == 0 && (s & 3) == 0 {
+        // 混合对齐（两端 4 对齐但 8 余数不匹配，如 src/dst x 奇偶不同的
+        // 行拷贝/窗口合成）：u32 字循环——lw/sw 对 4 对齐地址均合法，
+        // 8B/迭代，远快于字节循环；尾部单字 + 字节。
+        while end.saturating_sub(d) >= 8 {
+            asm!(
+                "lw {v0}, 0({s})",
+                "lw {v1}, 4({s})",
+                "sw {v0}, 0({d})",
+                "sw {v1}, 4({d})",
+                "addi {s}, {s}, 8",
+                "addi {d}, {d}, 8",
+                v0 = out(reg) _,
+                v1 = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
+        while end.saturating_sub(d) >= 4 {
+            asm!(
+                "lw {v}, 0({s})",
+                "sw {v}, 0({d})",
+                "addi {s}, {s}, 4",
+                "addi {d}, {d}, 4",
+                v = out(reg) _,
+                s = inout(reg) s,
+                d = inout(reg) d,
+                options(nostack),
+            );
+        }
     }
     // 尾部 / 未对齐：字节循环（保持任意对齐语义正确）
     while d < end {
