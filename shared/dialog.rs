@@ -4,8 +4,8 @@
 //! - 白色卡片 + 超椭圆圆角（连续曲率，与系统毛玻璃同一几何）+ 细描边，
 //!   屏幕正中弹出；卡片后方全屏半透明压暗遮罩；
 //! - 标题居中加粗、正文居中灰色；
-//! - 按钮区：1px 上分割线，双按钮等宽 + 中间竖分割线，纯文字按钮
-//!   （取消 = 深灰、确认 = 蓝、危险 = 红）；
+//! - 按钮区：毛玻璃胶囊（取消 = 浅色玻璃深字，确认 = 强调玻璃白字，
+//!   危险 = 红玻璃；2026-10-18 全系统按钮玻璃化统一）；
 //! - 选择行：单选圆点 / 多选圆角方框靠右，行间 1px 分割线；
 //! - 内嵌输入框（浅灰圆角 + 蓝色光标）与进度条（浅灰轨道 + 蓝色填充）。
 //!
@@ -66,10 +66,10 @@ pub const C_DLG_LINE: u32 = 0x00_EA_EA_EC;
 pub const C_DLG_BORDER: u32 = 0x00_E2_E2_E8;
 /// 取消按钮文字（深灰）。
 pub const C_DLG_CANCEL: u32 = 0x00_46_46_4C;
-/// 确认按钮文字（OriginOS 蓝）。
+/// 确认按钮文字（OriginOS 蓝；单选圆/复选框选中色）。
 pub const C_DLG_BLUE: u32 = 0x00_34_78_F6;
-/// 危险操作文字（红）。
-pub const C_DLG_RED: u32 = 0x00_FA_51_51;
+/// 玻璃胶囊上的确认文字（白）。
+pub const C_DLG_OK_TEXT: u32 = 0x00_FF_FF_FF;
 /// 输入框底色（浅灰）。
 pub const C_DLG_FIELD: u32 = 0x00_F2_F3_F5;
 /// 进度条轨道。
@@ -78,6 +78,25 @@ pub const C_DLG_TRACK: u32 = 0x00_E9_E9_EE;
 pub const C_DLG_RADIO: u32 = 0x00_C4_C4_CA;
 
 // ==================== 绘制目标 trait ====================
+
+/// 复用 shared/glass.rs 的真磨砂（降采样 + 盒式模糊 + 高光/描边）渲染
+/// 按钮胶囊：glass.rs 自包含（仅依赖 core），经 DialogUi 的 put/back 适配。
+/// 与各应用经 nav/app_kit 引入的 glass 模块为相互独立的模块实例，
+/// 互不冲突（静态降采样缓冲各自独立）。
+#[path = "glass.rs"]
+pub mod glass;
+
+/// 把 `&mut dyn DialogUi` 适配为 glass 渲染目标。
+struct DlgGlass<'a>(&'a mut dyn DialogUi);
+
+impl glass::GlassTarget for DlgGlass<'_> {
+    fn backdrop(&self, x: i32, y: i32) -> u32 {
+        self.0.back(x, y)
+    }
+    fn put(&mut self, x: i32, y: i32, color: u32) {
+        self.0.put(x, y, color)
+    }
+}
 
 /// 对话框绘制目标。由各应用适配自己的像素 / 文本管线：
 /// - `put`：把颜色写入当前 back buffer（全不透明）；
@@ -193,8 +212,9 @@ pub fn draw_message(ui: &mut dyn DialogUi, x: i32, y: i32, w: i32, msg: &[u8], p
     ui.text(x + (w - tw) / 2, ui.text_top(px, cy), msg, px, C_DLG_MSG);
 }
 
-/// 按钮行：1px 上分割线；`ok` 为 None 时绘制单个居中按钮，否则双按钮等宽
-/// + 竖分割线。取消深灰，确认蓝（danger = 红）。
+/// 按钮行（全系统按钮统一毛玻璃，2026-10-18 收官轮）：取消 = 浅色玻璃
+/// 胶囊深字，确认 = 强调玻璃胶囊白字（danger = 危险红玻璃）；`ok` 为
+/// None 时单个居中强调胶囊。此前为 iOS 风格纯文字 + 上下分割线。
 pub fn draw_buttons(
     ui: &mut dyn DialogUi,
     x: i32,
@@ -203,44 +223,70 @@ pub fn draw_buttons(
     cancel: &[u8],
     ok: Option<(&[u8], bool)>,
 ) {
-    // 上分割线。
-    for dx in 0..w {
-        ui.put(x + dx, y, C_DLG_LINE);
-    }
+    // 胶囊几何：行高 50 内上下各留 6px，全圆角胶囊。
+    let bh = DLG_BTN_H - 12;
+    let by = y + 6;
     let cy = y + DLG_BTN_H / 2;
     match ok {
         Some((ok_label, danger)) => {
-            // 竖分割线。
-            let mx = x + w / 2;
-            for dy in 1..DLG_BTN_H {
-                ui.put(mx, y + dy, C_DLG_LINE);
-            }
+            let bw = w / 2 - 18;
+            // 取消：浅色玻璃。
+            glass::glass_rect_style(
+                &mut DlgGlass(ui),
+                x + 12,
+                by,
+                bw,
+                bh,
+                bh / 2,
+                &glass::STYLE_LIGHT,
+                true,
+            );
             let cw = ui.text_w(cancel, 16.0);
             ui.text(
-                x + w / 4 - cw / 2,
+                x + 12 + bw / 2 - cw / 2,
                 ui.text_top(16.0, cy),
                 cancel,
                 16.0,
                 C_DLG_CANCEL,
             );
-            let oc = if danger { C_DLG_RED } else { C_DLG_BLUE };
+            // 确认：强调 / 危险玻璃，白字。
+            let ox = x + w / 2 + 6;
+            let st = if danger {
+                &glass::STYLE_DANGER
+            } else {
+                &glass::STYLE_ACCENT
+            };
+            glass::glass_rect_style(&mut DlgGlass(ui), ox, by, bw, bh, bh / 2, st, true);
             let ow = ui.text_w(ok_label, 16.0);
             ui.text(
-                x + w * 3 / 4 - ow / 2,
+                ox + bw / 2 - ow / 2,
                 ui.text_top(16.0, cy),
                 ok_label,
                 16.0,
-                oc,
+                C_DLG_OK_TEXT,
             );
         }
         None => {
+            // 单按钮：居中强调胶囊。
+            let bw = w * 2 / 3;
+            let bx = x + (w - bw) / 2;
+            glass::glass_rect_style(
+                &mut DlgGlass(ui),
+                bx,
+                by,
+                bw,
+                bh,
+                bh / 2,
+                &glass::STYLE_ACCENT,
+                true,
+            );
             let cw = ui.text_w(cancel, 16.0);
             ui.text(
                 x + w / 2 - cw / 2,
                 ui.text_top(16.0, cy),
                 cancel,
                 16.0,
-                C_DLG_BLUE,
+                C_DLG_OK_TEXT,
             );
         }
     }

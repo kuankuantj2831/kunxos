@@ -848,8 +848,9 @@ fn render() {
     draw_glass(16, 64, DISPLAY_W as i32 - 32, 240, 24);
     draw_text(32, 84, city.as_bytes(), C_TEXT);
     draw_text(32, 106, "点击切换".as_bytes(), C_DIM);
-    // 右上角刷新
-    draw_text(DISPLAY_W as i32 - 70, 84, "刷新".as_bytes(), C_ACCENT);
+    // 右上角刷新：强调玻璃胶囊按钮（全系统按钮玻璃化，2026-10-18）。
+    draw_glass_style(DISPLAY_W as i32 - 90, 76, 66, 32, 16, &STYLE_ACCENT);
+    draw_text(DISPLAY_W as i32 - 90 + 17, 84, "刷新".as_bytes(), 0x00_FF_FF_FF);
     // 状况 + 昼夜
     let mut cond = [0u8; 32];
     let mut cn = 0;

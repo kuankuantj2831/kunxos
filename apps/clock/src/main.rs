@@ -880,17 +880,17 @@ fn draw_alarm_list() {
         }
         // 开关。
         draw_switch(DISPLAY_W as i32 - 26 - 48, y + (row_h - 28) / 2 - 12, a.on);
-        // 删除。
-        fill_circle(DISPLAY_W as i32 - 26 - 16, y + row_h - 22, 12, C_RED);
-        // 危险红圆盘上的 × 保持白色。
+        // 删除：危险红玻璃圆角块（与实色红圆等大小）。
+        draw_glass_style(DISPLAY_W as i32 - 26 - 16 - 12, y + row_h - 22 - 12, 24, 24, 12, &STYLE_DANGER);
+        // 危险玻璃上的 × 保持白色。
         draw_center_text(y + row_h - 28, "×".as_bytes(), 16.0, C_ON_ACCENT);
     }
 
-    // 新建按钮（右下角悬浮）。
+    // 新建按钮（右下角悬浮）：强调绿玻璃胶囊。
     let add = "＋ 新建".as_bytes();
     let w = text_width_px(add, 15.0);
-    fill_round_rect(DISPLAY_W as i32 - w - 42, bottom - 52, w + 30, 40, 20, C_ACC);
-    // 强调绿底上保持白字。
+    draw_glass_style(DISPLAY_W as i32 - w - 42, bottom - 52, w + 30, 40, 20, &STYLE_ACCENT);
+    // 强调玻璃底上保持白字。
     draw_center_text(bottom - 42, add, 15.0, C_ON_ACCENT);
 }
 
@@ -921,11 +921,15 @@ fn draw_edit() {
     for i in 0..7 {
         let x = 26 + i as i32 * chip_w;
         let on = (unsafe { EDIT_REP } >> i) & 1 != 0;
-        fill_round_rect(x, cy + 16, chip_w - 4, 38, 10, if on { C_CHIP_ON } else { C_CARD });
+        if on {
+            draw_glass_style(x, cy + 16, chip_w - 4, 38, 10, &STYLE_ACCENT);
+        } else {
+            draw_glass(x, cy + 16, chip_w - 4, 38, 10);
+        }
         let d = weekday_char(i);
         let mut b = [0u8; 4];
         let k = d.encode_utf8(&mut b).len();
-        // 选中绿 chip 上白字，未选中白底 chip 上深字。
+        // 选中绿玻璃上白字，浅色玻璃上深字。
         draw_center_text(cy + 24, &b[..k], 14.0, if on { C_ON_ACCENT } else { C_TEXT });
     }
     // 快速选项。
@@ -966,14 +970,14 @@ fn weekday_char(i: u32) -> char {
 }
 
 fn draw_plus_minus(x: i32, y: i32, hour: bool) {
-    // 上箭头。
-    fill_round_rect(x - 30, y, 60, 40, 14, C_CARD);
+    // 上箭头：浅色玻璃。
+    draw_glass(x - 30, y, 60, 40, 14);
     draw_center_text(y + 11, "✚".as_bytes(), 17.0, C_TEXT);
     // 数值标签。
     let lbl: &[u8] = if hour { "小时".as_bytes() } else { "分钟".as_bytes() };
     draw_center_text(y + 56, lbl, 13.0, C_DIM);
-    // 下箭头。
-    fill_round_rect(x - 30, y + 86, 60, 40, 14, C_CARD);
+    // 下箭头：浅色玻璃。
+    draw_glass(x - 30, y + 86, 60, 40, 14);
     draw_center_text(y + 97, "−".as_bytes(), 17.0, C_TEXT);
 }
 
@@ -990,20 +994,25 @@ fn draw_quick_chips(y: i32) {
         } else {
             rep == 0
         };
-        fill_round_rect(x, y, cw - 6, 36, 10, if on { C_CHIP_ON } else { C_CARD });
-        // 选中绿 chip 上白字，未选中白底 chip 上深字。
+        if on {
+            draw_glass_style(x, y, cw - 6, 36, 10, &STYLE_ACCENT);
+        } else {
+            draw_glass(x, y, cw - 6, 36, 10);
+        }
+        // 选中绿玻璃上白字，浅色玻璃上深字。
         draw_center_text(y + 9, labels[i], 13.0, if on { C_ON_ACCENT } else { C_TEXT });
     }
 }
 
 fn draw_text_button(x: i32, y: i32, w: i32, h: i32, label: &[u8], primary: bool) {
+    // 全系统按钮统一毛玻璃：主按钮强调绿玻璃，次要浅色玻璃（与 settings/
+    // calculator/music 同款 app_kit 基建，2026-10-18 按钮玻璃化收官轮）。
     if primary {
-        fill_round_rect(x, y, w, h, 12, C_ACC);
+        draw_glass_style(x, y, w, h, 12, &STYLE_ACCENT);
     } else {
-        // 次要按钮：浅灰底（原深色填充浅色化）。
-        fill_round_rect(x, y, w, h, 12, 0x00_F2_F4_F8);
+        draw_glass(x, y, w, h, 12);
     }
-    // 主按钮（强调绿）上白字，次要浅灰底上深字。
+    // 主玻璃上白字，浅色玻璃上深字。
     draw_center_text(text_top(16.0, y + h / 2), label, 16.0, if primary { C_ON_ACCENT } else { C_TEXT });
 }
 
@@ -1060,7 +1069,11 @@ fn draw_timer() {
         let x = 26 + i as i32 * (pw + 6);
         let val = presets[i];
         let sel = unsafe { TMR_STATE } == 0 && unsafe { TMR_MIN } == val;
-        fill_round_rect(x, 336, pw - 6, 40, 10, if sel { C_CHIP_ON } else { C_CARD });
+        if sel {
+            draw_glass_style(x, 336, pw - 6, 40, 10, &STYLE_ACCENT);
+        } else {
+            draw_glass(x, 336, pw - 6, 40, 10);
+        }
         let mut b = [0u8; 6];
         let mut bn = 0usize;
         push_dec(&mut b, &mut bn, val as u64);
@@ -1250,10 +1263,10 @@ fn draw_ringing_overlay() {
     let stop = "停止".as_bytes();
     let w1 = text_width_px(snooze, 16.0);
     let w2 = text_width_px(stop, 16.0);
-    // 贪睡：浅灰底深字；停止：危险红底白字。
-    fill_round_rect(cx - 200, cy + 70, 200, 48, 14, 0x00_F2_F4_F8);
+    // 贪睡：浅色玻璃深字；停止：危险红玻璃白字。
+    draw_glass(cx - 200, cy + 70, 200, 48, 14);
     draw_center_text(cy + 82, snooze, 16.0, C_TEXT);
-    fill_round_rect(cx, cy + 70, 200, 48, 14, C_RED);
+    draw_glass_style(cx, cy + 70, 200, 48, 14, &STYLE_DANGER);
     draw_center_text(cy + 82, stop, 16.0, C_ON_ACCENT);
     let _ = w1;
     let _ = w2;
