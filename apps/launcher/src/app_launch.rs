@@ -182,6 +182,18 @@ pub struct Motion {
     pub fly_split: i32,
     /// 本次打断的最大撕裂间距（越快滑动撕得越开）。
     pub fly_split_max: i32,
+    /// 打断时刻的启动缩放（定点 256=图标原位）——ColorOS 17 可重定向打断：
+    /// 飞出动画从**当前视觉尺寸**连续收缩到图标大小，绝不跳回原位小图标。
+    pub fly_scale_start: u32,
+    /// 飞行当前绘制缩放（定点 256 基准，advance 逐帧更新）。
+    pub fly_cur_scale: u32,
+    /// 飞行当前白闪（打断时刻的启动白闪随飞出衰减）。
+    pub fly_cur_fade: u32,
+    /// 打断时刻捕获的白闪起点（衰减按 (1-e) 从起点算，非逐帧连乘）。
+    pub fly_fade_start: u32,
+    /// 打断时刻背景压暗等级（启动背景为 165/255 压暗桌面；150ms 内渐回 0，
+    /// 免「压暗→全亮」一帧跳变）。
+    pub fly_bg_dim: u32,
     /// 启动弹簧（scale 标量，定点 1.0=256）。
     pub launch_spring: Spring,
     /// 启动弹簧上次推进时刻（µs）。
@@ -220,6 +232,11 @@ pub static mut MOTION: Motion = Motion {
     fly_v: 0.0,
     fly_split: 0,
     fly_split_max: 0,
+    fly_scale_start: SCALE_1,
+    fly_cur_scale: SCALE_1,
+    fly_cur_fade: 0,
+    fly_fade_start: 0,
+    fly_bg_dim: 0,
     launch_spring: Spring::fixed(),
     launch_t: 0,
     launch_target: SCALE_1,
@@ -599,6 +616,67 @@ pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
             py += bs as i32;
         }
         // 3. 白色覆盖已熔进第 1/2 步（见 wlut）—— 无独立整屏扫描。
+    }
+}
+
+/// 打断飞行的瓦片绘制（ColorOS 17 可重定向打断）：应用瓦片以当前缩放
+/// （定点 256 = 图标原位）绘制于 (cx, cy)，垂直撕裂上下两半各向外平移
+/// ±split/2（内容不拉伸、中缝露出桌面），白闪 fade 混合。采样与
+/// launch_blit 同路径（2px 块 + 块中心双线性），收缩到 256 后由调用方
+/// 无缝交接 blit_icon_split（同尺寸原位图标）。
+pub fn blit_tile_fly_split(cx: i32, cy: i32, scale: u32, split: i32, fade: u32) {
+    unsafe {
+        let s = ((ICON_SIZE as u32 * scale) / SCALE_1).max(1) as i32;
+        let half = s / 2;
+        let w = DISPLAY_W as i32;
+        let h = DISPLAY_H as i32;
+        let wlut = if fade > 0 {
+            Some(build_white_lut(fade.min(255)))
+        } else {
+            None
+        };
+        let sf = ICON_SIZE as f32 / s.max(1) as f32;
+        let bs = 2usize;
+        let gap = (split / 2).max(0);
+        // 上半：内容 = 贴图上半，整体上移 gap；下半：整体下移 gap。
+        let halves: [(i32, i32); 2] = [(cy - half - gap, cy - gap), (cy + gap, cy + half + gap)];
+        for &(y_start, y_end) in &halves {
+            let mut py = y_start.max(0);
+            let py_end = y_end.min(h - 1);
+            while py <= py_end {
+                let fy = ((py - y_start) as f32 + 0.5) * sf - 0.5;
+                let mut px = (cx - half).max(0);
+                let px_end = (cx + half).min(w - 1);
+                while px <= px_end {
+                    let fx = ((px - (cx - half)) as f32 + 0.5) * sf - 0.5;
+                    let c0 = sample_icon_bilinear_stride(
+                        &ICON_TILE,
+                        ICON_SIZE as usize,
+                        ICON_SIZE as usize,
+                        fx,
+                        fy,
+                    );
+                    let c = match &wlut {
+                        Some(lut) => white_pixel(lut, c0),
+                        None => c0,
+                    };
+                    let bx_end = (px as usize + bs).min(w as usize);
+                    let by_end = (py as usize + bs).min(h as usize);
+                    let mut yy = py as usize;
+                    while yy < by_end {
+                        let iy = yy * DISPLAY_W;
+                        let mut xx = px as usize;
+                        while xx < bx_end {
+                            zoom_put(iy + xx, c);
+                            xx += 1;
+                        }
+                        yy += 1;
+                    }
+                    px += bs as i32;
+                }
+                py += bs as i32;
+            }
+        }
     }
 }
 
@@ -1028,6 +1106,20 @@ pub fn start_fly_away(app_idx: usize, dx: i32, dy: i32, dur_ms: u64) {
         MOTION.fly_y = hy;
         MOTION.fly_split = 0;
         MOTION.fly_split_max = split_max;
+        // ColorOS 17 可重定向打断：从**当前视觉状态**起飞——捕获打断时刻
+        // 的启动缩放/白闪/背景压暗，飞出段连续收缩到图标大小、白闪衰减、
+        // 背景 150ms 回亮，零跳变。背景压暗仅在启动已实际渲染过放大帧
+        //（缩放已离开原位）时引入——动画第 0ms 打断时屏上是正常亮度桌面，
+        // 强行压暗会反向闪一下。
+        MOTION.fly_scale_start = MOTION.cur_scale.max(SCALE_1);
+        MOTION.fly_cur_scale = MOTION.fly_scale_start;
+        MOTION.fly_cur_fade = MOTION.cur_fade;
+        MOTION.fly_fade_start = MOTION.cur_fade;
+        MOTION.fly_bg_dim = if MOTION.fly_scale_start > SCALE_1 + SCALE_1 / 16 {
+            165
+        } else {
+            0
+        };
         MOTION.press_app = usize::MAX;
         // 取消启动：门控写 "2" 通知已 fork 的应用子进程退出（应用尚未绘制）。
         gate_write(2);
@@ -1044,7 +1136,13 @@ pub fn start_fly_away(app_idx: usize, dx: i32, dy: i32, dur_ms: u64) {
         print_dec((dist + 0.5) as u32);
         print("px（速度=");
         print_dec((speed * 10.0) as u32);
-        print(" ×0.1px/ms）\n");
+        print(" ×0.1px/ms，缩放起点=");
+        print_dec(MOTION.fly_scale_start);
+        print("/256 即 ");
+        print_dec(((ICON_SIZE as u32 * MOTION.fly_scale_start) / SCALE_1).max(1));
+        print("px，启动已进行 ");
+        print_dec((now_us().saturating_sub(MOTION.t0) / 1000) as u32);
+        print("ms）\n");
         NEEDS_REDRAW = true;
     }
 }
@@ -1225,6 +1323,8 @@ pub fn motion_advance(now: u64) -> bool {
                 // 前 0.45s 沿滑动方向飞出（FastOutSlowIn）并同步撕裂（上下两半
                 // 分离，撕裂间距随飞出进度增长），随后悬停至 1s，之后转入
                 // 弹簧飞回合拢（总计约 1s + 回弹）。
+                // 连续性（ColorOS 17 可重定向打断）：尺寸从打断时刻的启动缩放
+                // 收敛到图标原位、白闪衰减、背景压暗 150ms 内回亮。
                 let t = now.saturating_sub(m.fly_t0) as f32 / 1_000_000.0;
                 if t >= 1.0 {
                     m.phase = Phase::FlyBack;
@@ -1232,6 +1332,9 @@ pub fn motion_advance(now: u64) -> bool {
                     m.fly_spring.pos = m.fly_dist;
                     m.fly_spring.target = 0.0;
                     m.fly_t0 = now;
+                    m.fly_cur_scale = SCALE_1;
+                    m.fly_cur_fade = 0;
+                    m.fly_bg_dim = 0;
                     return true;
                 }
                 let out = (t / 0.45).min(1.0);
@@ -1241,6 +1344,12 @@ pub fn motion_advance(now: u64) -> bool {
                 m.fly_y = m.fly_home_y + (m.fly_dir_y * d) as i32;
                 // 撕裂间距跟随飞出进度（ColorOS 打断：撕开 → 悬停保持 → 合拢）。
                 m.fly_split = (m.fly_split_max as f32 * e) as i32;
+                // 尺寸/白闪/背景连续收敛（飞出段 e 达 1 时全部归位）。
+                let s0 = m.fly_scale_start as f32;
+                m.fly_cur_scale = (s0 + (SCALE_1 as f32 - s0) * e) as u32;
+                m.fly_cur_fade = (m.fly_fade_start as f32 * (1.0 - e)) as u32;
+                let dim_t = (t / 0.15).min(1.0);
+                m.fly_bg_dim = (165.0 * (1.0 - dim_t)) as u32;
                 true
             }
             Phase::FlyBack => {

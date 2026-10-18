@@ -7112,20 +7112,55 @@ fn draw_desktop_full() {
             draw_edit_sheet();
         }
         draw_nav_bar();
-        // 打断动画（ColorOS 撕裂）：应用图标（桌面原位已被隐藏）在飞行位置
-        // 撕成上下两半绘制；撕裂进度越大，向白色淡出越明显。
+        // 打断动画（ColorOS 撕裂 + 17 连续性）：应用图标（桌面原位已被隐藏）
+        // 在飞行位置撕成上下两半绘制；撕裂进度越大，向白色淡出越明显。
         if MOTION.phase == Phase::FlyAway || MOTION.phase == Phase::FlyBack {
+            // 背景回亮（打断连续性）：启动背景是 165/255 压暗的桌面快照，
+            // 飞出前 150ms 从压暗渐回全亮（advance 维护 fly_bg_dim），
+            // 避免「暗底 → 全亮桌面」一帧跳变。LUT 一次构建，整屏三查表。
+            let dim = MOTION.fly_bg_dim;
+            if dim > 0 {
+                let mut lut = [0u32; 256];
+                let k = dim.min(255) as u32;
+                let inv = 255 - k;
+                for v in 0..256u32 {
+                    lut[v as usize] = (v * inv) / 255;
+                }
+                let total = DISPLAY_W * DISPLAY_H;
+                for i in 0..total {
+                    let v = BACK_BUF[i];
+                    BACK_BUF[i] = (lut[((v >> 16) & 0xFF) as usize] << 16)
+                        | (lut[((v >> 8) & 0xFF) as usize] << 8)
+                        | lut[(v & 0xFF) as usize];
+                }
+            }
             let app = &APPS[MOTION.app];
-            let ix = MOTION.fly_x - ICON_SIZE / 2;
-            let iy = MOTION.fly_y - ICON_SIZE / 2;
-            let idx = app_index_of(app);
             let split = MOTION.fly_split;
-            if split > 1 && idx < APPS.len() && ICON_CACHE_READY[idx] {
+            let idx = app_index_of(app);
+            // 尺寸连续（ColorOS 17 可重定向打断）：打断瞬间瓦片处于启动
+            // 放大途中（可能近全屏），飞出段从当前尺寸连续收缩到图标原位
+            // ——绝不跳回小图标。收缩到 256（原位尺寸）后无缝交接小图标
+            // 撕裂路径。
+            if MOTION.fly_cur_scale > SCALE_1 {
                 let smax = MOTION.fly_split_max.max(1);
                 let fade = ((split * 255) / smax).min(150) as u32;
-                blit_icon_split(idx, ix, iy, split, fade);
+                app_launch::blit_tile_fly_split(
+                    MOTION.fly_x,
+                    MOTION.fly_y,
+                    MOTION.fly_cur_scale,
+                    split,
+                    fade,
+                );
             } else {
-                draw_app_icon(app, ix, iy, ICON_SIZE);
+                let ix = MOTION.fly_x - ICON_SIZE / 2;
+                let iy = MOTION.fly_y - ICON_SIZE / 2;
+                if split > 1 && idx < APPS.len() && ICON_CACHE_READY[idx] {
+                    let smax = MOTION.fly_split_max.max(1);
+                    let fade = ((split * 255) / smax).min(150) as u32;
+                    blit_icon_split(idx, ix, iy, split, fade);
+                } else {
+                    draw_app_icon(app, ix, iy, ICON_SIZE);
+                }
             }
         }
         // 渐进式启动的加载指示器（最上层）。
