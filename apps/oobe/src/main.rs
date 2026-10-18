@@ -2902,6 +2902,9 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
     let t0 = mono_us();
     let mut nav_snap_ok = false;
     let mut frames: u32 = 0;
+    // [perf] 逐相位累计（µs）：混合 / 导航区 / 尾拷 / 呈现 / 输入泵。
+    // mono_us 实测 ~45µs/次 ×6/帧，对 ~45ms 帧的扰动 <0.6%。
+    let mut ph = [0u64; 5];
     loop {
         let el = mono_us().saturating_sub(t0);
         let t = (el as f32 / TRANS_DUR_US as f32).min(1.0);
@@ -2920,6 +2923,7 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
         // （47 万像素×3 div 是 TCG 下转场帧率第一大开销），ea 帧内恒定，
         // 预乘 257 后 >>16 近似 /255（误差 ≤1）；② 末帧 ea=255 直写新页
         // 免混合；③ sy 越界行 oldc==newc 也免混合直写。
+        let p0 = mono_us();
         if ea >= 255 {
             // 末帧：新页整行 memcpy 直写（宽通道），免逐像素
             for y in 0..ny {
@@ -2964,6 +2968,8 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
                 y += 1;
             }
         }
+        ph[0] += mono_us() - p0;
+        let p1 = mono_us();
         // 导航区：帧 0 全量画（玻璃+按钮），其后快照恢复 + 仅重画进度点
         // （毛玻璃降采样+盒式模糊每帧重画是转场第二大开销）。
         if !nav_snap_ok {
@@ -2987,15 +2993,22 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             }
             draw_progress_anim(to, e);
         }
+        ph[1] += mono_us() - p1;
+        let p2 = mono_us();
         // 导航区尾拷贝：整行 memcpy（宽通道），免逐像素 fb_set_px
         for y in ny..DISPLAY_H as i32 {
             let src = unsafe { BACK_BUF.as_ptr().add(y as usize * DISPLAY_W) };
             let dst = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
             unsafe { core::ptr::copy_nonoverlapping(src, dst, DISPLAY_W) };
         }
+        ph[2] += mono_us() - p2;
+        let p3 = mono_us();
         present_fb();
+        ph[3] += mono_us() - p3;
+        let p4 = mono_us();
         frames += 1;
         pump_input_during_anim();
+        ph[4] += mono_us() - p4;
         // ★ 退出条件（此前改真实时间推进时漏加 → 转场死循环：OOBE 卡死、输入停摆指针消失）
         if t >= 1.0 {
             break;
@@ -3007,7 +3020,17 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
     print_dec(frames as usize);
     print(" 帧 / ");
     print_dec(el_ms);
-    print("ms\n");
+    print("ms 相位µs/帧: 混合=");
+    print_dec((ph[0] / frames as u64) as usize);
+    print(" 导航=");
+    print_dec((ph[1] / frames as u64) as usize);
+    print(" 尾拷=");
+    print_dec((ph[2] / frames as u64) as usize);
+    print(" 呈现=");
+    print_dec((ph[3] / frames as u64) as usize);
+    print(" 泵=");
+    print_dec((ph[4] / frames as u64) as usize);
+    print("\n");
     render_and_flip();
 }
 
