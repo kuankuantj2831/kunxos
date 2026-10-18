@@ -87,18 +87,21 @@ const AVAIL_OFF: usize = QUEUE_SIZE * 16; // 1024
 const USED_OFF: usize = (AVAIL_OFF + 4 + 2 * QUEUE_SIZE + 3) & !3; // 1156
 const DESC_F_WRITE: u16 = 2;
 
-// ---- virtio-sound 控制消息码 ----
+// ---- virtio-sound 控制消息码（规范 virtio-snd：PCM 段 0x0100+） ----
+// 此前误用顺序 3..9——QEMU 拒收（"header not recognized: 3"）并以空负载
+// 应答，PCM_INFO 全零 → 探测判「不可用」→ RISC-V 上 virtio-sound 自
+// 架构切换起从未初始化成功（优化轮 020 实测抓出）。
 const SND_R_JACK_INFO: u32 = 1;
 #[allow(dead_code)]
 const SND_R_JACK_REMAP: u32 = 2;
-const SND_R_PCM_INFO: u32 = 3;
-const SND_R_PCM_SET_PARAMS: u32 = 4;
-const SND_R_PCM_PREPARE: u32 = 5;
-const SND_R_PCM_RELEASE: u32 = 6;
-const SND_R_PCM_START: u32 = 7;
-const SND_R_PCM_STOP: u32 = 8;
+const SND_R_PCM_INFO: u32 = 0x0100;
+const SND_R_PCM_SET_PARAMS: u32 = 0x0101;
+const SND_R_PCM_PREPARE: u32 = 0x0102;
+const SND_R_PCM_RELEASE: u32 = 0x0103;
+const SND_R_PCM_START: u32 = 0x0104;
+const SND_R_PCM_STOP: u32 = 0x0105;
 #[allow(dead_code)]
-const SND_R_CHMAP_INFO: u32 = 9;
+const SND_R_CHMAP_INFO: u32 = 0x0200;
 
 // ---- 响应状态码 ----
 const SND_S_OK: u32 = 0;
@@ -432,6 +435,16 @@ fn pcm_info(id: u32, info: &mut [u8; 32]) -> Option<u32> {
     }
     // 响应 = 状态头(4B) + 32B pcm_info 负载；设备校验 in_sg ≥ 4 + 32 = 36。
     let st = ctl_send(&unsafe { CTRL_REQ }[..16], 36)?;
+    // [debug] PCM_INFO 原始响应前 40 字节（优化轮 020：修码后告警归零
+    // 但负载仍全零，dump 定位响应头布局/描述符管道）。
+    crate::kinfo! {
+        crate::uart_send_str("[vsnd] PCM_INFO resp=");
+        for i in 0..40 {
+            if i > 0 { crate::uart_send_str(","); }
+            crate::print_hex(unsafe { CTRL_RESP[i] } as u64);
+        }
+        crate::uart_send_str("\n");
+    }
     unsafe {
         info.copy_from_slice(&CTRL_RESP[4..36]);
     }
