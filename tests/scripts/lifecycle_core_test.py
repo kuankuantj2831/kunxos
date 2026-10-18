@@ -119,6 +119,24 @@ def run_wait(cli, marker, timeout=6.0):
     return wait_since(before, marker, timeout)
 
 
+# ---- lifd 命令发布：与生产同款协议 ----
+# 生产写方（shared/lifecycle.rs lc_write_cmd / launcher app_life.rs / pushd）
+# 均为 cmd_<pid>_<seq> 每消息一文件 + 写 .tmp 后 mv（rename）原子发布。
+# 旧「echo > cmd_<pid>」单文件覆盖式写法在 lifd 消费（50ms 轮询）前就会被
+# 下一条覆盖（round-004 连锁假失败根因）；脚本迁移到真实 IPC 路径后，
+# 回归门覆盖的才是生产实际使用的协议。
+CMD_SEQ = [0]
+
+
+def run_cmd(pid, text, marker, timeout=6.0):
+    CMD_SEQ[0] += 1
+    base = "/data/life/cmd_%s_%d" % (pid, CMD_SEQ[0])
+    before = len(log)
+    send("echo %s > %s.tmp" % (text, base))
+    send("mv %s.tmp %s" % (base, base))
+    return wait_since(before, marker, timeout)
+
+
 def output_seg(cli, timeout=1.2):
     before = len(log)
     send(cli)
@@ -187,37 +205,31 @@ try:
     check("recents appB B", recents_frag("appB %s B" % sen))
 
     # ---- 多应用切换 + SIGSTOP/SIGCONT ----
-    check("bg appA", run_wait("echo BG > /data/life/cmd_%s" % aud, "已转入后台 appA", 5.0))
+    check("bg appA", run_cmd(aud, "BG", "已转入后台 appA", 5.0))
     time.sleep(0.4)
     check("appA T (SIGSTOP)", kernel_state(aud) == "T")
-    check("fg appB", run_wait("echo FG %s > /data/life/cmd_0" % sen, "已回前台 appB", 5.0))
+    check("fg appB", run_cmd(0, "FG %s" % sen, "已回前台 appB", 5.0))
     check("appB R", kernel_state(sen) == "R")
-    check("fg appA", run_wait("echo FG %s > /data/life/cmd_0" % aud, "已回前台 appA", 5.0))
+    check("fg appA", run_cmd(0, "FG %s" % aud, "已回前台 appA", 5.0))
     check("appA R (SIGCONT)", kernel_state(aud) == "R")
 
     # ---- 后台任务白名单 ----
     # 时长 10s（值按 µs 计）：慢宿主（RISC-V TCG）下命令往返 >0.5s，短任务
     # 在下一条提交前就到期，凑不满「每应用 2 个」上限（假失败）；10s 保证
     # 三个请求必然重叠，随后 BTASK_END 显式释放。
-    check("btask0 granted", run_wait("echo BTASK 0 10000000 > /data/life/cmd_%s" % sen,
-                                     "后台任务已授予", 5.0))
-    check("btask1 granted", run_wait("echo BTASK 1 10000000 > /data/life/cmd_%s" % sen,
-                                     "后台任务已授予", 5.0))
-    check("btask2 denied", run_wait("echo BTASK 2 10000000 > /data/life/cmd_%s" % sen,
-                                    "后台任务被拒: 单应用数量已达上限", 5.0))
+    check("btask0 granted", run_cmd(sen, "BTASK 0 10000000", "后台任务已授予", 5.0))
+    check("btask1 granted", run_cmd(sen, "BTASK 1 10000000", "后台任务已授予", 5.0))
+    check("btask2 denied", run_cmd(sen, "BTASK 2 10000000", "后台任务被拒: 单应用数量已达上限", 5.0))
     # 每应用上限 2 已满：先结束任务释放槽位，再请求 400ms 短任务测到期路径
     # （docs/lifecycle-test.md A7 的前置步骤 BTASK_END 在此脚本中缺失，
     #  此前 BTASK 3 恒被「单应用数量已达上限」拒绝）。
-    check("btask end", run_wait("echo BTASK_END > /data/life/cmd_%s" % sen,
-                                "后台任务已结束", 5.0))
-    check("btask3 expiring", run_wait("echo BTASK 3 400 > /data/life/cmd_%s" % sen,
-                                      "后台任务已授予", 5.0))
+    check("btask end", run_cmd(sen, "BTASK_END", "后台任务已结束", 5.0))
+    check("btask3 expiring", run_cmd(sen, "BTASK 3 400", "后台任务已授予", 5.0))
     check("btask expired", wait_for("后台任务已到期 pid=", 4.0))
 
     # ---- 超时挂起 ----
-    check("set timeout 1500", run_wait("echo SET_TIMEOUT 1500 > /data/life/cmd_0",
-                                       "bg->suspend 超时已设为 1500", 5.0))
-    check("bg appA(2)", run_wait("echo BG > /data/life/cmd_%s" % aud, "已转入后台 appA", 5.0))
+    check("set timeout 1500", run_cmd(0, "SET_TIMEOUT 1500", "bg->suspend 超时已设为 1500", 5.0))
+    check("bg appA(2)", run_cmd(aud, "BG", "已转入后台 appA", 5.0))
     # 慢宿主余量：50ms 轮询 + 150ms 宽限 + TCG 调度抖动，15s 足以区分
     # 「超时挂起正常」与「真不挂起」（旧 4s 在 RISC-V TCG 下偏紧）。
     check("appA suspended", wait_for("已挂起 appA", 15.0))
@@ -235,11 +247,11 @@ try:
     check("notify forwarded", run_wait("echo Hello World > /data/push/in/%s_1" % sen,
                                        "通知已投递", 5.0))
     check("evt NOTIFY", run_wait("cat /data/life/evt_%s" % sen, "NOTIFY", 5.0))
-    check("bg appB(2)", run_wait("echo BG > /data/life/cmd_%s" % sen, "已转入后台 appB", 5.0))
+    check("bg appB(2)", run_cmd(sen, "BG", "已转入后台 appB", 5.0))
     check("通知已延迟", run_wait("echo Deferred msg > /data/push/in/%s_2" % sen,
                                       "通知已延迟", 5.0))
     check("pending NOTIFY", run_wait("cat /data/push/pending/%s" % sen, "NOTIFY", 5.0))
-    check("fg appB(2)", run_wait("echo FG %s > /data/life/cmd_0" % sen, "已回前台 appB", 5.0))
+    check("fg appB(2)", run_cmd(0, "FG %s" % sen, "已回前台 appB", 5.0))
     check("evt RESUME+NOTIFY", run_wait("cat /data/life/evt_%s" % sen, "RESUME NOTIFY", 5.0))
     check("pending removed", not run_wait("cat /data/push/pending/%s" % sen, "NOTIFY", 2.5))
 

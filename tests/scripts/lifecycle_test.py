@@ -172,8 +172,27 @@ try:
         # 内容 "<pid> <FG|BG>"（无引号，shell 按空白切词后 echo 拼回）
         return run_cmd_and_wait(f"echo {pid} {fg} > /data/life/reg_{name}", "", 2.0)
 
+    # 生产协议：cmd_<pid>_<seq> 每消息一文件 + 写 .tmp 后 mv（rename）原子
+    # 发布（shared/lifecycle.rs lc_write_cmd / launcher app_life.rs / pushd 同款）。
+    # 旧单文件 echo 覆盖式写法在 lifd 消费（50ms 轮询）前即被下一条覆盖
+    # （round-004 连锁假失败根因）；迁移后回归覆盖生产真实 IPC 路径。
+    CMD_SEQ = [0]
+
+    def cmd_pub(pid, text):
+        CMD_SEQ[0] += 1
+        base = f"/data/life/cmd_{pid}_{CMD_SEQ[0]}"
+        return (run_cmd_and_wait(f"echo {text} > {base}.tmp", "", 2.0)
+                and run_cmd_and_wait(f"mv {base}.tmp {base}", "", 2.0))
+
+    def cmd_wait(pid, text, marker, timeout=6.0):
+        CMD_SEQ[0] += 1
+        base = f"/data/life/cmd_{pid}_{CMD_SEQ[0]}"
+        if not run_cmd_and_wait(f"echo {text} > {base}.tmp", "", 2.0):
+            return False
+        return run_cmd_and_wait(f"mv {base}.tmp {base}", marker, timeout)
+
     def cmd_to(pid, text):
-        return run_cmd_and_wait(f"echo {text} > /data/life/cmd_{pid}", "", 2.0)
+        return cmd_pub(pid, text)
 
     def cat_check(path, marker, timeout=3.0):
         return run_cmd_and_wait(f"cat {path}", marker, timeout)
@@ -214,20 +233,20 @@ try:
     # 在下一条提交前到期，凑不满每应用上限（与 lifecycle_core_test 同款修复）。
     # 每步等 lifd 的处理回执再发下一条：cmd_<pid> 是单文件信箱，连续 echo 会
     # 覆盖未消费的上一条（旧脚本 A2 被 A3 覆盖丢失 → 上限/到期/挂起连锁假失败）。
-    check("BTASK bad type", run_cmd_and_wait(f"echo BTASK 9 100 > /data/life/cmd_{pid_c}", "后台任务被拒: 未知类型", 6.0))
-    check("BTASK A1", run_cmd_and_wait(f"echo BTASK 1 10000000 > /data/life/cmd_{pid_a}", "后台任务已授予", 6.0))
-    check("BTASK A2", run_cmd_and_wait(f"echo BTASK 2 10000000 > /data/life/cmd_{pid_a}", "后台任务已授予", 6.0))
-    check("deny per-app limit", run_cmd_and_wait(f"echo BTASK 0 10000000 > /data/life/cmd_{pid_a}", "后台任务被拒: 单应用数量已达上限", 6.0))
+    check("BTASK bad type", cmd_wait(pid_c, "BTASK 9 100", "后台任务被拒: 未知类型", 6.0))
+    check("BTASK A1", cmd_wait(pid_a, "BTASK 1 10000000", "后台任务已授予", 6.0))
+    check("BTASK A2", cmd_wait(pid_a, "BTASK 2 10000000", "后台任务已授予", 6.0))
+    check("deny per-app limit", cmd_wait(pid_a, "BTASK 0 10000000", "后台任务被拒: 单应用数量已达上限", 6.0))
     # 显式结束并等回执释放槽位，否则后续 BTASK 仍被上限拒绝
-    check("BTASK_END A", run_cmd_and_wait(f"echo BTASK_END > /data/life/cmd_{pid_a}", "后台任务已结束", 6.0))
-    check("BTASK A short", run_cmd_and_wait(f"echo BTASK 3 400 > /data/life/cmd_{pid_a}", "后台任务已授予 type=", 6.0))
+    check("BTASK_END A", cmd_wait(pid_a, "BTASK_END", "后台任务已结束", 6.0))
+    check("BTASK A short", cmd_wait(pid_a, "BTASK 3 400", "后台任务已授予 type=", 6.0))
     check("expired event", wait_for("后台任务已到期 pid=", 8.0))
     check("evt BG_TASK_EXPIRED", cat_check(f"/data/life/evt_{pid_a}", "BG_TASK_EXPIRED", 3.0))
 
     # ---- 5. 超时挂起 ----
     # appA 后台化（无任务）→ SET_TIMEOUT 800ms 后转 Suspended（lifd now_us 已
     # 改 CLOCK_MONOTONIC，墙钟回拨不再使超时永久失效）
-    check("SET_TIMEOUT", run_cmd_and_wait(f"echo SET_TIMEOUT 800 > /data/life/cmd_{pid_c}", "bg->suspend 超时已设为 800", 6.0))
+    check("SET_TIMEOUT", cmd_wait(pid_c, "SET_TIMEOUT 800", "bg->suspend 超时已设为 800", 6.0))
     time.sleep(0.3)
     check("BG A", cmd_to(pid_a, "BG"))
     check("suspend appA", wait_for("已挂起 appA", 15.0))
