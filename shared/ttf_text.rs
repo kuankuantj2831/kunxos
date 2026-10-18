@@ -77,11 +77,51 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
         // dst 更低或无重叠：前向宽通道。
         wide_copy(dest, src, n);
     } else {
-        // dst > src 且重叠：反向逐字节（保序）。
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            *dest.add(i) = *src.add(i);
+        // dst > src 且重叠：反向宽通道（与内核 memmove 同款镜像策略）——
+        // 两端 8 字节同余先回拷尾部字节对齐，16B/迭代负偏移 ld/sd，
+        // 余数不同余或头部剩余回退字节循环（volatile 防 LoopIdiomRecognize
+        // 把循环改写回 call memmove 造成无限递归）。
+        let dstart = dest as usize;
+        let mut d = dstart.wrapping_add(n);
+        let mut s = (src as usize).wrapping_add(n);
+        if (d & 7) == (s & 7) && n >= 32 {
+            while (d & 7) != 0 {
+                d -= 1;
+                s -= 1;
+                (d as *mut u8).write_volatile((s as *const u8).read_volatile());
+            }
+            while d.saturating_sub(dstart) >= 16 {
+                asm!(
+                    "ld {v0}, -16({s})",
+                    "ld {v1}, -8({s})",
+                    "sd {v0}, -16({d})",
+                    "sd {v1}, -8({d})",
+                    "addi {s}, {s}, -16",
+                    "addi {d}, {d}, -16",
+                    v0 = out(reg) _,
+                    v1 = out(reg) _,
+                    s = inout(reg) s,
+                    d = inout(reg) d,
+                    options(nostack),
+                );
+            }
+            while d.saturating_sub(dstart) >= 8 {
+                asm!(
+                    "ld {v}, -8({s})",
+                    "sd {v}, -8({d})",
+                    "addi {s}, {s}, -8",
+                    "addi {d}, {d}, -8",
+                    v = out(reg) _,
+                    s = inout(reg) s,
+                    d = inout(reg) d,
+                    options(nostack),
+                );
+            }
+        }
+        while d > dstart {
+            d -= 1;
+            s -= 1;
+            (d as *mut u8).write_volatile((s as *const u8).read_volatile());
         }
     }
     dest

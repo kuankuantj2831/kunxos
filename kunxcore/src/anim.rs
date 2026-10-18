@@ -1134,6 +1134,19 @@ pub fn perf_test() {
     crate::print_dec(if d_even == 0 { 0 } else { d_odd * 100 / d_even });
     uart("%\n");
 
+    // ---- E. 重叠拷贝基线：memmove 反向路径（滚动/同缓冲平移形态） ----
+    // 同缓冲 320×200 块下移 16 字节（dst>src 全程重叠）；附单次语义正确性
+    // 抽查（序号模式逐字核对），反向宽通道错序会以「正确性失败」暴露。
+    let e = compositor::bench_overlap_copy(200, 30);
+    uart(" [anim-perf] E/overlap-copy-320x200+16B ");
+    if e == u64::MAX {
+        uart("正确性失败!\n");
+    } else {
+        uart("=");
+        crate::print_dec(e);
+        uart("us/次\n");
+    }
+
     // ---- 汇总：1080p 外推 + 判定 ----
     let n_b = stats_b.count.max(1);
     let full_avg = stats_b.render_sum / n_b as u64;

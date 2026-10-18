@@ -800,6 +800,45 @@ pub fn bench_row_copy(x0: i32, w: u32, h: u32, iters: u32) -> u64 {
     }
 }
 
+/// [perf] 重叠拷贝基线（anim::perf_test 场景 E）：同缓冲内把 320×h 块
+/// 下移 16 字节（dst>src 全程重叠 → memmove 反向路径，滚动/平移形态）
+/// 的平均单次耗时（µs）。返回 u64::MAX 表示正确性抽查失败（反向宽通道
+/// 错序的信号哨兵）；抽查为「单次搬移后逐字核对序号模式」。
+pub fn bench_overlap_copy(h: u32, iters: u32) -> u64 {
+    unsafe {
+        if C.width == 0 {
+            return 0;
+        }
+        let words = 320usize * h as usize; // u32 字数（×4 = 字节）
+        let scratch = heap::kmalloc((words + 4) * 4) as *mut u32;
+        if scratch.is_null() {
+            return 0;
+        }
+        let t0 = crate::timer::now_us();
+        for _ in 0..iters {
+            core::ptr::copy(scratch, scratch.add(4), words);
+        }
+        let t1 = crate::timer::now_us();
+        // 正确性抽查：重填序号 → 单次下移 16B → dst[i] 应等于原 src[i]
+        for i in 0..(words + 4) {
+            *scratch.add(i) = i as u32;
+        }
+        core::ptr::copy(scratch, scratch.add(4), words);
+        let mut ok = true;
+        for i in 0..words {
+            if *scratch.add(i + 4) != i as u32 {
+                ok = false;
+                break;
+            }
+        }
+        heap::kfree(scratch as *mut u8);
+        if !ok {
+            return u64::MAX;
+        }
+        (t1 - t0) / iters as u64
+    }
+}
+
 /// 创建窗口，返回窗口 id（失败返回 usize::MAX）。
 pub fn create_window(x: i32, y: i32, w: u32, h: u32, z: i32, alpha: u8) -> usize {
     let id = (0..MAX_WINDOWS).find(|&i| unsafe { !C.windows[i].active });
