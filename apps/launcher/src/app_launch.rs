@@ -252,6 +252,8 @@ static mut FRAME_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_
 static mut DESK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
 /// Return 转场是否处于「桌面预渲染」模式（render_frame Return 分支据此选路）。
 static mut DESK_PRERENDERED: bool = false;
+/// 本应用会话是否已预烘焙返回桌面（防每 4ms 重烘焙；start_launch 复位）。
+static mut DESK_BAKED: bool = false;
 /// 上一合成帧的应用帧矩形（恢复基准）：缩回矩形逐帧变小，若只写矩形内部
 /// 会在四周留下上一帧的应用像素拖尾 —— 每帧先用 DESK_BUF 恢复该区域再合成。
 static mut DESK_RET_PREV: [i32; 4] = [0; 4];
@@ -259,6 +261,45 @@ static mut DESK_RET_PREV: [i32; 4] = [0; 4];
 /// Return 转场当前是否以预渲染桌面为底图（main.rs render_frame 查询）。
 pub fn desk_prerendered() -> bool {
     unsafe { DESK_PRERENDERED }
+}
+
+/// 占位页骨架屏呼吸是否仍在进行（= 应用首帧尚未上屏）。
+pub fn placeholder_on() -> bool {
+    unsafe { PLACE_ON }
+}
+
+/// 应用前台空闲期预烘焙返回转场桌面（2026-10-18 上滑退出卡顿修复）。
+///
+/// launcher 在应用前台期间持续运行（4ms 轮询）且不渲染桌面，趁空闲把
+/// 整幅桌面渲染进 DESK_BUF（**不 flip、不触碰显存**——应用独占屏幕，
+/// 完全隐形）。上划返回手势到来时 start_return 直接复用，免掉手势
+/// 关键路径上的整屏 TTF 重渲染（TCG 下 ~百毫秒级 = 「卡一下」主因）。
+///
+/// # 安全：仅限动画全部结束（MOTION::Idle）时调用——Launch/Return/
+/// FlyAway 等动画帧的合成路径以 BACK_BUF 为画布，烘焙会与之互踩。
+/// 由主循环前台分支按 `!in_resuming && MOTION==Idle && !placeholder_on`
+/// 门控调用。
+pub fn desk_bake_for_return() {
+    unsafe {
+        if DESK_BAKED || MOTION.phase != Phase::Idle {
+            return;
+        }
+        DESK_BAKED = true;
+        let t0 = now_us();
+        draw_desktop_full();
+        DESK_BUF.copy_from_slice(&BACK_BUF);
+        DESK_PRERENDERED = true;
+        print("[motion] 返回桌面预烘焙 ");
+        print_dec(((now_us() - t0) / 1000) as u32);
+        print("ms（应用前台空闲期，零手势路径成本）\n");
+    }
+}
+
+/// 新应用会话开始：预烘焙标记复位（start_launch 调用）。
+pub fn desk_bake_reset() {
+    unsafe {
+        DESK_BAKED = false;
+    }
 }
 
 /// 供 app_life 写入 Resume 动画的缩放源（应用末帧快照）。
@@ -772,6 +813,8 @@ pub fn cancel_press() {
 /// 放行应用绘制首帧；应用未就绪则显示占位页。
 pub fn start_launch(app_idx: usize) {
     unsafe {
+        // 新应用会话：返回桌面预烘焙标记复位（应用前台空闲期重烘焙）。
+        DESK_BAKED = false;
         // 连续启动打断（ColorOS 极光引擎）：返回转场中途点击新图标，不等
         // 300ms 播完 —— 以当前中途帧为背景快照，无缝切换为新应用的启动
         // 转场（快照时 MOTION.phase 仍是 Return，render_frame 走 zoom_blit
@@ -891,6 +934,7 @@ pub fn start_launch(app_idx: usize) {
 /// 「桌面 + 缩回应用帧」合成；结束时整体恢复，不再付整屏重绘尾巴。
 pub fn start_return(app_idx: usize) {
     unsafe {
+        let t_sr0 = now_us();
         if !FB.is_null() {
             let w = FB_W.min(DISPLAY_W);
             let h = FB_H.min(DISPLAY_H);
@@ -902,14 +946,26 @@ pub fn start_return(app_idx: usize) {
                 );
             }
         }
-        // 壁纸偏好同步挪到转场开始（原在 return_animation_done —— 转场后的
-        // 关键路径上）；若调色板变化触发了淡入，直接结算到终态：预渲染是
-        // 静态底图，淡入无从插帧。
+        // 壁纸偏好同步（原在 return_animation_done）：设置应用可能改壁纸。
+        // 调色板变化触发的淡入直接结算到终态（预渲染是静态底图）。
         wallpaper_sync_from_prefs();
+        let wp_changed = WP_FADE_ACTIVE;
         WP_FADE_ACTIVE = false;
-        draw_desktop_full();
-        DESK_BUF.copy_from_slice(&BACK_BUF);
-        DESK_PRERENDERED = true;
+        // 返回转场桌面（2026-10-18 上滑退出卡顿修复）：优先复用应用前台
+        // 空闲期预烘焙的 DESK_BUF（desk_bake_for_return）——launcher 在
+        // 应用前台期间持续运行且不渲染桌面，烘焙结果与应用退出时刻的
+        // 桌面完全一致。仅未烘焙/壁纸变化时才在手势路径上整屏重渲染
+        //（TCG 下 ~百毫秒级 TFF 图标重绘 = 上滑退出「卡一下」的主因）。
+        if !DESK_PRERENDERED || wp_changed {
+            let t_r0 = now_us();
+            draw_desktop_full();
+            let t_r1 = now_us();
+            DESK_BUF.copy_from_slice(&BACK_BUF);
+            DESK_PRERENDERED = true;
+            print("[motion] 返回桌面兜底渲染 ");
+            print_dec(((t_r1 - t_r0) / 1000) as u32);
+            print("ms（未命中预烘焙）\n");
+        }
         // 恢复基准 = 全屏：首帧先把整幅桌面恢复进 BACK_BUF 再合成应用帧。
         DESK_RET_PREV = [0, 0, DISPLAY_W as i32 - 1, DISPLAY_H as i32 - 1];
         let (hx, hy) = icon_center(app_idx);
@@ -920,6 +976,9 @@ pub fn start_return(app_idx: usize) {
         MOTION.cur_scale = SCALE_1;
         MOTION.cur_fade = 0;
         NEEDS_REDRAW = true;
+        print("[motion] 上滑返回就绪耗时 ");
+        print_dec(((now_us() - t_sr0) / 1000) as u32);
+        print("ms\n");
     }
 }
 

@@ -8838,6 +8838,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             //（内部 4ms 节流 + 骨架区脏矩形 flip，开销极小；应用首帧写入
             // 显存后基线偏离自动停止）。
             placeholder_breathe(now);
+            // 返回转场桌面预烘焙（2026-10-18 上滑退出卡顿修复）：应用首帧
+            // 已上屏（占位页停）且无动画进行时，趁空闲把整幅桌面渲染进
+            // DESK_BUF（不 flip 不触显存，完全隐形）——上滑返回手势路径
+            // 零整屏渲染，免掉「卡一下」。
+            if !app_life::in_resuming() && !app_launch::placeholder_on() {
+                app_launch::desk_bake_for_return();
+            }
             // 前台等待帧距 4ms（≈250fps 采样；内核精确睡眠后为真实 4ms，
             // 此前 sleep_ms(8) 被 10ms tick 量化成 ~100fps 上限）。
             sleep_us(4_000);
