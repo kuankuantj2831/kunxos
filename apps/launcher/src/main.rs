@@ -1421,9 +1421,15 @@ fn print_dec(mut v: u32) {
 }
 
 fn sleep_ms(ms: usize) {
+    sleep_us(ms as u64 * 1_000);
+}
+
+/// 微秒级睡眠：内核精确睡眠（sleep_until 登记后重编程硬件定时器，
+/// 2026-10-18）生效后帧循环节距不再被 10ms 调度 tick 量化。
+fn sleep_us(us: u64) {
     let mut req = [0u8; 16];
-    let sec = (ms / 1000) as u64;
-    let nsec = ((ms % 1000) * 1_000_000) as u64;
+    let sec = us / 1_000_000;
+    let nsec = (us % 1_000_000) * 1_000;
     req[..8].copy_from_slice(&sec.to_le_bytes());
     req[8..].copy_from_slice(&nsec.to_le_bytes());
     unsafe {
@@ -8829,10 +8835,12 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
             }
             // B10 占位页骨架屏呼吸：应用首帧未就绪的等待期内保持加载反馈
-            //（内部 33ms 节流 + 骨架区脏矩形 flip，开销极小；应用首帧写入
+            //（内部 4ms 节流 + 骨架区脏矩形 flip，开销极小；应用首帧写入
             // 显存后基线偏离自动停止）。
             placeholder_breathe(now);
-            sleep_ms(8);
+            // 前台等待帧距 4ms（≈250fps 采样；内核精确睡眠后为真实 4ms，
+            // 此前 sleep_ms(8) 被 10ms tick 量化成 ~100fps 上限）。
+            sleep_us(4_000);
             continue;
         }
         // 0.5 桌面期间：处理 lifd 事件（LMK 击杀后台应用 → 回收清理）。
@@ -9187,9 +9195,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             move_cursor_fb();
         }
 
-        // 4. 帧预算：空闲锁定 16ms（≈60fps）；控制中心动画/拖动期间锁定
-        //    8ms（≈120Hz），渲染/输入耗时从睡眠中扣除。
-        //    超预算时立即进入下一帧（干净掉帧而非越积越慢），动画期间节奏稳定。
+        // 4. 帧预算：空闲锁定 16ms（≈60fps）；动画/拖动/转场期间锁定
+        //    4ms（≈250fps，内核精确睡眠后为真实节距），渲染/输入耗时从
+        //    睡眠中扣除。超预算时立即进入下一帧（干净掉帧而非越积越慢），
+        //    动画期间节奏稳定。
         let elapsed = now_us() - frame_start;
         // 4.5 转场停滞压缩：宿主机高负载 / TCG 卡顿下单帧可能耗时数百毫秒，
         //    启动/返回转场会看起来"卡死"。单帧耗时 >250ms 时把转场时钟提前
@@ -9205,9 +9214,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
             }
         }
-        // 跟手/吸附中的翻页也走高刷新率（拖动流畅度优先）。
-        let high_refresh = unsafe { control_center::cc_high_refresh() || PAGE_ANIM || PAGE_DRAG };
-        let budget = if high_refresh { 8_000 } else { 16_000 };
+        // 跟手/吸附中的翻页也走高刷新率（拖动流畅度优先）；启动/返回/恢复
+        // 转场与按压反馈（MOTION 状态机非空闲）同样走高刷（2026-10-18
+        // 帧率上限拉满轮：转场此前只吃 16ms 预算 ≈62fps）。
+        let high_refresh = unsafe {
+            control_center::cc_high_refresh() || PAGE_ANIM || PAGE_DRAG || MOTION.phase != Phase::Idle
+        };
+        let budget = if high_refresh { 4_000 } else { 16_000 };
         // 光标流畅优先（与 OOBE 同款，R7-D 修正为真生效条件）：本帧有
         // 输入（CURSOR_DIRTY 多在帧内已被消费，静态判定是死条件）时跳过
         // 帧预算睡眠，光标下一帧即刻处理，不叠 16ms 预算。

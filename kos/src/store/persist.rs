@@ -35,6 +35,7 @@ pub const IDS_PER_IDX_BLOCK: usize = 509;
 /// hint（超级块 reserved[0..32]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountHint {
+    /// 快速挂载标记魔数。
     pub magic: u32,
     /// 写入时的 manifest generation（与活动槽一致才走快速路径）。
     pub seq: u64,
@@ -49,8 +50,10 @@ pub struct MountHint {
 }
 
 impl MountHint {
+    /// 磁盘序列化字节数。
     pub const SIZE: usize = 32;
 
+    /// 序列化为 32 字节小端（写入超级块保留区）。
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut b = [0u8; 32];
         b[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -79,6 +82,7 @@ impl MountHint {
         })
     }
 
+    /// 把提示写进超级块保留区（mkfs 时调用）。
     pub fn write_to_sb(&self, sb: &mut KosSuperblock) {
         sb.reserved[..32].copy_from_slice(&self.to_bytes());
     }

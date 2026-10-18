@@ -140,7 +140,12 @@ pub enum KosError {
     /// write_range 的偏移/长度非法（如负溢出、超上限）。
     OffsetInvalid,
     /// 上传会话未完成即请求 finish。
-    UploadIncomplete { received: u32, total: u32 },
+    UploadIncomplete {
+        /// 已收到的块数。
+        received: u32,
+        /// 会话声明的总块数。
+        total: u32,
+    },
 }
 
 impl fmt::Display for KosError {

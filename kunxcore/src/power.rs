@@ -154,11 +154,15 @@ pub const T_EMERGENCY_C: u32 = 90;
 /// Hot 级别下的频率上限（Hz）：压到 900MHz（表内最接近且 ≤ 它的频点）。
 pub const HOT_CAP_HZ: u32 = 900_000_000;
 
-/// 帧时钟档位（µs）：120Hz / 90Hz / 60Hz（CNTP 动画定时器周期）。
+/// 帧时钟档位（µs）：240Hz / 120Hz / 90Hz / 60Hz（动画定时器周期）。
 ///
 /// 热—功耗—流畅联动（稳态帧率而非短时冲刺）：热/低电时按档位降帧时钟，
 /// 而非让合成器硬扛预算失败（每帧超时 → 抖动比低帧率更差）。anim 内部
 /// 按实际 dt 积分，变帧率天然兼容。
+///
+/// 2026-10-18 帧率上限拉满轮：常态档 120→240Hz（动画采样密度翻倍）；
+/// 热/低电降档策略不变（90/60Hz）。
+pub const FRAME_240_US: u64 = 4_167;
 pub const FRAME_120_US: u64 = 8_333;
 pub const FRAME_90_US: u64 = 11_111;
 pub const FRAME_60_US: u64 = 16_667;
@@ -377,17 +381,16 @@ fn thermal_cap_hz(table: &[FreqPoint], level: ThermalLevel) -> u32 {
     }
 }
 
-/// 当前帧时钟周期（µs）——热/低电降档的唯一定策点。
-///
-/// 动画帧时钟（CNTP）按此周期驱动：热级别 Hot 压到 90Hz、Critical+
-/// 压到 60Hz；低电量未充电封顶 60Hz。恢复后回到 120Hz。`anim.rs` 的
-/// 帧时钟启动/刷新统一取本值，热/电池采样在档位边沿调用
-/// `anim::refresh_frame_clock()` 立即生效（动画不活动时下次启动生效）。
+/// 动画帧时钟（监督定时器 ch2）按此周期驱动：热级别 Hot 压到 90Hz、
+/// Critical+ 压到 60Hz；低电量未充电封顶 60Hz。恢复后回到 240Hz
+/// （常态档，2026-10-18 起）。`anim.rs` 的帧时钟启动/刷新统一取本值，
+/// 热/电池采样在档位边沿调用 `anim::refresh_frame_clock()` 立即生效
+/// （动画不活动时下次启动生效）。
 pub fn anim_frame_interval_us() -> u64 {
     let base = match unsafe { THERMAL_LEVEL } {
         ThermalLevel::Critical | ThermalLevel::Emergency => FRAME_60_US,
         ThermalLevel::Hot => FRAME_90_US,
-        ThermalLevel::Normal | ThermalLevel::Warm => FRAME_120_US,
+        ThermalLevel::Normal | ThermalLevel::Warm => FRAME_240_US,
     };
     // 低电量（≤15% 未充电，battery-low 事件已触发）：稳态 60Hz，省电优先
     if unsafe { BATT_LOW_EVENTED } && base < FRAME_60_US {

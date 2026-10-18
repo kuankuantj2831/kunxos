@@ -6,7 +6,8 @@
 //   - 禁止：整体 40% 透明度，不可点击
 // 圆角半径 = min(高度 * 0.30, 16px)（ColorOS 15 连续曲率超椭圆）；高度固定 50px；
 // 宽度 = min(内容宽度 + 48px, 屏幕宽度 * 0.85)；无阴影。
-// 按压反馈：按下着色变暗 15%，松开后 150ms 过渡回弹（无墙钟，按帧计数）。
+// 按压反馈：按下着色变暗 15%，松开后 150ms 过渡回弹（真实时间推进，
+// crate::mono_us 单调时钟——帧循环提速后回弹时长不随帧率变化）。
 
 /// 按钮固定高度。
 pub const BTN_H: i32 = 50;
@@ -22,8 +23,9 @@ pub const BTN_MIN_W: i32 = 176;
 pub const BTN_PRESS_DARKEN: u32 = 218;
 /// 禁止态透明度（0.4 * 255）。
 pub const BTN_DISABLED_ALPHA: u32 = 102;
-/// 松开回弹帧数（≈150ms @ 60fps / 16ms 每帧）。
-pub const BTN_RELEASE_FRAMES: i32 = 9;
+/// 松开回弹时长（µs，真实时间；此前 9 帧计数在帧率拉满后会被压缩成
+/// 几十毫秒的闪跳，帧率与时长解耦后固定 150ms）。
+pub const BTN_RELEASE_DUR_US: u64 = 150_000;
 
 /// 按钮文字色（白底/浅玻璃上的近黑主文字）。
 const C_PRIMARY: u32 = 0x00_1A_1C_22;
@@ -80,7 +82,8 @@ pub struct Button {
     pub w: i32,
     pub h: i32,
     pressed: bool,
-    release_ticks: i32,
+    /// 回弹结束时刻（mono µs）；0 = 无回弹进行中。
+    release_end_us: u64,
 }
 
 impl Button {
@@ -93,7 +96,7 @@ impl Button {
             w: 0,
             h: 0,
             pressed: false,
-            release_ticks: 0,
+            release_end_us: 0,
         }
     }
 
@@ -136,31 +139,32 @@ impl Button {
     /// 按下：立即进入变暗态。
     pub fn press(&mut self) {
         self.pressed = true;
-        self.release_ticks = 0;
+        self.release_end_us = 0;
     }
 
-    /// 松开：开始 150ms 回弹过渡。
+    /// 松开：开始 150ms 回弹过渡（结束时刻按单调时钟记录）。
     pub fn release(&mut self) {
         self.pressed = false;
-        self.release_ticks = BTN_RELEASE_FRAMES;
+        self.release_end_us = crate::mono_us() + BTN_RELEASE_DUR_US;
     }
 
     /// 立即复位（不触发过渡），切步骤时调用。
     pub fn reset(&mut self) {
         self.pressed = false;
-        self.release_ticks = 0;
+        self.release_end_us = 0;
     }
 
-    /// 每帧推进一次回弹过渡。
+    /// 推进回弹过渡：到点收敛为静止态（进度本身由绘制时的单调时钟
+    /// 实时求值，这里只负责把「回弹中」状态落地为完成）。
     pub fn tick(&mut self) {
-        if self.release_ticks > 0 {
-            self.release_ticks -= 1;
+        if self.release_end_us != 0 && crate::mono_us() >= self.release_end_us {
+            self.release_end_us = 0;
         }
     }
 
     /// 是否正处于松开回弹过渡中。
     pub fn animating(&self) -> bool {
-        self.release_ticks > 0
+        self.release_end_us != 0 && crate::mono_us() < self.release_end_us
     }
 
     /// 按当前状态绘制按钮，并记录命中区（宽度自适应，见 [`Self::width`]）。
@@ -228,12 +232,19 @@ impl Button {
         }
     }
 
-    /// 按压进度：按下=1，松开回弹期间线性回落到 0。
+    /// 按压进度：按下=1，松开回弹期间按真实剩余时间线性回落到 0。
     fn press_progress(&self) -> f32 {
         if self.pressed {
             1.0
-        } else if self.release_ticks > 0 {
-            (BTN_RELEASE_FRAMES - self.release_ticks) as f32 / BTN_RELEASE_FRAMES as f32
+        } else if self.release_end_us != 0 {
+            let now = crate::mono_us();
+            if now >= self.release_end_us {
+                0.0
+            } else {
+                // 剩余时长比例 = 1 - 已进行比例
+                let remain = self.release_end_us - now;
+                1.0 - (remain as f32 / BTN_RELEASE_DUR_US as f32).min(1.0)
+            }
         } else {
             0.0
         }
@@ -243,10 +254,9 @@ impl Button {
     fn darken_factor(&self) -> u32 {
         if self.pressed {
             BTN_PRESS_DARKEN
-        } else if self.release_ticks > 0 {
-            BTN_PRESS_DARKEN
-                + (256 - BTN_PRESS_DARKEN) * (BTN_RELEASE_FRAMES - self.release_ticks) as u32
-                    / BTN_RELEASE_FRAMES as u32
+        } else if self.release_end_us != 0 {
+            let p = (self.press_progress() * 256.0) as u32;
+            BTN_PRESS_DARKEN + (256 - BTN_PRESS_DARKEN) * p / 256
         } else {
             256
         }

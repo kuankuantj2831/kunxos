@@ -98,7 +98,9 @@ pub fn check_access(uid: u32, owner_uid: u32, capability: u32, want: u32) -> boo
 /// 写序与原子提交依旧，只是持久性窗口放宽到 n 次提交）。
 #[derive(Debug, Clone, Copy)]
 pub enum FlushPolicy {
+    /// 每次写入立即落盘（默认）。
     Eager,
+    /// 攒 `u32` 次写入后统一落盘。
     Batched(u32),
 }
 
@@ -661,10 +663,6 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         }
     }
 
-    fn write_header_block(&mut self, block: u64, hdr: &KosObject) -> Result<(), KosError> {
-        self.write_header_block_inline(block, hdr, None)
-    }
-
     /// 写头块；`inline` 为内联区段表字节（置于偏移 96）。
     fn write_header_block_inline(
         &mut self,
@@ -982,7 +980,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
 
         type PatchMap = BTreeMap<usize, [u8; 32]>;
         let mut pending_drop: Option<Vec<Extent>> = None;
-        let mut leaves = self.read_leaf_hashes(&idx, old_chunks)?;
+        let leaves = self.read_leaf_hashes(&idx, old_chunks)?;
         let (extents, patched, tree) = if new_chunks == old_chunks {
             let t = MerkleTree::build_from_chunk_hashes(&leaves, &self.hasher);
             (idx.data_extents.clone(), PatchMap::new(), t)
@@ -1119,7 +1117,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
     fn commit_record_switch(
         &mut self,
         old: &ObjIndex,
-        root: [u8; 32],
+        _root: [u8; 32],
         new_len: u64,
         total_chunks: u32,
         loc: TableLoc,
@@ -1249,35 +1247,6 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         extents.extend(runs_of(&new_blocks, KIND_DATA));
         extents.extend(tail);
         Ok((extents, hashes))
-    }
-
-    /// 把 `content` 的 chunk 集写回：旧 chunk 原地覆盖（复用旧区段块），
-    /// 扩容的新 chunk 走新区段。返回合并后的数据区段列表。
-    fn rewrite_chunks(
-        &mut self,
-        idx: &ObjIndex,
-        content: &[u8],
-        old_chunks: usize,
-        new_chunks: usize,
-    ) -> Result<Vec<Extent>, KosError> {
-        let mut buf = [0u8; BLK];
-        for c in 0..old_chunks.min(new_chunks) {
-            let block = Self::chunk_block_no(idx, c as u32)?;
-            let start = c * DATA_CHUNK_SIZE;
-            let end = core::cmp::min(start + DATA_CHUNK_SIZE, content.len());
-            buf = [0u8; BLK];
-            buf[..end - start].copy_from_slice(&content[start..end]);
-            self.write_blk(block, &buf)?;
-        }
-        if new_chunks <= old_chunks {
-            return Ok(idx.data_extents.clone());
-        }
-        // 扩容：新增 chunk 挂新区段。
-        let tail = &content[old_chunks * DATA_CHUNK_SIZE..];
-        let mut extents = idx.data_extents.clone();
-        let new_extents = self.write_chunk_extents(tail)?;
-        extents.extend_from_slice(&new_extents);
-        Ok(extents)
     }
 
     /// 读第 0 层索引块提取全部 chunk 哈希（append/重建用，不读数据块）。
@@ -1939,7 +1908,7 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
             .filter(|k| !reachable.contains(k))
             .cloned()
             .collect();
-        let mut freed_blocks = 0u64;
+        let freed_blocks: u64;
         let before_free = self.free_cnt;
         let zero = [0u8; BLK];
         for k in &dead {
@@ -2082,7 +2051,6 @@ impl<B: crate::block::BlockDevice> KosStore<B> {
         }
         // 回绕范围 = 全池（懒加载截断不影响）；is_free 越界即空闲。
         let total = self.sb.obj_pool_blocks as usize;
-        let per = crate::store::persist::BITS_PER_BMP_BLOCK;
         let mut runs: Vec<(u64, u32)> = Vec::new();
         let mut got = 0u64;
         // F3 局部性：分配提示点起恰好有连续 need 空闲块 → 直接取用。
@@ -2330,21 +2298,6 @@ fn split_extents_at(extents: &[Extent], chunk: usize) -> (Vec<Extent>, Vec<Exten
         }
     }
     (head, tail)
-}
-
-/// 按区段列表定位第 `chunk` 个数据块的绝对块号。
-fn extents_block_no(extents: &[Extent], chunk: u32) -> Result<u64, KosError> {
-    let mut c = chunk as u64;
-    for ext in extents {
-        if c < ext.count as u64 {
-            return Ok(ext.start + c);
-        }
-        c -= ext.count as u64;
-    }
-    Err(KosError::ChunkIndexOutOfRange {
-        index: chunk as usize,
-        total_chunks: 0,
-    })
 }
 
 /// 区段表落点：单表可容纳时内联进头块（省 1 块），否则链式块。

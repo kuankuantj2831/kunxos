@@ -780,10 +780,11 @@ power-test: kernel
 	python3 tests/scripts/power_test.py /tmp/kx_power.log
 
 # ---- 生命周期测试（docs/lifecycle-test.md） ----
-# GUI 端到端（默认）：经 launcher 启动/后台化/恢复 lcapp，OOBE 快进 +
-# 触摸帧驱动，覆盖状态机/后台任务/LMK/推送/状态持久化全链路。
+# 无头完整回归 + 命令信箱背靠背连发（cmd_<pid>_<seq> 生产协议不丢命令）。
+# 两个都绿才算过：前者覆盖状态机全链路，后者守护 IPC 原子发布语义。
 lifecycle-test: kernel
 	python3 tests/scripts/lifecycle_test.py /tmp/kx_life.log
+	python3 tests/scripts/lifecycle_cmd_burst.py /tmp/kx_life_burst.log
 
 # 无头核心回归（快速、确定性）：仅串口 shell 驱动 /data/life 文件信箱与
 # /proc/pressure 注入，直接验证 lifd 状态机（R/B/S/T）、SIGSTOP/SIGCONT、

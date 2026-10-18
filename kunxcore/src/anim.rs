@@ -337,7 +337,7 @@ pub fn tween(
                 apply(window, prop, from);
                 ANY_ACTIVE = true;
                 // 按需点亮 CNTP：空闲时动画定时器已停（frame_tick 无活动时停），
-                // 有新动画立即重新启动 120Hz 帧节拍。
+                // 有新动画立即重新启动 240Hz 帧节拍。
                 frame_clock_start();
                 irq_restore(saved);
                 return true;
@@ -469,7 +469,7 @@ pub fn cancel_window(window: usize) {
         if !any {
             // 帧时钟只由本模块启停：取消后无剩余动画时立即停掉 CNTP，
             // 否则 frame_tick 的 `!ANY_ACTIVE` 早退路径永远不会走到停表，
-            // 定时器以 120Hz 空转唤醒。清零 LAST_TICK_US 保证下次动画
+            // 定时器以 240Hz 空转唤醒。清零 LAST_TICK_US 保证下次动画
             // 首帧 dt 从 0 开始。
             LAST_TICK_US = 0;
             crate::timer::timer2_stop();
@@ -694,7 +694,7 @@ fn report_frame_stats() {
 /// 按当前电源/热策略点亮帧时钟（动画启动统一入口）。
 ///
 /// 周期取 `power::anim_frame_interval_us()`：热级别 Hot→90Hz、Critical+→60Hz、
-/// 低电封顶 60Hz、常态 120Hz。已有定时器重复调用等价一次平滑 reload。
+/// 低电封顶 60Hz、常态 240Hz。已有定时器重复调用等价一次平滑 reload。
 fn frame_clock_start() {
     crate::timer::timer2_set_interval(crate::power::anim_frame_interval_us());
 }
@@ -709,7 +709,8 @@ pub fn refresh_frame_clock() {
     }
 }
 
-/// 定时器驱动的帧推进（与调度器同周期，10ms 一次；弹簧内部按实际 dt 积分）。
+/// 定时器驱动的帧推进（帧时钟周期见 power::anim_frame_interval_us，常态
+/// 240Hz；弹簧内部按实际 dt 积分，帧率变化不改动画速度只改采样密度）。
 ///
 /// 有活动动画且合成器就绪时，在推进后合成并呈现一帧，形成动画渲染管线：
 /// `timer IRQ → anim::frame_tick → composite + present`。
@@ -782,7 +783,7 @@ pub fn frame_tick() {
                 record_frame(now, render_us);
             }
         }
-        // 无活动动画：停掉 120Hz CNTP —— 空转时不再被每秒 120 次中断唤醒
+        // 无活动动画：停掉帧时钟 —— 空转时不再被每秒 240 次中断唤醒
         // （内核覆盖窗口动画结束后系统只保留调度 tick，空闲 CPU 可真正 wfi）。
         if !ANY_ACTIVE {
             crate::timer::timer2_stop();
@@ -792,12 +793,12 @@ pub fn frame_tick() {
 
 // ==================== 启动期动画管线性能自检 ====================
 
-/// 帧率基线测试：验证 CNTP 120Hz 帧时钟驱动 `frame_tick` 全管线，并建立
-/// 应用直绘路径（`fb_damage` → 脏区拷贝 → `composite` → `present`）的帧率
-/// 基线。
+/// 帧率基线测试：验证 CNTP 帧时钟（常态 240Hz）驱动 `frame_tick` 全管线，
+/// 并建立应用直绘路径（`fb_damage` → 脏区拷贝 → `composite` → `present`）
+/// 的帧率基线。
 ///
 /// 场景（直接驱动，模拟应用在帧边界的 present）：
-///   0. 定时器看门狗：补间动画 + 开 IRQ，验证 frame_tick 在推进帧（120Hz）；
+///   0. 定时器看门狗：补间动画 + 开 IRQ，验证 frame_tick 在推进帧（240Hz）；
 ///   A. 局部脏区（320×200 移动矩形）：时钟/通知/拖动等局部更新的典型开销；
 ///   B. 整屏脏区（最坏情况：页面切换/整帧重绘）；540×960 实测后按像素比
 ///      （×4）外推 1080p 全屏预算（纯 CPU 行拷贝/混合为线性带宽瓶颈）；
@@ -807,7 +808,7 @@ pub fn frame_tick() {
 /// 仅在启动期调用（定时器与 GIC 已就绪、调度器尚未启动）：IRQ 默认屏蔽，
 /// 本函数自行开/关；应用直绘（launcher）尚未接管显示，不与用户 UI 冲突。
 
-/// 掉帧判定阈值（µs）：120Hz 帧预算 8.33ms 的宽松上界（任务验收阈值）。
+/// 掉帧判定阈值（µs）：240Hz 帧预算 4.17ms 的宽松上界（任务验收阈值）。
 const DROP_US: u64 = 12_000;
 
 /// 单场景统计窗口（样本数）。
@@ -925,15 +926,17 @@ fn perf_report(label: &str, s: &PerfStats) {
     uart("\n");
 }
 
-/// 输出「p95 合成+呈现耗时」相对 120Hz 预算与任务阈值（12ms）的判定。
+/// 输出「p95 合成+呈现耗时」相对 240Hz 预算与任务阈值（12ms）的判定。
 fn perf_verdict(label: &str, p95_render: u64) {
     uart(" [anim-perf] ");
     uart(label);
     uart(" p95-render=");
     crate::print_dec(p95_render);
     uart("us → ");
-    if p95_render < 8_333 {
-        uart("120Hz 通过（符合 8.33ms 预算）\n");
+    if p95_render < 4_167 {
+        uart("240Hz 通过（符合 4.17ms 预算）\n");
+    } else if p95_render < 8_333 {
+        uart("p95<8.33ms 通过（超 240Hz 预算、符合 120Hz）\n");
     } else if p95_render < 12_000 {
         uart("p95<12ms 通过（超出 120Hz 预算）\n");
     } else {
@@ -1003,7 +1006,7 @@ pub fn perf_test() {
     crate::print_dec(sh as u64);
     uart("\n");
 
-    // ---- 0. 定时器看门狗：CNTP 120Hz → frame_tick → composite → present ----
+    // ---- 0. 定时器看门狗：CNTP 240Hz → frame_tick → composite → present ----
     let w = compositor::create_window(30, 200, 320, 400, 10, 255);
     if w != usize::MAX {
         if let Some(s) = compositor::window_surface(w) {
@@ -1024,7 +1027,9 @@ pub fn perf_test() {
         let frames = frames_presented();
         uart(" [anim-perf] 300ms 动画内定时器驱动帧数：");
         crate::print_dec(frames);
-        uart(if frames >= 20 {
+        uart(if frames >= 40 {
+            "（240Hz 帧时钟正常）\n"
+        } else if frames >= 20 {
             "（120Hz 帧时钟正常）\n"
         } else {
             "（WARN：定时器未驱动帧节拍！）\n"

@@ -623,9 +623,16 @@ fn mono_us() -> u64 {
 }
 
 fn sleep_ms(ms: usize) {
+    sleep_us(ms as u64 * 1_000);
+}
+
+/// 微秒级睡眠（nanosleep）：内核精确睡眠（sleep_until 登记后重编程硬件
+/// 定时器，2026-10-18）生效后实际精度 ~µs 级，帧循环节距不再被 10ms
+/// 调度 tick 量化（这是空闲动画 ~100fps 上限的根源）。
+fn sleep_us(us: u64) {
     let mut req = [0u8; 16];
-    let sec = (ms / 1000) as u64;
-    let nsec = ((ms % 1000) * 1_000_000) as u64;
+    let sec = us / 1_000_000;
+    let nsec = (us % 1_000_000) * 1_000;
     req[..8].copy_from_slice(&sec.to_le_bytes());
     req[8..].copy_from_slice(&nsec.to_le_bytes());
     unsafe { syscall2(SYS_NANOSLEEP, req.as_ptr() as usize, 0); }
@@ -1472,10 +1479,16 @@ fn draw_brand_idle(sc: f32) {
 }
 
 fn draw_brand_ex(e: f32, scale: f32) {
-    let r = (HERO_R as f32 * scale) as i32;
+    // 亚像素半径（2026-10-18 帧率上限拉满轮）：呼吸缩放的连续变化体现在
+    // AA 边带覆盖率上。此前 r 直接取整，0.975..1.025 缩放范围只剩 2~3 级
+    // 整数半径跳变，「呼吸」几乎不可见。
+    let rf = HERO_R as f32 * scale;
+    // 覆盖边界 = floor(rf)+1（no_std 无 ceil，正数 as i32 即 floor；
+    // AA 边带最远触及 rf+1，越界像素由覆盖率 0 自然剪掉）。
+    let r_out = rf as i32 + 1;
     let a = (255.0 * e) as u32;
     let cy = HERO_CY + ((1.0 - e) * 10.0) as i32;
-    let glow_r = r + 10;
+    let glow_r = rf as i32 + 10;
     // ColorOS 入场光晕：徽标背后先扩散一圈淡绿柔光（淡入淡出）。
     // scanline 优化（帧率关键）：每行先解出圆内水平段 [x0,x1]，段内
     // d 只随 dx 线性变化，免去逐像素圆判定与越界 continue（TCG 实测
@@ -1508,25 +1521,59 @@ fn draw_brand_ex(e: f32, scale: f32) {
             }
         }
     }
-    for dy in -r..=r {
+    let rf2 = rf * rf;
+    let rin = rf - 1.0;
+    let rin2f = rin * rin;
+    for dy in -r_out..=r_out {
         let y = cy + dy;
         if y < 0 || y >= DISPLAY_H as i32 {
             continue;
         }
-        let span2 = r * r - dy * dy;
-        if span2 <= 0 {
-            continue;
+        let dy2 = dy * dy;
+        if (dy2 as f32) >= rf2 {
+            continue; // 整行在圆外
         }
-        let half = isqrt(span2) ;
         // ColorOS 绿垂直渐变（顶部亮绿 → 底部深绿）：行内同色，一次算好
-        let t = ((dy + r) * 255 / (2 * r)).min(255) as u32;
+        let t = (((dy as f32 / rf) + 1.0) * 127.5).min(255.0) as u32;
         let c = blend_px(0x00_45_E0_8B, 0x00_09_9E_58, t);
         let disc = blend_px(0x00_F0_FA_F6, c, a);
-        let x0 = (HERO_CX - half).max(0);
-        let x1 = (HERO_CX + half).min(DISPLAY_W as i32 - 1);
-        let yl = y as usize * DISPLAY_W;
-        for x in x0..=x1 {
-            unsafe { BACK_BUF[yl + x as usize] = disc };
+        // 完全覆盖内段：|dx| <= isqrt((rf-1)² - dy²) 直接行写。
+        let inn2f = rin2f - dy2 as f32;
+        let half_in = if inn2f > 0.0 { isqrt(inn2f as i32) } else { -1 };
+        if half_in >= 0 {
+            let x0 = (HERO_CX - half_in).max(0);
+            let x1 = (HERO_CX + half_in).min(DISPLAY_W as i32 - 1);
+            let yl = y as usize * DISPLAY_W;
+            for x in x0..=x1 {
+                unsafe { BACK_BUF[yl + x as usize] = disc };
+            }
+        }
+        // AA 边带（两侧）：4x4 超采样覆盖率对背景混合，覆盖率为 0 即止。
+        for &side in &[-1i32, 1] {
+            let mut dx = (half_in + 1).max(0);
+            while dx <= r_out + 1 {
+                let x = HERO_CX + side * dx;
+                if x < 0 || x >= DISPLAY_W as i32 {
+                    break;
+                }
+                let mut hits = 0u32;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let px = dx as f32 - 0.5 + (sx as f32 + 0.5) * 0.25;
+                        let py = dy as f32 - 0.5 + (sy as f32 + 0.5) * 0.25;
+                        if px * px + py * py <= rf2 {
+                            hits += 1;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    break;
+                }
+                let cov = hits * 255 / 16;
+                let bg = put_pixel_get(x, y);
+                put_pixel(x, y, blend_px(bg, disc, cov));
+                dx += 1;
+            }
         }
     }
     // 内圈高光（ColorOS 徽标镜面感）。
@@ -3072,8 +3119,26 @@ fn animate_welcome() {
 // 呼吸脉动；卡片上带「进入悬浮态」高亮。全部只重绘小区域并 `present_rect`，
 // 避免整屏 canvas→back 拷贝（这是 QEMU 下鼠标拖动卡顿的主因）。
 
-/// 动画帧计数（16ms/帧，三角形振荡做呼吸）。
-static mut ANIM_T: u32 = 0;
+/// 呼吸动画（2026-10-18 帧率上限拉满轮）改真实时间三角波推进：帧率与
+/// 节奏彻底解耦（此前 24/40 帧计数，帧循环提速会同步加快呼吸节奏）。
+/// 量化级无变化的本帧免重绘免呈现（变化检测），帧距见主循环 sleep_us。
+
+/// 进度点呼吸周期（µs）与半径量化级（5.0..6.0 分 32 级 ≈ 每半周期
+/// 32 次呈现；周期取原 24 帧@60fps 设计意图 ≈400ms）。
+const DOT_PERIOD_US: u64 = 400_000;
+const DOT_RSTEP: u32 = 32;
+static mut DOT_LAST_STEP: u32 = u32::MAX;
+
+/// Hero 呼吸周期（µs，原注释设计意图 ≈640ms）与缩放量化级（半径 1/16px，
+/// 0.975..1.025 缩放范围 ≈ 每半周期 36 次呈现）。
+const HERO_PERIOD_US: u64 = 640_000;
+static mut HERO_LAST_STEP: u32 = u32::MAX;
+
+/// 三角波 0→1→0（t ∈ [0,1)）。
+#[inline]
+fn tri_wave(t: f32) -> f32 {
+    1.0 - (2.0 * t - 1.0).abs()
+}
 
 /// Hero 动画 brand 区域背景快照（静态区域循环前拍一次，每帧行拷贝恢复）。
 const HERO_BW: usize = (HERO_R as usize + 50) * 2;
@@ -3133,20 +3198,28 @@ fn idle_snap_invalidate() {
     unsafe {
         HERO_SNAP_OK = false;
         DOT_SNAP_OK = false;
+        // 量化级缓存一并失效：快照重拍后的首帧必须重绘呈现。
+        HERO_LAST_STEP = u32::MAX;
+        DOT_LAST_STEP = u32::MAX;
     }
 }
 
-/// 进度点呼吸：半径 5..6 脉动（周期 24 帧 ≈ 380ms）。每帧先恢复基线快照
-/// 再绘制 —— 此前 r=6 的外圈会永久残留（「基圆始终被覆盖」的假设在
-/// r>5 的帧不成立）。
+/// 进度点呼吸：亚像素半径 5.0↔6.0 连续脉动（周期 400ms，真实时间）。
+/// 此前 24 帧计数 + 整数半径：24 帧里 23 帧同为 r=5，「呼吸」实际是每周期
+/// 一帧的单点闪跳；现在边带 4x4 超采样抗锯齿，量化级（1/32 半径）无变化
+/// 的帧免重绘免呈现。每帧先恢复基线快照再绘制（防外圈残留，同前）。
 fn dot_breathe(step: usize) {
-    let ph = (unsafe { ANIM_T } % 24) as f32 / 24.0;
-    let up = if unsafe { ANIM_T % 24 } < 12 {
-        ph * 2.0
-    } else {
-        2.0 - ph * 2.0
-    };
-    let r = 5 + (up * 1.0) as i32;
+    let now = mono_us();
+    let t = (now % DOT_PERIOD_US) as f32 / DOT_PERIOD_US as f32;
+    let up = tri_wave(t);
+    let rf = 5.0 + up;
+    let q = (rf * DOT_RSTEP as f32) as u32;
+    unsafe {
+        if DOT_SNAP_OK && q == DOT_LAST_STEP {
+            return; // 本帧视觉无变化
+        }
+        DOT_LAST_STEP = q;
+    }
     let (cx, cy) = dot_center(step);
     unsafe {
         let mut i = 0usize;
@@ -3179,20 +3252,63 @@ fn dot_breathe(step: usize) {
             }
         }
     }
-    fill_circle(cx, cy, r, C_ACCENT);
+    // 亚像素 AA 实心圆：r-1 内侧整像素直写，边带 4x4 超采样对快照底图混合。
+    let rf2 = rf * rf;
+    let rin2 = (rf - 1.0) * (rf - 1.0);
+    unsafe {
+        let mut i = 0usize;
+        for dy in -7i32..=7 {
+            for dx in -7i32..=7 {
+                let d2 = (dx * dx + dy * dy) as f32;
+                let bg = DOT_SNAP[i];
+                i += 1;
+                if d2 <= rin2 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+                        BACK_BUF[y as usize * DISPLAY_W + x as usize] = C_ACCENT;
+                    }
+                } else if d2 < rf2 + 2.0 * rf + 1.0 {
+                    let mut hits = 0u32;
+                    for sy in 0..4 {
+                        for sx in 0..4 {
+                            let px = dx as f32 - 0.5 + (sx as f32 + 0.5) * 0.25;
+                            let py = dy as f32 - 0.5 + (sy as f32 + 0.5) * 0.25;
+                            if px * px + py * py <= rf2 {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    let cov = hits * 255 / 16;
+                    if cov > 0 {
+                        let (x, y) = (cx + dx, cy + dy);
+                        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
+                            BACK_BUF[y as usize * DISPLAY_W + x as usize] =
+                                blend_px(bg, C_ACCENT, cov);
+                        }
+                    }
+                }
+            }
+        }
+    }
     present_back_rect(cx - 7, cy - 7, 15, 15);
 }
 
-/// 欢迎页 Hero 呼吸：徽标整体 0.975..1.025 缩放（周期 40 帧 ≈ 640ms）。
-/// 每帧先恢复基线快照再绘制 —— 此前光晕在 BACK_BUF 上逐帧叠加，
-/// 1-3 秒内饱和成实心绿圈，且 1.025 缩放的外圈残永久留。
+/// 欢迎页 Hero 呼吸：徽标整体 0.975..1.025 缩放（周期 640ms，真实时间；
+/// 圆盘为亚像素 AA 半径，连续缩放 → 连续呼吸）。每帧先恢复基线快照再
+/// 绘制 —— 此前光晕在 BACK_BUF 上逐帧叠加，1-3 秒内饱和成实心绿圈。
+/// 量化级（半径 1/16px）无变化的帧免重绘免呈现。
 fn hero_breathe() {
-    let ph = (unsafe { ANIM_T } % 40) as f32 / 40.0;
-    let up = if unsafe { ANIM_T % 40 } < 20 {
-        ph * 2.0
-    } else {
-        2.0 - ph * 2.0
-    };
+    let now = mono_us();
+    let t = (now % HERO_PERIOD_US) as f32 / HERO_PERIOD_US as f32;
+    let up = tri_wave(t);
+    let scale = 1.0 + 0.025 * up;
+    let q = ((HERO_R as f32 * scale) * 16.0) as u32;
+    unsafe {
+        if HERO_SNAP_OK && q == HERO_LAST_STEP {
+            return; // 本帧视觉无变化
+        }
+        HERO_LAST_STEP = q;
+    }
     unsafe {
         let half = HERO_SNAP_HALF;
         let mut i = 0usize;
@@ -3225,7 +3341,7 @@ fn hero_breathe() {
             }
         }
     }
-    draw_brand_idle(1.0 + 0.025 * up);
+    draw_brand_idle(scale);
     let size = HERO_SNAP_HALF * 2 + 1;
     present_back_rect(
         HERO_CX - HERO_SNAP_HALF,
@@ -3235,15 +3351,11 @@ fn hero_breathe() {
     );
 }
 
-/// 每帧闲置推进：Hero（第 0 步）/ 进度点（其余步）呼吸。
+/// 每帧闲置推进：Hero（第 0 步）/ 进度点（其余步）呼吸（真实时间）。
 fn animate_idle(step: usize) {
-    //（优化轮 005，2026-10-18）合成器 prev_app 累积并集修复后，单次呈现
-    // ~40µs（此前 ~1.6-1.8ms 整屏拷贝），「每 2 循环推进一次、让位光标」
-    // 的依据已消失——改为每循环呼吸，空闲动画 51fps → ~95fps；空闲 8ms
-    // sleep 让出 CPU 的节拍不变，光标仍每循环处理（见主循环 CURSOR_DIRTY）。
-    unsafe {
-        ANIM_T = ANIM_T.wrapping_add(1);
-    }
+    //（2026-10-18 帧率上限拉满轮）呼吸由 mono_us 三角波推进，与主循环
+    // 帧率彻底解耦：帧距降到 2ms（≈500fps 采样），呼吸只在量化级变化时
+    // 重绘呈现（dot ≈160 呈现/s、hero ≈113 呈现/s），其余帧零渲染零呈现。
     if step == 0 {
         hero_breathe();
     } else {
@@ -4474,9 +4586,11 @@ fn wait_for_tap_next_button() -> i32 {
                 btn_tick_nav_only();
             }
             // 光标流畅优先（用户实测移动卡）：有输入待处理/光标待更新时
-            // 帧间不睡眠；静态空闲 8ms 让出。
+            // 帧间不睡眠；静态 2ms 让出（内核精确睡眠后为真实 2ms ≈ 500fps
+            // 采样；呼吸按量化级变化检测门控呈现，此前 8ms 睡眠被 10ms
+            // tick 量化成 ~100fps 上限）。
             if !unsafe { CURSOR_DIRTY } && !unsafe { ANY_INPUT_RECENT } && !btn_animating() {
-                sleep_ms(8);
+                sleep_us(2_000);
             }
             // 纯指针移动（不构成点击）也算用户在场：重置真实时间空闲计时
             if unsafe { ANY_INPUT_RECENT } {
