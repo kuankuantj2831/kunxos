@@ -35,13 +35,22 @@ PIPE = os.path.join(WORKDIR, "kx")
 os.mkfifo(PIPE + ".in")
 os.mkfifo(PIPE + ".out")
 
+# RISC-V 移植后（2026-09 架构切换）重定向：QEMU/BIOS 与顶层 Makefile 同源，
+# 可用环境变量 QEMU / BIOS 覆盖；AC97（aarch64 遗留）换 virtio-sound。
+QEMU = os.environ.get(
+    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
+BIOS = os.environ.get(
+    "BIOS", os.path.expanduser(
+        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
+
 cmd = [
-    "qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
+    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
     "-kernel", KERNEL, "-append", "shell",
     "-serial", "pipe:" + PIPE,
     "-no-reboot", "-display", "none",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
-    "-device", "virtio-rng-device", "-device", "AC97",
+    "-device", "virtio-rng-device",
+    "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
 logf = open(LOGFILE, "wb")
 p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -187,11 +196,14 @@ try:
     check("appA R (SIGCONT)", kernel_state(aud) == "R")
 
     # ---- 后台任务白名单 ----
-    check("btask0 granted", run_wait("echo BTASK 0 500000 > /data/life/cmd_%s" % sen,
+    # 时长 10s（值按 µs 计）：慢宿主（RISC-V TCG）下命令往返 >0.5s，短任务
+    # 在下一条提交前就到期，凑不满「每应用 2 个」上限（假失败）；10s 保证
+    # 三个请求必然重叠，随后 BTASK_END 显式释放。
+    check("btask0 granted", run_wait("echo BTASK 0 10000000 > /data/life/cmd_%s" % sen,
                                      "后台任务已授予", 5.0))
-    check("btask1 granted", run_wait("echo BTASK 1 500000 > /data/life/cmd_%s" % sen,
+    check("btask1 granted", run_wait("echo BTASK 1 10000000 > /data/life/cmd_%s" % sen,
                                      "后台任务已授予", 5.0))
-    check("btask2 denied", run_wait("echo BTASK 2 500000 > /data/life/cmd_%s" % sen,
+    check("btask2 denied", run_wait("echo BTASK 2 10000000 > /data/life/cmd_%s" % sen,
                                     "后台任务被拒: 单应用数量已达上限", 5.0))
     # 每应用上限 2 已满：先结束任务释放槽位，再请求 400ms 短任务测到期路径
     # （docs/lifecycle-test.md A7 的前置步骤 BTASK_END 在此脚本中缺失，
@@ -206,7 +218,9 @@ try:
     check("set timeout 1500", run_wait("echo SET_TIMEOUT 1500 > /data/life/cmd_0",
                                        "bg->suspend 超时已设为 1500", 5.0))
     check("bg appA(2)", run_wait("echo BG > /data/life/cmd_%s" % aud, "已转入后台 appA", 5.0))
-    check("appA suspended", wait_for("已挂起 appA", 4.0))
+    # 慢宿主余量：50ms 轮询 + 150ms 宽限 + TCG 调度抖动，15s 足以区分
+    # 「超时挂起正常」与「真不挂起」（旧 4s 在 RISC-V TCG 下偏紧）。
+    check("appA suspended", wait_for("已挂起 appA", 15.0))
     time.sleep(0.3)
     check("recents appA S", recents_frag("appA %s S" % aud))
 

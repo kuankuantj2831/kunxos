@@ -54,13 +54,22 @@ PIPE = os.path.join(WORKDIR, "kx")
 os.mkfifo(PIPE + ".in")
 os.mkfifo(PIPE + ".out")
 
+# RISC-V 移植后（2026-09 架构切换）重定向：QEMU/BIOS 与顶层 Makefile 同源，
+# 可用环境变量 QEMU / BIOS 覆盖；AC97（aarch64 遗留）换 virtio-sound。
+QEMU = os.environ.get(
+    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
+BIOS = os.environ.get(
+    "BIOS", os.path.expanduser(
+        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
+
 cmd = [
-    "qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
+    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
     "-kernel", KERNEL, "-append", "shell",
     "-serial", "pipe:" + PIPE,
     "-no-reboot", "-display", "none",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
-    "-device", "virtio-rng-device", "-device", "AC97",
+    "-device", "virtio-rng-device",
+    "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
 logf = open(LOGFILE, "wb")
 p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

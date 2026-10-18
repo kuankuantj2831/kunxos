@@ -38,7 +38,8 @@ const SYS_NANOSLEEP: usize = 101;
 const SYS_GETPID: usize = 172;
 const SYS_KILL: usize = 129;
 const SYS_SETPRIORITY: usize = 140;
-const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_CLOCK_GETTIME: usize = 113;
+const CLOCK_MONOTONIC: usize = 1;
 /// 自定义：内核内存压力等级（0/1/2）。
 const SYS_LC_MEMPRESSURE: usize = 404;
 
@@ -223,17 +224,25 @@ fn log2(s: &str, v: u64) {
 
 /// 墙钟时间（µs）。失败返回 0。
 fn now_us() -> u64 {
+    // 单调钟：墙钟（gettimeofday）在 RTC 就绪前后/校时会跳变，回拨时
+    // now-last_used 的 saturating_sub 恒为 0，超时挂起永久失效（黑屏事故
+    // 同族防御清剿时本守护进程漏网，lifecycle-core 回归于 2026-10-18 抓出）。
+    // 返回值只用于时间差判定（超时/到期），不用于显示。
     let mut tv = [0u8; 16];
     unsafe {
-        let r = syscall2(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as usize, 0);
+        let r = syscall3(
+            SYS_CLOCK_GETTIME,
+            CLOCK_MONOTONIC,
+            tv.as_mut_ptr() as usize,
+            0,
+        );
         if (r as isize) < 0 {
             return 0;
         }
-        let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
-        let usec =
-            u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
-        sec * 1_000_000 + usec
     }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let nsec = u64::from_le_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+    sec * 1_000_000 + nsec / 1_000
 }
 
 fn sleep_ms(ms: usize) {
