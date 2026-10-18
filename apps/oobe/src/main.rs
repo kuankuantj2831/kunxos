@@ -3226,14 +3226,11 @@ fn hero_breathe() {
 
 /// 每帧闲置推进：Hero（第 0 步）/ 进度点（其余步）呼吸。
 fn animate_idle(step: usize) {
-    // 呼吸 ≤30fps 足够（ANIM_T 每 2 循环推进一次）：每帧呼吸都要恢复
-    // 13K 像素快照 + 重绘 brand + 区域呈现，是空闲循环的大头 —— 让出
-    // 一半循环给光标移动（用户实测移动卡）。
+    //（优化轮 005，2026-10-18）合成器 prev_app 累积并集修复后，单次呈现
+    // ~40µs（此前 ~1.6-1.8ms 整屏拷贝），「每 2 循环推进一次、让位光标」
+    // 的依据已消失——改为每循环呼吸，空闲动画 51fps → ~95fps；空闲 8ms
+    // sleep 让出 CPU 的节拍不变，光标仍每循环处理（见主循环 CURSOR_DIRTY）。
     unsafe {
-        ANIM_IDLE_SKIP = !ANIM_IDLE_SKIP;
-        if ANIM_IDLE_SKIP {
-            return;
-        }
         ANIM_T = ANIM_T.wrapping_add(1);
     }
     if step == 0 {
@@ -3242,8 +3239,6 @@ fn animate_idle(step: usize) {
         dot_breathe(step);
     }
 }
-
-static mut ANIM_IDLE_SKIP: bool = false;
 
 /// 转场期 nav 区快照（帧 0 画一次玻璃+按钮，其后恢复 + 仅重画进度点）。
 static mut TRANS_NAV_SNAP: [[u32; DISPLAY_W]; NAV_H as usize] =
