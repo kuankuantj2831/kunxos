@@ -134,7 +134,7 @@ pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
 /// 用户可访问的地址。继承的内核设备大页（L1[0] = PLIC/UART 等）无 U 位，
 /// 此函数对它们返回 `false` —— 与记录表一致，不把设备寄存器区放行给
 /// 用户指针。
-fn user_page_pte_u(root: usize, va: usize) -> bool {
+pub fn user_page_pte_u(root: usize, va: usize) -> bool {
     if root == 0 {
         return false;
     }

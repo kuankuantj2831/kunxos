@@ -2113,20 +2113,26 @@ pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
     let end = va + len;
     let mut cur = va & !(vm::PAGE_SIZE - 1);
     while cur < end {
-        // 先落地 LAZY 页（未映射则无法判断是否 COW，且写前必须映射）
-        if !vm::user_range_mapped(current_root(), cur, vm::PAGE_SIZE) {
-            if !page_fault_resolve(cur) {
-                return false;
+        // ★ 单次带下标查找（优化轮 031）：此前每页跑 user_range_mapped +
+        // current_page_flags 两轮全表线性扫描，LAZY 页还要 page_fault_resolve
+        // 第三轮。LAZY 记录视为未映射（同 root_page_recorded 语义）→
+        // 按下标原位落地；无记录页走 PTE U 位漫游放行（SHM/framebuffer，
+        // 与 user_range_mapped 的共享映射路径同语义）。
+        match lookup_page_idx(cur) {
+            Some((idx, rec)) => {
+                if rec.paddr == vm::LAZY_PAGE && !page_fault_resolve_at(cur, idx) {
+                    return false;
+                }
+                // COW 共享页 → break；AP_USER_RO 页（ELF text/rodata、蹦床）
+                // → 复制私有副本。LAZY 落地保留原 flags，rec.flags 仍有效。
+                if vm::is_cow(rec.flags) || vm::is_user_ro(rec.flags) {
+                    if !mprotect_page(cur, vm::AP_USER_RW) {
+                        return false;
+                    }
+                }
             }
-        }
-        // 查记录权限：COW 共享页 → break；AP_USER_RO 页（ELF text/rodata、
-        // 蹦床）→ 复制私有副本。两者都走 mprotect_page（其内部对 COW/共享
-        // 只读/普通页分支处理完备，OOM 返回 false）。
-        // 注意：无记录的共享映射（SHM/framebuffer，经页表漫游放行）无法在
-        // 此处理——它们映射为 RW，EL1 写安全，跳过即可。
-        if let Some(fl) = current_page_flags(cur) {
-            if vm::is_cow(fl) || vm::is_user_ro(fl) {
-                if !mprotect_page(cur, vm::AP_USER_RW) {
+            None => {
+                if !vm::user_page_pte_u(current_root(), cur) {
                     return false;
                 }
             }
@@ -2134,6 +2140,46 @@ pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
         cur += vm::PAGE_SIZE;
     }
     true
+}
+
+/// 单次线性查找当前进程 `page` 的记录，返回 (下标, 记录)。
+fn lookup_page_idx(page: usize) -> Option<(usize, vm::UserPage)> {
+    let pid = current_pid();
+    unsafe {
+        let pt = &PROCESSES[pid as usize].pt;
+        for i in 0..pt.count {
+            let r = pt.user_pages[i];
+            if r.vaddr == page {
+                return Some((i, r));
+            }
+        }
+    }
+    None
+}
+
+/// [`page_fault_resolve`] 的按下标变体：调用方已定位 LAZY 记录下标，
+/// 免去全表重扫（分配 + 清零 + 映射 + 原位更新语义完全一致）。
+fn page_fault_resolve_at(vaddr: usize, idx: usize) -> bool {
+    let page = vaddr & !(vm::PAGE_SIZE - 1);
+    let pid = current_pid();
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        let rec = p.pt.user_pages[idx];
+        if rec.vaddr != page || rec.paddr != vm::LAZY_PAGE {
+            // 下标失效（并发变异防御）：退回全表路径
+            return page_fault_resolve(page);
+        }
+        let Some(pa) = allocator::alloc_page() else { return false };
+        core::ptr::write_bytes(pa as *mut u8, 0, vm::PAGE_SIZE);
+        if !vm::map_page_in(p.pt.ttbr0, page, pa, rec.flags) {
+            allocator::free_page(pa);
+            crate::uart_send_str("[fault] 页表 OOM\n");
+            return false;
+        }
+        p.pt.user_pages[idx] = vm::UserPage { vaddr: page, paddr: pa, flags: rec.flags };
+        PAGE_FAULTS_RESOLVED += 1;
+        true
+    }
 }
 
 /// 查询当前进程 `vaddr` 所在页的记录 flags；不在记录表返回 `None`。
