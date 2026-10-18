@@ -2899,8 +2899,20 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
         btn_reset_all();
     }
     let ny = NAV_Y;
+    // 2.5 预渲染导航区玻璃+按钮并快照（e 无关：玻璃/按钮复位态不随进度
+    // 变化，仅进度点依赖 e 且循环内逐帧重画）。phase 分解（round-018）
+    // 实测帧 0 的玻璃全量绘制 ~120ms 独占 160ms 动画窗口——交叉淡化
+    // 实际只剩 t≈0.7 后两三帧可见。移出动画窗口后帧 0 与后续帧同速。
+    unsafe {
+        draw_nav_anim(to, 0.0);
+        for y in 0..NAV_H as usize {
+            TRANS_NAV_SNAP[y].copy_from_slice(
+                &BACK_BUF[(DISPLAY_H as usize - NAV_H as usize + y) * DISPLAY_W
+                    ..(DISPLAY_H as usize - NAV_H as usize + y + 1) * DISPLAY_W],
+            );
+        }
+    }
     let t0 = mono_us();
-    let mut nav_snap_ok = false;
     let mut frames: u32 = 0;
     // [perf] 逐相位累计（µs）：混合 / 导航区 / 尾拷 / 呈现 / 输入泵。
     // mono_us 实测 ~45µs/次 ×6/帧，对 ~45ms 帧的扰动 <0.6%。
@@ -2970,29 +2982,15 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
         }
         ph[0] += mono_us() - p0;
         let p1 = mono_us();
-        // 导航区：帧 0 全量画（玻璃+按钮），其后快照恢复 + 仅重画进度点
-        // （毛玻璃降采样+盒式模糊每帧重画是转场第二大开销）。
-        if !nav_snap_ok {
-            draw_nav_anim(to, e);
-            unsafe {
-                for y in 0..NAV_H as usize {
-                    TRANS_NAV_SNAP[y].copy_from_slice(
-                        &BACK_BUF[(DISPLAY_H as usize - NAV_H as usize + y) * DISPLAY_W
-                            ..(DISPLAY_H as usize - NAV_H as usize + y + 1) * DISPLAY_W],
-                    );
-                }
+        // 导航区：每帧仅快照恢复 + 重画进度点（玻璃已在 t0 前预渲染快照）。
+        unsafe {
+            let base = (DISPLAY_H as usize - NAV_H as usize) * DISPLAY_W;
+            for y in 0..NAV_H as usize {
+                BACK_BUF[base + y * DISPLAY_W..base + (y + 1) * DISPLAY_W]
+                    .copy_from_slice(&TRANS_NAV_SNAP[y]);
             }
-            nav_snap_ok = true;
-        } else {
-            unsafe {
-                let base = (DISPLAY_H as usize - NAV_H as usize) * DISPLAY_W;
-                for y in 0..NAV_H as usize {
-                    BACK_BUF[base + y * DISPLAY_W..base + (y + 1) * DISPLAY_W]
-                        .copy_from_slice(&TRANS_NAV_SNAP[y]);
-                }
-            }
-            draw_progress_anim(to, e);
         }
+        draw_progress_anim(to, e);
         ph[1] += mono_us() - p1;
         let p2 = mono_us();
         // 导航区尾拷贝：整行 memcpy（宽通道），免逐像素 fb_set_px
