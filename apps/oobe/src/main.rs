@@ -2914,6 +2914,10 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
     }
     let t0 = mono_us();
     let mut frames: u32 = 0;
+    // 水平半幅混合（round-025 同开机配对 A/B 判决采纳：14 vs 9.5 帧中位
+    // +48%，混合耗时 -43%）——运动期降 fidelity 换帧率的标准手法，仅
+    // 160ms 转场期间水平分辨率减半；回退 = step_x 改回 1 一行。
+    let half_res = true;
     // [perf] 逐相位累计（µs）：混合 / 导航区 / 尾拷 / 呈现 / 输入泵。
     // mono_us 实测 ~45µs/次 ×6/帧，对 ~45ms 帧的扰动 <0.6%。
     let mut ph = [0u64; 5];
@@ -2951,12 +2955,14 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
             // 混合路径：全量混合 + 行指针直写（隔行变体经 round-015 同开机
             // 配对 A/B 实证无增益——中位 4 vs 4 帧、1.00x，混合并非转场
             // 瓶颈；垂直半分辨率的画质代价不再支付）。
+            let step_x = if half_res { 2 } else { 1 };
             let mut y = 0i32;
             while y < ny {
                 let sy = y + off;
                 let in_range = sy >= 0 && sy < ny;
                 let dst_row = unsafe { FB_PTR.add(y as usize * FB_STRIDE_PX) };
-                for x in 0..DISPLAY_W as usize {
+                let mut x = 0usize;
+                while x < DISPLAY_W as usize {
                     let i = y as usize * DISPLAY_W + x;
                     let oldc = unsafe { PREV_BUF[i] };
                     let newc = if in_range {
@@ -2964,18 +2970,23 @@ fn transition_pages(_from: usize, to: usize, reverse: bool) {
                     } else {
                         oldc
                     };
-                    if oldc == newc || ea == 0 {
-                        unsafe { *dst_row.add(x) = oldc };
-                        continue;
+                    let outc = if oldc == newc || ea == 0 {
+                        oldc
+                    } else {
+                        // 近似混合：((v*t + n*inv) * 257) >> 16 ≈ /255
+                        let (ar, br_, ab) = (oldc >> 16 & 0xFF, oldc >> 8 & 0xFF, oldc & 0xFF);
+                        let (cr, cg, cb) = (newc >> 16 & 0xFF, newc >> 8 & 0xFF, newc & 0xFF);
+                        let inv = 255 - ea;
+                        let r = ((ar * inv + cr * ea) * 257) >> 16;
+                        let g = ((br_ * inv + cg * ea) * 257) >> 16;
+                        let b = ((ab * inv + cb * ea) * 257) >> 16;
+                        (r << 16) | (g << 8) | b
+                    };
+                    unsafe { *dst_row.add(x) = outc };
+                    if step_x == 2 && x + 1 < DISPLAY_W as usize {
+                        unsafe { *dst_row.add(x + 1) = outc };
                     }
-                    // 近似混合：((v*t + n*inv) * 257) >> 16 ≈ /255
-                    let (ar, br_, ab) = (oldc >> 16 & 0xFF, oldc >> 8 & 0xFF, oldc & 0xFF);
-                    let (cr, cg, cb) = (newc >> 16 & 0xFF, newc >> 8 & 0xFF, newc & 0xFF);
-                    let inv = 255 - ea;
-                    let r = ((ar * inv + cr * ea) * 257) >> 16;
-                    let g = ((br_ * inv + cg * ea) * 257) >> 16;
-                    let b = ((ab * inv + cb * ea) * 257) >> 16;
-                    unsafe { *dst_row.add(x) = (r << 16) | (g << 8) | b };
+                    x += step_x;
                 }
                 y += 1;
             }
