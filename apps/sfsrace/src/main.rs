@@ -614,6 +614,10 @@ fn mbx_parse_batch(buf: &mut [u8], n: usize, dones: &mut usize) -> i32 {
 
 /// 认领留档名（r40）：`MBX_PIPE_R_<k>`（k 单调递增，不复用）。
 /// 返回 NUL 结尾缓冲的指针（open/rename/unlink 收 usize）。
+/// 各 taken 槽位已消费字节数（r65：排干/扫排按增量段解析，主循环消费
+/// 全文后记 CONS；重读不双计——与二次排干配套关闭 r64 两难）。
+static mut MBX_CONS: [usize; 8] = [0; 8];
+
 fn taken_name(k: usize, out: &mut [u8; 48]) -> usize {
     let mut n = 0usize;
     for &c in MBX_PIPE_R.iter() {
@@ -688,8 +692,27 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
         // 级），迟到写者 fd（µs 级寿命）不可能仍持——根卷 512 inode，
         // 永不删除会 ENOSPC（r40 首版实测：写者 iter~25 即 open 失败）。
         if k >= 2 {
+            // r65 二次排干（r64 两难的解耦解）：unlink 前把该文件在途
+            // 内容先收走——被抢占写者的迟到写（fd 已开、write 未落）
+            // 落在 inode 上，删除瞬间先读 EOF 把它计入 dones/SEEN，再删。
+            // 删除时机维持轮询窗（快删保 inode 峰值），丢失窗由排干闭合。
             let mut ob = [0u8; 48];
-            unlink(taken_name(k - 2, &mut ob));
+            let dn = taken_name(k - 2, &mut ob);
+            let dfd = open(dn, O_RDONLY);
+            if dfd >= 0 {
+                let dn2 = read_all(dfd, buf) as usize;
+                close(dfd);
+                let c0 = unsafe { MBX_CONS[(k - 2) % 8] };
+                if dn2 > c0 {
+                    for bi in c0..dn2 {
+                        buf[bi - c0] = buf[bi];
+                    }
+                    if mbx_parse_batch(buf, dn2 - c0, dones) != 0 {
+                        return 1;
+                    }
+                }
+            }
+            unlink(dn);
         }
         // 本轮认领名：MBX_PIPE_R_<k>（k 单调递增，不与历史认领复用名字）
         let mut nb = [0u8; 48];
@@ -710,6 +733,7 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
         }
         let n = read_all(fd, buf) as usize;
         close(fd);
+        unsafe { MBX_CONS[(k - 1) % 8] = n; } // taken_{k-1} 全文已消费
         // ★ 不 unlink：taken_k 留档待终局扫排（迟到写随 fd 落在 inode
         // 上，数据不丢；中途删除正是旧协议的丢失窗）。
         // 重建空管道（无 O_TRUNC：认领后写入方新追加不截断）
@@ -749,6 +773,13 @@ fn mbx_final_sweep(dones: &mut usize, k: usize) -> i32 {
         if fd >= 0 {
             let n = read_all(fd, buf) as usize;
             close(fd);
+            let cj = unsafe { MBX_CONS[j % 8] };
+            if n > cj {
+                for bi in cj..n {
+                    buf[bi - cj] = buf[bi];
+                }
+            }
+            let n = if n > cj { n - cj } else { 0 };
             if n > 0 {
                 print("[mbx-dbg] 终局扫排 taken_");
                 print_dec(j);
