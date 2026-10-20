@@ -481,6 +481,16 @@ pub fn draw_overlay() {
 
 /// 打印统计到控制台（shell `perf stats`）。
 pub fn print_stats() {
+    {
+        let (dm, df) = crate::input::ev_drop_counts();
+        if dm > 0 || df > 0 {
+            crate::uart_send_str("[perf] input丢弃: 合并=");
+            crate::print_dec(dm);
+            crate::uart_send_str(" 全满=");
+            crate::print_dec(df);
+            crate::uart_send_str("\n");
+        }
+    }
     crate::uart_send_str("[perf] fps=");
     crate::print_dec(fps() as u64);
     crate::uart_send_str(" cpu=");

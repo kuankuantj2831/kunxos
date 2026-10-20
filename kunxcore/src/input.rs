@@ -178,6 +178,16 @@ const EMPTY_PARSER: Parser = Parser { buf: [0; FRAME_LEN], n: 0 };
 
 static mut PARSER: Parser = EMPTY_PARSER;
 
+/// 环形缓冲丢弃累计（诊断：r50 链路 52 发点按仅 8 达应用，把「内核侧
+/// 丢弃」从推断变成可测量；perf stats 输出）。
+static mut EV_DROPPED_MOVE: u64 = 0; // 移动合并（无损语义，位置类帧）
+static mut EV_DROPPED_FULL: u64 = 0; // 全满整帧丢弃（真实丢失）
+
+/// 读取累计丢弃计数（移动合并, 全满）。
+pub fn ev_drop_counts() -> (u64, u64) {
+    unsafe { (EV_DROPPED_MOVE, EV_DROPPED_FULL) }
+}
+
 /// 向 UART 协议解析器喂入一个字节。
 ///
 /// 返回 `true` 表示该字节被触摸协议帧消费（不应再送入 tty/shell 缓冲）；
@@ -295,6 +305,7 @@ pub fn push_event(ev: InputEvent) {
                 {
                     DEV.head = (h + 3) % EV_BUF_SIZE;
                     DEV.count -= 3;
+                    unsafe { EV_DROPPED_MOVE += 3; }
                 } else {
                     break;
                 }
@@ -315,6 +326,7 @@ pub fn push_event(ev: InputEvent) {
             }
             DEV.head = (DEV.head + k) % EV_BUF_SIZE;
             DEV.count -= k;
+            unsafe { EV_DROPPED_FULL += k as u64; }
         }
         DEV.ev_buf[DEV.tail] = ev;
         DEV.tail = (DEV.tail + 1) % EV_BUF_SIZE;
