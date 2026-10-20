@@ -108,7 +108,7 @@ def reader():
             for m, name in MARKERS:
                 if m in s:
                     note(name)
-            if "[perf] 帧" in s or "[launcher]" in s or "转场" in s:
+            if "[perf] 帧" in s or "[launcher]" in s or "转场" in s or "t2f" in s:
                 lines.append((t, s))
 
 
@@ -192,6 +192,28 @@ def main():
                     time.sleep(0.8)
                 else:
                     time.sleep(1.0)
+        # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
+        # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
+        # 触控→上屏延迟）。坐标取 app_open_shots.py APPS_DB。
+        taps = [("clock", 150, 182, "[clock] 就绪"),
+                ("calculator", 230, 182, "[calculator] 就绪"),
+                ("settings", 418, 872, "[settings] 就绪")]
+        for name, x, y, marker in taps:
+            tap(x, y)
+            t0 = time.time()
+            while time.time() - t0 < 25:
+                if marker in hits:
+                    break
+                try:
+                    with open(LOG, "rb") as f:
+                        if marker.encode() in f.read():
+                            note(name)
+                            break
+                except OSError:
+                    pass
+                if p.poll() is not None:
+                    break
+                time.sleep(0.3)
         # 桌面 [perf] 采集窗口
         t_perf0 = time.time()
         while time.time() - t_perf0 < PERF_SECS:
