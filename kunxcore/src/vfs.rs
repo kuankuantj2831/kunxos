@@ -284,6 +284,77 @@ fn resolve_path(path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, 
 /// - `hops`：累计展开次数，超限返回 None（防环路死循环）。
 /// - 绝对符号链接目标重新走挂载点解析；相对目标从当前目录继续。
 /// - 目录中的 "." / ".." 是真实目录项，天然支持相对目标中的相对行走。
+// ==================== dentry 缓存（优化轮 036） ====================
+// 深路径逐组件查找实测 ~17µs/组件（目录块读+线性扫描，r35 bench 实证）。
+// (dev, 父 inode, 名字) → 子 inode 正向缓存，环形 64 槽 + 全局代际：
+// fsops 四个目录变更分发点（create/mkdir/unlink/rename）统一 bump——
+// 陈旧风险仅在「漏 bump」，分发点全集四处在 fsops.rs，sfsrace/mailbox
+// 回归门兜底并发变更正确性。
+const DCACHE_SLOTS: usize = 64;
+const DCACHE_NAME_MAX: usize = 28; // 超长名不走缓存（bypass）
+
+struct DCacheEntry {
+    gen: u64,
+    dev: u32,
+    dir: u32,
+    name: [u8; DCACHE_NAME_MAX],
+    name_len: usize,
+    ino: u32,
+}
+
+const DC_EMPTY: DCacheEntry =
+    DCacheEntry { gen: 0, dev: 0, dir: 0, name: [0; DCACHE_NAME_MAX], name_len: 0, ino: 0 };
+static mut DCACHE: [DCacheEntry; DCACHE_SLOTS] = [DC_EMPTY; DCACHE_SLOTS];
+static mut DCACHE_GEN: u64 = 1;
+static mut DCACHE_NEXT: usize = 0;
+
+/// 目录变更失效（fsops 变更分发点调用）：全表代际失效。
+pub fn dcache_invalidate() {
+    unsafe {
+        DCACHE_GEN += 1;
+    }
+}
+
+fn dcache_lookup(dev: u32, dir: u32, name: &str) -> Option<u32> {
+    let nb = name.as_bytes();
+    if nb.is_empty() || nb.len() > DCACHE_NAME_MAX {
+        return None;
+    }
+    unsafe {
+        let gen = DCACHE_GEN;
+        for i in 0..DCACHE_SLOTS {
+            let e = &DCACHE[i];
+            if e.gen == gen
+                && e.dev == dev
+                && e.dir == dir
+                && e.name_len == nb.len()
+                && &e.name[..nb.len()] == nb
+            {
+                return Some(e.ino);
+            }
+        }
+    }
+    None
+}
+
+fn dcache_insert(dev: u32, dir: u32, name: &str, ino: u32) {
+    let nb = name.as_bytes();
+    if nb.is_empty() || nb.len() > DCACHE_NAME_MAX {
+        return;
+    }
+    unsafe {
+        let slot = DCACHE_NEXT % DCACHE_SLOTS;
+        DCACHE_NEXT += 1;
+        let e = &mut DCACHE[slot];
+        e.gen = DCACHE_GEN;
+        e.dev = dev;
+        e.dir = dir;
+        e.name_len = nb.len();
+        e.name[..nb.len()].copy_from_slice(nb);
+        e.ino = ino;
+    }
+}
+
 fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, u32)> {
     let mut d = dev;
     let mut cur = dir;
@@ -305,7 +376,16 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
         if fsops::fs_type(d, cur) != T_DIR {
             return None;
         }
-        let next = fsops::fs_lookup(d, cur, comp);
+        let next = match dcache_lookup(d, cur, comp) {
+            Some(cached) => cached as i32,
+            None => {
+                let r = fsops::fs_lookup(d, cur, comp);
+                if r >= 0 {
+                    dcache_insert(d, cur, comp, r as u32);
+                }
+                r
+            }
+        };
         if next < 0 {
             // 临时诊断：定位失败的分量
             if comp.starts_with("Packages") {

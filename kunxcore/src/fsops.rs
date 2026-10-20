@@ -98,6 +98,7 @@ pub fn fs_lookup(dev: u32, dir_ino: u32, name: &str) -> i32 {
 
 /// 创建文件/设备节点。
 pub fn fs_create(dev: u32, dir_ino: u32, name: &str, typ: u16, rdev: u32) -> i32 {
+    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_create(dev, dir_ino, name, typ, rdev),
         FsKind::Fat32 => fat32::fs_create(dev, dir_ino, name, typ, rdev),
@@ -106,6 +107,7 @@ pub fn fs_create(dev: u32, dir_ino: u32, name: &str, typ: u16, rdev: u32) -> i32
 
 /// 创建目录。
 pub fn fs_mkdir(dev: u32, dir_ino: u32, name: &str) -> i32 {
+    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_mkdir(dev, dir_ino, name),
         FsKind::Fat32 => fat32::fs_mkdir(dev, dir_ino, name),
@@ -166,6 +168,7 @@ pub fn fs_truncate(dev: u32, ino: u32) -> i32 {
 
 /// 删除文件/目录。
 pub fn fs_unlink(dev: u32, dir_ino: u32, name: &str) -> i32 {
+    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_unlink(dev, dir_ino, name),
         FsKind::Fat32 => fat32::fs_unlink(dev, dir_ino, name),
@@ -174,6 +177,7 @@ pub fn fs_unlink(dev: u32, dir_ino: u32, name: &str) -> i32 {
 
 /// 重命名。
 pub fn fs_rename(dev: u32, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> i32 {
+    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
     match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_rename(dev, old_dir, old_name, new_dir, new_name),
         FsKind::Fat32 => fat32::fs_rename(dev, old_dir, old_name, new_dir, new_name),
