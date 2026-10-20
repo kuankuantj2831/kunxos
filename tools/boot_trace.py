@@ -219,6 +219,7 @@ def main():
                     try:
                         with open(LOG, "rb") as f:
                             if "已退出".encode() in f.read()[-6000:]:
+                                time.sleep(2.0)  # 返回转场落定（转场中点击=「启动已取消」）
                                 break
                     except OSError:
                         pass
