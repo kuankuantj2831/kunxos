@@ -205,15 +205,20 @@ def main():
                     print(f"[boot-trace] OOBE 步进 {cur}/13 (+{time.time()-t_start:.0f}s)", flush=True)
                     time.sleep(2.5)  # 转场/入场动画落定
                     continue
-                if time.time() - step_t < 30:
+                if time.time() - step_t < 8:
                     tap(465, 925)
                     since_tap = 0.0
                     time.sleep(1.8)
                 else:
-                    # 卡步 >30s：停手让空闲兜底（快速连点会重置其计时器）
+                    # 卡步 >8s：点右上角「跳过」胶囊（r59：BTN_SKIP 于
+                    # SKIP_Y=14/margin=16，实测热区 ~(495,30)；跳过直达
+                    # 完成页，替代 30s 空闲兜底）。
                     if since_tap == 0.0:
-                        print(f"[boot-trace] 步 {cur} 卡 >30s，停手等空闲兜底", flush=True)
+                        print(f"[boot-trace] 步 {cur} 卡 >8s，点「跳过」", flush=True)
+                        tap(495, 30)
                         since_tap = time.time()
+                        time.sleep(3.0)
+                        continue
                     time.sleep(1.0)
         # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
         # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
