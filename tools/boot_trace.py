@@ -176,13 +176,15 @@ def main():
         # 普通步点「下一步」(465,925)；密码/胁迫 PIN 步拒绝空输入，停手
         # 35s 等「30 秒无输入自动下一步」（与 app_open_shots.py 同款）。
         if not wait_for("[launcher] 桌面就绪", 30):
-            # 每步混合策略：先密集点「下一步」8s（按钮命中的步 4x 提速）；
-            # 步号未变则停手 ≥30s 让「30 秒无输入自动下一步」兜底——密集
-            # 点击会不断重置该空闲计时器，按钮落空的步会永久卡死（首两跑
-            # 卡在 3/13 的根因；兜底路径 rounds 2-5 已实证全覆盖 13 步）。
+            # 连续风暴快进（r053，r052 定证变现）：r47 窗口化点按的
+            # 「52 发 8 达」是时序伪影——连续风暴实测 40/40 全达且卡片页
+            # 照样推进。改为持续点按，仅在步号刚变时退避 2.5s（转场+入场
+            # 动画落定，动画期 pump 吞点击为已知设计）；步号 >30s 未变则
+            # 停手让「30 秒无输入」兜底（密码/胁迫 PIN 页拒绝空输入）。
             deadline = time.time() + 700
             last_step = -1
             step_t = time.time()
+            since_tap = 0.0
             while time.time() < deadline:
                 if "桌面就绪" in hits:
                     break
@@ -199,11 +201,19 @@ def main():
                 if cur != last_step:
                     last_step = cur
                     step_t = time.time()
+                    since_tap = 0.0
                     print(f"[boot-trace] OOBE 步进 {cur}/13 (+{time.time()-t_start:.0f}s)", flush=True)
-                if time.time() - step_t < 8:
+                    time.sleep(2.5)  # 转场/入场动画落定
+                    continue
+                if time.time() - step_t < 30:
                     tap(465, 925)
-                    time.sleep(0.8)
+                    since_tap = 0.0
+                    time.sleep(1.8)
                 else:
+                    # 卡步 >30s：停手让空闲兜底（快速连点会重置其计时器）
+                    if since_tap == 0.0:
+                        print(f"[boot-trace] 步 {cur} 卡 >30s，停手等空闲兜底", flush=True)
+                        since_tap = time.time()
                     time.sleep(1.0)
         # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
         # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
