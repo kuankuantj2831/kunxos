@@ -199,6 +199,7 @@ def main():
                 if cur != last_step:
                     last_step = cur
                     step_t = time.time()
+                    print(f"[boot-trace] OOBE 步进 {cur}/13 (+{time.time()-t_start:.0f}s)", flush=True)
                 if time.time() - step_t < 8:
                     tap(465, 925)
                     time.sleep(0.8)
@@ -211,6 +212,7 @@ def main():
                 ("calculator", 230, 182, "[calculator]"),
                 ("settings", 418, 872, "[settings]")]
         import re as _re
+        print("[boot-trace] 桌面就绪，开始应用点按采集", flush=True)
         for name, x, y, marker in taps:
             if name != taps[0][0]:
                 swipe_up()  # 回桌面（前一应用仍在前台，否则点击打在其界面上）
@@ -219,7 +221,7 @@ def main():
                     try:
                         with open(LOG, "rb") as f:
                             if "已退出".encode() in f.read()[-6000:]:
-                                time.sleep(2.0)  # 返回转场落定（转场中点击=「启动已取消」）
+                                time.sleep(5.0)  # 返回/取消转场落定（转场中点击=「启动已取消」；r47 实测取消路径回弹更久）
                                 break
                     except OSError:
                         pass
@@ -245,6 +247,7 @@ def main():
             if not hit:
                 print(f"[boot-trace] {name}: 40s 无 [{name}] 行", flush=True)
         # 桌面 [perf] 采集窗口
+        print(f"[boot-trace] 采集桌面 [perf] 窗口 {PERF_SECS}s…", flush=True)
         t_perf0 = time.time()
         while time.time() - t_perf0 < PERF_SECS:
             if p.poll() is not None:
