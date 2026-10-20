@@ -300,10 +300,12 @@ struct DCacheEntry {
     name: [u8; DCACHE_NAME_MAX],
     name_len: usize,
     ino: u32,
+    /// 子 inode 类型（fs_type 值；walk 免每组件两次 inode 读，r37/r41）。
+    typ: u16,
 }
 
 const DC_EMPTY: DCacheEntry =
-    DCacheEntry { gen: 0, dev: 0, dir: 0, name: [0; DCACHE_NAME_MAX], name_len: 0, ino: 0 };
+    DCacheEntry { gen: 0, dev: 0, dir: 0, name: [0; DCACHE_NAME_MAX], name_len: 0, ino: 0, typ: 0 };
 static mut DCACHE: [DCacheEntry; DCACHE_SLOTS] = [DC_EMPTY; DCACHE_SLOTS];
 static mut DCACHE_GEN: u64 = 1;
 static mut DCACHE_NEXT: usize = 0;
@@ -315,7 +317,7 @@ pub fn dcache_invalidate() {
     }
 }
 
-fn dcache_lookup(dev: u32, dir: u32, name: &str) -> Option<u32> {
+fn dcache_lookup(dev: u32, dir: u32, name: &str) -> Option<(u32, u16)> {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > DCACHE_NAME_MAX {
         return None;
@@ -330,14 +332,14 @@ fn dcache_lookup(dev: u32, dir: u32, name: &str) -> Option<u32> {
                 && e.name_len == nb.len()
                 && &e.name[..nb.len()] == nb
             {
-                return Some(e.ino);
+                return Some((e.ino, e.typ));
             }
         }
     }
     None
 }
 
-fn dcache_insert(dev: u32, dir: u32, name: &str, ino: u32) {
+fn dcache_insert(dev: u32, dir: u32, name: &str, ino: u32, typ: u16) {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > DCACHE_NAME_MAX {
         return;
@@ -352,12 +354,17 @@ fn dcache_insert(dev: u32, dir: u32, name: &str, ino: u32) {
         e.name_len = nb.len();
         e.name[..nb.len()].copy_from_slice(nb);
         e.ino = ino;
+        e.typ = typ;
     }
 }
 
 fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, u32)> {
     let mut d = dev;
     let mut cur = dir;
+    // cur 类型线程传递（r41，v2）：免每组件两次 fs_type inode 读。挂载根
+    // 恒为目录；symlink 跳转后置 UNKNOWN（下一轮顶实测一次）。
+    const T_UNKNOWN: u16 = u16::MAX;
+    let mut cur_type: u16 = T_DIR;
     let bytes = path.as_bytes();
     let n = bytes.len();
     let mut pos = 0usize;
@@ -373,17 +380,23 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
             pos += 1;
         }
         let comp = &path[start..pos];
-        if fsops::fs_type(d, cur) != T_DIR {
+        if cur_type == T_UNKNOWN {
+            cur_type = fsops::fs_type(d, cur);
+        }
+        if cur_type != T_DIR {
             return None;
         }
-        let next = match dcache_lookup(d, cur, comp) {
-            Some(cached) => cached as i32,
+        let (next, nt) = match dcache_lookup(d, cur, comp) {
+            Some((cached_ino, cached_typ)) => (cached_ino as i32, cached_typ),
             None => {
                 let r = fsops::fs_lookup(d, cur, comp);
                 if r >= 0 {
-                    dcache_insert(d, cur, comp, r as u32);
+                    let t = fsops::fs_type(d, r as u32);
+                    dcache_insert(d, cur, comp, r as u32, t);
+                    (r, t)
+                } else {
+                    (r, 0)
                 }
-                r
             }
         };
         if next < 0 {
@@ -405,7 +418,6 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
             q += 1;
         }
         let is_final = q >= n;
-        let nt = fsops::fs_type(d, next as u32);
         if nt == T_SYM && (follow_final || !is_final) {
             if *hops >= MAX_SYMLINK_HOPS {
                 return None;
@@ -428,10 +440,12 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
                 d = td;
                 cur = ti;
             }
+            cur_type = T_UNKNOWN;
             pos = q;
             continue;
         }
         cur = next as u32;
+        cur_type = nt;
         pos = q;
     }
     Some((d, cur))
