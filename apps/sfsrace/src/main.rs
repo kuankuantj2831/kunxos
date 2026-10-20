@@ -611,23 +611,68 @@ fn mbx_parse_batch(buf: &mut [u8], n: usize, dones: &mut usize) -> i32 {
     0
 }
 
-/// 阶段 A 读者（父进程执行）：认领 → 读 → 删 → 重建 → 解析计数。
+
+/// 认领留档名（r40）：`MBX_PIPE_R_<k>`（k 单调递增，不复用）。
+/// 返回 NUL 结尾缓冲的指针（open/rename/unlink 收 usize）。
+fn taken_name(k: usize, out: &mut [u8; 48]) -> usize {
+    let mut n = 0usize;
+    for &c in MBX_PIPE_R.iter() {
+        out[n] = c;
+        n += 1;
+    }
+    out[n] = b'_';
+    n += 1;
+    let mut v = k;
+    let mut dg = [0u8; 8];
+    let mut di = dg.len();
+    if v == 0 {
+        di -= 1;
+        dg[di] = b'0';
+    }
+    while v > 0 {
+        di -= 1;
+        dg[di] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &d in dg[di..].iter() {
+        out[n] = d;
+        n += 1;
+    }
+    out[n] = 0;
+    out.as_ptr() as usize
+}
+
+/// 阶段 A 读者（父进程执行）：认领 → 读 → **编号留档** → 重建 → 解析
+/// 计数（r40 零窗口协议重写）。
+///
+/// 原协议在 read_all→unlink(taken) 之间有个迟到写丢失窗：写者每条
+/// open(O_APPEND)→write→close，若 open 抢在读者 rename 之前、write 落
+/// 在 read_all 之后，该条消息（可能是 DONE 哨兵）随 unlink 永久删除——
+/// 实测 dones=2 从 polls=6000 冻结到 30000（r39 心跳定证）。TAKEN_LEFT
+/// 「持 fd 时 unlink 失败」防御对每条开关的写者无效（unlink 时写者已
+/// close）。
+///
+/// 新协议**零窗口 by construction**：
+/// - 认领改为 rename(pipe → taken_k)（k 单调递增）——rename 原子且
+///   fd 随 inode，迟到写落在 taken_k 里**不会丢**（文件不再中途删除）；
+/// - 运行中绝不 unlink 任何 taken_k；
+/// - dones==WRITERS 且取空一轮后，**终局扫排**全部 taken_k（哨兵是各
+///   写者最后一条，哨兵齐 ⟹ 写者已写完 close，扫排兜住全部非哨兵迟到
+///   者），再统一清理。
 /// 返回 0 成功；1 失败（已打印原因）。
 fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(MBX_BUF) };
     let mut p = [0u8; 64];
     let pipe = cstr(&mut p, MBX_PIPE);
-    let mut r = [0u8; 64];
-    let taken = cstr(&mut r, MBX_PIPE_R);
-    // 残留标记：仅在上一轮 unlink(taken) 失败（写者持 fd）时才需要排干
-    // ——否则每轮多一次 ENOENT open（刷 vfs 失败日志）。
-    static mut TAKEN_LEFT: bool = false;
+    let mut k = 0usize; // taken_k 编号
     loop {
         *polls += 1;
         if *polls > MBX_POLLS_MAX {
             print("[sfsrace] MAILBOX FAIL: 认领轮询超限（疑似死锁/活锁）\n");
             print("[mbx-dbg] 超限时 dones=");
             print_dec(*dones);
+            print(" taken_k=");
+            print_dec(k);
             print("\n");
             return 1;
         }
@@ -639,25 +684,22 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
             print_dec(*dones);
             print("\n");
         }
-        // 残留认领文件：上一轮 rename 后写者迟到 append 落在其上（写者持
-        // fd 期间 unlink 失败）——先排干再删。盲删会把迟到消息销毁，
-        // 把认领协议自身的窗口误报成「丢失消息」内核 bug（假阳性 FAIL）。
-        if unsafe { TAKEN_LEFT } {
-            let lfd = open(taken, O_RDONLY);
-            if lfd >= 0 {
-                let ln = read_all(lfd, buf) as usize;
-                close(lfd);
-                if mbx_parse_batch(buf, ln, dones) != 0 {
-                    return 1;
-                }
-            }
-            unsafe { TAKEN_LEFT = unlink(taken) != 0 };
+        // 隔离删除（inode 卫生）：taken_{k-2} 距其认领已跨两整轮（毫秒
+        // 级），迟到写者 fd（µs 级寿命）不可能仍持——根卷 512 inode，
+        // 永不删除会 ENOSPC（r40 首版实测：写者 iter~25 即 open 失败）。
+        if k >= 2 {
+            let mut ob = [0u8; 48];
+            unlink(taken_name(k - 2, &mut ob));
         }
+        // 本轮认领名：MBX_PIPE_R_<k>（k 单调递增，不与历史认领复用名字）
+        let mut nb = [0u8; 48];
+        let taken = taken_name(k, &mut nb);
+        k += 1;
         if rename(pipe, taken) != 0 {
             // 无消息：sleep 后再试（写者还在跑）
             nanosleep_us(1000);
             if *dones >= MBX_WRITERS {
-                return 0; // 全部哨兵已收齐：调用方再做一次取空确认
+                return mbx_final_sweep(dones, k);
             }
             continue;
         }
@@ -668,21 +710,18 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
         }
         let n = read_all(fd, buf) as usize;
         close(fd);
-        unsafe { TAKEN_LEFT = unlink(taken) != 0 };
+        // ★ 不 unlink：taken_k 留档待终局扫排（迟到写随 fd 落在 inode
+        // 上，数据不丢；中途删除正是旧协议的丢失窗）。
         // 重建空管道（无 O_TRUNC：认领后写入方新追加不截断）
         let fd2 = open(pipe, O_WRONLY | O_CREAT);
         if fd2 >= 0 {
             close(fd2);
         }
         if n == 0 {
-            // 取空确认：三个 DONE 哨兵已收齐 + 本轮认领为空 → 管道再无
-            // 新写入（DONE 是各写者最后一条，其被消费即此前全部消息已
-            // 计入；迟到追加只可能发生在哨兵之前）。管道由本方重建、
-            // rename 恒成功，退出检查必须在认领成功路径也可达——原实现
-            // 只查 rename 失败分支，dones=3 后仍无限认领空管道直到轮询
-            // 上限（MAILBOX 确定性假失败）。
+            // 取空确认：哨兵齐 + 本轮空 → 终局扫排全部 taken_k 兜住
+            // 非哨兵迟到者（哨兵是写者最后一条，哨兵齐 ⟹ 无人再写）。
             if *dones >= MBX_WRITERS {
-                return 0;
+                return mbx_final_sweep(dones, k);
             }
             continue;
         }
@@ -690,6 +729,35 @@ fn mbx_reader(dones: &mut usize, polls: &mut usize) -> i32 {
             return 1;
         }
     }
+}
+
+/// 终局扫排（r40）：重读最近 3 份留档（更早的已被两轮隔离删除；各写者
+/// 哨兵已收齐，必然已写完 close，重读捕获全部迟到非哨兵消息），再清理。
+/// 返回 0 成功。
+fn mbx_final_sweep(dones: &mut usize, k: usize) -> i32 {
+    let lo = k.saturating_sub(3);
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(MBX_BUF) };
+    for j in lo..k {
+        let mut nb = [0u8; 48];
+        let name = taken_name(j, &mut nb);
+        let fd = open(name, O_RDONLY);
+        if fd >= 0 {
+            let n = read_all(fd, buf) as usize;
+            close(fd);
+            if n > 0 {
+                print("[mbx-dbg] 终局扫排 taken_");
+                print_dec(j);
+                print(" 追到 ");
+                print_dec(n);
+                print(" 字节\n");
+                if mbx_parse_batch(buf, n, dones) != 0 {
+                    return 1;
+                }
+            }
+        }
+        unlink(name);
+    }
+    0
 }
 
 /// 阶段 A 主控：fork 写者 + 父进程认领消费 + 终局断言。
