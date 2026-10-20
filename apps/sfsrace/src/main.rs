@@ -741,6 +741,11 @@ fn mbx_final_sweep(dones: &mut usize, k: usize) -> i32 {
         let mut nb = [0u8; 48];
         let name = taken_name(j, &mut nb);
         let fd = open(name, O_RDONLY);
+        if fd < 0 {
+            print("[mbx-diag] sweep open 失败 j=");
+            print_dec(j);
+            print("\n");
+        }
         if fd >= 0 {
             let n = read_all(fd, buf) as usize;
             close(fd);
