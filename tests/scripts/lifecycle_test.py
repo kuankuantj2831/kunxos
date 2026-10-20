@@ -133,17 +133,24 @@ def run_cmd_and_wait(cmdline: str, marker: str, timeout: float = 8.0):
 
 
 def ps_pid(names):
-    """从 ps 输出解析任一名字的 pid（names 为候选列表），返回第一个命中。"""
+    """从 ps 输出解析任一名字的 pid（names 为候选列表），返回第一个命中。
+
+    轮询解析最长 2s（r43）：固定 sleep(0.4) 在宿主抖动下偶尔取空 ps 输出，
+    三个 pid 全 None → 后续 21 项连锁超时假失败（lifecycle-core 同款逻辑
+    用 1.0s 从未踩中；对齐为轮询更稳）。
+    """
     before = len(log)
     send("ps")
-    time.sleep(0.4)
-    seg = bytes(log[before:])
-    for line in seg.split(b"\n"):
-        mm = re.match(rb"^(\d+)\s+\d+\s+(\w+)\s*$", line)
-        if mm:
-            name = mm.group(2).decode()
-            if name in names:
-                return mm.group(1).decode()
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        seg = bytes(log[before:])
+        for line in seg.split(b"\n"):
+            mm = re.match(rb"^(\d+)\s+\d+\s+(\w+)\s*$", line)
+            if mm:
+                name = mm.group(2).decode()
+                if name in names:
+                    return mm.group(1).decode()
+        time.sleep(0.2)
     return None
 
 
