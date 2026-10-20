@@ -6,7 +6,7 @@
 //! - 常规文件读写分发给 `fs_simple`；字符设备读写按 (major, minor) 分发给 `devfs`。
 
 use crate::devfs;
-use crate::fsops::{self, T_CHR, T_DIR, T_REG, T_SYM};
+use crate::fsops::{self, T_BLK, T_CHR, T_DIR, T_REG, T_SYM};
 use crate::process::{self, FdKind};
 
 /// 保存 DAIF 并屏蔽 IRQ（嵌套安全：恢复的是调用前的完整 DAIF 值）。
@@ -262,7 +262,7 @@ const MAX_SYMLINK_HOPS: u32 = 8;
 pub fn resolve(path: &str, dev: &mut u32, ino: &mut u32) -> i32 {
     let mut hops = 0u32;
     match resolve_path(path, true, &mut hops) {
-        Some((d, i)) => {
+        Some((d, i, _t)) => {
             *dev = d;
             *ino = i;
             0
@@ -272,7 +272,7 @@ pub fn resolve(path: &str, dev: &mut u32, ino: &mut u32) -> i32 {
 }
 
 /// 顶层解析：定位挂载点后在根 inode 上逐分量行走。
-fn resolve_path(path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, u32)> {
+fn resolve_path(path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, u32, u16)> {
     let (d, root, skip) = find_mount(path)?;
     walk_from(d, root, &path[skip..], follow_final, hops)
 }
@@ -358,7 +358,13 @@ fn dcache_insert(dev: u32, dir: u32, name: &str, ino: u32, typ: u16) {
     }
 }
 
-fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32) -> Option<(u32, u32)> {
+fn walk_from(
+    dev: u32,
+    dir: u32,
+    path: &str,
+    follow_final: bool,
+    hops: &mut u32,
+) -> Option<(u32, u32, u16)> {
     let mut d = dev;
     let mut cur = dir;
     // cur 类型线程传递（r41，v2）：免每组件两次 fs_type inode 读。挂载根
@@ -431,12 +437,12 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
             let target = core::str::from_utf8(&tbuf[..tn as usize]).ok()?;
             if target.starts_with('/') {
                 // 绝对目标：重新走挂载点（可能跨 FS），再继续原路径剩余分量
-                let (td, ti) = resolve_path(target, false, hops)?;
+                let (td, ti, _tt) = resolve_path(target, false, hops)?;
                 d = td;
                 cur = ti;
             } else {
                 // 相对目标：从当前目录继续走 target，再继续原路径剩余分量
-                let (td, ti) = walk_from(d, cur, target, true, hops)?;
+                let (td, ti, _tt) = walk_from(d, cur, target, true, hops)?;
                 d = td;
                 cur = ti;
             }
@@ -448,7 +454,14 @@ fn walk_from(dev: u32, dir: u32, path: &str, follow_final: bool, hops: &mut u32)
         cur_type = nt;
         pos = q;
     }
-    Some((d, cur))
+    // 出口带出最终类型（r42）：UNKNOWN（终分量经 symlink 跳转）时实测
+    // 一次——resolve 的调用方（open/stat）不再重复 fs_type inode 读。
+    let final_typ = if cur_type == T_UNKNOWN {
+        fsops::fs_type(d, cur)
+    } else {
+        cur_type
+    };
+    Some((d, cur, final_typ))
 }
 
 /// 解析路径的父目录，返回 (dev, 父目录 ino, 最后一段名字)；失败 None。
@@ -640,17 +653,21 @@ fn open_impl(path: &str, flags: u32) -> i32 {
         let rel = &path[crate::kos_vfs::KOS_PREFIX.len()..];
         return kos64_as_i32(crate::kos_vfs::posix_open(rel, flags, process::current_uid()));
     }
-    let mut dev = 0u32;
-    let mut ino = 0u32;
-    if resolve(path, &mut dev, &mut ino) == 0 {
-        let typ = fsops::fs_type(dev, ino);
+    let mut hops = 0u32;
+    if let Some((dev, ino, typ)) = resolve_path(path, true, &mut hops) {
         if typ == T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
             return -1; // 目录不可写
         }
         // ★ 先占打开文件表/进程 fd 槽位、再执行 O_TRUNC：若 fd 表或打开
         // 文件表已满，open 会返回 -1，此时不得先截断——否则文件内容已被
         // 销毁而调用方拿到的是失败返回值。
-        let fd = open_file(dev, ino, typ, fsops::fs_rdev(dev, ino), flags);
+        // rdev 仅字符/块设备有意义（r42）：普通文件/目录免一次 inode 读。
+        let rdev = if typ == T_CHR || typ == T_BLK {
+            fsops::fs_rdev(dev, ino)
+        } else {
+            0
+        };
+        let fd = open_file(dev, ino, typ, rdev, flags);
         if fd < 0 {
             // 临时诊断：区分 resolve 成功但 open_file 失败
             if path.starts_with("/var/lib/pkg") {
