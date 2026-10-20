@@ -691,10 +691,38 @@ fn open_impl(path: &str, flags: u32) -> i32 {
         crate::uart_send_str("\n");
     }
     if flags & O_CREAT != 0 {
-        if let Some((d, pino, name)) = resolve_parent(path) {
-            let new_ino = fsops::fs_create(d, pino, name, T_REG, 0);
-            if new_ino >= 0 {
-                return open_file(d, new_ino as u32, T_REG, 0, flags);
+        match resolve_parent(path) {
+            Some((d, pino, name)) => {
+                let new_ino = fsops::fs_create(d, pino, name, T_REG, 0);
+                if new_ino >= 0 {
+                    return open_file(d, new_ino as u32, T_REG, 0, flags);
+                }
+                // [mbx-diag]（r62 诊断包）：O_CREAT 下 fs_create 失败——
+                // mailbox 悬案的写者 open 失败点（实测 used=8/256 已排除
+                // 打开表满）。打印卷剩余 inode 与父目录 inode，区分
+                // 「卷 inode 耗尽」与「目录项/journal 失败」。
+                crate::kinfo! {
+                    crate::uart_send_str("[mbx-diag] create 失败 path=");
+                    crate::uart_send_str(path);
+                    crate::uart_send_str(" free_ino=");
+                    if let Some(f) = fsops::fs_free_inodes(d) {
+                        crate::print_dec(f as u64)
+                    } else {
+                        crate::uart_send_str("?")
+                    }
+                    crate::uart_send_str(" dir=");
+                    crate::print_dec(pino as u64);
+                    crate::uart_send_str("\n");
+                }
+            }
+            None => {
+                // [mbx-diag] resolve_parent 失败（路径中间组件消失——
+                // mailbox 读者 rename 竞争的候选形态）
+                crate::kinfo! {
+                    crate::uart_send_str("[mbx-diag] resolve_parent 失败 path=");
+                    crate::uart_send_str(path);
+                    crate::uart_send_str("\n");
+                }
             }
         }
     }
