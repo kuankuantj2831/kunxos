@@ -119,6 +119,18 @@ def frame(kind, x=0, y=0):
     return bytes((0xAA, kind, x & 0xFF, x >> 8, y & 0xFF, y >> 8))
 
 
+def swipe_up():
+    """底部上滑回桌面（Home）：按下→分步上移→抬起。"""
+    infd = os.open(PIPE + ".in", os.O_WRONLY)
+    os.write(infd, frame(0x01, 270, 900))
+    for y in range(860, 240, -60):
+        os.write(infd, frame(0x02, 270, y))
+        time.sleep(0.03)
+    os.write(infd, frame(0x00))
+    os.close(infd)
+    time.sleep(0.1)
+
+
 def tap(x, y, hold=0.06):
     infd = os.open(PIPE + ".in", os.O_WRONLY)
     os.write(infd, frame(0x01, x, y))
@@ -195,25 +207,42 @@ def main():
         # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
         # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
         # 触控→上屏延迟）。坐标取 app_open_shots.py APPS_DB。
-        taps = [("clock", 150, 182, "[clock] 就绪"),
-                ("calculator", 230, 182, "[calculator] 就绪"),
-                ("settings", 418, 872, "[settings] 就绪")]
+        taps = [("clock", 150, 182, "[clock]"),
+                ("calculator", 230, 182, "[calculator]"),
+                ("settings", 418, 872, "[settings]")]
+        import re as _re
         for name, x, y, marker in taps:
+            if name != taps[0][0]:
+                swipe_up()  # 回桌面（前一应用仍在前台，否则点击打在其界面上）
+                t0 = time.time()
+                while time.time() - t0 < 15:
+                    try:
+                        with open(LOG, "rb") as f:
+                            if "已退出".encode() in f.read()[-6000:]:
+                                break
+                    except OSError:
+                        pass
+                    time.sleep(0.5)
             tap(x, y)
             t0 = time.time()
-            while time.time() - t0 < 25:
-                if marker in hits:
-                    break
+            hit = None
+            while time.time() - t0 < 40:
                 try:
                     with open(LOG, "rb") as f:
-                        if marker.encode() in f.read():
-                            note(name)
-                            break
+                        txt = f.read().decode(errors="replace")
+                    for ln in txt.splitlines():
+                        if ln.startswith(marker):
+                            hit = ln[:70]
+                    if hit:
+                        print(f"[boot-trace] {name}: {hit}", flush=True)
+                        break
                 except OSError:
                     pass
                 if p.poll() is not None:
                     break
-                time.sleep(0.3)
+                time.sleep(0.5)
+            if not hit:
+                print(f"[boot-trace] {name}: 40s 无 [{name}] 行", flush=True)
         # 桌面 [perf] 采集窗口
         t_perf0 = time.time()
         while time.time() - t_perf0 < PERF_SECS:
