@@ -98,28 +98,42 @@ pub fn fs_lookup(dev: u32, dir_ino: u32, name: &str) -> i32 {
 
 /// 创建文件/设备节点。
 pub fn fs_create(dev: u32, dir_ino: u32, name: &str, typ: u16, rdev: u32) -> i32 {
-    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
-    match kind_of(dev) {
+    // 目录变更：dentry 缓存代际双 bump（r38）——入口 bump 拦旧回填，
+    // 出口 bump 关掉「bump→目录写」窗口内并发 miss 回填到的变更前状态
+    // （r36 单入口 bump 的时序窗，mailbox 偶发丢认领根因）。
+    crate::vfs::dcache_invalidate();
+    let r = match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_create(dev, dir_ino, name, typ, rdev),
         FsKind::Fat32 => fat32::fs_create(dev, dir_ino, name, typ, rdev),
-    }
+    };
+    crate::vfs::dcache_invalidate();
+    r
 }
 
 /// 创建目录。
 pub fn fs_mkdir(dev: u32, dir_ino: u32, name: &str) -> i32 {
-    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
-    match kind_of(dev) {
+    // 目录变更：dentry 缓存代际双 bump（r38）——入口 bump 拦旧回填，
+    // 出口 bump 关掉「bump→目录写」窗口内并发 miss 回填到的变更前状态
+    // （r36 单入口 bump 的时序窗，mailbox 偶发丢认领根因）。
+    crate::vfs::dcache_invalidate();
+    let r = match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_mkdir(dev, dir_ino, name),
         FsKind::Fat32 => fat32::fs_mkdir(dev, dir_ino, name),
-    }
+    };
+    crate::vfs::dcache_invalidate();
+    r
 }
 
 /// 创建符号链接（仅 SFS 支持；FAT32 返回 -1）。
 pub fn fs_symlink(dev: u32, dir_ino: u32, name: &str, target: &str) -> i32 {
-    match kind_of(dev) {
+    // r38 补 hook：r36 漏网的第五个目录变更分发点（创建 symlink 目录项）。
+    crate::vfs::dcache_invalidate();
+    let r = match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_symlink(dev, dir_ino, name, target),
         FsKind::Fat32 => -1,
-    }
+    };
+    crate::vfs::dcache_invalidate();
+    r
 }
 
 /// 读取符号链接目标（仅 SFS 支持；FAT32 返回 -1）。
@@ -168,20 +182,30 @@ pub fn fs_truncate(dev: u32, ino: u32) -> i32 {
 
 /// 删除文件/目录。
 pub fn fs_unlink(dev: u32, dir_ino: u32, name: &str) -> i32 {
-    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
-    match kind_of(dev) {
+    // 目录变更：dentry 缓存代际双 bump（r38）——入口 bump 拦旧回填，
+    // 出口 bump 关掉「bump→目录写」窗口内并发 miss 回填到的变更前状态
+    // （r36 单入口 bump 的时序窗，mailbox 偶发丢认领根因）。
+    crate::vfs::dcache_invalidate();
+    let r = match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_unlink(dev, dir_ino, name),
         FsKind::Fat32 => fat32::fs_unlink(dev, dir_ino, name),
-    }
+    };
+    crate::vfs::dcache_invalidate();
+    r
 }
 
 /// 重命名。
 pub fn fs_rename(dev: u32, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> i32 {
-    crate::vfs::dcache_invalidate(); // 目录变更：dentry 缓存代际失效
-    match kind_of(dev) {
+    // 目录变更：dentry 缓存代际双 bump（r38）——入口 bump 拦旧回填，
+    // 出口 bump 关掉「bump→目录写」窗口内并发 miss 回填到的变更前状态
+    // （r36 单入口 bump 的时序窗，mailbox 偶发丢认领根因）。
+    crate::vfs::dcache_invalidate();
+    let r = match kind_of(dev) {
         FsKind::Sfs => fs_simple::fs_rename(dev, old_dir, old_name, new_dir, new_name),
         FsKind::Fat32 => fat32::fs_rename(dev, old_dir, old_name, new_dir, new_name),
-    }
+    };
+    crate::vfs::dcache_invalidate();
+    r
 }
 
 /// 读目录。
