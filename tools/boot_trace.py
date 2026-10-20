@@ -218,8 +218,11 @@ def main():
         # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
         # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
         # 触控→上屏延迟）。坐标取 app_open_shots.py APPS_DB。
+        # 坐标以实测为准（r54 定证）：APPS_DB 的 calculator(230,182) 在
+        # 当前 21 应用布局实际命中 Clock——旧表过时。三连点改为
+        # clock×2+settings（两处独立坐标均实证可启动）。
         taps = [("clock", 150, 182, "[clock]"),
-                ("calculator", 230, 182, "[calculator]"),
+                ("clock2", 230, 182, "[clock]"),
                 ("settings", 418, 872, "[settings]")]
         import re as _re
         print("[boot-trace] 桌面就绪，开始应用点按采集", flush=True)
