@@ -128,6 +128,17 @@ static void bench(long n) {
     put("open+close /  ");
     put_u64(m ? (t1 - t0) / (u64)m : 0);
     put(" ns/op\n");
+
+    /* 长路径（33 字符）：read_cstr 逐页校验 + 路径解析的受益观测 */
+    t0 = now_ns();
+    for (long i = 0; i < m; i++) {
+        i64 fd = sys6(56, -100, (i64)"/var/lib/pkg/repo/main/Packages", 0, 0, 0, 0);
+        if (fd >= 0) sys1(57, fd);
+    }
+    t1 = now_ns();
+    put("open+close 长 ");
+    put_u64(m ? (t1 - t0) / (u64)m : 0);
+    put(" ns/op\n");
 }
 
 void busybox_main(long argc, char **argv) {

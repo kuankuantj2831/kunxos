@@ -1147,10 +1147,20 @@ pub fn root_page_recorded(root: usize, page: usize) -> bool {
         return false;
     }
     unsafe {
-        let pt = &PROCESSES[pid as usize].pt;
+        let pt = &mut PROCESSES[pid as usize].pt;
+        // r33 自证式单槽缓存快路径：命中即已登记（LAZY 视为未登记，
+        // 缓存命中项必为非 LAZY——回填只在下方非 LAZY 命中处发生）。
+        let ci = pt.cache_idx;
+        if ci < pt.count {
+            let r = pt.user_pages[ci];
+            if r.vaddr == page {
+                return r.paddr != 0 && r.paddr != vm::LAZY_PAGE;
+            }
+        }
         for i in 0..pt.count {
             let r = pt.user_pages[i];
             if r.vaddr == page && r.paddr != 0 && r.paddr != vm::LAZY_PAGE {
+                pt.cache_idx = i;
                 return true;
             }
         }

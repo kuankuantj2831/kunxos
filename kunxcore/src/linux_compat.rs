@@ -355,10 +355,10 @@ fn user_ok(addr: u64, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if !process::ensure_user_range_mapped(addr as usize, len) {
-        return false;
-    }
-    vm::user_range_mapped(process::current_root(), addr as usize, len)
+    // ensure_user_range_mapped 内部已按页 user_range_mapped（含共享映射
+    // 放行）并完成 LAZY 落地，成功即「已映射」——尾部再跑全量
+    // user_range_mapped 是纯冗余第二轮扫描（r30 已砍写侧同款）。
+    process::ensure_user_range_mapped(addr as usize, len)
 }
 
 /// 校验用户指针 `[addr, addr+len)` 可写：范围合法、每页已映射，且 COW 共享
@@ -426,13 +426,20 @@ unsafe fn read_cstr(addr: u64, buf: &mut [u8]) -> usize {
         return 0;
     }
     let mut i = 0usize;
-    // 整个读取过程处于 uaccess 区（PAN 放行）；user_ok 逐字节校验边界，
-    // 避免越过用户区读入内核恒等映射内存
+    // 整个读取过程处于 uaccess 区（PAN 放行）；校验改**逐页**（r35）：
+    // 同页字节不重验——原逐字节 user_ok 每字节跑两轮映射检查（33 字节
+    // 路径 = 66 次），页级校验覆盖页内全部字节，越界语义不变（进入
+    // 未校验页前必先触发该页校验失败）。
     crate::mmu::uaccess_begin();
+    let mut ok_page: u64 = u64::MAX; // 已校验页基址（MAX=无）
     while i < buf.len() - 1 {
-        // 逐字节校验边界，避免越过用户区读入内核恒等映射内存
-        if !user_ok(addr + i as u64, 1) {
-            break;
+        let a = addr + i as u64;
+        let pg = a & !0xFFF;
+        if pg != ok_page {
+            if !user_ok(a, 1) {
+                break;
+            }
+            ok_page = pg;
         }
         let c = *(addr as *const u8).add(i);
         if c == 0 {
