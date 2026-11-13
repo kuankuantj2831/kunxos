@@ -23,4 +23,11 @@ fn main() {
     // （表象：测试标记"间歇性"丢失，sfsrace/audiotest 一直 FAIL）。
     // 本包唯一的 include_bytes 就是 ramdisk.img，显式跟踪即完备。
     println!("cargo:rerun-if-changed=ramdisk.img");
+    // Isolated GUI/regression images can embed a staged rootfs without changing
+    // the user's normal ramdisk or the running system's image.
+    println!("cargo:rerun-if-env-changed=KUNX_RAMDISK");
+    let ramdisk = env::var("KUNX_RAMDISK")
+        .unwrap_or_else(|_| format!("{}/ramdisk.img", manifest_dir));
+    println!("cargo:rerun-if-changed={}", ramdisk);
+    println!("cargo:rustc-env=KUNX_RAMDISK_PATH={}", ramdisk);
 }

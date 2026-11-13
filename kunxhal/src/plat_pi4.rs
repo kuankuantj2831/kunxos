@@ -343,10 +343,9 @@ fn try_framebuffer(w: u32, h: u32) -> Option<DisplayInfo> {
     }
     // VC 返回 bus 地址，低 1GB 掩码还原物理地址（1GB 变体）。
     let fb_phys = (fb_bus & 0x3FFF_FFFF) as usize;
-    // pitch 为固件实际行字节数（可能大于 w*4）；DisplayInfo 不含 stride，
-    // 内核侧按 bpp=32 使用，保留字段供后续驱动参考。
-    let _ = pitch;
-    Some(DisplayInfo::new(fb_phys, w, h, 32))
+    let mut info = DisplayInfo::new(fb_phys, w, h, 32);
+    info.stride_bytes = pitch.max(w * 4);
+    Some(info)
 }
 
 // ==================== 电源 / 热 / DVFS（mailbox + PSCI） ====================

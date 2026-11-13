@@ -59,6 +59,8 @@ pub const FBIO_FADE_SPLASH: u32 = 0x4601;
 pub const FBIO_PUT_DAMAGE: u32 = 0x4602;
 /// FBIO_PRESENT 请求码：应用帧呈现（合成器提交 + 翻页）。
 pub const FBIO_PRESENT: u32 = 0x4603;
+/// Versioned display metrics; layout and refresh are independent of legacy fb ABI.
+pub const FBIO_DISPLAY_INFO: u32 = 0x4604;
 
 /// Modem 控制请求码（ioctl）：查询调制解调器是否存在（1=存在）。
 pub const MODEM_IOCTL_PRESENT: u32 = 0x4800;
@@ -313,6 +315,12 @@ fn fb_write(_minor: u32, buf: &[u8]) -> i32 {
 
 /// /dev/fb0：返回可变屏幕信息（24 字节，与 launcher 约定布局一致）。
 fn fb_ioctl(_minor: u32, request: u32, out: &mut [u8]) -> i32 {
+    if request == FBIO_DISPLAY_INFO {
+        let info = crate::gpu_simple::display_metrics().encode();
+        if out.len() < info.len() { return -22; }
+        out[..info.len()].copy_from_slice(&info);
+        return info.len() as i32;
+    }
     if request == FBIO_FADE_SPLASH {
         crate::splash_fade();
         return 0;

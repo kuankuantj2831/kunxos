@@ -790,6 +790,7 @@ pub extern "C" fn rust_main() -> ! {
             // QEMU `-append "shell"` 会写入 /chosen/bootargs；含 "shell" 时
             // 在 /init 之外再拉起内置交互 shell（供 UART 驱动测试）。
             if let Some(args) = chosen.prop_str(&fdt, "bootargs") {
+                gpu_simple::configure_host_rate(args);
                 boot_smp = args.split_whitespace().any(|w| w == "smp");
                 boot_shell = args.split_whitespace().any(|w| w == "shell");
                 boot_wifitest = args.split_whitespace().any(|w| w == "wifitest");
@@ -912,6 +913,7 @@ pub extern "C" fn rust_main() -> ! {
     // ===== 2.1 打印平台信息（HAL） =====
     // 注意：display_init/net_init 有初始化副作用，必须在门控外调用。
     let hal_display = platform.display_init();
+    gpu_simple::configure_display(hal_display.as_ref());
     let hal_net = platform.net_init();
     kinfo! {
         uart_send_str("[hal] platform=");
@@ -1682,7 +1684,7 @@ const RAMDISK_BLOCKS: usize = 4096;
 
 /// 内嵌的 rootfs 镜像（由顶层 `make rootfs` 用 tools/mkfs_sfs.py 生成，
 /// 输出到 kunxcore/ramdisk.img，随内核一并编译进 .rodata）。
-const RAMDISK_IMG: &[u8] = include_bytes!("../ramdisk.img");
+const RAMDISK_IMG: &[u8] = include_bytes!(env!("KUNX_RAMDISK_PATH"));
 
 /// 内嵌 KOS 对象存储卷（`make kosdisk` 用 kosctl 生成：mkfs + 导入
 /// /etc/kos-seed 种子树）。以第二个 RAM 磁盘注册（KOSDISK_MAJOR），

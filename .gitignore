@@ -14,6 +14,8 @@ kunxos.dtb
 
 # Debug logs & scratch
 *.log
+tools/gdb_*.txt
+tools/rsp_capture.txt
 *.pyc
 __pycache__/
 subprocess

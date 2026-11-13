@@ -27,6 +27,19 @@ use core::panic::PanicInfo;
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
 
+#[path = "../../../shared/display.rs"]
+mod display;
+
+fn display_frame_rate() -> u32 {
+    let mut bytes = [0u8; display::INFO_BYTES];
+    unsafe {
+        if FB_FD >= 0 && syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, bytes.as_mut_ptr() as usize) == 0 {
+            if let Some(info) = display::DisplayMetrics::decode(&bytes) { return info.target_millihz; }
+        }
+    }
+    240_000
+}
+
 // 共享系统导航（用于主题步骤的导航方式预览）。
 #[path = "../../../shared/nav.rs"]
 mod sys_nav;
@@ -4627,8 +4640,16 @@ fn wait_for_tap_next_button() -> i32 {
         backspace: false,
     };
     let mut idle; // 空闲毫秒（真实时间，每帧由 loop_t0 重算）
-            let mut loop_t0 = mono_us();
+    let mut loop_t0 = mono_us();
+    let mut frame_clock = display::FrameClock::new();
+    let mut display_query_at = 0;
+    let mut frame_rate = 240_000;
     loop {
+        let frame_start = mono_us();
+        if frame_start >= display_query_at {
+            frame_rate = display_frame_rate();
+            display_query_at = frame_start.saturating_add(1_000_000);
+        }
         err_ui::err_tick();
         if read_input_event(&mut event) {
             loop_t0 = mono_us(); // 有输入：重置真实时间空闲计时的锚点
@@ -4719,13 +4740,12 @@ fn wait_for_tap_next_button() -> i32 {
             if btn_animating() {
                 btn_tick_nav_only();
             }
-            // 光标流畅优先（用户实测移动卡）：有输入待处理/光标待更新时
-            // 帧间不睡眠；静态 2ms 让出（内核精确睡眠后实际 ~3-4ms——TCG
-            // 宿主侧定时器派发延迟 ~2ms，真机为 µs 级；此前 8ms 睡眠被
-            // 10ms tick 量化成 ~100fps 上限）。
-            if !unsafe { CURSOR_DIRTY } && !unsafe { ANY_INPUT_RECENT } && !btn_animating() {
-                sleep_us(2_000);
-            }
+            // Subtract rendering from an absolute deadline; animation duration
+            // remains based on mono_us, independent of the device refresh rate.
+            if !unsafe { CURSOR_DIRTY } && !unsafe { ANY_INPUT_RECENT } {
+                let wait = frame_clock.wait_us(frame_start, mono_us(), frame_rate);
+                if wait > 0 { sleep_us(wait); }
+            } else { frame_clock.reset(); }
             // 纯指针移动（不构成点击）也算用户在场：重置真实时间空闲计时
             if unsafe { ANY_INPUT_RECENT } {
                 unsafe { ANY_INPUT_RECENT = false };

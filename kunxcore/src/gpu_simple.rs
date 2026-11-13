@@ -17,6 +17,49 @@ use core::arch::asm;
 use core::ptr::{addr_of, read_volatile, write_volatile};
 
 use crate::allocator;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static REFRESH_MILLIHZ: AtomicU32 = AtomicU32::new(0);
+static DENSITY: AtomicU32 = AtomicU32::new(1024);
+
+/// The ramfb backend has neither a VSYNC interrupt nor a host resize event.
+/// Keep both capability bits clear until a display driver implements them.
+pub fn configure_display(info: Option<&kunxhal::DisplayInfo>) {
+    if let Some(info) = info {
+        REFRESH_MILLIHZ.store(info.refresh_millihz, Ordering::Relaxed);
+        DENSITY.store(info.density.clamp(256, 8192), Ordering::Relaxed);
+    }
+}
+
+/// Explicit QEMU host hint, not a hardware refresh measurement.
+/// Used only when ramfb cannot report a native rate.
+static HOST_RATE_MILLIHZ: AtomicU32 = AtomicU32::new(0);
+pub fn configure_host_rate(args: &str) {
+    for arg in args.split_whitespace() {
+        if let Some(hz) = arg.strip_prefix("display-hz=").and_then(|s| s.parse::<u32>().ok()) {
+            if (24..=360).contains(&hz) {
+                HOST_RATE_MILLIHZ.store(hz * 1000, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub fn frame_interval_us() -> u64 {
+    let native = REFRESH_MILLIHZ.load(Ordering::Relaxed);
+    let host = HOST_RATE_MILLIHZ.load(Ordering::Relaxed);
+    let rate = if native != 0 { native } else if host != 0 { host } else { 240_000 };
+    1_000_000_000u64.div_ceil(rate.clamp(1_000, 1_000_000) as u64)
+}
+
+pub fn display_metrics() -> kunxhal::display::protocol::DisplayMetrics {
+    kunxhal::display::protocol::DisplayMetrics {
+        generation: 1, width: width(), height: height(), stride_bytes: stride(),
+        density: DENSITY.load(Ordering::Relaxed),
+        refresh_millihz: REFRESH_MILLIHZ.load(Ordering::Relaxed),
+        target_millihz: (1_000_000_000 / crate::power::anim_frame_interval_us()) as u32,
+        capabilities: 0,
+    }
+}
 
 /// 默认渲染分辨率（竖屏手机比例，540x960）。
 pub const DEFAULT_WIDTH: u32 = 540;

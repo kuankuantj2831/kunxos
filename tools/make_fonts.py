@@ -10,14 +10,11 @@
                    码点取自 shared/icons.rs → /fonts/icon-fill.ttf
   icon-line-subset.ttf  Phosphor-Bold（fonts/Phosphor-Bold.ttf）粗线图标子集，
                    码点取自 shared/icons.rs → /fonts/icon-line.ttf（行内 emoji）
-  emoji-subset.ttf Noto Color Emoji 子集（CBDT 位图，retain_gids 保持字形 id 稳定）：
-                   常用 Emoji + ZWJ 家庭序列 + 肤色修饰 + 键盘字符
 
-用法：python3 tools/make_fonts.py [--no-emoji]
+用法：python3 tools/make_fonts.py
 """
 import os
 import re
-import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "tools", "fonts")
@@ -247,83 +244,6 @@ def build_oobe():
         print(f"[{tag}] -> {dst} ({os.path.getsize(dst)//1024} KB)")
 
 
-# ==================== 3) Emoji 子集（CBDT 位图，retain_gids） ====================
-
-EMOJI_BASE = (
-    "😀😁😂🤣😊😍😘😗😜🤪🤨🧐🤓😎🤩🥳😏😒🙄😮💨😴😷🤒🤕🤢🤮🥵🥶😭😱😳🤔🤫🤭"
-    "😡😠😤😇🥰😉🙃😋🤤😴😈👿💀👻👽🤖💩😺😸😹😻😼😽🙀😿😾"
-    "👋🤚🖐✋🖖👌🤌🤏✌🤞🤟🤘🤙👈👉👆👇☝👍👎✊👊🤛🤜👏🙌👐🤲🤝🙏"
-    "💪🦾🦿🦵🦶👂🦻👃🧠🦷🦴👀👁👅👄💋"
-    "❤🧡💛💚💙💜🖤🤍🤎💔❣💕💞💓💗💖💘💝💟"
-    "🌹🥀🌷🌸💐🌻🌼🌺🌾🍀🍁🍂🍃🌵🌴🌳🌲🌿☘🍄🌊🌈☀🌤⛅🌥☁🌦🌧⛈🌩🌨❄☃⛄🌬💨💧💦☔"
-    "🍏🍎🍐🍊🍋🍌🍉🍇🍓🍈🍒🍑🥭🍍🥥🥝🍅🥑🍆🥔🥕🌽🌶🥒🥬🥦🧄🧅🍄🥜🌰"
-    "🍞🥐🥖🥨🥯🥞🧇🧀🍖🍗🥩🥓🍔🍟🍕🌭🥪🌮🌯🥙🧆🥚🍳🥘🍲🥣🥗🍿🧈🍱🍘🍙🍚🍛🍜🍝🍠🍢🍣🍤🍥🥮🍡🥟🥠🥡🦀🦞🦐🦑🦪🍦🍧🍨🍩🍪🎂🍰🧁🥧🍫🍬🍭🍮🍯🍼🥛☕🍵🍶🍾🍷🍸🍹🍺🍻🥂🥃"
-    "⚽⚾🏀🏐🏈🏉🎾🎱🎳🏏🏑🏒🏓🏸🥊🥋🥅🎣🤿🎽🎿🛷🥌🎯🪀🪁🎱🔮🎮🕹🎲♟🎭🎨🎪🎤🎧🎼🎹🥁🎷🎺🎸🪕🎻🎬🎽🎾"
-    "🚗🚕🚙🚌🚎🏎🚓🚑🚒🚐🛻🚚🚛🚜🛴🚲🛵🏍🛺🚨🚔🚍🚘🚖🚡🚠🚟🚃🚋🚞🚝🚄🚅🚈🚂🚆🚇🚊🚉✈🛫🛬🛩💺🛰🚀🛸🚁🛶⛵🚤🛥🛳⛴🚢⚓"
-    "⌚📱📲💻⌨🖥🖨🖱🖲🕹🗜💽💾💿📀📼📷📸📹🎥📽🎞📞☎📟📠📺📻🎙🎚🎛⏱⏲⏰🕰⌛⏳📡🔋🔌💡🔦🕯🪔🧯🛢💸💵💴💶💷💰💳🧾💎⚖🪜🧰🪛🔧🔨⚒🛠⛏🪚🔩⚙🪤🧱⛓🧲🔫💣🧨🪓🔪🗡⚔🛡🚬⚰🪦⚱🏺🔮📿🧿"
-    "📝📁📂🗂📅📆🗒🗓📇📈📉📊📋📌📍📎🖇📏📐✂🗃🗄🗑🔒🔓🔏🔐🔑🗝🔨"
-    "❤️✨⭐🌟💫💥💢💣💬💭💤🗨🗯💦💨🕳💉💊🚬"
-    "🎉🎊🎁🎈🎏🎀🪄🎊🪅🎪🎭🎨🎬🎤🎧🎼🎹🥁🎷🎺🎸🪕🎻🎲♟🎯🎳🎮🎰🧩"
-    "🏠🏡🏘🏢🏣🏤🏥🏦🏨🏩🏪🏫🏬🏭🏯🏰💒🗼🗽🗻🏔⛰🌋🗾🏕🏖🏜🏝🏟🏛🏗🧱🏘"
-    "🇨🇳🇺🇸🇬🇧🇯🇵🇰🇷🇫🇷🇩🇪🇮🇹🇪🇸🇷🇺🇧🇷🇮🇳🇦🇪🇸🇦"
-    "1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣0️⃣🔟"
-    "↔️↕️↖️↗️↘️↙️↩️↪️⤴️⤵️🔃🔄🔙🔚🔛🔜🔝🛐"
-    "⚛️🕉️✡️☸️☯️✝️☦️☪️☮️🕎🔯♈️♉️♊️♋️♌️♍️♎️♏️♐️♑️♒️♓️⛎️"
-    "▶️⏸️⏹️⏺️⏭️⏮️⏩️⏪️⏫️⏬️◀️🔼🔽➡️⬅️⬆️⬇️↗️↘️↙️↖️↕️↔️"
-    "🔴🟠🟡🟢🔵🟣🟤⚫️⚪️🟥🟧🟨🟩🟦🟪🟫⬛️⬜️"
-    "🆕🆙🆒🆓🆖🆗🆘🆚🈁🈂️🈷️🈶️🈯️🉐️🈹️🈚️🈲️🉑️🈸️🈴️🈳️㊗️㊙️🈺️🈵️🔞"
-    "🟰©️®️™️#️⃣*️⃣ℹ️❕❗❓❔❕❗⭕️✅️☑️✔️❌️❎️➕️➖️➗️➰️➿️〽️✳️✴️❇️‼️⁉️❓❔"
-    "0️⃣1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣🔟"
-)
-
-# ZWJ 家庭/职业序列（GSUB 连字，必须整序列传入）
-EMOJI_ZWJ = (
-    "👨‍👩‍👧‍👦👩‍👩‍👧‍👦👨‍👨‍👧‍👦👨‍👩‍👦‍👦👨‍👩‍👧‍👧👩‍👩‍👦‍👦👩‍👩‍👧‍👧👨‍👨‍👦‍👦👨‍👨‍👧‍👧"
-    "👨‍👩‍👦👨‍👩‍👧👩‍👩‍👦👩‍👩‍👧👨‍👨‍👦👨‍👨‍👧"
-    "👩‍❤️‍👨👨‍❤️‍👨👩‍❤️‍👩👩‍❤️‍💋‍👨👨‍❤️‍💋‍👨👩‍❤️‍💋‍👩"
-    "👨‍💻👩‍💻👨‍💼👩‍💼👨‍🏫👩‍🏫👨‍🚀👩‍🚀👨‍🔧👩‍🔧👨‍🍳👩‍🍳👨‍⚕️👩‍⚕️👨‍🎨👩‍🎨👨‍🌾👩‍🌾👨‍🎤👩‍🎤👨‍🎓👩‍🎓👨‍🏭👩‍🏭👨‍🔬👩‍🔬👨‍✈️👩‍✈️👨‍🚒👩‍🚒👮‍♂️👮‍♀️👷‍♂️👷‍♀️💂‍♂️💂‍♀️🕵️‍♂️🕵️‍♀️👩‍⚖️👨‍⚖️👩‍🌾👨‍🌾👩‍🍳👨‍🍳👩‍🎓👨‍🎓"
-    "👋🏻👋🏼👋🏽👋🏾👋🏿👍🏻👍🏼👍🏽👍🏾👍🏿👎🏻👎🏼👎🏽👎🏾👎🏿✌🏻✌🏼✌🏽✌🏾✌🏿👌🏻👌🏼👌🏽👌🏾👌🏿🤙🏻🤙🏼🤙🏽🤙🏾🤙🏿🤝🏻🤝🏼🤝🏽🤝🏾🤝🏿🙏🏻🙏🏼🙏🏽🙏🏾🙏🏿👏🏻👏🏼👏🏽👏🏾👏🏿💪🏻💪🏼💪🏽💪🏾💪🏿"
-    "🏃🏻🏃🏼🏃🏽🏃🏾🏃🏿🧑‍🦱🧑‍🦰🧑‍🦳🧑‍🦲🧑‍🎄"
-)
-
-# 肤色修饰符本身（供直接引用）
-EMOJI_MODIFIERS = "🏻🏼🏽🏾🏿"
-
-
-def build_emoji():
-    from fontTools import subset
-    src = os.path.join(ROOT, "fonts", "emoji-full.ttf")
-    dst = os.path.join(OUT, "emoji-subset.ttf")
-
-    text = EMOJI_BASE + EMOJI_ZWJ + EMOJI_MODIFIERS
-    # 去重（保留顺序）
-    seen = set()
-    chars = []
-    for ch in text:
-        if ch not in seen:
-            seen.add(ch)
-            chars.append(ch)
-    # 排除代理对之外的（全为 BMP 平面内 emoji）
-    chars = [c for c in chars if 0x20 <= ord(c) <= 0x10FFFF]
-    print(f"[emoji] {len(chars)} unique codepoints")
-    opts = subset.Options()
-    opts.retain_gids = True        # 保持字形 id 稳定 -> CBDT 位图索引不变
-    opts.notdef_outline = True
-    opts.recalc_bounds = True
-    opts.name_IDs = ["*"]
-    opts.recommended_glyphs = False
-    opts.layout_features = ["*"]
-    opts.layout_closure = True
-    subsetter = subset.Subsetter(options=opts)
-    subsetter.populate(text="".join(chars))
-    from fontTools.ttLib import TTFont
-    font = TTFont(src)
-    subsetter.subset(font)
-    font.save(dst)
-    size = os.path.getsize(dst)
-    print(f"[emoji] -> {dst} ({size//1024} KB, {size/1048576:.1f} MB)")
-
-
 def build_launcher():
     """桌面启动器超小子集：仅扫描 apps/launcher 文案（应用名/dock/小组件/状态栏/
     控制中心/弹窗），字体小一个量级 → 桌面首帧即平滑，慢 TCG 宿主不再卡在
@@ -407,6 +327,4 @@ if __name__ == "__main__":
     build_oobe()
     build_launcher()
     build_icons()
-    if "--no-emoji" not in sys.argv:
-        build_emoji()
     print("done")

@@ -324,12 +324,8 @@ pub fn frame_buf_mut() -> *mut u32 {
     unsafe { FRAME_BUF.as_mut_ptr() }
 }
 
-/// 转场缩放块采样粒度（输出像素块边长）。
-///
-/// 2 → 4：每帧全屏缩放合成的迭代数降至 1/4。转场（启动/返回/恢复）只在
-/// 350ms/300ms 内播放，块边 4px 的最近邻放大在 540×960 下肉眼差异很小，
-/// 但把 TCG 慢宿主下「每帧 13 万次像素迭代」降到 ~3.3 万次，动画帧率直接翻倍。
-const ZOOM_BLOCK: i32 = 4;
+/// Work starts at native pixels; only sustained overload enables 2/4px sampling.
+fn zoom_block() -> usize { unsafe { super::ANIMATION_QUALITY.block() } }
 
 /// 压暗乘数 LUT（快照压暗：blend(c, 黑, 90) = c * 165 / 255）。
 static mut DARK_LUT: [u32; 256] = [0; 256];
@@ -380,6 +376,10 @@ fn build_white_lut(f: u32) -> [u32; 256] {
 /// 以 `(cx, cy)` 为锚点把 `FRAME_BUF` 缩放（定点 `scale`，1.0=256）绘制到 BACK_BUF，
 /// 可选白色覆盖 `fade`（0..255）。最近邻采样 + `ZOOM_BLOCK` 块采样。
 pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
+    if scale == SCALE_1 && fade == 0 {
+        unsafe { BACK_BUF.copy_from_slice(&FRAME_BUF); }
+        return;
+    }
     let s = scale.max(1) as i64;
     let inv = (256i64 << 16) / s;
     let w = DISPLAY_W as i32;
@@ -390,11 +390,13 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
     } else {
         None
     };
-    let bs = ZOOM_BLOCK as usize;
+    let bs = zoom_block();
     // 列采样表每帧预计算一次：sx 只依赖 px，此前每行重算（240 行 × 135 列
     // 的 i64 乘移位）降为 135 次；越界列以 -1 标记（输出 COLOR_BG）。
-    let mut sx_tab = [-1i32; (DISPLAY_W / ZOOM_BLOCK as usize) + 1];
+    let mut sx_tab = [-1i32; DISPLAY_W];
+    let mut sx_fixed = [0i64; DISPLAY_W];
     for (ci, px) in (0..w).step_by(bs).enumerate() {
+        sx_fixed[ci] = ((cx as i64) << 16) + (px - cx) as i64 * inv;
         let sx = cx + (((px - cx) as i64 * inv) >> 16) as i32;
         sx_tab[ci] = if sx >= 0 && sx < w { sx } else { -1 };
     }
@@ -404,7 +406,10 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
         // 块填充边界一次性钳制（末行/末列可能不满块），内层循环无边界分支
         let bh = bs.min(h as usize - py as usize);
         for (ci, px) in (0..w).step_by(bs).enumerate() {
-            let mut c = if sy_ok && sx_tab[ci] >= 0 {
+            let mut c = if bs == 1 {
+                let sy_fixed = ((cy as i64) << 16) + (py - cy) as i64 * inv;
+                unsafe { super::display::sample_xrgb(&FRAME_BUF, bw, h as usize, sx_fixed[ci], sy_fixed).unwrap_or(COLOR_BG) }
+            } else if sy_ok && sx_tab[ci] >= 0 {
                 unsafe { FRAME_BUF[sy as usize * bw + sx_tab[ci] as usize] }
             } else {
                 COLOR_BG
@@ -454,7 +459,7 @@ pub fn return_blit_over_desktop(scale: u32, cx: i32, cy: i32) {
         if x0 > x1 || y0 > y1 {
             return;
         }
-        let bs = ZOOM_BLOCK as i32;
+        let bs = zoom_block() as i32;
         // 1. 恢复上一帧矩形 ∪ 当前矩形（防御性包围盒）区域的桌面底图。
         let px0 = DESK_RET_PREV[0].min(x0).max(0);
         let py0 = DESK_RET_PREV[1].min(y0).max(0);
@@ -475,7 +480,11 @@ pub fn return_blit_over_desktop(scale: u32, cx: i32, cy: i32) {
             let mut px = x0;
             while px <= x1 {
                 let sx = cx + (((px - cx) as i64 * inv) >> 16) as i32;
-                let c = if sy_ok && sx >= 0 && sx < w {
+                let c = if bs == 1 {
+                    let xf = ((cx as i64) << 16) + (px - cx) as i64 * inv;
+                    let yf = ((cy as i64) << 16) + (py - cy) as i64 * inv;
+                    super::display::sample_xrgb(&FRAME_BUF, bw, h as usize, xf, yf).unwrap_or(COLOR_BG)
+                } else if sy_ok && sx >= 0 && sx < w {
                     FRAME_BUF[sy as usize * bw + sx as usize]
                 } else {
                     COLOR_BG

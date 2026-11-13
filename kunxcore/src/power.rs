@@ -390,14 +390,15 @@ pub fn anim_frame_interval_us() -> u64 {
     let base = match unsafe { THERMAL_LEVEL } {
         ThermalLevel::Critical | ThermalLevel::Emergency => FRAME_60_US,
         ThermalLevel::Hot => FRAME_90_US,
-        ThermalLevel::Normal | ThermalLevel::Warm => FRAME_240_US,
+        ThermalLevel::Normal | ThermalLevel::Warm => crate::gpu_simple::frame_interval_us(),
     };
     // 低电量（≤15% 未充电，battery-low 事件已触发）：稳态 60Hz，省电优先
-    if unsafe { BATT_LOW_EVENTED } && base < FRAME_60_US {
+    let thermal_budget = if unsafe { BATT_LOW_EVENTED } && base < FRAME_60_US {
         FRAME_60_US
     } else {
         base
-    }
+    };
+    thermal_budget.max(crate::gpu_simple::frame_interval_us())
 }
 
 /// governor 决策：给定负载与当前频率，返回目标频率。

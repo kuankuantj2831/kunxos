@@ -32,6 +32,25 @@ mod sys_nav;
 #[path = "../../../shared/motion.rs"]
 mod motion;
 
+#[path = "../../../shared/display.rs"]
+mod display;
+static mut ANIMATION_QUALITY: display::AnimationQuality = display::AnimationQuality::new();
+static mut FRAME_TARGET_MILLIHZ: u32 = 240_000;
+
+fn refresh_display_target() {
+    unsafe {
+        let mut data = [0u8; display::INFO_BYTES];
+        if FB_FD >= 0 && syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) == 0 {
+            if let Some(info) = display::DisplayMetrics::decode(&data) {
+                if FRAME_TARGET_MILLIHZ != info.target_millihz {
+                    print("[launcher] pacing mHz="); print_dec(info.target_millihz); print("\n");
+                }
+                FRAME_TARGET_MILLIHZ = info.target_millihz;
+            }
+        }
+    }
+}
+
 use sys_nav::*;
 
 // 控制中心（右上角下拉；含与通知中心的手势区分）。
@@ -8831,6 +8850,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     let start = now_us();
     let mut sim_clicked = false;
+    let mut frame_clock = display::FrameClock::new();
+    let mut display_query_at = 0u64;
 
     // 打开真实输入设备（非阻塞）；失败则回退为固定坐标模拟点击。
     let input_fd = unsafe { open(INPUT_PATH, O_RDONLY | O_NONBLOCK) };
@@ -8844,6 +8865,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 帧开始时刻（µs）：既是本帧时间戳，也是帧预算的起点
         let frame_start = now_us();
         let now = frame_start;
+        if now >= display_query_at {
+            refresh_display_target();
+            display_query_at = now.saturating_add(1_000_000);
+        }
 
         // 0. 生命周期：应用前台/恢复期间，launcher 不渲染桌面、不读输入
         //    （应用独占 fb0 与输入设备）；只轮询 wait4(WNOHANG) 与 lifd 事件。
@@ -9237,11 +9262,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             move_cursor_fb();
         }
 
-        // 4. 帧预算：空闲锁定 16ms（≈60fps）；动画/拖动/转场期间锁定
-        //    4ms（≈250fps，内核精确睡眠后为真实节距），渲染/输入耗时从
-        //    睡眠中扣除。超预算时立即进入下一帧（干净掉帧而非越积越慢），
-        //    动画期间节奏稳定。
-        let elapsed = now_us() - frame_start;
+        let elapsed = now_us().saturating_sub(frame_start);
         // 4.5 转场停滞压缩：宿主机高负载 / TCG 卡顿下单帧可能耗时数百毫秒，
         //    启动/返回转场会看起来"卡死"。单帧耗时 >250ms 时把转场时钟提前
         //    相应时间，使转场在 1-2 帧内收敛到完成（应用立即出现），
@@ -9262,18 +9283,19 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         let high_refresh = unsafe {
             control_center::cc_high_refresh() || PAGE_ANIM || PAGE_DRAG || MOTION.phase != Phase::Idle
         };
-        let budget = if high_refresh { 4_000 } else { 16_000 };
+        let target = unsafe { FRAME_TARGET_MILLIHZ };
+        let rate = if high_refresh { target } else { target.min(60_000) };
+        if high_refresh {
+            unsafe { ANIMATION_QUALITY.observe(elapsed, 1_000_000_000 / rate as u64); }
+        }
         // 光标流畅优先（与 OOBE 同款，R7-D 修正为真生效条件）：本帧有
         // 输入（CURSOR_DIRTY 多在帧内已被消费，静态判定是死条件）时跳过
         // 帧预算睡眠，光标下一帧即刻处理，不叠 16ms 预算。
         let had_input = unsafe { FRAME_INPUT };
         unsafe { FRAME_INPUT = false };
-        if elapsed < budget && !had_input {
-            let rem = (budget - elapsed) / 1000;
-            if rem > 0 {
-                sleep_ms(rem as usize);
-            }
-        }
+        let wait = frame_clock.wait_us(frame_start, now_us(), rate);
+        if had_input { frame_clock.reset(); }
+        else if wait > 0 { sleep_us(wait); }
     }
 }
 

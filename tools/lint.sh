@@ -11,32 +11,26 @@
 #   tools/lint.sh [报告文件路径]
 #
 # 环境变量：
-#   TARGET  编译目标架构（默认 aarch64-unknown-none）
+#   TARGET  编译目标架构（默认 riscv64gc-unknown-none-elf）
 
 set -uo pipefail
 
 TOPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="${TARGET:-aarch64-unknown-none}"
+TARGET="${TARGET:-riscv64gc-unknown-none-elf}"
 REPORT_FILE="${1:-${TOPDIR}/lint-report.txt}"
 
 cd "$TOPDIR" || exit 1
 
-# 收集所有 crate 的 Cargo.toml（排除构建产物与工具目录）。
+# 仅检查仓库源码与未忽略的新源码，排除本地工具链和构建缓存。
 mapfile -t CRATES < <(
-  find . -name Cargo.toml \
-    -not -path '*/target/*' \
-    -not -path '*/.kilo/*' \
-    -not -path '*/node_modules/*' |
-    sort
+  git ls-files --cached --others --exclude-standard -- '**/Cargo.toml' |
+    while IFS= read -r path; do [ ! -f "$path" ] || printf '%s\n' "$path"; done |
+    sort -u
 )
-
-# 收集所有 Rust 源文件（同样排除构建产物与工具目录）。
 mapfile -t RS_FILES < <(
-  find . -name '*.rs' \
-    -not -path '*/target/*' \
-    -not -path '*/.kilo/*' \
-    -not -path '*/node_modules/*' |
-    sort
+  git ls-files --cached --others --exclude-standard -- '*.rs' |
+    while IFS= read -r path; do [ ! -f "$path" ] || printf '%s\n' "$path"; done |
+    sort -u
 )
 
 # 统一输出：既打印到终端，又写入报告文件。
@@ -67,7 +61,12 @@ for manifest in "${CRATES[@]}"; do
   crate_name="$(basename "$crate_dir")"
   log_file="$(mktemp)"
 
-  if cargo check --target "$TARGET" --manifest-path "$manifest" >"$log_file" 2>&1; then
+  # 宿主工具与测试使用宿主目标，裸机系统组件使用 TARGET。
+  target_args=(--target "$TARGET")
+  case "$manifest" in
+    kos/*|tests/*|tools/*|*/hosttest/*) target_args=() ;;
+  esac
+  if cargo check "${target_args[@]}" --manifest-path "$manifest" >"$log_file" 2>&1; then
     # 统计真实的 warning 数量：去掉 cargo 末尾的 "generated N warning(s)" 汇总行。
     total_warn_lines="$(grep -cE '^warning:' "$log_file" || true)"
     summary_lines="$(grep -cE '^warning: .* generated [0-9]+ warning' "$log_file" || true)"

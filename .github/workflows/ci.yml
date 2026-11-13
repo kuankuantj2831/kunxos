@@ -32,10 +32,8 @@ jobs:
           # - tools/sfs_host_test：SFS 内核源 include 宿主测试（test 清单内）
           # - tests/text_host：l10n 宿主测试（test 清单内）
           # - tools/kunxverify、tests/weather_json：手动宿主工具
-          # - kunxboot：aarch64 专用 bootloader（mrs/ic/dsb 等 ARM 指令），
-          #   RISC-V 经 OpenSBI 启动不参与，riscv64 目标编不过
-          HOST_CRATES='^\./(kos|tests|tools|kunxboot)/|/hosttest/'
-          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*' | grep -Ev "$HOST_CRATES"); do
+          HOST_CRATES='^(kos|tests|tools)/|/hosttest/'
+          for m in $(git ls-files '**/Cargo.toml' | grep -Ev "$HOST_CRATES"); do
             echo "==> cargo build $m"
             cargo build --release --target "$TARGET" --manifest-path "$m"
           done
@@ -65,7 +63,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          for m in $(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.kilo/*' -not -path '*/node_modules/*'); do
+          for m in $(git ls-files '**/Cargo.toml'); do
             echo "==> cargo fmt --check $m"
             cargo fmt --check --manifest-path "$m"
           done

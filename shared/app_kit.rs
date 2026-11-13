@@ -336,6 +336,26 @@ pub const KEY_RIGHTSHIFT: u16 = 54;
 
 pub const DISPLAY_W: usize = 540;
 pub const DISPLAY_H: usize = 960;
+#[path = "display.rs"]
+pub mod display;
+static mut DISPLAY_INFO: Option<display::DisplayMetrics> = None;
+static mut DISPLAY_QUERY_AT: u64 = 0;
+
+/// Query device metrics independently of the legacy 540x960 drawing canvas.
+/// Callers can compare generations before rebuilding layout/mappings.
+pub fn display_metrics() -> Option<display::DisplayMetrics> {
+    unsafe {
+        let now = now_us();
+        if FB_FD >= 0 && now >= DISPLAY_QUERY_AT {
+            DISPLAY_QUERY_AT = now.saturating_add(1_000_000);
+            let mut data = [0u8; display::INFO_BYTES];
+            if syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) == 0 {
+                if let Some(info) = display::DisplayMetrics::decode(&data) { DISPLAY_INFO = Some(info); }
+            }
+        }
+        DISPLAY_INFO
+    }
+}
 pub const TITLE_H: i32 = 44;
 pub const BACK_SZ: i32 = 36;
 pub const BACK_X: i32 = 4;

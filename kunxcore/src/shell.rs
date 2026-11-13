@@ -1969,7 +1969,7 @@ fn cmd_help(_cmd: &Command, sink: &mut Sink) {
         "builtins: cd echo export exit pwd ls cat run busybox pkg ps uname clear mkdir rm touch cp mv wc head tail grep df history uptime ping sysinfo calc sort netstat tcp_echo udp_echo http_serve http_get gdb nslookup poweroff reboot power sleep kill date which uniq sha1sum stat dmesg od tee verbose true false basename dirname kos help\n",
     );
     sink.emit_str(
-        "debug: top mount ifconfig log crash perf irqstat netdiag (see docs/DEBUGGING.md)\n",
+        "debug: top mount ifconfig log crash perf display irqstat netdiag (see docs/DEBUGGING.md)\n",
     );
 }
 
@@ -3638,6 +3638,7 @@ fn run_builtin(cmd: &Command, input: &[u8], sink: &mut Sink) {
         "log" => cmd_log(cmd, sink),
         "crash" => cmd_crash(cmd, sink),
         "perf" => cmd_perf(cmd, sink),
+        "display" => cmd_display(sink),
         "irqstat" => cmd_irqstat(cmd, sink),
         "netdiag" => cmd_netdiag(cmd, sink),
         "verbose" => cmd_verbose(cmd, sink),
@@ -3941,7 +3942,7 @@ const BUILTINS: &[&str] = &[
     "false", "basename", "dirname", "dmesg", "od", "tee", "ln", "beep",
     "verbose",
     "audio", "audiolat",
-    "top", "mount", "ifconfig", "log", "crash", "health", "perf", "irqstat", "netdiag",
+    "top", "mount", "ifconfig", "log", "crash", "health", "perf", "display", "irqstat", "netdiag",
 ];
 
 /// 在内置命令中匹配前缀；唯一匹配时写入 `out`，返回匹配数。
@@ -4999,6 +5000,20 @@ fn cmd_netdiag(_cmd: &Command, sink: &mut Sink) {
         sink.emit_str("  [提示] TX 仅 clean（回写自身数据不丢弃），共享行无数据丢失风险\n");
     } else {
         sink.emit_str("  [安全] 全部独占行\n");
+    }
+}
+
+fn cmd_display(sink: &mut Sink) {
+    let info = crate::gpu_simple::display_metrics();
+    sink.emit_str("display: "); sink.emit_u32(info.width); sink.emit_str("x"); sink.emit_u32(info.height);
+    sink.emit_str(" stride="); sink.emit_u32(info.stride_bytes);
+    sink.emit_str(" density="); sink.emit_u32(info.density);
+    sink.emit_str("/1024 native-mHz="); sink.emit_u32(info.refresh_millihz);
+    sink.emit_str(" target-mHz="); sink.emit_u32(info.target_millihz);
+    sink.emit_str(" capabilities="); sink.emit_u32(info.capabilities);
+    sink.emit_str("\n");
+    if info.capabilities == 0 {
+        sink.emit_str("ramfb: software pacing; no VSYNC or host resize notification\n");
     }
 }
 

@@ -3,8 +3,6 @@
 
 输入：tools/cjk/hzk16.bin（标准 HZK16，GB2312 区位码索引，每字 32 字节）
 用法：
-  python3 tools/gen_cjk_font.py full shared/cjk_font_full.rs
-      # 全量 GB2312 一级字库（3755 字），供内核使用
   python3 tools/gen_cjk_font.py subset <out.rs> <src1.rs> [src2.rs ...]
       # 从指定源文件中提取用到的 CJK 字符生成子集，供各应用使用（SFS 单文件 96KB 限制）
 
@@ -19,14 +17,6 @@ HZK16 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cjk", "hzk16.b
 def load_font(path):
     with open(path, "rb") as f:
         return f.read()
-
-def quwei_to_char(qu, wei):
-    """1 基区位 → 字符（GB2312）。"""
-    b0, b1 = qu + 0xA0, wei + 0xA0
-    try:
-        return bytes([b0, b1]).decode("gb2312")
-    except UnicodeDecodeError:
-        return None
 
 def glyph_offset(qu, wei):
     return ((qu - 1) * 94 + (wei - 1)) * 32  # qu/wei 1 基
@@ -56,16 +46,6 @@ def collect(font, chars):
         out.append((cp, g))
     out.sort()
     return out
-
-def collect_level1(font):
-    """GB2312 一级字库：区 16..=55。"""
-    chars = []
-    for qu in range(16, 56):
-        for wei in range(1, 95):
-            ch = quwei_to_char(qu, wei)
-            if ch is not None:
-                chars.append(ch)
-    return collect(font, chars)
 
 def scan_sources(paths):
     """扫描源文件中的全部 CJK 字符。"""
@@ -182,22 +162,14 @@ pub fn text_width(s: &[u8]) -> i32 {{
     return src
 
 def main():
-    mode = sys.argv[1]
-    if mode == "full":
-        out = sys.argv[2]
-        font = load_font(HZK16)
-        glyphs = collect_level1(font)
-        note = "共享 CJK 16x16 点阵字库（GB2312 一级字库，%d 个常用汉字）" % len(glyphs)
-    elif mode == "subset":
-        out = sys.argv[2]
-        srcs = sys.argv[3:]
-        font = load_font(HZK16)
-        chars = scan_sources(srcs)
-        glyphs = collect(font, chars)
-        note = "共享 CJK 16x16 点阵字库（按应用源码提取 %d 字子集）" % len(glyphs)
-    else:
-        print("usage: gen_cjk_font.py full <out.rs> | subset <out.rs> <src...>")
+    if len(sys.argv) < 4 or sys.argv[1] != "subset":
+        print("usage: gen_cjk_font.py subset <out.rs> <src...>")
         sys.exit(1)
+    out = sys.argv[2]
+    font = load_font(HZK16)
+    chars = scan_sources(sys.argv[3:])
+    glyphs = collect(font, chars)
+    note = "共享 CJK 16x16 点阵字库（按应用源码提取 %d 字子集）" % len(glyphs)
     print(f"collected {len(glyphs)} glyphs")
     out = os.path.abspath(out)
     os.makedirs(os.path.dirname(out), exist_ok=True)

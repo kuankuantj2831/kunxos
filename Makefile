@@ -8,11 +8,8 @@
 #   make launcher 编译桌面启动器 + 测试应用（apps/launcher、apps/settings 等）
 #   make rootfs   把 init/networkd/launcher/apps/busybox 复制进 rootfs 并打包 ramdisk
 #   make run      构建全部并用 QEMU 启动
-#   make boot     构建内核 + bootloader + 磁盘镜像，经 virtio-blk 由 bootloader 加载内核
 #   make test-audio  注入 /etc/audio-test 标记跑音频混音/延迟自动化（默认镜像不含，
 #                 避免每次开机串行跑 audiomix+audiolat 拖慢启动）
-#   make boot-pi4 编译 Raspberry Pi 4 bootloader 后端（编译检查）
-#   make pi4      编译 Raspberry Pi 4 后端（编译检查，--features pi4）
 #   make clean    清理所有构建产物
 # 控制台安静模式（默认开启）：启动/运行期信息日志不上串口，CLI 只保留错误与
 # 交互输出。需要完整日志：make run-gui QEMU_APPEND="verbose"（或运行时 shell
@@ -40,7 +37,7 @@ ALARMD    := $(KUNXSERV)/alarmd
 RILD      := $(KUNXSERV)/rild
 WIFID     := $(KUNXSERV)/wifid
 # 用户态应用共享源码（经 #[path] 引入；任一变化都需重编所有应用）。
-SHARED_SRC := $(TOPDIR)/shared/ttf_text.rs $(TOPDIR)/shared/font_render.rs \
+SHARED_SRC := $(TOPDIR)/shared/ttf_text.rs $(TOPDIR)/shared/font_render.rs $(TOPDIR)/shared/display.rs \
               $(TOPDIR)/shared/icons.rs \
               $(TOPDIR)/shared/nav.rs $(TOPDIR)/shared/app_kit.rs $(TOPDIR)/shared/error_ui.rs \
               $(TOPDIR)/shared/cursor_overlay.rs $(TOPDIR)/shared/ds.rs \
@@ -54,7 +51,6 @@ TERMINAL  := $(APPS)/terminal
 CALC      := $(APPS)/calculator
 OOBE      := $(APPS)/oobe
 STORE     := $(APPS)/store
-STUB      := $(APPS)/stub
 FILES     := $(APPS)/files
 PHONE     := $(APPS)/phone
 SMS       := $(APPS)/sms
@@ -75,7 +71,6 @@ LCAPP     := $(APPS)/lcapp
 KUNXPKG   := $(TOPDIR)/kunxpkg
 ROOTFS    := $(TOPDIR)/rootfs
 TOOLS     := $(TOPDIR)/tools
-KUNXBOOT  := $(TOPDIR)/kunxboot
 RECOVERY  := $(APPS)/recovery
 RECOV_ELF = $(RECOVERY)/target/$(TARGET)/release/recovery
 
@@ -100,7 +95,6 @@ TERMINAL_ELF := $(TERMINAL)/target/$(TARGET)/release/terminal
 CALC_ELF     := $(CALC)/target/$(TARGET)/release/calculator
 OOBE_ELF     := $(OOBE)/target/$(TARGET)/release/oobe
 STORE_ELF    := $(STORE)/target/$(TARGET)/release/store
-STUB_ELF     := $(STUB)/target/$(TARGET)/release/stub
 FILES_ELF    := $(FILES)/target/$(TARGET)/release/files
 PHONE_ELF    := $(PHONE)/target/$(TARGET)/release/phone
 SMS_ELF      := $(SMS)/target/$(TARGET)/release/sms
@@ -131,7 +125,6 @@ KOSTEST_ELF   := $(APPS)/kostest/target/$(TARGET)/release/kostest
 KOSDEMO_ELF   := $(APPS)/kosdemo/target/$(TARGET)/release/kosdemo
 BUSYBOX    := $(KUNXCORE)/apps/busybox.elf
 RAMDISK    := $(KUNXCORE)/ramdisk.img
-BOOT_IMG   := $(KUNXBOOT)/bootloader.img
 DTB        := $(TOPDIR)/kunxos.dtb
 DISK_IMG   := $(TOPDIR)/disk.img
 # 平滑字体子集（tools/make_fonts.py 生成，随 rootfs 提供为 /fonts/*.ttf）：
@@ -177,15 +170,9 @@ QEMU_ACCEL ?= tcg
 # 内核启动参数（QEMU -append）：如 QEMU_APPEND="verbose" 开启完整启动日志。
 QEMU_APPEND ?=
 
-# 平台选择：make（默认 QEMU），make pi4（Raspberry Pi 4）。
-PLATFORM ?= qemu
-ifeq ($(PLATFORM),pi4)
-  CARGO_FEATURES := --no-default-features --features pi4
-else
-  CARGO_FEATURES := --features qemu
-endif
+CARGO_FEATURES := --features qemu
 
-.PHONY: all kernel pi4 init networkd kosdisk kos-disk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test boot boot-pi4 disk run-disk clean
+.PHONY: all kernel init networkd kosdisk kos-disk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test disk run-disk clean
 
 all: kernel
 
@@ -265,8 +252,6 @@ $(OOBE_ELF): $(shell find $(OOBE)/src -name '*.rs') $(OOBE)/Cargo.toml $(OOBE)/b
 $(STORE_ELF): $(shell find $(STORE)/src -name '*.rs') $(STORE)/Cargo.toml $(STORE)/build.rs $(STORE)/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(STORE)/Cargo.toml
 
-$(STUB_ELF): $(shell find $(STUB)/src -name '*.rs') $(STUB)/Cargo.toml $(STUB)/build.rs $(STUB)/linker.ld $(SHARED_SRC)
-	$(CARGO) build --release --target $(TARGET) --manifest-path $(STUB)/Cargo.toml
 
 $(FILES_ELF): $(shell find $(FILES)/src -name '*.rs') $(FILES)/Cargo.toml $(FILES)/build.rs $(FILES)/linker.ld $(SHARED_SRC) $(TOPDIR)/shared/cjk_font_files.rs
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(FILES)/Cargo.toml
@@ -325,7 +310,7 @@ $(LCAPP_ELF): $(shell find $(LCAPP)/src -name '*.rs') $(LCAPP)/Cargo.toml $(LCAP
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(LCAPP)/Cargo.toml
 lcapp: $(LCAPP_ELF)
 
-launcher: $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) \
+launcher: $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(STORE_ELF) $(FILES_ELF) \
 	$(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) \
 	$(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF)
 oobe: $(OOBE_ELF)
@@ -389,7 +374,7 @@ $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done: $(CALC_ELF) $(TERMINAL_ELF) $(NOTES_
 $(ROOTFS)/var/lib/pkg/available: $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done
 	cp -f $(ROOTFS)/var/lib/pkg/repo/main/Packages $@
 
-$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(KOSDEMO_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(STUB_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
+$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(KOSDEMO_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
 	@mkdir -p $(ROOTFS)/bin $(ROOTFS)/dev $(ROOTFS)/etc/init.d $(ROOTFS)/proc \
 		$(ROOTFS)/tmp $(ROOTFS)/var/run $(ROOTFS)/var/log $(ROOTFS)/data $(ROOTFS)/data/oobe \
 		$(ROOTFS)/data/photos $(ROOTFS)/data/videos \
@@ -529,11 +514,6 @@ kosdisk: kosctl
 kernel: $(RAMDISK) $(KOSDISK)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(KUNXCORE)/Cargo.toml $(CARGO_FEATURES)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $(KERNEL_IMG)
-
-# Raspberry Pi 4 后端编译检查：仅 cargo build，不覆盖 kernel.img。
-pi4: $(RAMDISK)
-	$(CARGO) build --release --target $(TARGET) --manifest-path $(KUNXCORE)/Cargo.toml \
-		--no-default-features --features pi4
 
 # ---- 运行 ----
 KOS_DRV := -drive file=$(KOS_DISK_IMG),format=raw,if=none,id=kosdisk -device virtio-blk-device,drive=kosdisk
@@ -714,12 +694,6 @@ test-pdu:
 	gcc -O2 -Wall -I $(RILD)/src/pdu -o /tmp/test_pdu tests/scripts/test_pdu.c $(RILD)/src/pdu/pdu.c
 	/tmp/test_pdu
 
-# ---- 引导加载程序 ----
-# 编译 bootloader，生成磁盘镜像（MBR + FAT32），由 bootloader 从 virtio-blk
-# 读取 KERNEL.IMG / KUNXOS.DTB / RAMDISK.IMG 并跳转内核。
-$(BOOT_IMG): $(shell find $(KUNXBOOT)/src -name '*.rs') $(KUNXBOOT)/Cargo.toml $(KUNXBOOT)/build.rs $(KUNXBOOT)/linker.ld $(KUNXBOOT)/linker_pi4.ld
-	$(MAKE) -C $(KUNXBOOT) all
-
 # QEMU 转储机器 DTB（内核设备树来源）。
 $(DTB):
 	$(QEMU) -M virt,accel=$(QEMU_ACCEL),dumpdtb=$@ -cpu rv64 -m 512M -nographic >/dev/null 2>&1 || true
@@ -729,16 +703,6 @@ $(DISK_IMG): $(KERNEL_IMG) $(DTB) $(RAMDISK) $(RECOV_RAMDISK) $(TOOLS)/mkdisk.py
 
 # 构建带分区表（MBR + boot FAT32 + rootfs SFS + data SFS）的磁盘镜像。
 disk: $(DISK_IMG)
-
-boot: kernel $(BOOT_IMG) $(RECOV_RAMDISK) $(DISK_IMG)
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -smp 2 -bios $(OPENBI) -m 512M \
-		-device loader,file=$(BOOT_IMG),addr=0x46000000,cpu-num=0 \
-		-drive file=$(DISK_IMG),format=raw,if=none,id=disk0 \
-		-device virtio-blk-device,drive=disk0 \
-		-device ramfb \
-		-device virtio-rng-device \
-		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0 \
-		-nographic -no-reboot
 
 # 以当前方式（-kernel）直接加载内核，并挂载磁盘镜像验证 /data 持久化。
 run-disk: kernel $(DISK_IMG)
@@ -755,10 +719,6 @@ run-disk: kernel $(DISK_IMG)
 run-smp: kernel
 	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -smp 2 -m 512M -kernel $(KERNEL_IMG) \
 		-append "verbose" -nographic -no-reboot
-
-# Pi 4 bootloader 骨架编译检查。
-boot-pi4:
-	$(MAKE) -C $(KUNXBOOT) pi4
 
 # ---- Wi-Fi 无头自检 ----
 # QEMU `-append "wifitest"`：内核跑 wifi::selftest（扫描 → WPA2-PSK 4-way →
@@ -809,7 +769,6 @@ clean:
 	$(CARGO) clean --manifest-path $(CALC)/Cargo.toml
 	$(CARGO) clean --manifest-path $(OOBE)/Cargo.toml
 	$(CARGO) clean --manifest-path $(STORE)/Cargo.toml
-	$(CARGO) clean --manifest-path $(STUB)/Cargo.toml
 	$(CARGO) clean --manifest-path $(FILES)/Cargo.toml
 	$(CARGO) clean --manifest-path $(PHONE)/Cargo.toml
 	$(CARGO) clean --manifest-path $(SMS)/Cargo.toml
@@ -826,7 +785,6 @@ clean:
 	$(CARGO) clean --manifest-path $(KUNXPKG)/Cargo.toml
 	$(CARGO) clean --manifest-path $(ALARMD)/Cargo.toml
 	$(CARGO) clean --manifest-path $(LCAPP)/Cargo.toml
-	$(CARGO) clean --manifest-path $(KUNXBOOT)/Cargo.toml
 	rm -f $(RAMDISK) $(KERNEL_IMG) $(ROOTFS)/init $(ROOTFS)/bin/networkd \
 		$(ROOTFS)/bin/lcapp \
 		$(ROOTFS)/bin/logd \
@@ -840,4 +798,4 @@ $(ROOTFS)/bin/oobe $(ROOTFS)/bin/store $(ROOTFS)/bin/pkg \
 		$(ROOTFS)/bin/calendar $(ROOTFS)/bin/camera $(ROOTFS)/bin/gallery \
 		$(ROOTFS)/bin/music $(ROOTFS)/bin/mail $(ROOTFS)/bin/map \
 		$(ROOTFS)/bin/weather \
-		$(BOOT_IMG) $(DTB) $(DISK_IMG)
+		$(DTB) $(DISK_IMG)
