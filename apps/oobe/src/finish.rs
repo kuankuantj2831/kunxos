@@ -17,7 +17,7 @@ const O_RDONLY: usize = 0;
 
 const STATUS_H: i32 = 24;
 const DOCK_H: i32 = 48;
-const DOCK_Y: i32 = crate::DISPLAY_H as i32 - DOCK_H - 56;
+fn dock_y() -> i32 { crate::display_h() as i32 - DOCK_H - 56 }
 
 const C_TEXT: u32 = 0x00_1A_1C_22;      // 主文字（浅玻璃/白底上）
 const C_STATUS_BG: u32 = 0x00_F2_F4_F8; // 状态栏浅色底（备用）
@@ -78,8 +78,8 @@ fn draw_wallpaper_a(alpha: u32) {
         }
     };
     let a = alpha.min(255);
-    let w = crate::DISPLAY_W as u32;
-    let h = crate::DISPLAY_H as u32;
+    let w = crate::display_w() as u32;
+    let h = crate::display_h() as u32;
     for y in 0..h {
         let t = y;
         let inv = h - t;
@@ -162,7 +162,7 @@ mod ttf_cp {
 
 fn draw_status_bar() {
     // 液态玻璃状态栏（与 launcher 一致：浅色玻璃 + 深色文字）。
-    crate::draw_glass(0, 0, crate::DISPLAY_W as i32, STATUS_H, 0);
+    crate::draw_glass(0, 0, crate::display_w() as i32, STATUS_H, 0);
     let mut hhmm = [0u8; 5];
     time_hhmm(&mut hhmm);
     crate::draw_text(8, (STATUS_H - 8) / 2, &hhmm, C_TEXT);
@@ -172,7 +172,7 @@ fn draw_status_bar() {
 
 fn draw_dock_strip() {
     // 悬浮液态玻璃 Dock（与 launcher 的浅色玻璃药丸一致）。
-    crate::draw_glass(12, DOCK_Y + 2, crate::DISPLAY_W as i32 - 24, DOCK_H - 4, 30);
+    crate::draw_glass(12, dock_y() + 2, crate::display_w() as i32 - 24, DOCK_H - 4, 30);
 }
 
 fn pct_text(pct: usize, out: &mut [u8; 8]) -> usize {
@@ -200,8 +200,8 @@ fn pct_text(pct: usize, out: &mut [u8; 8]) -> usize {
 /// 过渡 UI：液态玻璃进度面板（位于 Dock 上方，launcher 启动后在同一位置接管指示器）。
 fn draw_progress_overlay(pct: usize) {
     let bw = 240i32;
-    let bx = (crate::DISPLAY_W as i32 - bw) / 2;
-    let by = DOCK_Y - 56;
+    let bx = (crate::display_w() as i32 - bw) / 2;
+    let by = dock_y() - 56;
     crate::draw_glass(bx - 10, by, bw + 20, 52, 16);
     let label: &[u8] = if unsafe { crate::LANG == 0 } {
         "正在进入系统".as_bytes()

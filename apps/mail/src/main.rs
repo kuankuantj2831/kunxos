@@ -68,17 +68,17 @@ fn render_list() {
     draw_title_bar("邮件".as_bytes());
     for (i, m) in MAILS.iter().enumerate() {
         let y = LIST_TOP + i as i32 * ROW_H;
-        if y + ROW_H > DISPLAY_H as i32 {
+        if y + ROW_H > display_h() as i32 {
             break;
         }
         // 邮件行：液态玻璃卡片（r = min(68*25/100, 24) = 17）
-        draw_glass(12, y, DISPLAY_W as i32 - 24, ROW_H - 8, 17);
+        draw_glass(12, y, display_w() as i32 - 24, ROW_H - 8, 17);
         if m.unread {
             draw_disc(26, y + ROW_H / 2 - 4, 5, C_UNREAD);
         }
         draw_text(44, y + 12, m.sender.as_bytes(), C_SENDER);
         draw_text(44, y + 38, m.subject.as_bytes(), C_SUBJECT);
-        draw_text(DISPLAY_W as i32 - 16 - text_width(m.time.as_bytes()), y + 12, m.time.as_bytes(), C_TIME);
+        draw_text(display_w() as i32 - 16 - text_width(m.time.as_bytes()), y + 12, m.time.as_bytes(), C_TIME);
     }
     draw_sys_nav();
 }
@@ -88,19 +88,19 @@ fn render_view(idx: usize) {
     let m = &MAILS[idx];
 
     // 标题栏：返回 + 主题（玻璃，与 draw_title_bar 同款）
-    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
     draw_glass(BACK_X, BACK_Y, BACK_SZ - 8, BACK_SZ - 8, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
     draw_text(48, (TITLE_H - 8) / 2, m.subject.as_bytes(), C_TEXT);
 
     // 邮件内容面板（液态玻璃，覆盖内容区到导航栏之上）
-    draw_glass(16, 64, DISPLAY_W as i32 - 32, content_bottom() - 64, 24);
+    draw_glass(16, 64, display_w() as i32 - 32, content_bottom() - 64, 24);
 
     // 发件人 + 时间
     draw_text(24, 72, "发件人: ".as_bytes(), C_DIM2);
     draw_text(84, 72, m.sender.as_bytes(), C_TEXT);
     draw_text(24, 100, m.time.as_bytes(), C_DIM2);
-    draw_line(16, 120, DISPLAY_W as i32 - 16, 120, C_ROW_BORDER);
+    draw_line(16, 120, display_w() as i32 - 16, 120, C_ROW_BORDER);
 
     // 正文折行
     let mut y = 144i32;
@@ -115,7 +115,7 @@ fn render_view(idx: usize) {
             y += 28;
             n = 0;
         }
-        if n > 0 && text_width(&line[..n]) + cw > DISPLAY_W as i32 - 48 {
+        if n > 0 && text_width(&line[..n]) + cw > display_w() as i32 - 48 {
             draw_text(24, y, &line[..n], C_BODY);
             y += 28;
             n = 0;
@@ -127,7 +127,7 @@ fn render_view(idx: usize) {
         draw_text(24, y, &line[..n], C_BODY);
     }
 
-    draw_text(16, DISPLAY_H as i32 - 60, "返回键回到收件箱".as_bytes(), C_DIM2);
+    draw_text(16, display_h() as i32 - 60, "返回键回到收件箱".as_bytes(), C_DIM2);
     draw_sys_nav();
 }
 
@@ -145,6 +145,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }

@@ -243,6 +243,10 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
     }
     let mut brk = 0usize;
     let mut mapped = 0usize;
+    // Only addresses below a previous segment's end can overlap its pages.
+    // Scanning all earlier page records for every new BSS page made ordinary
+    // multi-megabyte GUI executables quadratic to load, blocking their transition.
+    let mut loaded_end = 0usize;
     // 程序头表落在哪个 PT_LOAD 段内（auxv AT_PHDR 用；找不到则置 0，
     // musl 单线程静态程序在 phnum=0 时仍能完成最小 TLS 初始化）
     let mut phdr_va = 0usize;
@@ -309,6 +313,8 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
         let start = p_vaddr & !(vm::PAGE_SIZE - 1);
         let end = p_vaddr + p_memsz;
         let file_end = p_vaddr + p_filesz;
+        let previous_end = loaded_end;
+        loaded_end = loaded_end.max(end.div_ceil(vm::PAGE_SIZE) * vm::PAGE_SIZE);
 
         // 段整块加载：优先连续分配整段物理页 + 一次整块 memcpy（省去逐页
         // 分配/清零/拷贝循环）；连续分配失败时回退逐页加载。段内文件范围
@@ -337,7 +343,7 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
                     // 用本段 PTE 覆盖前段（丢执行位 → 入口取指失败且
                     // mapped=1）并追加同 VA 双记录（退出双释放），且新帧
                     // 清零会抹掉前段已拷内容。
-                    if let Some((j, r)) = pt.find_mapped_page(va) {
+                    if let Some((j, r)) = if va < previous_end { pt.find_mapped_page(va) } else { None } {
                         let copy_start = p_vaddr.max(va);
                         let copy_end = file_end.min(va + vm::PAGE_SIZE);
                         if copy_start < copy_end {
@@ -386,7 +392,7 @@ pub fn load(data: &[u8]) -> Result<ElfImage, i32> {
                 let mut va = start;
                 while va < end {
                     // ★ 段边界共享页：同块路径（见上），逐页路径无需分配。
-                    if let Some((j, r)) = pt.find_mapped_page(va) {
+                    if let Some((j, r)) = if va < previous_end { pt.find_mapped_page(va) } else { None } {
                         let copy_start = p_vaddr.max(va);
                         let copy_end = file_end.min(va + vm::PAGE_SIZE);
                         if copy_start < copy_end {

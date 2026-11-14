@@ -70,8 +70,8 @@ const STORE_Y: i32 = PATH_BAR_Y + PATH_BAR_H + 4;
 const STORE_H: i32 = 22;
 const LIST_TOP: i32 = STORE_Y + STORE_H + 4;
 const TOOL_H: i32 = 58;
-const TOOL_Y: i32 = NAV_Y - TOOL_H - 4;
-const LIST_BOTTOM: i32 = TOOL_Y - 6;
+fn tool_y() -> i32 { nav_y() - TOOL_H - 4 }
+fn list_bottom() -> i32 { tool_y() - 6 }
 
 /// 界面模式。
 const MODE_BROWSE: u8 = 0;
@@ -141,7 +141,7 @@ static mut SEG_N: usize = 0;
 // ==================== 页面切换转场（P0-2，settings/sms 同款整页滑动） ====================
 
 /// 离场页整帧快照（2MB BSS，与 BACK_BUF 同级）。
-static mut SNAP_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut SNAP_BUF: PixelBuffer = PixelBuffer::new(kit::display::MAX_PIXELS, 540 * 960);
 /// 转场起始时刻；0 = 无转场。
 static mut TRANS_T0: u64 = 0;
 /// true = 推入（进入子目录/查看器）；false = 弹出（返回上级）。
@@ -163,7 +163,7 @@ fn snapshot_page() {
         core::ptr::copy_nonoverlapping(
             BACK_BUF.as_ptr(),
             SNAP_BUF.as_mut_ptr(),
-            DISPLAY_W * DISPLAY_H,
+            display_w() * display_h(),
         );
     }
 }
@@ -187,12 +187,12 @@ fn compose_transition(e: f32) {
         return;
     }
     unsafe {
-        let w = DISPLAY_W;
+        let w = display_w();
         let off = ((1.0 - e) * w as f32) as usize;
         if off == 0 {
             return;
         }
-        for y in 0..DISPLAY_H {
+        for y in 0..display_h() {
             let row = y * w;
             if TRANS_PUSH {
                 for x in (off..w).rev() {
@@ -1009,14 +1009,14 @@ fn viewer_lines() -> (usize, usize) {
             }
         }
     }
-    let rows = ((NAV_Y - TITLE_H - 24) / 20) as usize;
+    let rows = ((nav_y() - TITLE_H - 24) / 20) as usize;
     (lines, rows.max(1))
 }
 
 // ==================== 绘制 ====================
 
 fn fill_screen(color: u32) {
-    fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, color);
+    fill_rect(0, 0, display_w() as i32, display_h() as i32, color);
 }
 
 /// 尺寸格式化："512B" / "3KB" / "1.2MB" / "4.5GB"，返回长度。
@@ -1101,7 +1101,7 @@ fn draw_file_icon(x: i32, y: i32, color: u32) {
 /// 视图：图标 + 选中圈。
 fn draw_list() {
     unsafe {
-        let rows_visible = ((LIST_BOTTOM - LIST_TOP) / ROW_H) as usize;
+        let rows_visible = ((list_bottom() - LIST_TOP) / ROW_H) as usize;
         let max_scroll = ENT_COUNT.saturating_sub(rows_visible);
         if LIST_SCROLL > max_scroll {
             LIST_SCROLL = max_scroll;
@@ -1112,7 +1112,7 @@ fn draw_list() {
                 break;
             }
             let y = LIST_TOP + r as i32 * ROW_H;
-            draw_glass(8, y + 3, DISPLAY_W as i32 - 16, ROW_H - 6, 12);
+            draw_glass(8, y + 3, display_w() as i32 - 16, ROW_H - 6, 12);
             let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
             let t = ENT_TYPE[idx];
             // 图标 + 名称颜色。
@@ -1132,7 +1132,7 @@ fn draw_list() {
                 draw_file_icon(20, y + (ROW_H - 16) / 2, icon_color);
             }
             // 名称。
-            let namew = DISPLAY_W as i32 - 24 - 96;
+            let namew = display_w() as i32 - 24 - 96;
             let mut w = 0i32;
             let mut cut = ENT_LEN[idx];
             for i in (0..ENT_LEN[idx]).rev() {
@@ -1153,14 +1153,14 @@ fn draw_list() {
                 let mut szb = [0u8; 16];
                 let sl = fmt_size(ENT_SIZE[idx], &mut szb);
                 draw_text(
-                    DISPLAY_W as i32 - 12 - 54 - text_width(&szb[..sl]),
+                    display_w() as i32 - 12 - 54 - text_width(&szb[..sl]),
                     y + (ROW_H - 8) / 2,
                     &szb[..sl],
                     C_DIM,
                 );
             }
             // 选中圈（右侧）。
-            let cx = DISPLAY_W as i32 - 34;
+            let cx = display_w() as i32 - 34;
             let cy = y + ROW_H / 2 - 8;
             draw_circle(cx, cy, 8, if idx == SEL_IDX { C_ACCENT } else { C_DIM });
             if idx == SEL_IDX {
@@ -1225,8 +1225,8 @@ fn render_path_bar() {
             } else {
                 w
             };
-            if x + tw > DISPLAY_W as i32 - 10 {
-                tw = (DISPLAY_W as i32 - 10 - x).max(16);
+            if x + tw > display_w() as i32 - 10 {
+                tw = (display_w() as i32 - 10 - x).max(16);
                 if tw < w {
                     // 截断：省略尾部。
                     let _ = tw;
@@ -1260,7 +1260,7 @@ fn render_path_bar() {
         }
         SEG_N = xi;
         // 右端提示：当前路径太长时省略。
-        if x >= DISPLAY_W as i32 - 40 {
+        if x >= display_w() as i32 - 40 {
             // 已截断处理。
         }
     }
@@ -1338,9 +1338,9 @@ fn render_storage() {
     n = push_fmt(&mut line, n, free);
     draw_text(12, STORE_Y, &line[..n], C_DIM);
     // 使用率条。
-    let bw = DISPLAY_W as i32 - 24 - 8 * text_width("剩余 ".as_bytes()) - 100;
+    let bw = display_w() as i32 - 24 - 8 * text_width("剩余 ".as_bytes()) - 100;
     let bw = bw.max(120);
-    let bar_x = DISPLAY_W as i32 - 12 - bw;
+    let bar_x = display_w() as i32 - 12 - bw;
     let frac = if total > 0 {
         ((used as u64 * bw as u64 / total as u64) as i32).min(bw)
     } else {
@@ -1375,22 +1375,22 @@ fn render_toolbar() {
         };
         let gap = 8i32;
         let n = 5i32;
-        let sw = (DISPLAY_W as i32 - 16 - gap * (n - 1)) / n;
+        let sw = (display_w() as i32 - 16 - gap * (n - 1)) / n;
         for i in 0..5i32 {
             let x = 8 + i * (sw + gap);
             let accent = (pending && i == 0) || (!pending && i == 0);
             let danger = !pending && i == 4;
             if danger {
-                draw_glass_style(x, TOOL_Y, sw, TOOL_H - 6, 12, &STYLE_DANGER);
+                draw_glass_style(x, tool_y(), sw, TOOL_H - 6, 12, &STYLE_DANGER);
             } else if accent {
-                draw_glass_style(x, TOOL_Y, sw, TOOL_H - 6, 12, &STYLE_ACCENT);
+                draw_glass_style(x, tool_y(), sw, TOOL_H - 6, 12, &STYLE_ACCENT);
             } else {
-                draw_glass(x, TOOL_Y, sw, TOOL_H - 6, 12);
+                draw_glass(x, tool_y(), sw, TOOL_H - 6, 12);
             }
             let w = text_width(labels[i as usize]);
             // 彩色玻璃（强调绿/危险红）上保持白字，浅玻璃上用深色文字。
             let tc = if danger || accent { C_ON_ACCENT } else { C_TEXT };
-            draw_text(x + (sw - w) / 2, TOOL_Y + (TOOL_H - 6 - 20) / 2, labels[i as usize], tc);
+            draw_text(x + (sw - w) / 2, tool_y() + (TOOL_H - 6 - 20) / 2, labels[i as usize], tc);
         }
         // 剪贴板状态提示。
         if pending {
@@ -1408,9 +1408,9 @@ fn render_toolbar() {
                 hint[n2] = c;
                 n2 += 1;
             }
-            draw_text(12, TOOL_Y - 20, &hint[..n2], C_SEL);
+            draw_text(12, tool_y() - 20, &hint[..n2], C_SEL);
         } else {
-            draw_text(12, TOOL_Y - 20, "点右侧圆点选择项目".as_bytes(), C_DIM);
+            draw_text(12, tool_y() - 20, "点右侧圆点选择项目".as_bytes(), C_DIM);
         }
     }
 }
@@ -1430,7 +1430,7 @@ fn draw_viewer() {
     unsafe {
         let dark = glass_dark();
         draw_gradient_bg(C_BG, dark);
-        draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+        draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
         draw_glass(4, 4, 36, TITLE_H - 8, 10);
         draw_text(12, 10, b"<", C_TEXT);
         draw_text(48, 10, "查看文件".as_bytes(), C_TEXT);
@@ -1476,7 +1476,7 @@ fn draw_viewer() {
             vp[vl] = VIEW_PATH[vl];
             vl += 1;
         }
-        draw_text(8, NAV_Y - 18, &vp[..vl], C_DIM);
+        draw_text(8, nav_y() - 18, &vp[..vl], C_DIM);
         let mut st = [0u8; 32];
         let mut off = 0usize;
         for &c in "第 ".as_bytes() {
@@ -1493,7 +1493,7 @@ fn draw_viewer() {
             st[off] = c;
             off += 1;
         }
-        draw_text(DISPLAY_W as i32 - 8 - text_width(&st[..off]), NAV_Y - 18, &st[..off], C_DIM);
+        draw_text(display_w() as i32 - 8 - text_width(&st[..off]), nav_y() - 18, &st[..off], C_DIM);
         draw_sys_nav();
     }
 }
@@ -1516,8 +1516,8 @@ impl dialog::DialogUi for DlgUi {
         put_pixel(x, y, color);
     }
     fn back(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -1537,16 +1537,16 @@ impl dialog::DialogUi for DlgUi {
         cy - 10
     }
     fn fill_row(&mut self, y: i32, x0: i32, x1: i32, color: u32, alpha: u32) {
-        if y < 0 || y >= DISPLAY_H as i32 || x1 <= x0 {
+        if y < 0 || y >= display_h() as i32 || x1 <= x0 {
             return;
         }
         let xa = x0.max(0);
-        let xb = x1.min(DISPLAY_W as i32);
+        let xb = x1.min(display_w() as i32);
         if xb <= xa {
             return;
         }
         unsafe {
-            let base = y as usize * DISPLAY_W;
+            let base = y as usize * display_w();
             for idx in base + xa as usize..base + xb as usize {
                 BACK_BUF[idx] = dialog::blend_into(BACK_BUF[idx], color, alpha);
             }
@@ -1583,8 +1583,8 @@ fn dlg_stroke(
 
 fn draw_input_dialog() {
     unsafe {
-        let sw = DISPLAY_W as i32;
-        let sh = DISPLAY_H as i32;
+        let sw = display_w() as i32;
+        let sh = display_h() as i32;
         let w = dialog::DLG_W;
         let h = DLG_INPUT_H;
         let (x, y) = dialog::center_rect(sw, sh, w, h);
@@ -1626,8 +1626,8 @@ fn draw_input_dialog() {
 
 fn draw_confirm_dialog() {
     unsafe {
-        let sw = DISPLAY_W as i32;
-        let sh = DISPLAY_H as i32;
+        let sw = display_w() as i32;
+        let sh = display_h() as i32;
         let w = dialog::DLG_W;
         let h = DLG_CONFIRM_H;
         let (x, y) = dialog::center_rect(sw, sh, w, h);
@@ -1675,8 +1675,8 @@ fn draw_confirm_dialog() {
 
 fn draw_progress_dialog() {
     unsafe {
-        let sw = DISPLAY_W as i32;
-        let sh = DISPLAY_H as i32;
+        let sw = display_w() as i32;
+        let sh = display_h() as i32;
         let w = dialog::DLG_W;
         let h = DLG_PROGRESS_H;
         let (x, y) = dialog::center_rect(sw, sh, w, h);
@@ -2158,13 +2158,13 @@ fn progress_cancel() {
 /// 工具栏命中：返回操作 id（0=粘贴/新建，1=取消/复制，2=新建/移动，3=复制/重命名，4=移动/删除）。
 fn toolbar_hit(x: i32, y: i32) -> Option<usize> {
     unsafe {
-        if y < TOOL_Y || y >= TOOL_Y + TOOL_H {
+        if y < tool_y() || y >= tool_y() + TOOL_H {
             return None;
         }
         let pending = CLIP_OP != CLIP_NONE;
         let gap = 8i32;
         let n = 5i32;
-        let sw = (DISPLAY_W as i32 - 16 - gap * (n - 1)) / n;
+        let sw = (display_w() as i32 - 16 - gap * (n - 1)) / n;
         for i in 0..5i32 {
             let bx = 8 + i * (sw + gap);
             if x >= bx && x < bx + sw {
@@ -2226,7 +2226,7 @@ fn handle_browse_click(x: i32, y: i32) -> bool {
             return false;
         }
         // 工具栏。
-        if y >= TOOL_Y && y < TOOL_Y + TOOL_H {
+        if y >= tool_y() && y < tool_y() + TOOL_H {
             if let Some(act) = toolbar_hit(x, y) {
                 match act {
                     10 => {
@@ -2325,18 +2325,18 @@ fn handle_browse_click(x: i32, y: i32) -> bool {
             return false;
         }
         // 列表。
-        if y < LIST_TOP || y >= LIST_BOTTOM {
+        if y < LIST_TOP || y >= list_bottom() {
             return false;
         }
         let row = ((y - LIST_TOP) / ROW_H) as usize;
-        let rows_visible = ((LIST_BOTTOM - LIST_TOP) / ROW_H) as usize;
+        let rows_visible = ((list_bottom() - LIST_TOP) / ROW_H) as usize;
         let idx = LIST_SCROLL.min(ENT_COUNT.saturating_sub(rows_visible)) + row;
         if idx >= ENT_COUNT {
             return false;
         }
         let nm = &ENT_NAMES[idx][..ENT_LEN[idx]];
         // 右侧选中圈。
-        let cx = DISPLAY_W as i32 - 34;
+        let cx = display_w() as i32 - 34;
         if x >= cx - 12 && x <= cx + 12 {
             SEL_IDX = if SEL_IDX == idx { usize::MAX } else { idx };
             redraw();
@@ -2385,7 +2385,7 @@ fn handle_viewer_click(x: i32, y: i32) {
         if y < TITLE_H {
             return;
         }
-        if y < DISPLAY_H as i32 / 2 {
+        if y < display_h() as i32 / 2 {
             VIEW_SCROLL = VIEW_SCROLL.saturating_sub(rows / 2);
         } else {
             VIEW_SCROLL = (VIEW_SCROLL + rows / 2).min(max_scroll);
@@ -2397,7 +2397,7 @@ fn handle_input_click(x: i32, y: i32) {
     unsafe {
         let w = dialog::DLG_W;
         let h = DLG_INPUT_H;
-        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let (px, py) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
         match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
             Some(false) => {
                 // 取消。
@@ -2424,7 +2424,7 @@ fn handle_confirm_click(x: i32, y: i32) {
     unsafe {
         let w = dialog::DLG_W;
         let h = DLG_CONFIRM_H;
-        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let (px, py) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
         match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
             Some(false) => {
                 UI_MODE = MODE_BROWSE;
@@ -2448,7 +2448,7 @@ fn handle_progress_click(x: i32, y: i32) {
     unsafe {
         let w = dialog::DLG_W;
         let h = DLG_PROGRESS_H;
-        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let (px, py) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
         // 进度进行中仅响应「取消」按钮（单按钮行：整行宽均命中）。
         if matches!(
             dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y),
@@ -2512,6 +2512,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     loop {
         let ev = poll_input();
+        if ev.resized { unsafe { SNAP_BUF.resize_len(display_w() * display_h()); } redraw(); }
         if ev.moved {
             cursor_overlay_move();
         }

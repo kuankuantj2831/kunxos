@@ -5012,8 +5012,13 @@ fn cmd_display(sink: &mut Sink) {
     sink.emit_str(" target-mHz="); sink.emit_u32(info.target_millihz);
     sink.emit_str(" capabilities="); sink.emit_u32(info.capabilities);
     sink.emit_str("\n");
+    let (presents, configs) = crate::gpu_simple::scanout_stats();
+    sink.emit_str("ramfb: presents="); sink.emit_u32(presents);
+    sink.emit_str(" reconfigurations="); sink.emit_u32(configs); sink.emit_str("\n");
     if info.capabilities == 0 {
         sink.emit_str("ramfb: software pacing; no VSYNC or host resize notification\n");
+    } else if info.capabilities & 2 != 0 {
+        sink.emit_str("ramfb: host resize bridge enabled; software pacing, no hardware VSYNC\n");
     }
 }
 

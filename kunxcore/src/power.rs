@@ -382,8 +382,8 @@ fn thermal_cap_hz(table: &[FreqPoint], level: ThermalLevel) -> u32 {
 }
 
 /// 动画帧时钟（监督定时器 ch2）按此周期驱动：热级别 Hot 压到 90Hz、
-/// Critical+ 压到 60Hz；低电量未充电封顶 60Hz。恢复后回到 240Hz
-/// （常态档，2026-10-18 起）。`anim.rs` 的帧时钟启动/刷新统一取本值，
+/// Critical+ 压到 60Hz；低电量未充电封顶 60Hz。正常时跟随设备模式或
+/// 宿主提示；二者均未知时回退约 240Hz 软件目标。`anim.rs` 统一取本值，
 /// 热/电池采样在档位边沿调用 `anim::refresh_frame_clock()` 立即生效
 /// （动画不活动时下次启动生效）。
 pub fn anim_frame_interval_us() -> u64 {

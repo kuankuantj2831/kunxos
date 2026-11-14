@@ -60,7 +60,7 @@ const C_TEXT: u32 = 0x00_1A_1C_22;
 const C_DIM: u32 = 0x00_6B_72_80;
 const C_SAVE: u32 = 0x00_00_B9_6B;
 
-const SHUTTER_CX: i32 = (DISPLAY_W / 2) as i32;
+fn shutter_cx() -> i32 { (display_w() / 2) as i32 }
 const SHUTTER_CY: i32 = 850;
 const SHUTTER_R: i32 = 44;
 const THUMB_X: i32 = 24;
@@ -409,17 +409,17 @@ fn draw_thumb_card(x: i32, y: i32) {
 fn draw_sim_viewfinder() {
     let mut seed: u32 = 0x12345678;
     for y in 100..700 {
-        for x in 0..DISPLAY_W as i32 {
+        for x in 0..display_w() as i32 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let v = ((seed >> 16) & 0xFF) as u32;
             let color = 0x00_10_14_20 | (v << 8) | (v << 16);
             put_pixel(x, y, color);
         }
     }
-    draw_line(0, 100, DISPLAY_W as i32, 100, C_GRID);
-    draw_line(0, 700, DISPLAY_W as i32, 700, C_GRID);
-    draw_line(DISPLAY_W as i32 / 3, 100, DISPLAY_W as i32 / 3, 700, C_GRID);
-    draw_line(DISPLAY_W as i32 / 3 * 2, 100, DISPLAY_W as i32 / 3 * 2, 700, C_GRID);
+    draw_line(0, 100, display_w() as i32, 100, C_GRID);
+    draw_line(0, 700, display_w() as i32, 700, C_GRID);
+    draw_line(display_w() as i32 / 3, 100, display_w() as i32 / 3, 700, C_GRID);
+    draw_line(display_w() as i32 / 3 * 2, 100, display_w() as i32 / 3 * 2, 700, C_GRID);
 }
 
 fn render() {
@@ -429,10 +429,10 @@ fn render() {
     // 取景器
     if unsafe { CAM_OK } {
         // 已由 draw_preview_frame 绘制（仅在帧更新时调用）
-        draw_line(0, VIEW_Y, DISPLAY_W as i32, VIEW_Y, C_GRID);
-        draw_line(0, VIEW_Y + VIEW_H, DISPLAY_W as i32, VIEW_Y + VIEW_H, C_GRID);
-        draw_line(DISPLAY_W as i32 / 3, VIEW_Y, DISPLAY_W as i32 / 3, VIEW_Y + VIEW_H, C_GRID);
-        draw_line(DISPLAY_W as i32 / 3 * 2, VIEW_Y, DISPLAY_W as i32 / 3 * 2, VIEW_Y + VIEW_H, C_GRID);
+        draw_line(0, VIEW_Y, display_w() as i32, VIEW_Y, C_GRID);
+        draw_line(0, VIEW_Y + VIEW_H, display_w() as i32, VIEW_Y + VIEW_H, C_GRID);
+        draw_line(display_w() as i32 / 3, VIEW_Y, display_w() as i32 / 3, VIEW_Y + VIEW_H, C_GRID);
+        draw_line(display_w() as i32 / 3 * 2, VIEW_Y, display_w() as i32 / 3 * 2, VIEW_Y + VIEW_H, C_GRID);
     } else {
         draw_sim_viewfinder();
     }
@@ -455,15 +455,15 @@ fn render() {
 
     // 快门
     draw_glass_style(
-        SHUTTER_CX - SHUTTER_R,
+        shutter_cx() - SHUTTER_R,
         SHUTTER_CY - SHUTTER_R,
         SHUTTER_R * 2,
         SHUTTER_R * 2,
         SHUTTER_R,
         &STYLE_ACCENT,
     );
-    draw_disc(SHUTTER_CX, SHUTTER_CY, SHUTTER_R - 10, C_SHUTTER_IN);
-    draw_circle(SHUTTER_CX, SHUTTER_CY, SHUTTER_R - 10, C_SHUTTER);
+    draw_disc(shutter_cx(), SHUTTER_CY, SHUTTER_R - 10, C_SHUTTER_IN);
+    draw_circle(shutter_cx(), SHUTTER_CY, SHUTTER_R - 10, C_SHUTTER);
 
     // 录像按钮（液态玻璃小按钮）：录像中红色内芯用白字，待机白色内芯用深字。
     let rec_color = if unsafe { RECORDING } { C_REC } else { C_BTN };
@@ -487,12 +487,12 @@ fn render() {
     // 处理中进度
     let p = unsafe { PROCESSING };
     if p > 0 && p < 100 {
-        draw_glass(60, 200, DISPLAY_W as i32 - 120, 8, 2);
-        fill_rect(60, 200, (DISPLAY_W as i32 - 120) * (p as i32) / 100, 8, C_REC);
+        draw_glass(60, 200, display_w() as i32 - 120, 8, 2);
+        fill_rect(60, 200, (display_w() as i32 - 120) * (p as i32) / 100, 8, C_REC);
         draw_center(220, "处理中...".as_bytes(), C_DIM);
     }
 
-    draw_text(16, DISPLAY_H as i32 - 40, "点击快门拍照 · REC 录像".as_bytes(), C_DIM);
+    draw_text(16, display_h() as i32 - 40, "点击快门拍照 · REC 录像".as_bytes(), C_DIM);
     draw_sys_nav();
 }
 
@@ -631,6 +631,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut last_draw_seq: u32 = u32::MAX;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -651,7 +652,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 print("[camera] 返回 -> 退出\n");
                 break;
             }
-            let dx = x - SHUTTER_CX;
+            let dx = x - shutter_cx();
             let dy = y - SHUTTER_CY;
             if dx * dx + dy * dy <= SHUTTER_R * SHUTTER_R && unsafe { PROCESSING == 0 } {
                 print("[camera] 快门！\n");
@@ -728,7 +729,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             render();
             // 闪光帧覆盖全白
             if unsafe { FLASH > 0 } {
-                fill_rect(0, 0, DISPLAY_W as i32, DISPLAY_H as i32, 0x00_FF_FF_FF);
+                fill_rect(0, 0, display_w() as i32, display_h() as i32, 0x00_FF_FF_FF);
             }
             flip();
             cursor_overlay_redraw();

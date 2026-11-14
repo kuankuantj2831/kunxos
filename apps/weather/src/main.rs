@@ -845,12 +845,12 @@ fn render() {
     let city = weather_city();
 
     // 当前天气卡（液态玻璃面板）
-    draw_glass(16, 64, DISPLAY_W as i32 - 32, 240, 24);
+    draw_glass(16, 64, display_w() as i32 - 32, 240, 24);
     draw_text(32, 84, city.as_bytes(), C_TEXT);
     draw_text(32, 106, "点击切换".as_bytes(), C_DIM);
     // 右上角刷新：强调玻璃胶囊按钮（全系统按钮玻璃化，2026-10-18）。
-    draw_glass_style(DISPLAY_W as i32 - 90, 76, 66, 32, 16, &STYLE_ACCENT);
-    draw_text(DISPLAY_W as i32 - 90 + 17, 84, "刷新".as_bytes(), 0x00_FF_FF_FF);
+    draw_glass_style(display_w() as i32 - 90, 76, 66, 32, 16, &STYLE_ACCENT);
+    draw_text(display_w() as i32 - 90 + 17, 84, "刷新".as_bytes(), 0x00_FF_FF_FF);
     // 状况 + 昼夜
     let mut cond = [0u8; 32];
     let mut cn = 0;
@@ -927,11 +927,11 @@ fn render() {
     for i in 0..5 {
         let f = weather_day(i);
         let y = 356 + i as i32 * 96;
-        if y + 92 > DISPLAY_H as i32 {
+        if y + 92 > display_h() as i32 {
             break;
         }
         // 逐日预报行（液态玻璃卡片）
-        draw_glass(16, y, DISPLAY_W as i32 - 32, 84, 21);
+        draw_glass(16, y, display_w() as i32 - 32, 84, 21);
         draw_text(32, y + 36, day_label(i).as_bytes(), C_TEXT);
         cond_icon(140, y + 42, wmo_icon(f.code));
         let label = wmo_label(f.code);
@@ -948,7 +948,7 @@ fn render() {
             n = tmp.len();
         }
         n = push_temp(&mut tmp, n, f.low);
-        draw_text(DISPLAY_W as i32 - 160, y + 36, &tmp[..n.min(tmp.len())], C_TEXT);
+        draw_text(display_w() as i32 - 160, y + 36, &tmp[..n.min(tmp.len())], C_TEXT);
     }
 
     draw_error_banner();
@@ -959,7 +959,7 @@ fn render() {
 
 /// 「刷新」热区（当前卡右上角）。
 fn refresh_hit(x: i32, y: i32) -> bool {
-    x >= DISPLAY_W as i32 - 100 && x < DISPLAY_W as i32 - 16 && y >= 64 && y < 120
+    x >= display_w() as i32 - 100 && x < display_w() as i32 - 16 && y >= 64 && y < 120
 }
 
 /// 城市名热区（点击切换城市）。
@@ -1000,6 +1000,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }

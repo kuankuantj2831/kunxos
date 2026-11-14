@@ -71,12 +71,12 @@ impl CcSpring {
 
 // ==================== 面板几何 ====================
 
-const CC_PANEL_H: i32 = DISPLAY_H as i32 / 2; // 480 = 屏幕高度 50%
+fn cc_panel_h() -> i32 { display_h() as i32 / 2 } // 480 = 屏幕高度 50%
 const CC_RADIUS: i32 = 24; // 底部圆角
 const CC_GLASS_ALPHA: u32 = 178; // 0.7 * 255
 const CC_DOWN: usize = 6; // 毛玻璃降采样倍率
-const CC_SMALL_W: usize = (DISPLAY_W + CC_DOWN - 1) / CC_DOWN; // 90
-const CC_SMALL_H: usize = (CC_PANEL_H as usize + CC_DOWN - 1) / CC_DOWN; // 80
+fn cc_small_w() -> usize { (display_w() + CC_DOWN - 1) / CC_DOWN } // 90
+fn cc_small_h() -> usize { (cc_panel_h() as usize + CC_DOWN - 1) / CC_DOWN } // 80
 const CC_BLUR_R: i32 = 3; // 小缓冲盒式模糊半径（≈30px）
 
 // 布局
@@ -124,10 +124,20 @@ static mut CC_SPRING: CcSpring = CcSpring::fixed();
 static mut CC_SPRING_T: u64 = 0;
 /// 收起起始进度：从打开进行中的当前进度收起（否则面板先闪跳到全开）。
 static mut CC_GLASS_READY: bool = false;
-static mut CC_GLASS: [u32; DISPLAY_W * (CC_PANEL_H as usize)] =
-    [0; DISPLAY_W * (CC_PANEL_H as usize)];
-static mut CC_SMALL: [u32; CC_SMALL_W * CC_SMALL_H] = [0; CC_SMALL_W * CC_SMALL_H];
-static mut CC_TMP: [u32; CC_SMALL_W * CC_SMALL_H] = [0; CC_SMALL_W * CC_SMALL_H];
+pub fn invalidate_geometry() {
+    unsafe {
+        CC_GLASS_READY = false;
+        CC_GLASS.resize_len(cc_pixels());
+        CC_SMALL.resize_len(cc_small_pixels());
+        CC_TMP.resize_len(cc_tmp_pixels());
+    }
+}
+fn cc_pixels() -> usize { display_w() * cc_panel_h() as usize }
+static mut CC_GLASS: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 480);
+fn cc_small_pixels() -> usize { cc_small_w() * cc_small_h() }
+static mut CC_SMALL: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS / 36 + 1000, 90 * 80);
+fn cc_tmp_pixels() -> usize { cc_small_w() * cc_small_h() }
+static mut CC_TMP: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS / 36 + 1000, 90 * 80);
 
 // 开关状态：0 飞行模式 / 1 WiFi / 2 蓝牙 / 3 蜂窝数据
 static mut CC_SW: [bool; 4] = [false; 4];
@@ -301,7 +311,7 @@ pub fn shade_drag_release() {
                     mass: 1.0,
                     target: 1.0,
                     pos: CC_PROG,
-                    vel: (SHADE_VEL / CC_PANEL_H as f32).clamp(-4.0, 4.0),
+                    vel: (SHADE_VEL / cc_panel_h() as f32).clamp(-4.0, 4.0),
                 };
                 CC_SPRING_T = now_us();
             } else {
@@ -313,7 +323,7 @@ pub fn shade_drag_release() {
                     target: 0.0,
                     pos: CC_PROG,
                     // 继承手指速度（收起方向的负速度同样接续）
-                    vel: (SHADE_VEL / CC_PANEL_H as f32).clamp(-4.0, 4.0),
+                    vel: (SHADE_VEL / cc_panel_h() as f32).clamp(-4.0, 4.0),
                 };
                 CC_SPRING_T = now_us();
             }
@@ -413,7 +423,7 @@ pub fn notif_visible() -> bool {
 }
 
 fn cc_panel_top() -> f32 {
-    unsafe { CC_PANEL_H as f32 * (CC_PROG - 1.0) }
+    unsafe { cc_panel_h() as f32 * (CC_PROG - 1.0) }
 }
 
 // ==================== 通知中心（最小占位，另行实现） ====================
@@ -505,7 +515,7 @@ pub fn cc_handle(g: Gesture) -> bool {
                 // 面板均关闭：按起点区分通知中心（左上）与控制中心（右上）
                 if dy > CC_OPEN_MIN_DIST && dy.abs() > dx.abs() {
                     let (px, py) = (TOUCH.press_x, TOUCH.press_y);
-                    if py <= 50 && px >= DISPLAY_W as i32 - 50 {
+                    if py <= 50 && px >= display_w() as i32 - 50 {
                         cc_open();
                         return true;
                     }
@@ -551,7 +561,7 @@ enum CcEl {
 
 fn cc_row1_x(i: usize) -> i32 {
     let total = 4 * CC_BIG + 3 * CC_ROW1_GAP;
-    let x0 = (DISPLAY_W as i32 - total) / 2;
+    let x0 = (display_w() as i32 - total) / 2;
     x0 + i as i32 * (CC_BIG + CC_ROW1_GAP)
 }
 
@@ -572,10 +582,10 @@ fn cc_hit(x: i32, y: i32) -> CcEl {
             return CcEl::Tile(4 + i as u8);
         }
     }
-    if x >= CC_MX && x < DISPLAY_W as i32 - CC_MX && y >= CC_BR_Y && y < CC_BR_Y + CC_SL_H {
+    if x >= CC_MX && x < display_w() as i32 - CC_MX && y >= CC_BR_Y && y < CC_BR_Y + CC_SL_H {
         return CcEl::Slider(0);
     }
-    if x >= CC_MX && x < DISPLAY_W as i32 - CC_MX && y >= CC_VOL_Y && y < CC_VOL_Y + CC_SL_H {
+    if x >= CC_MX && x < display_w() as i32 - CC_MX && y >= CC_VOL_Y && y < CC_VOL_Y + CC_SL_H {
         return CcEl::Slider(1);
     }
     if y >= CC_MUS_Y && y < CC_MUS_Y + CC_MUS_H {
@@ -604,7 +614,7 @@ fn cc_tap(x: i32, y: i32) -> bool {
         if CC_PHASE != CcPhase::Open {
             return true;
         }
-        if y >= CC_PANEL_H || y < 0 {
+        if y >= cc_panel_h() || y < 0 {
             cc_close();
             return true;
         }
@@ -838,7 +848,7 @@ pub fn cc_load() {
 // ==================== 滑块 ====================
 
 fn cc_slider_w() -> i32 {
-    DISPLAY_W as i32 - 2 * CC_MX - 46
+    display_w() as i32 - 2 * CC_MX - 46
 }
 
 fn cc_slider_fx(label: &[u8]) -> i32 {
@@ -884,7 +894,7 @@ unsafe fn cc_slider_pop(oy: i32) {
     }
     let v = if s == 0 { BRIGHTNESS } else { CC_VOLUME };
     let y = if s == 0 { CC_BR_Y } else { CC_VOL_Y } + oy;
-    let cx = DISPLAY_W as i32 / 2;
+    let cx = display_w() as i32 / 2;
     draw_glass(cx - 34, y - 44, 68, 30, 15);
     let mut buf = [0u8; 5];
     let n = push_dec(&mut buf, v);
@@ -910,9 +920,9 @@ fn cc_screenshot() {
         }
         static mut SHOT_BUF: [u8; 4096] = [0u8; 4096];
         let mut off = 0usize;
-        while off < DISPLAY_W * DISPLAY_H {
+        while off < display_w() * display_h() {
             let mut m = 0usize;
-            while m + 3 <= SHOT_BUF.len() && off < DISPLAY_W * DISPLAY_H {
+            while m + 3 <= SHOT_BUF.len() && off < display_w() * display_h() {
                 let p = BACK_BUF[off];
                 SHOT_BUF[m] = ((p >> 16) & 0xFF) as u8;
                 SHOT_BUF[m + 1] = ((p >> 8) & 0xFF) as u8;
@@ -942,7 +952,7 @@ pub fn cc_touch_down(x: i32, y: i32) {
         CC_PRESS_SCALE = 1.0;
         CC_DRAG_SLIDER = -1;
         CC_DRAG_MOVED = false;
-        if y >= CC_PANEL_H || y < 0 {
+        if y >= cc_panel_h() || y < 0 {
             return;
         }
         match cc_hit(x, y) {
@@ -1112,69 +1122,69 @@ pub fn cc_high_refresh() -> bool {
 fn cc_build_glass() {
     unsafe {
         // 1. 降采样面板区域
-        for j in 0..CC_SMALL_H {
-            let sy = (j * CC_DOWN + CC_DOWN / 2).min(CC_PANEL_H as usize - 1);
-            for i in 0..CC_SMALL_W {
-                let sx = (i * CC_DOWN + CC_DOWN / 2).min(DISPLAY_W - 1);
-                CC_SMALL[j * CC_SMALL_W + i] = BACK_BUF[sy * DISPLAY_W + sx];
+        for j in 0..cc_small_h() {
+            let sy = (j * CC_DOWN + CC_DOWN / 2).min(cc_panel_h() as usize - 1);
+            for i in 0..cc_small_w() {
+                let sx = (i * CC_DOWN + CC_DOWN / 2).min(display_w() - 1);
+                CC_SMALL[j * cc_small_w() + i] = BACK_BUF[sy * display_w() + sx];
             }
         }
         // 2. 两次可分离盒式模糊（水平 + 垂直），近似 30px 高斯
         for _ in 0..2 {
-            for j in 0..CC_SMALL_H {
-                for i in 0..CC_SMALL_W {
+            for j in 0..cc_small_h() {
+                for i in 0..cc_small_w() {
                     let mut rs = 0u32;
                     let mut gs = 0u32;
                     let mut bs = 0u32;
                     let mut n = 0u32;
                     let i0 = (i as i32 - CC_BLUR_R).max(0);
-                    let i1 = (i as i32 + CC_BLUR_R).min(CC_SMALL_W as i32 - 1);
+                    let i1 = (i as i32 + CC_BLUR_R).min(cc_small_w() as i32 - 1);
                     for k in i0..=i1 {
-                        let p = CC_SMALL[j * CC_SMALL_W + k as usize];
+                        let p = CC_SMALL[j * cc_small_w() + k as usize];
                         rs += (p >> 16) & 0xFF;
                         gs += (p >> 8) & 0xFF;
                         bs += p & 0xFF;
                         n += 1;
                     }
-                    CC_TMP[j * CC_SMALL_W + i] = ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
+                    CC_TMP[j * cc_small_w() + i] = ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
                 }
             }
-            for i in 0..CC_SMALL_W {
-                for j in 0..CC_SMALL_H {
+            for i in 0..cc_small_w() {
+                for j in 0..cc_small_h() {
                     let mut rs = 0u32;
                     let mut gs = 0u32;
                     let mut bs = 0u32;
                     let mut n = 0u32;
                     let j0 = (j as i32 - CC_BLUR_R).max(0);
-                    let j1 = (j as i32 + CC_BLUR_R).min(CC_SMALL_H as i32 - 1);
+                    let j1 = (j as i32 + CC_BLUR_R).min(cc_small_h() as i32 - 1);
                     for k in j0..=j1 {
-                        let p = CC_TMP[k as usize * CC_SMALL_W + i];
+                        let p = CC_TMP[k as usize * cc_small_w() + i];
                         rs += (p >> 16) & 0xFF;
                         gs += (p >> 8) & 0xFF;
                         bs += p & 0xFF;
                         n += 1;
                     }
-                    CC_SMALL[j * CC_SMALL_W + i] = ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
+                    CC_SMALL[j * cc_small_w() + i] = ((rs / n) << 16) | ((gs / n) << 8) | (bs / n);
                 }
             }
         }
         // 3. 双线性放大 + 浅色着色（白色磨砂），写入玻璃层
-        for y in 0..CC_PANEL_H {
+        for y in 0..cc_panel_h() {
             let fy = (y as f32 / CC_DOWN as f32) - 0.5;
             let j0 = cc_floor_i32(fy).max(0);
-            let j1 = (j0 + 1).min(CC_SMALL_H as i32 - 1);
+            let j1 = (j0 + 1).min(cc_small_h() as i32 - 1);
             let ty = fy - j0 as f32;
-            for x in 0..DISPLAY_W {
+            for x in 0..display_w() {
                 let fx = (x as f32 / CC_DOWN as f32) - 0.5;
                 let i0 = cc_floor_i32(fx).max(0);
-                let i1 = (i0 + 1).min(CC_SMALL_W as i32 - 1);
+                let i1 = (i0 + 1).min(cc_small_w() as i32 - 1);
                 let tx = fx - i0 as f32;
-                let a = CC_SMALL[j0 as usize * CC_SMALL_W + i0 as usize];
-                let b = CC_SMALL[j0 as usize * CC_SMALL_W + i1 as usize];
-                let c = CC_SMALL[j1 as usize * CC_SMALL_W + i0 as usize];
-                let d = CC_SMALL[j1 as usize * CC_SMALL_W + i1 as usize];
+                let a = CC_SMALL[j0 as usize * cc_small_w() + i0 as usize];
+                let b = CC_SMALL[j0 as usize * cc_small_w() + i1 as usize];
+                let c = CC_SMALL[j1 as usize * cc_small_w() + i0 as usize];
+                let d = CC_SMALL[j1 as usize * cc_small_w() + i1 as usize];
                 let bl = cc_bilerp(a, b, c, d, tx, ty);
-                CC_GLASS[y as usize * DISPLAY_W + x] = blend(bl, 0x00_FF_FF_FF, 150);
+                CC_GLASS[y as usize * display_w() + x] = blend(bl, 0x00_FF_FF_FF, 150);
             }
         }
     }
@@ -1223,11 +1233,11 @@ fn cc_bilerp(a: u32, b: u32, c: u32, d: u32, tx: f32, ty: f32) -> u32 {
 
 fn cc_bottom_round(x: i32, r: i32) -> bool {
     let rad = CC_RADIUS;
-    if r < CC_PANEL_H - rad {
+    if r < cc_panel_h() - rad {
         return true;
     }
     // 超椭圆几何与系统 glass 模块一致（ColorOS 15 连续曲率）。
-    glass::in_round_rect(x, r, DISPLAY_W as i32, CC_PANEL_H, rad)
+    glass::in_round_rect(x, r, display_w() as i32, cc_panel_h(), rad)
 }
 
 // ==================== 渲染 ====================
@@ -1251,19 +1261,19 @@ fn cc_composite() {
     unsafe {
         let y_top = cc_panel_top();
         let y0 = cc_ceil_i32(y_top);
-        let yb = cc_ceil_i32(y_top + CC_PANEL_H as f32);
+        let yb = cc_ceil_i32(y_top + cc_panel_h() as f32);
         if y0 >= yb {
             return;
         }
-        let y1 = yb.min(DISPLAY_H as i32);
+        let y1 = yb.min(display_h() as i32);
         for y in y0.max(0)..y1 {
             let r = (y as f32 - y_top) as i32;
-            if r < 0 || r >= CC_PANEL_H {
+            if r < 0 || r >= cc_panel_h() {
                 continue;
             }
-            let row = y as usize * DISPLAY_W;
-            let grow = r as usize * DISPLAY_W;
-            for x in 0..DISPLAY_W {
+            let row = y as usize * display_w();
+            let grow = r as usize * display_w();
+            for x in 0..display_w() {
                 if !cc_bottom_round(x as i32, r) {
                     continue;
                 }
@@ -1442,8 +1452,8 @@ fn cc_fill_round_blend(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, a: u3
             if not_corner || in_round_rect(dx, dy, w, h, r) {
                 let px = x + dx;
                 let py = y + dy;
-                if px >= 0 && py >= 0 && px < DISPLAY_W as i32 && py < DISPLAY_H as i32 {
-                    let bg = unsafe { BACK_BUF[py as usize * DISPLAY_W + px as usize] };
+                if px >= 0 && py >= 0 && px < display_w() as i32 && py < display_h() as i32 {
+                    let bg = unsafe { BACK_BUF[py as usize * display_w() + px as usize] };
                     put_pixel(px, py, blend(bg, color, a));
                 }
             }
@@ -1492,7 +1502,7 @@ fn cc_music(oy: i32) {
             i += 1;
         }
         draw_text(
-            (DISPLAY_W as i32 - text_width(&buf[..n])) / 2,
+            (display_w() as i32 - text_width(&buf[..n])) / 2,
             CC_MUS_Y - 14 + oy,
             &buf[..n],
             COLOR_TEXT_DIM,
@@ -1551,11 +1561,11 @@ fn cc_shortcuts(oy: i32) {
 }
 
 fn cc_mus_x0() -> i32 {
-    (DISPLAY_W as i32 - (3 * CC_MUS_W + 2 * CC_MUS_GAP)) / 2
+    (display_w() as i32 - (3 * CC_MUS_W + 2 * CC_MUS_GAP)) / 2
 }
 
 fn cc_short_x0() -> i32 {
-    (DISPLAY_W as i32 - (3 * CC_SHORT_W + 2 * CC_SHORT_GAP)) / 2
+    (display_w() as i32 - (3 * CC_SHORT_W + 2 * CC_SHORT_GAP)) / 2
 }
 
 // ==================== 图标 ====================
@@ -1687,16 +1697,16 @@ fn cc_draw_notif() {
         }
         let y_top = (NOTIF_H as f32 * (NOTIF_PROG - 1.0)) as i32;
         let y0 = y_top.max(0);
-        let y1 = (y_top + NOTIF_H).min(DISPLAY_H as i32);
+        let y1 = (y_top + NOTIF_H).min(display_h() as i32);
         for y in y0..y1 {
             let r = y - y_top;
-            let row = y as usize * DISPLAY_W;
-            for x in 0..DISPLAY_W as i32 {
+            let row = y as usize * display_w();
+            for x in 0..display_w() as i32 {
                 if r >= NOTIF_H - 20 {
                     let cx2 = if x < 20 {
                         20 - x
-                    } else if x >= DISPLAY_W as i32 - 20 {
-                        x - (DISPLAY_W as i32 - 1 - 20)
+                    } else if x >= display_w() as i32 - 20 {
+                        x - (display_w() as i32 - 1 - 20)
                     } else {
                         0
                     };
@@ -1728,7 +1738,7 @@ fn cc_draw_notif() {
         for i in 0..3usize {
             let ny = y_top + 64 + i as i32 * 76;
             // 通知卡片：浅色面板上的浅灰卡（深色 9% 叠加）。
-            cc_fill_round_blend(16, ny, DISPLAY_W as i32 - 32, 64, 16, 0x00_1A_1C_22, 24);
+            cc_fill_round_blend(16, ny, display_w() as i32 - 32, 64, 16, 0x00_1A_1C_22, 24);
             draw_text(36, ny + 12, samples[i].0, COLOR_TEXT_DIM);
             draw_text(36, ny + 34, samples[i].1, COLOR_TEXT_MAIN);
         }

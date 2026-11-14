@@ -187,7 +187,7 @@ pub(crate) unsafe fn page_pop() {
 }
 
 pub(crate) unsafe fn max_scroll() -> i32 {
-    let vis = LIST_BOTTOM - LIST_TOP;
+    let vis = list_bottom() - LIST_TOP;
     let c = unsafe { CONTENT_H };
     if c > vis {
         c - vis
@@ -218,9 +218,9 @@ pub(crate) unsafe fn pointer_down(x: i32, y: i32) {
         // None、导航命中只看 NAV_Y 以下，保留区只会把列表最后 1~2 行的滚动
         // 起点变成死区（BOTTOM_ZONE=130 比导航条本身高 74px）。
         NAV_EXCLUDE = sys_nav::nav_mode() == sys_nav::MODE_GESTURE
-            && (y >= DISPLAY_H as i32 - sys_nav::BOTTOM_ZONE
+            && (y >= display_h() as i32 - sys_nav::BOTTOM_ZONE
                 || x < sys_nav::EDGE_W
-                || x >= DISPLAY_W as i32 - sys_nav::EDGE_W);
+                || x >= display_w() as i32 - sys_nav::EDGE_W);
     }
     SLIDER_GRAB = if unsafe { NAV_EXCLUDE || CONFIRM_OPEN } {
         (-1, -1)
@@ -383,7 +383,7 @@ pub(crate) unsafe fn render() {
 // ==================== 主页面（搜索） ====================
 
 pub(crate) unsafe fn draw_search_bar() {
-    ui::draw_glass(SEARCH_X, SEARCH_Y, SEARCH_W, SEARCH_H, SEARCH_R);
+    ui::draw_glass(SEARCH_X, SEARCH_Y, search_w(), SEARCH_H, SEARCH_R);
     unsafe {
         if SEARCH_LEN > 0 {
             let mut txt = [0u8; 40];
@@ -398,13 +398,13 @@ pub(crate) unsafe fn draw_search_bar() {
             );
             // 清除叉号：Phosphor x 矢量字形（原 8x8 点阵 2 倍放大的中心不变）。
             if !draw_icon_glyph_centered(
-                SEARCH_X + SEARCH_W - 18,
+                SEARCH_X + search_w() - 18,
                 SEARCH_Y + 19,
                 ttf_text::font_render::icons::settings::X,
                 14.0,
                 C_SUB,
             ) {
-                draw_bits(SEARCH_X + SEARCH_W - 26, SEARCH_Y + 11, &crate::FONT_X, 2, C_SUB);
+                draw_bits(SEARCH_X + search_w() - 26, SEARCH_Y + 11, &crate::FONT_X, 2, C_SUB);
             }
         } else {
             draw_text_px(
@@ -503,7 +503,7 @@ unsafe fn render_display() {
     let mut vv = [0u8; 16];
     vv[..bn].copy_from_slice(&num[..bn]);
     vv[bn] = b'%';
-    ui::draw_glass(MARGIN, y, CARD_W, ROW_H, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), ROW_H, CARD_R);
     draw_text_px(
         MARGIN + 4,
         text_top(font_px(), y + ROW_H / 2),
@@ -513,7 +513,7 @@ unsafe fn render_display() {
     );
     let vw = text_width_px(&vv[..bn + 1], 14.0);
     draw_text_px(
-        DISPLAY_W as i32 - MARGIN - vw,
+        display_w() as i32 - MARGIN - vw,
         text_top(14.0, y + ROW_H / 2),
         &vv[..bn + 1],
         14.0,
@@ -531,7 +531,7 @@ unsafe fn render_display() {
         (b"\xE8\x87\xAA\xE5\x8A\xA8\xE6\x97\x8B\xE8\xBD\xAC", I_ACC, 4),
     ];
     let card_h = ui::card_h(5, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon, _)) in rows.iter().enumerate() {
         let value: &[u8] = match i {
@@ -551,14 +551,14 @@ unsafe fn render_display() {
             if i == 0 {
                 ui::draw_row(ry, *icon, title, value, false, false);
                 ui::draw_switch(
-                    DISPLAY_W as i32 - MARGIN - 48,
+                    display_w() as i32 - MARGIN - 48,
                     ry + (ROW_H - 28) / 2,
                     dark,
                 );
             } else {
                 let rot = cfg::cfg_get_int(cfg::CONF_DISPLAY, b"auto_rotate", 0) != 0;
                 ui::draw_row(ry, *icon, title, value, false, false);
-                ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, rot);
+                ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, rot);
             }
         } else {
             ui::draw_row(ry, *icon, title, value, true, false);
@@ -575,7 +575,7 @@ unsafe fn render_display() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -621,7 +621,7 @@ unsafe fn render_sound() {
         (b"\xE9\x80\x9A\xE8\xAF\x9D\xE9\x9F\xB3\xE9\x87\x8F", b"vol_call"),
     ];
     let card_h = ui::card_h(4, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, key)) in keys.iter().enumerate() {
         let v = vol_value(key);
@@ -639,7 +639,7 @@ unsafe fn render_sound() {
         );
         let vw = text_width_px(&vv[..bn + 1], 14.0);
         draw_text_px(
-            DISPLAY_W as i32 - MARGIN - vw,
+            display_w() as i32 - MARGIN - vw,
             text_top(14.0, ry + ROW_H / 2),
             &vv[..bn + 1],
             14.0,
@@ -660,7 +660,7 @@ unsafe fn render_sound() {
         (b"\xE5\x8B\xBF\xE6\x89\xB0\xE6\xA8\xA1\xE5\xBC\x8F", I_MOON, 2),
     ];
     let card_h2 = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon, _)) in rows.iter().enumerate() {
         match i {
@@ -668,7 +668,7 @@ unsafe fn render_sound() {
             1 => {
                 let on = cfg::cfg_get_int(cfg::CONF_SOUND, b"vibration", 1) != 0;
                 ui::draw_row(ry, *icon, title, b"", false, false);
-                ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+                ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
             }
             _ => {
                 let on = cfg::cfg_get_int(cfg::CONF_SOUND, b"dnd_enabled", 0) != 0;
@@ -711,14 +711,14 @@ unsafe fn render_notif() {
         (b"\xE5\xBA\x94\xE7\x94\xA8\xE9\x80\x9A\xE7\x9F\xA5\xE7\xAE\xA1\xE7\x90\x86", I_APPS, 2),
     ];
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon, _)) in rows.iter().enumerate() {
         match i {
             0 => {
                 let on = cfg::cfg_get_int(cfg::CONF_NOTIF, b"push_enabled", 1) != 0;
                 ui::draw_row(ry, *icon, title, b"", false, false);
-                ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+                ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
             }
             1 => ui::draw_row(ry, *icon, title, preview_label(), true, false),
             _ => ui::draw_row(ry, *icon, title, b"", true, false),
@@ -747,13 +747,13 @@ unsafe fn render_perapp() {
     let y = LIST_TOP - s;
     if APP_COUNT == 0 {
         let card_h = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
         ui::draw_row(y + CARD_PAD, I_INFO, b"\xE6\x97\xA0\xE5\xBA\x94\xE7\x94\xA8\xE6\xB8\x85\xE5\x8D\x95", b"", false, false);
         CONTENT_H = card_h;
         return;
     }
     let card_h = ui::card_h(APP_COUNT, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     for i in 0..APP_COUNT {
         let name = &APP_NAMES[i];
         let ln = name.iter().position(|&c| c == 0).unwrap_or(name.len());
@@ -836,7 +836,7 @@ unsafe fn render_sec() {
         (b"\xE8\x83\x81\xE8\xBF\xAB PIN \xE4\xB8\x8E\xE5\x8A\xA8\xE4\xBD\x9C", I_FINGER),
     ];
     let card_h = ui::card_h(5, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon)) in rows.iter().enumerate() {
         let value: &[u8] = if i == 0 { lock_type_label() } else if i == 4 { duress_label() } else { b"" };
@@ -854,13 +854,13 @@ unsafe fn render_sec() {
         (b"\xE9\x87\x8D\xE7\xBD\xAE\xE5\xB9\xBF\xE5\x91\x8A\xE6\xA0\x87\xE8\xAF\x86\xE7\xAC\xA6", I_INFO),
     ];
     let card_h2 = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon)) in rows2.iter().enumerate() {
         if i == 1 {
             let on = cfg::cfg_get_int(cfg::CONF_SEC, b"location", 1) != 0;
             ui::draw_row(ry, *icon, title, b"", false, false);
-            ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+            ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
         } else {
             ui::draw_row(ry, *icon, title, b"", true, false);
         }
@@ -908,7 +908,7 @@ unsafe fn render_secret_input(title: &[u8], numeric: bool) {
     ui::draw_gradient_bg();
     ui::draw_title_bar(title);
     let fx = 24;
-    let fw = DISPLAY_W as i32 - 2 * fx;
+    let fw = display_w() as i32 - 2 * fx;
     let fy = 84;
     ui::draw_glass(fx, fy, fw, 52, 12);
     let mut disp = [0u8; 64];
@@ -942,7 +942,7 @@ unsafe fn render_secret_input(title: &[u8], numeric: bool) {
 
 unsafe fn draw_secret_keypad_hint() {
     // 3x4 数字键盘。
-    let kx = (DISPLAY_W as i32 - 3 * 90 - 2 * 16) / 2;
+    let kx = (display_w() as i32 - 3 * 90 - 2 * 16) / 2;
     let ky = 180;
     for r in 0..4 {
         for c in 0..3 {
@@ -973,7 +973,7 @@ unsafe fn draw_secret_keypad_hint() {
 
 /// 按键命中数字键盘：返回 (r,c) 或 None。
 unsafe fn secret_keypad_hit(x: i32, y: i32) -> Option<(i32, i32)> {
-    let kx = (DISPLAY_W as i32 - 3 * 90 - 2 * 16) / 2;
+    let kx = (display_w() as i32 - 3 * 90 - 2 * 16) / 2;
     let ky = 180;
     for r in 0..4 {
         for c in 0..3 {
@@ -996,7 +996,7 @@ const PAT_Y: i32 = 260;
 unsafe fn pat_center(i: usize) -> (i32, i32) {
     let r = (i / 3) as i32;
     let c = (i % 3) as i32;
-    let x0 = (DISPLAY_W as i32 - (2 * PAT_GAP)) / 2;
+    let x0 = (display_w() as i32 - (2 * PAT_GAP)) / 2;
     (x0 + c * PAT_GAP, PAT_Y + r * PAT_GAP)
 }
 
@@ -1004,7 +1004,7 @@ unsafe fn render_pattern() {
     ui::draw_gradient_bg();
     ui::draw_title_bar(b"\xE4\xBF\xAE\xE6\x94\xB9\xE5\x9B\xBE\xE6\xA1\x88");
     let fx = 24;
-    let fw = DISPLAY_W as i32 - 2 * fx;
+    let fw = display_w() as i32 - 2 * fx;
     let fy = 96;
     ui::draw_glass(fx, fy, fw, 52, 12);
     let mut disp = [0u8; 16];
@@ -1053,7 +1053,7 @@ unsafe fn render_pattern() {
 
     // 操作按钮。
     let by = PAT_Y + 2 * PAT_GAP + 34;
-    let bw = (DISPLAY_W as i32 - 3 * MARGIN - 20) / 2;
+    let bw = (display_w() as i32 - 3 * MARGIN - 20) / 2;
     ui::draw_glass(MARGIN, by, bw, 48, 24);
     let w = text_width_px(b"\xE6\xB8\x85\xE9\x99\xA4", 16.0);
     draw_text_px(MARGIN + (bw - w) / 2, text_top(16.0, by + 24), b"\xE6\xB8\x85\xE9\x99\xA4", 16.0, ui::c_text());
@@ -1098,7 +1098,7 @@ unsafe fn render_duress() {
         (b"\xE8\xAF\xB4\xE6\x98\x8E", I_INFO, 2),
     ];
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon, _)) in rows.iter().enumerate() {
         match i {
@@ -1121,7 +1121,7 @@ unsafe fn render_duress() {
         (b"\xE5\x8F\x91\xE9\x80\x81\xE4\xBD\x8D\xE7\xBD\xAE\xE8\xAD\xA6\xE6\x8A\xA5", b"alert"),
     ];
     let card_h2 = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (label, val)) in opts.iter().enumerate() {
         let mut cur = [0u8; 16];
@@ -1150,7 +1150,7 @@ unsafe fn render_reset() {
     let mut y = LIST_TOP - s;
 
     let card_h = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_RESET, b"\xE8\xBF\x98\xE5\x8E\x9F\xE6\x89\x80\xE6\x9C\x89\xE8\xAE\xBE\xE7\xBD\xAE", b"\xE4\xBB\x85\xE6\x9C\xAC\xE9\xA1\xB9\xE7\x9B\xAE\xE9\x85\x8D\xE7\xBD\xAE", false, false);
     ui::draw_divider(y + CARD_PAD);
     ui::draw_row(y + CARD_PAD + ROW_H, I_RESET, b"\xE6\xB8\x85\xE9\x99\xA4\xE6\x89\x80\xE6\x9C\x89\xE6\x95\xB0\xE6\x8D\xAE\xEF\xBC\x88\xE6\x81\xA2\xE5\xA4\x8D\xE5\x87\xBA\xE5\x8E\x82\xEF\xBC\x89", b"", false, false);
@@ -1159,7 +1159,7 @@ unsafe fn render_reset() {
     ui::draw_group_header(y, b"\xE5\x85\xB6\xE5\xAE\x83");
     y += HEADER_H;
     let card_h2 = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     ui::draw_row(y + CARD_PAD, I_GEAR, b"\xE7\xAB\x8B\xE5\x8D\xB3\xE9\x87\x8D\xE5\x90\xAF\xE7\xB3\xBB\xE7\xBB\x9F", b"", false, false);
     ui::draw_divider(y + CARD_PAD);
     ui::draw_row(y + CARD_PAD + ROW_H, I_GEAR, b"\xE8\xBF\x94\xE5\x9B\x9E", b"", true, false);
@@ -1189,7 +1189,7 @@ unsafe fn render_input() {
     ui::draw_gradient_bg();
     ui::draw_title_bar(input_title());
     let fx = 24;
-    let fw = DISPLAY_W as i32 - 2 * fx;
+    let fw = display_w() as i32 - 2 * fx;
     let fy = 84;
     ui::draw_glass(fx, fy, fw, 52, 12);
     let mut disp = [0u8; 64];
@@ -1254,8 +1254,8 @@ struct DlgSmooth;
 impl sys_nav::glass::SmoothTarget for DlgSmooth {
     fn put_aa(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
         unsafe {
-            if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-                let idx = y as usize * DISPLAY_W + x as usize;
+            if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+                let idx = y as usize * display_w() + x as usize;
                 BACK_BUF[idx] = sys_nav::glass::blend(BACK_BUF[idx], color, alpha);
             }
         }
@@ -1269,8 +1269,8 @@ impl dialog::DialogUi for ConfirmUi {
         put_pixel(x, y, color);
     }
     fn back(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -1288,16 +1288,16 @@ impl dialog::DialogUi for ConfirmUi {
         text_top(px, cy)
     }
     fn fill_row(&mut self, y: i32, x0: i32, x1: i32, color: u32, alpha: u32) {
-        if y < 0 || y >= DISPLAY_H as i32 || x1 <= x0 {
+        if y < 0 || y >= display_h() as i32 || x1 <= x0 {
             return;
         }
         let xa = x0.max(0);
-        let xb = x1.min(DISPLAY_W as i32);
+        let xb = x1.min(display_w() as i32);
         if xb <= xa {
             return;
         }
         unsafe {
-            let base = y as usize * DISPLAY_W;
+            let base = y as usize * display_w();
             for idx in base + xa as usize..base + xb as usize {
                 BACK_BUF[idx] = sys_nav::glass::blend(BACK_BUF[idx], color, alpha);
             }
@@ -1334,9 +1334,9 @@ fn cf_stroke(
 unsafe fn render_confirm_dialog() {
     let w = dialog::DLG_W;
     let h = CONFIRM_DLG_H;
-    let (x, y) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+    let (x, y) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
     let mut ui = ConfirmUi;
-    dialog::scrim(&mut ui, DISPLAY_W as i32, DISPLAY_H as i32, 115);
+    dialog::scrim(&mut ui, display_w() as i32, display_h() as i32, 115);
     dialog::draw_card(&mut ui, cf_fill, cf_stroke, x, y, w, h);
     dialog::draw_title(&mut ui, x, y, w, confirm_title());
     dialog::draw_message(&mut ui, x, y + dialog::DLG_TITLE_H, w, confirm_msg(), 15.0);
@@ -1365,7 +1365,7 @@ pub(crate) enum KeyEffect {
 }
 
 unsafe fn row_at(_page: usize, y: i32, count: usize, offset: i32) -> Option<usize> {
-    if y < LIST_TOP + offset || y >= LIST_BOTTOM {
+    if y < LIST_TOP + offset || y >= list_bottom() {
         return None;
     }
     let yy = y - (LIST_TOP + offset - unsafe { SCROLL });
@@ -1407,8 +1407,8 @@ unsafe fn tap_root(x: i32, y: i32) -> TapEffect {
         return TapEffect::Exit;
     }
     // 搜索栏。
-    if x >= SEARCH_X && x < SEARCH_X + SEARCH_W && y >= SEARCH_Y && y < SEARCH_Y + SEARCH_H {
-        if x >= SEARCH_X + SEARCH_W - 40 && unsafe { SEARCH_LEN } > 0 {
+    if x >= SEARCH_X && x < SEARCH_X + search_w() && y >= SEARCH_Y && y < SEARCH_Y + SEARCH_H {
+        if x >= SEARCH_X + search_w() - 40 && unsafe { SEARCH_LEN } > 0 {
             unsafe { SEARCH_LEN = 0; }
             return TapEffect::Redraw;
         }
@@ -1889,7 +1889,7 @@ unsafe fn tap_pattern(x: i32, y: i32) -> TapEffect {
     pattern_press(x, y);
     // 按钮：清除 / 确认。
     let by = PAT_Y + 2 * PAT_GAP + 34;
-    let bw = (DISPLAY_W as i32 - 3 * MARGIN - 20) / 2;
+    let bw = (display_w() as i32 - 3 * MARGIN - 20) / 2;
     if x >= MARGIN && x < MARGIN + bw && y >= by && y < by + 48 {
         unsafe { PATTERN_LEN = 0; }
         return TapEffect::Redraw;
@@ -2027,7 +2027,7 @@ unsafe fn tap_input(x: i32, y: i32) -> TapEffect {
 unsafe fn tap_confirm(x: i32, y: i32) -> TapEffect {
     let w = dialog::DLG_W;
     let h = CONFIRM_DLG_H;
-    let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+    let (px, py) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
     match dialog::hit_buttons(px, py + h - dialog::DLG_BTN_H, w, x, y) {
         Some(false) => {
             unsafe { CONFIRM_OPEN = false; }

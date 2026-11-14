@@ -128,11 +128,40 @@ pub(crate) const KEY_RIGHTSHIFT: u16 = 54;
 
 // ==================== 显示与布局参数 ====================
 
-pub(crate) const DISPLAY_W: usize = 540;
-pub(crate) const DISPLAY_H: usize = 960;
+#[path = "../../../shared/display.rs"]
+mod display;
+#[path = "../../../shared/pixel_buffer.rs"]
+mod pixel_buffer;
+use pixel_buffer::PixelBuffer;
+fn display_w() -> usize { unsafe { FB_W } }
+fn display_h() -> usize { unsafe { FB_H } }
+fn resize_buffers() {
+    unsafe {
+        BACK_BUF.resize_len(FB_W * FB_H);
+        SNAP_BUF.resize_len(FB_W * FB_H);
+        sys_nav::set_viewport(FB_W as i32, FB_H as i32);
+    }
+}
+fn refresh_geometry() -> bool {
+    unsafe {
+        if syscall3(SYS_IOCTL, FB_FD as usize, display::RESIZE_IOCTL, 0) != 0 { return false; }
+        let mut data = [0u8; display::INFO_BYTES];
+        if syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) != 0 { return false; }
+        let Some(info) = display::DisplayMetrics::decode(&data) else { return false; };
+        if info.width as usize == FB_W && info.height as usize == FB_H { return false; }
+        FB_W = info.width as usize;
+        FB_H = info.height as usize;
+        FB_STRIDE_PX = info.stride_bytes as usize / 4;
+        resize_buffers();
+        CUR_X = CUR_X.clamp(0, FB_W as i32 - 1);
+        CUR_Y = CUR_Y.clamp(0, FB_H as i32 - 1);
+        print("[settings] resize "); print_dec(FB_W as u32); print("x"); print_dec(FB_H as u32); print("\n");
+        true
+    }
+}
 
 pub(crate) const MARGIN: i32 = 16;
-pub(crate) const CARD_W: i32 = DISPLAY_W as i32 - 2 * MARGIN;
+pub(crate) fn card_w() -> i32 { display_w() as i32 - 2 * MARGIN }
 pub(crate) const CARD_R: i32 = 16;
 pub(crate) const ROW_H: i32 = 56;
 pub(crate) const ICON_SZ: i32 = 24;
@@ -149,12 +178,12 @@ pub(crate) const TOP_BACK_SZ: i32 = 36;
 
 pub(crate) const SEARCH_X: i32 = 58;
 pub(crate) const SEARCH_Y: i32 = 10;
-pub(crate) const SEARCH_W: i32 = 470;
+pub(crate) fn search_w() -> i32 { display_w() as i32 - SEARCH_X - 12 }
 pub(crate) const SEARCH_H: i32 = 40;
 pub(crate) const SEARCH_R: i32 = 20;
 
 pub(crate) const LIST_TOP: i32 = 56;
-pub(crate) const LIST_BOTTOM: i32 = sys_nav::NAV_Y;
+pub(crate) fn list_bottom() -> i32 { sys_nav::nav_y() }
 
 // ==================== 颜色（0x00RRGGBB，ui.rs 复用；浅色主题） ====================
 
@@ -196,12 +225,12 @@ pub(crate) fn dark_on() -> bool {
 pub(crate) static mut FB_PTR: *mut u32 = core::ptr::null_mut();
 /// 保留的 /dev/fb0 fd：FBIO_PRESENT 提交脏区需要（mmap 后页表已指向画布，fd 仅用于 ioctl）。
 pub(crate) static mut FB_FD: isize = -1;
-pub(crate) static mut FB_W: usize = DISPLAY_W;
-pub(crate) static mut FB_H: usize = DISPLAY_H;
-pub(crate) static mut FB_STRIDE_PX: usize = DISPLAY_W;
-pub(crate) static mut BACK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+pub(crate) static mut FB_W: usize = 540;
+pub(crate) static mut FB_H: usize = 960;
+pub(crate) static mut FB_STRIDE_PX: usize = 540;
+pub(crate) static mut BACK_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 /// 页面转场快照：推入/弹出时保存的离场页整帧（2MB BSS，与 BACK_BUF 同级）。
-pub(crate) static mut SNAP_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+pub(crate) static mut SNAP_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 
 /// 已保存 Wi-Fi 网络清单（ssid）。
 pub(crate) static mut SAVED_SSIDS: [[u8; 32]; 8] = [[0u8; 32]; 8];
@@ -425,7 +454,7 @@ pub(crate) fn fb_init() -> bool {
                 FB_STRIDE_PX = if stride >= w * 4 { stride / 4 } else { w };
             }
         }
-        let len = FB_W * FB_H * 4;
+        let len = display::MAX_PIXELS * 4;
         let base = syscall6(
             SYS_MMAP,
             0,
@@ -443,6 +472,7 @@ pub(crate) fn fb_init() -> bool {
         // 保留 fd：FBIO_PRESENT / FBIO_PUT_DAMAGE 依赖它提交脏区（mmap 后
         // 页表已指向画布，fd 仅用于 ioctl）。
         FB_FD = fd as isize;
+        resize_buffers();
         true
     }
 }
@@ -507,7 +537,7 @@ pub(crate) fn snapshot_page() {
         core::ptr::copy_nonoverlapping(
             BACK_BUF.as_ptr(),
             SNAP_BUF.as_mut_ptr(),
-            DISPLAY_W * DISPLAY_H,
+            display_w() * display_h(),
         );
     }
 }
@@ -521,12 +551,12 @@ pub(crate) fn compose_page_transition(e: f32, push: bool) {
         return;
     }
     unsafe {
-        let w = DISPLAY_W;
+        let w = display_w();
         let off = ((1.0 - e) * w as f32) as usize;
         if off == 0 {
             return;
         }
-        for y in 0..DISPLAY_H {
+        for y in 0..display_h() {
             let row = y * w;
             if push {
                 for x in (off..w).rev() {
@@ -593,21 +623,21 @@ fn flip() {
         // 亮度/反色/对比度合成通道 LUT（参数不变时复用）；identity 表示
         // 参数为默认直通（亮度 100、无反色/对比度），整屏走 memcpy 快路。
         let (lut, identity) = flip_lut();
-        if FB_W == DISPLAY_W && FB_H == DISPLAY_H && FB_STRIDE_PX == DISPLAY_W {
+        if FB_W == display_w() && FB_H == display_h() && FB_STRIDE_PX == display_w() {
             if identity {
-                core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB_PTR, DISPLAY_W * DISPLAY_H);
+                core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB_PTR, display_w() * display_h());
             } else {
-                for i in 0..DISPLAY_W * DISPLAY_H {
+                for i in 0..display_w() * display_h() {
                     *FB_PTR.add(i) = lut_px(BACK_BUF[i], lut);
                 }
             }
         } else {
-            let w = FB_W.min(DISPLAY_W);
-            let h = FB_H.min(DISPLAY_H);
+            let w = FB_W.min(display_w());
+            let h = FB_H.min(display_h());
             if identity {
                 for y in 0..h {
                     core::ptr::copy_nonoverlapping(
-                        BACK_BUF.as_ptr().add(y * DISPLAY_W),
+                        BACK_BUF.as_ptr().add(y * display_w()),
                         FB_PTR.add(y * FB_STRIDE_PX),
                         w,
                     );
@@ -615,7 +645,7 @@ fn flip() {
             } else {
                 for y in 0..h {
                     for x in 0..w {
-                        let v = BACK_BUF[y * DISPLAY_W + x];
+                        let v = BACK_BUF[y * display_w() + x];
                         *FB_PTR.add(y * FB_STRIDE_PX + x) = lut_px(v, lut);
                     }
                 }
@@ -697,10 +727,10 @@ pub(crate) unsafe fn press_feedback_down(x: i32, y: i32) {
             }
             let px = x + dx;
             let py = y + dy;
-            if px < 0 || py < 0 || px >= DISPLAY_W as i32 || py >= DISPLAY_H as i32 {
+            if px < 0 || py < 0 || px >= display_w() as i32 || py >= display_h() as i32 {
                 continue;
             }
-            let idx = py as usize * DISPLAY_W + px as usize;
+            let idx = py as usize * display_w() + px as usize;
             let cur = *FB_PTR.add(idx);
             // 中心 ~35% 压暗，软边衰减
             let a = (90 * (r2 - d2) / r2) as u32;
@@ -724,8 +754,8 @@ pub(crate) unsafe fn press_feedback_up() {
     }
     let x0 = (x - PRESS_R).max(0);
     let y0 = (y - PRESS_R).max(0);
-    let x1 = (x + PRESS_R).min(DISPLAY_W as i32 - 1);
-    let y1 = (y + PRESS_R).min(DISPLAY_H as i32 - 1);
+    let x1 = (x + PRESS_R).min(display_w() as i32 - 1);
+    let y1 = (y + PRESS_R).min(display_h() as i32 - 1);
     if x1 < x0 || y1 < y0 {
         return;
     }
@@ -735,7 +765,7 @@ pub(crate) unsafe fn press_feedback_up() {
     let (lut, _) = flip_lut();
     for py in y0..=y1 {
         for px in x0..=x1 {
-            let idx = py as usize * DISPLAY_W + px as usize;
+            let idx = py as usize * display_w() + px as usize;
             *FB_PTR.add(idx) = lut_px(BACK_BUF[idx], lut);
         }
     }
@@ -745,10 +775,10 @@ pub(crate) unsafe fn press_feedback_up() {
 // ==================== 绘制原语 ====================
 
 pub(crate) fn put_pixel(x: i32, y: i32, color: u32) {
-    if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+    if x < 0 || y < 0 || x >= display_w() as i32 || y >= display_h() as i32 {
         return;
     }
-    unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] = color; }
+    unsafe { BACK_BUF[y as usize * display_w() + x as usize] = color; }
 }
 
 pub(crate) fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
@@ -759,14 +789,14 @@ pub(crate) fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     // 每像素 4 次边界检查降为每行一次。
     let x0 = x.max(0);
     let y0 = y.max(0);
-    let x1 = (x + w).min(DISPLAY_W as i32);
-    let y1 = (y + h).min(DISPLAY_H as i32);
+    let x1 = (x + w).min(display_w() as i32);
+    let y1 = (y + h).min(display_h() as i32);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
     unsafe {
         for yy in y0..y1 {
-            let base = yy as usize * DISPLAY_W + x0 as usize;
+            let base = yy as usize * display_w() + x0 as usize;
             BACK_BUF[base..base + (x1 - x0) as usize].fill(color);
         }
     }
@@ -777,11 +807,11 @@ struct SettingsSmooth;
 
 impl sys_nav::glass::SmoothTarget for SettingsSmooth {
     fn put_aa(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
-        if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+        if x < 0 || y < 0 || x >= display_w() as i32 || y >= display_h() as i32 {
             return;
         }
         unsafe {
-            let idx = y as usize * DISPLAY_W + x as usize;
+            let idx = y as usize * display_w() + x as usize;
             BACK_BUF[idx] = sys_nav::glass::blend(BACK_BUF[idx], color, alpha);
         }
     }
@@ -866,11 +896,11 @@ pub(crate) fn draw_icon_glyph_centered(
             }
             let gx = x0 + col as i32;
             let gy = y0 + row as i32;
-            if gx < 0 || gy < 0 || gx >= DISPLAY_W as i32 || gy >= DISPLAY_H as i32 {
+            if gx < 0 || gy < 0 || gx >= display_w() as i32 || gy >= display_h() as i32 {
                 continue;
             }
             unsafe {
-                let bg = BACK_BUF[gy as usize * DISPLAY_W + gx as usize];
+                let bg = BACK_BUF[gy as usize * display_w() + gx as usize];
                 put_pixel(gx, gy, ttf_text::font_render::blend(bg, color, a));
             }
         }
@@ -893,8 +923,8 @@ pub(crate) fn ttf_glyph_px(x: i32, y: i32, cp: u32, px: f32, color: u32) -> i32 
                 if a != 0 {
                     let px_ = gx + col as i32;
                     let py_ = y + row as i32;
-                    if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32 {
-                        let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                    if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                        let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                         put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                     }
                 }
@@ -933,8 +963,8 @@ pub(crate) fn ttf_glyph_bold_px(x: i32, y: i32, cp: u32, px: f32, color: u32) ->
                 if a != 0 {
                     let px_ = gx + col as i32;
                     let py_ = y + row as i32;
-                    if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32 {
-                        let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                    if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                        let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                         put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                     }
                 }
@@ -1156,8 +1186,8 @@ pub(crate) struct PollRes {
 }
 
 static mut INPUT_FD: isize = -1;
-pub(crate) static mut CUR_X: i32 = DISPLAY_W as i32 / 2;
-pub(crate) static mut CUR_Y: i32 = DISPLAY_H as i32 / 2;
+pub(crate) static mut CUR_X: i32 = 270;
+pub(crate) static mut CUR_Y: i32 = 480;
 static mut TOUCH_DOWN: bool = false;
 static mut TOUCH_PX: i32 = 0;
 static mut TOUCH_PY: i32 = 0;
@@ -1197,7 +1227,7 @@ fn poll_input() -> PollRes {
             match etype {
                 EV_REL => {
                     if code == REL_X {
-                        CUR_X = (CUR_X + value).clamp(0, DISPLAY_W as i32 - 1);
+                        CUR_X = (CUR_X + value).clamp(0, display_w() as i32 - 1);
                         res.moved = true;
                     } else if code == REL_Y {
                         if MOUSE_DOWN {
@@ -1210,7 +1240,7 @@ fn poll_input() -> PollRes {
                                 res.redraw = true;
                             }
                         }
-                        CUR_Y = (CUR_Y + value).clamp(0, DISPLAY_H as i32 - 1);
+                        CUR_Y = (CUR_Y + value).clamp(0, display_h() as i32 - 1);
                         res.moved = true;
                     } else if code == REL_WHEEL {
                         if unsafe { pages::wheel_by(value) } {
@@ -1220,7 +1250,7 @@ fn poll_input() -> PollRes {
                 }
                 EV_ABS => {
                     if code == ABS_X {
-                        CUR_X = value.clamp(0, DISPLAY_W as i32 - 1);
+                        CUR_X = value.clamp(0, display_w() as i32 - 1);
                         res.moved = true;
                     } else if code == ABS_Y {
                         if TOUCH_DOWN {
@@ -1233,7 +1263,7 @@ fn poll_input() -> PollRes {
                                 res.redraw = true;
                             }
                         }
-                        CUR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
+                        CUR_Y = value.clamp(0, display_h() as i32 - 1);
                         res.moved = true;
                     }
                 }
@@ -1402,8 +1432,8 @@ fn draw_nav_bar() {
             put_pixel(x, y, color);
         }
         fn backdrop(&self, x: i32, y: i32) -> u32 {
-            if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-                unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+            if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+                unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
             } else {
                 0
             }
@@ -1423,7 +1453,7 @@ fn draw_toast() {
         return;
     }
     let w = (text_width_px(msg, 14.0) + 56).clamp(80, 460);
-    let x = (DISPLAY_W as i32 - w) / 2;
+    let x = (display_w() as i32 - w) / 2;
     let y = 96;
     ui::draw_glass(x, y, w, 40, 20);
     // 浅色玻璃药丸上用深色文字（白字在浅玻璃上不可读）。
@@ -1473,6 +1503,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     unsafe { pages::play_root_enter(10); }
 
     loop {
+        if refresh_geometry() { full_redraw(); }
         let res = poll_input();
         // 系统导航动作最优先：必须先于 redraw 的 continue 分支 —— 否则同一
         // 批事件里只要有一个移动帧置了 redraw，上滑回桌面/边缘返回的 nav

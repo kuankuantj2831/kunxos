@@ -59,7 +59,7 @@ const KEY_COLS: i32 = 3;
 const KEY_W: i32 = 96;
 const KEY_H: i32 = 72;
 const KEY_GAP: i32 = 14;
-const PAD_X: i32 = (DISPLAY_W as i32 - (KEY_COLS * KEY_W + (KEY_COLS - 1) * KEY_GAP)) / 2;
+fn pad_x() -> i32 { (display_w() as i32 - (KEY_COLS * KEY_W + (KEY_COLS - 1) * KEY_GAP)) / 2 }
 const PAD_Y: i32 = 560;
 
 const KEYS: [[u8; 3]; 4] = [
@@ -220,7 +220,7 @@ fn answer_cmd() {
 
 fn key_rect(row: i32, col: i32) -> (i32, i32, i32, i32) {
     (
-        PAD_X + col * (KEY_W + KEY_GAP),
+        pad_x() + col * (KEY_W + KEY_GAP),
         PAD_Y + row * (KEY_H + KEY_GAP),
         KEY_W,
         KEY_H,
@@ -271,7 +271,7 @@ fn draw_dialer() {
     draw_status();
 
     // 号码显示屏
-    draw_glass(16, 64, DISPLAY_W as i32 - 32, 100, 24);
+    draw_glass(16, 64, display_w() as i32 - 32, 100, 24);
     let number = unsafe { &NUMBER[..NUMBER_LEN] };
     if number.is_empty() {
         if unsafe { SIM_ABSENT } {
@@ -294,8 +294,8 @@ fn draw_dialer() {
     // 删除 + 呼叫（删除=红色危险玻璃白字，呼叫=强调绿玻璃白字）。
     draw_glass_style(16, PAD_Y - 96, 130, 64, 16, &STYLE_DANGER);
     draw_text(50, PAD_Y - 96 + 26, "删除".as_bytes(), C_DEL);
-    draw_glass_style(DISPLAY_W as i32 - 146, PAD_Y - 96, 130, 64, 16, &STYLE_ACCENT);
-    draw_center_in(PAD_Y - 96 + 26, "呼叫".as_bytes(), 0x00_FF_FF_FF, DISPLAY_W as i32 - 146, 130);
+    draw_glass_style(display_w() as i32 - 146, PAD_Y - 96, 130, 64, 16, &STYLE_ACCENT);
+    draw_center_in(PAD_Y - 96 + 26, "呼叫".as_bytes(), 0x00_FF_FF_FF, display_w() as i32 - 146, 130);
 
     // 未接来电横幅
     if unsafe { MISSED } {
@@ -306,11 +306,11 @@ fn draw_dialer() {
         if 7 + nl <= s.len() {
             s[7..7 + nl].copy_from_slice(&num[..nl]);
         }
-        draw_glass_style(16, 120, DISPLAY_W as i32 - 32, 44, 12, &STYLE_DANGER);
+        draw_glass_style(16, 120, display_w() as i32 - 32, 44, 12, &STYLE_DANGER);
         draw_text(32, 134, &s[..(7 + nl).min(s.len())], 0x00_FF_FF_FF);
     }
 
-    draw_text(16, DISPLAY_H as i32 - 60, "支持键盘输入数字，回车拨号".as_bytes(), C_DIM);
+    draw_text(16, display_h() as i32 - 60, "支持键盘输入数字，回车拨号".as_bytes(), C_DIM);
     draw_sys_nav();
 }
 
@@ -318,7 +318,7 @@ fn draw_dialing() {
     draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("电话".as_bytes());
     draw_status();
-    draw_glass(16, 120, DISPLAY_W as i32 - 32, 160, 24);
+    draw_glass(16, 120, display_w() as i32 - 32, 160, 24);
     draw_text(32, 160, "拨号中...".as_bytes(), C_ACCENT);
     let num = unsafe { &NUM[..NUM_LEN] };
     draw_text(32, 200, num, C_TEXT);
@@ -327,16 +327,16 @@ fn draw_dialing() {
         draw_text(32, 240, name, C_DIM);
     }
     // 挂断（红色危险玻璃白字）
-    draw_glass_style((DISPLAY_W as i32 - 150) / 2, 420, 150, 72, 20, &STYLE_DANGER);
-    draw_center_in(448, "挂断".as_bytes(), 0x00_FF_FF_FF, (DISPLAY_W as i32 - 150) / 2, 150);
+    draw_glass_style((display_w() as i32 - 150) / 2, 420, 150, 72, 20, &STYLE_DANGER);
+    draw_center_in(448, "挂断".as_bytes(), 0x00_FF_FF_FF, (display_w() as i32 - 150) / 2, 150);
     draw_sys_nav();
 }
 
 fn draw_incoming() {
     draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("来电".as_bytes());
-    draw_disc((DISPLAY_W / 2) as i32, 220, 64, C_CALL);
-    draw_char((DISPLAY_W / 2) as i32 - 6, 210, b'?', 0x00_FF_FF_FF);
+    draw_disc((display_w() / 2) as i32, 220, 64, C_CALL);
+    draw_char((display_w() / 2) as i32 - 6, 210, b'?', 0x00_FF_FF_FF);
     let num = unsafe { &NUM[..NUM_LEN] };
     draw_center(330, num, C_TEXT);
     let name = unsafe { &NAME[..NAME_LEN] };
@@ -347,7 +347,7 @@ fn draw_incoming() {
     let bw = 170;
     let gap = 30;
     let total = bw * 2 + gap;
-    let x0 = (DISPLAY_W as i32 - total) / 2;
+    let x0 = (display_w() as i32 - total) / 2;
     draw_glass_style(x0, 520, bw, 76, 20, &STYLE_DANGER);
     draw_center_in(548, "拒绝".as_bytes(), 0x00_FF_FF_FF, x0, bw);
     draw_glass_style(x0 + bw + gap, 520, bw, 76, 20, &STYLE_ACCENT);
@@ -358,8 +358,8 @@ fn draw_incoming() {
 fn draw_active() {
     draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("通话中".as_bytes());
-    draw_disc((DISPLAY_W / 2) as i32, 220, 64, C_CALL);
-    draw_char((DISPLAY_W / 2) as i32 - 6, 210, b'?', 0x00_FF_FF_FF);
+    draw_disc((display_w() / 2) as i32, 220, 64, C_CALL);
+    draw_char((display_w() / 2) as i32 - 6, 210, b'?', 0x00_FF_FF_FF);
     let num = unsafe { &NUM[..NUM_LEN] };
     draw_center(330, num, C_TEXT);
     let name = unsafe { &NAME[..NAME_LEN] };
@@ -381,13 +381,13 @@ fn draw_active() {
 
     // 免提切换（开=强调绿玻璃白字，关=浅色玻璃深字）。
     let speaker = unsafe { ROUTE == 1 };
-    let (sx, sw) = ((DISPLAY_W as i32 - 300) / 2, 300);
+    let (sx, sw) = ((display_w() as i32 - 300) / 2, 300);
     draw_glass_style(sx, 480, sw, 64, 16, if speaker { &STYLE_ACCENT } else { &STYLE_LIGHT });
     draw_center_in(508, if speaker { "扬声器开".as_bytes() } else { "免提".as_bytes() }, if speaker { 0x00_FF_FF_FF } else { C_TEXT }, sx, sw);
 
     // 挂断（红色危险玻璃白字）
-    draw_glass_style((DISPLAY_W as i32 - 170) / 2, 580, 170, 76, 20, &STYLE_DANGER);
-    draw_center_in(608, "挂断".as_bytes(), 0x00_FF_FF_FF, (DISPLAY_W as i32 - 170) / 2, 170);
+    draw_glass_style((display_w() as i32 - 170) / 2, 580, 170, 76, 20, &STYLE_DANGER);
+    draw_center_in(608, "挂断".as_bytes(), 0x00_FF_FF_FF, (display_w() as i32 - 170) / 2, 170);
     draw_sys_nav();
 }
 
@@ -421,6 +421,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     loop {
         read_state();
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -438,7 +439,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             match call {
                 CallSt::Idle => {
                     // 清除未接来电横幅
-                    if unsafe { MISSED } && x >= 16 && x < DISPLAY_W as i32 - 16 && y >= 120 && y < 164 {
+                    if unsafe { MISSED } && x >= 16 && x < display_w() as i32 - 16 && y >= 120 && y < 164 {
                         unsafe { MISSED = false; }
                         dirty = true;
                     }
@@ -448,7 +449,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                             unsafe { NUMBER_LEN -= 1; }
                             dirty = true;
                         }
-                    } else if x >= DISPLAY_W as i32 - 146 && x < DISPLAY_W as i32 - 16
+                    } else if x >= display_w() as i32 - 146 && x < display_w() as i32 - 16
                         && y >= PAD_Y - 96 && y < PAD_Y - 32 {
                         if unsafe { NUMBER_LEN } > 0 {
                             dial_number();
@@ -467,7 +468,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
                 CallSt::Dialing => {
                     // 挂断
-                    if x >= (DISPLAY_W as i32 - 150) / 2 && x < (DISPLAY_W as i32 + 150) / 2
+                    if x >= (display_w() as i32 - 150) / 2 && x < (display_w() as i32 + 150) / 2
                         && y >= 420 && y < 492 {
                         hangup_cmd();
                     }
@@ -476,7 +477,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     let bw = 170;
                     let gap = 30;
                     let total = bw * 2 + gap;
-                    let x0 = (DISPLAY_W as i32 - total) / 2;
+                    let x0 = (display_w() as i32 - total) / 2;
                     if x >= x0 && x < x0 + bw && y >= 520 && y < 596 {
                         hangup_cmd(); // 拒绝
                     } else if x >= x0 + bw + gap && x < x0 + total && y >= 520 && y < 596 {
@@ -485,13 +486,13 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 }
                 CallSt::Active => {
                     // 免提
-                    let (sx, sw) = ((DISPLAY_W as i32 - 300) / 2, 300);
+                    let (sx, sw) = ((display_w() as i32 - 300) / 2, 300);
                     if x >= sx && x < sx + sw && y >= 480 && y < 544 {
                         toggle_speaker();
                         dirty = true;
                     }
                     // 挂断
-                    if x >= (DISPLAY_W as i32 - 170) / 2 && x < (DISPLAY_W as i32 + 170) / 2
+                    if x >= (display_w() as i32 - 170) / 2 && x < (display_w() as i32 + 170) / 2
                         && y >= 580 && y < 656 {
                         hangup_cmd();
                     }

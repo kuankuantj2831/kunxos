@@ -17,6 +17,9 @@ use core::ptr::addr_of;
 
 use crate::allocator;
 
+#[path = "page_records.rs"]
+mod page_records;
+
 /// 页大小
 pub const PAGE_SIZE: usize = 4096;
 /// L2 大页大小（2MB）
@@ -591,17 +594,25 @@ impl ProcPageTable {
     pub fn free_user_pages(&mut self) {
         // 去重：同一 VA 以相同物理页重复登记的记录（同 VA 多次 add_page）
         // 只允许释放一次，否则 free_page 二次归还同一页会破坏空闲链。
-        for i in 0..self.count {
+        let duplicates = page_records::duplicate_indices(self.count, |i| {
             let p = self.user_pages[i];
-            if p.paddr == 0 || p.paddr == LAZY_PAGE {
-                continue;
-            }
-            for j in 0..i {
-                let q = self.user_pages[j];
-                if q.vaddr == p.vaddr && q.paddr == p.paddr {
-                    // 重复登记：标记为无需释放（置 0，与空记录同语义）
-                    self.user_pages[i].paddr = 0;
-                    break;
+            if p.paddr == 0 || p.paddr == LAZY_PAGE { None } else { Some((p.vaddr, p.paddr)) }
+        });
+        if let Ok(indices) = duplicates {
+            for i in indices { self.user_pages[i].paddr = 0; }
+        } else {
+            // OOM fallback keeps the original allocation-free release semantics.
+            for i in 0..self.count {
+                let p = self.user_pages[i];
+                if p.paddr == 0 || p.paddr == LAZY_PAGE {
+                    continue;
+                }
+                for j in 0..i {
+                    let q = self.user_pages[j];
+                    if q.vaddr == p.vaddr && q.paddr == p.paddr {
+                        self.user_pages[i].paddr = 0;
+                        break;
+                    }
                 }
             }
         }

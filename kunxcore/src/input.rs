@@ -167,6 +167,7 @@ const FRAME_LEN: usize = 6;
 const FRAME_UP: u8 = 0x00;
 const FRAME_DOWN: u8 = 0x01;
 const FRAME_MOVE: u8 = 0x02;
+const FRAME_RESIZE: u8 = 0x03;
 
 /// UART 协议帧解析状态机（静态，位于 .bss）。
 struct Parser {
@@ -177,6 +178,11 @@ struct Parser {
 const EMPTY_PARSER: Parser = Parser { buf: [0; FRAME_LEN], n: 0 };
 
 static mut PARSER: Parser = EMPTY_PARSER;
+
+/// The Windows resize bridge sends display-pixel coordinates, like virtio-tablet.
+pub fn set_display_geometry(w: u32, h: u32) {
+    unsafe { DEV.max_x = w; DEV.max_y = h; }
+}
 
 /// 环形缓冲丢弃累计（诊断：r50 链路 52 发点按仅 8 达应用，把「内核侧
 /// 丢弃」从推断变成可测量；perf stats 输出）。
@@ -204,7 +210,7 @@ pub fn feed_uart_byte(c: u8) -> bool {
         }
         // 帧进行中：第二字节必须是合法帧类型，否则视为伪 0xAA / 数据损坏，
         // 复位解析器并把当前字节交给 shell，避免吞掉后续用户输入并产生垃圾事件。
-        if PARSER.n == 1 && !matches!(c, FRAME_UP | FRAME_DOWN | FRAME_MOVE) {
+        if PARSER.n == 1 && !matches!(c, FRAME_UP | FRAME_DOWN | FRAME_MOVE | FRAME_RESIZE) {
             PARSER.n = 0;
             return false;
         }
@@ -224,6 +230,10 @@ fn handle_frame(frame: &[u8; FRAME_LEN]) {
     let kind = frame[1];
     let mut x = u16::from_le_bytes([frame[2], frame[3]]) as i32;
     let mut y = u16::from_le_bytes([frame[4], frame[5]]) as i32;
+    if kind == FRAME_RESIZE {
+        crate::gpu_simple::request_resize(x as u32, y as u32);
+        return;
+    }
     // 钳制到设备物理最大值（max_x/max_y 未初始化时保持原值），
     // 防止损坏/伪造帧产生越界坐标（消费端按设备范围解释）
     unsafe {

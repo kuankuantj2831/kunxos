@@ -491,23 +491,23 @@ fn render_list() {
         for mi in 0..mn {
             let c = &CONTACTS[matches[mi]];
             let y = LIST_TOP2 + mi as i32 * ROW_H;
-            if y + ROW_H > DISPLAY_H as i32 {
+            if y + ROW_H > display_h() as i32 {
                 break;
             }
             let rh = ROW_H - 8;
-            draw_glass(12, y, DISPLAY_W as i32 - 24, rh, (rh * 25 / 100).min(16));
+            draw_glass(12, y, display_w() as i32 - 24, rh, (rh * 25 / 100).min(16));
             let initial = if c.name_len > 0 { c.name[0] } else { b'?' };
             draw_avatar(44, y + ROW_H / 2 - 4, 18, c.color, initial);
             draw_text(76, y + 14, &c.name[..c.name_len], C_NAME);
             draw_text(76, y + 40, &c.phone[..c.phone_len], C_NUM);
             if c.synced {
-                draw_disc(DISPLAY_W as i32 - 34, y + ROW_H / 2 - 4, 5, C_DOT);
+                draw_disc(display_w() as i32 - 34, y + ROW_H / 2 - 4, 5, C_DOT);
             }
         }
     }
     if unsafe { SYNC_MSG_LEN > 0 } {
         unsafe {
-            draw_text(16, DISPLAY_H as i32 - 60, &SYNC_MSG[..SYNC_MSG_LEN], C_DIM2);
+            draw_text(16, display_h() as i32 - 60, &SYNC_MSG[..SYNC_MSG_LEN], C_DIM2);
         }
     }
     draw_sys_nav();
@@ -541,14 +541,14 @@ fn render_detail(idx: usize) {
     draw_gradient_bg(C_BG, glass_dark());
     let c = unsafe { &CONTACTS[idx] };
 
-    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
     let bs = BACK_SZ - 8;
     draw_glass(BACK_X, BACK_Y, bs, bs, (bs * 25 / 100).min(16));
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
     draw_text(48, (TITLE_H - 8) / 2, &c.name[..c.name_len], C_TEXT);
 
     let initial = if c.name_len > 0 { c.name[0] } else { b'?' };
-    draw_avatar((DISPLAY_W / 2) as i32, 190, 60, c.color, initial);
+    draw_avatar((display_w() / 2) as i32, 190, 60, c.color, initial);
     draw_center(280, &c.name[..c.name_len], C_TEXT);
 
     draw_text(60, 340, "手机".as_bytes(), C_DIM2);
@@ -578,7 +578,7 @@ fn render_detail(idx: usize) {
         }
     }
 
-    draw_text(16, DISPLAY_H as i32 - 60, "呼叫后可在电话应用查看通话".as_bytes(), C_DIM2);
+    draw_text(16, display_h() as i32 - 60, "呼叫后可在电话应用查看通话".as_bytes(), C_DIM2);
     draw_sys_nav();
 }
 
@@ -642,8 +642,8 @@ fn render() {
     // 提示气泡（toast）
     if unsafe { TOAST_LEN > 0 && now_us() < TOAST_UNTIL } {
         let t = unsafe { &TOAST[..TOAST_LEN] };
-        draw_glass((DISPLAY_W as i32 - 280) / 2, 760, 280, 48, 14);
-        draw_text((DISPLAY_W as i32 - 280) / 2 + 20, 782, t, C_TEXT);
+        draw_glass((display_w() as i32 - 280) / 2, 760, 280, 48, 14);
+        draw_text((display_w() as i32 - 280) / 2 + 20, 782, t, C_TEXT);
     }
 }
 
@@ -956,6 +956,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }

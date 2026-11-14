@@ -1,0 +1,8 @@
+[package]
+name = "font_startup_host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eager = { package = "fontdue", version = "=0.9.4" }
+lazy = { package = "fontdue", path = "../../third_party/fontdue", features = ["lazy"] }

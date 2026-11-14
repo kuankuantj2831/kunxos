@@ -90,7 +90,7 @@ static mut PULL: PullRefresh = PullRefresh::new();
 // ==================== 页面切换转场（P0-2，settings 同款整页滑动） ====================
 
 /// 离场页整帧快照（2MB BSS，与 BACK_BUF 同级）。
-static mut SNAP_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut SNAP_BUF: PixelBuffer = PixelBuffer::new(kit::display::MAX_PIXELS, 540 * 960);
 /// 转场起始时刻；0 = 无转场。
 static mut TRANS_T0: u64 = 0;
 /// true = 推入（列表 → 子页）；false = 弹出（子页 → 列表）。
@@ -112,7 +112,7 @@ fn snapshot_page() {
         core::ptr::copy_nonoverlapping(
             BACK_BUF.as_ptr(),
             SNAP_BUF.as_mut_ptr(),
-            DISPLAY_W * DISPLAY_H,
+            display_w() * display_h(),
         );
     }
 }
@@ -133,12 +133,12 @@ fn compose_transition(e: f32) {
         return;
     }
     unsafe {
-        let w = DISPLAY_W;
+        let w = display_w();
         let off = ((1.0 - e) * w as f32) as usize;
         if off == 0 {
             return;
         }
-        for y in 0..DISPLAY_H {
+        for y in 0..display_h() {
             let row = y * w;
             if TRANS_PUSH {
                 for x in (off..w).rev() {
@@ -275,7 +275,7 @@ fn draw_notice() {
     unsafe {
         let s = &NOTICE[..NOTICE_LEN];
         let w = text_width(s);
-        let x = (DISPLAY_W as i32 - w) / 2;
+        let x = (display_w() as i32 - w) / 2;
         draw_glass(x - 14, 54, w + 28, 32, 12);
         draw_text(x, 66, s, C_TEXT);
     }
@@ -295,14 +295,14 @@ fn draw_list() {
                 if off > 4 {
                     let cy = LIST_TOP + (off / 2).min(28);
                     let r = 3 + (off * 5 / PULL.trigger as i32).min(5);
-                    draw_disc(DISPLAY_W as i32 / 2, cy, r, C_ACCENT);
+                    draw_disc(display_w() as i32 / 2, cy, r, C_ACCENT);
                 }
             }
             PrState::Loading => {
                 let now = kit::now_us();
                 for d in 0..3usize {
                     let r = 2 + (PULL.loader_phase(now, d) * 3.0) as i32;
-                    let cx = DISPLAY_W as i32 / 2 + (d as i32 - 1) * 16;
+                    let cx = display_w() as i32 / 2 + (d as i32 - 1) * 16;
                     draw_disc(cx, LIST_TOP + 20, r, C_ACCENT);
                 }
             }
@@ -313,10 +313,10 @@ fn draw_list() {
     for c in 0..unsafe { CONV_N } {
         let conv = unsafe { &CONVS[c] };
         let m = unsafe { &MSGS[conv.last] };
-        if y + ROW_H > DISPLAY_H as i32 {
+        if y + ROW_H > display_h() as i32 {
             break;
         }
-        draw_glass(12, y, DISPLAY_W as i32 - 24, ROW_H - 10, 16);
+        draw_glass(12, y, display_w() as i32 - 24, ROW_H - 10, 16);
         // 头像（姓名首字符）
         let title = conv_title(conv);
         // 磁盘数据可能带空号码记录：空标题用 '?' 占位，避免 title[0] panic。
@@ -336,20 +336,20 @@ fn draw_list() {
             t[4] = time[3];
             t[5] = 0;
         }
-        draw_text(DISPLAY_W as i32 - 16 - text_width(&t[..5]), y + 14, &t[..5], C_TIME);
+        draw_text(display_w() as i32 - 16 - text_width(&t[..5]), y + 14, &t[..5], C_TIME);
         // 未读标记
         if conv.unread > 0 {
             let mut badge = [0u8; 4];
             badge[0] = b'0' + conv.unread.min(9) as u8;
-            draw_disc(DISPLAY_W as i32 - 30, y + 44, 10, C_END_COLOR);
-            draw_char(DISPLAY_W as i32 - 33, y + 40, badge[0], C_ON_COLOR);
+            draw_disc(display_w() as i32 - 30, y + 44, 10, C_END_COLOR);
+            draw_char(display_w() as i32 - 33, y + 40, badge[0], C_ON_COLOR);
         }
         y += ROW_H;
     }
     // 新建短信按钮
-    draw_glass_style(16, DISPLAY_H as i32 - 84, DISPLAY_W as i32 - 32, 60, 16, &STYLE_ACCENT);
+    draw_glass_style(16, display_h() as i32 - 84, display_w() as i32 - 32, 60, 16, &STYLE_ACCENT);
     let tw = text_width("新建短信".as_bytes());
-    draw_text((DISPLAY_W as i32 - tw) / 2, DISPLAY_H as i32 - 66, "新建短信".as_bytes(), C_ON_COLOR);
+    draw_text((display_w() as i32 - tw) / 2, display_h() as i32 - 66, "新建短信".as_bytes(), C_ON_COLOR);
     draw_sys_nav();
 }
 
@@ -357,7 +357,7 @@ fn draw_thread(idx: usize) {
     draw_gradient_bg(C_BG, glass_dark());
     let conv = unsafe { &CONVS[idx] };
     let title = conv_title(conv);
-    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
     let bs = BACK_SZ - 8;
     draw_glass(BACK_X, BACK_Y, bs, bs, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
@@ -372,9 +372,9 @@ fn draw_thread(idx: usize) {
         }
         let text = &m.text[..m.text_len];
         let w = text_width(text) + 24;
-        let bubble_w = w.max(40).min(DISPLAY_W as i32 - 64);
+        let bubble_w = w.max(40).min(display_w() as i32 - 64);
         if m.out {
-            let x = DISPLAY_W as i32 - bubble_w - 16;
+            let x = display_w() as i32 - bubble_w - 16;
             draw_glass_style(x, y, bubble_w, 40, 10, &STYLE_ACCENT);
             draw_text(x + 12, y + 16, text, C_BUBBLE_TEXT);
             // 状态标签（草稿 / 发送中 / 失败）
@@ -389,13 +389,13 @@ fn draw_thread(idx: usize) {
             draw_text(28, y + 16, text, C_BUBBLE_TEXT_IN);
         }
         y += 56;
-        if y > DISPLAY_H as i32 - 120 {
+        if y > display_h() as i32 - 120 {
             break;
         }
     }
     // 回复输入条
-    let iy = DISPLAY_H as i32 - 76;
-    draw_glass(16, iy, DISPLAY_W as i32 - 32, 56, 12);
+    let iy = display_h() as i32 - 76;
+    draw_glass(16, iy, display_w() as i32 - 32, 56, 12);
     let input = unsafe { &INPUT[..INPUT_LEN] };
     if input.is_empty() {
         draw_text(32, iy + 22, "输入回复，回车发送".as_bytes(), C_TIME);
@@ -409,14 +409,14 @@ fn draw_compose() {
     draw_gradient_bg(C_BG, glass_dark());
     draw_title_bar("新短信".as_bytes());
     draw_notice();
-    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
     let bs = BACK_SZ - 8;
     draw_glass(BACK_X, BACK_Y, bs, bs, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
 
     // 号码输入
     draw_text(32, 90, "收件人".as_bytes(), C_TIME);
-    draw_glass(16, 120, DISPLAY_W as i32 - 32, 56, 12);
+    draw_glass(16, 120, display_w() as i32 - 32, 56, 12);
     let num = unsafe { &INPUT_NUM[..INPUT_NUM_LEN] };
     if num.is_empty() && unsafe { INPUT_STAGE } == 0 {
         draw_text(32, 142, "输入号码".as_bytes(), C_TIME);
@@ -425,7 +425,7 @@ fn draw_compose() {
     }
     // 内容输入
     draw_text(32, 210, "内容".as_bytes(), C_TIME);
-    draw_glass(16, 240, DISPLAY_W as i32 - 32, 140, 12);
+    draw_glass(16, 240, display_w() as i32 - 32, 140, 12);
     let input = unsafe { &INPUT[..INPUT_LEN] };
     if input.is_empty() && unsafe { INPUT_STAGE } == 1 {
         draw_text(32, 280, "输入内容，回车发送".as_bytes(), C_TIME);
@@ -433,9 +433,9 @@ fn draw_compose() {
         draw_text(32, 280, input, C_TEXT);
     }
     // 发送按钮
-    draw_glass_style(16, DISPLAY_H as i32 - 110, DISPLAY_W as i32 - 32, 64, 16, &STYLE_ACCENT);
+    draw_glass_style(16, display_h() as i32 - 110, display_w() as i32 - 32, 64, 16, &STYLE_ACCENT);
     let tw = text_width("发送".as_bytes());
-    draw_text((DISPLAY_W as i32 - tw) / 2, DISPLAY_H as i32 - 90, "发送".as_bytes(), C_ON_COLOR);
+    draw_text((display_w() as i32 - tw) / 2, display_h() as i32 - 90, "发送".as_bytes(), C_ON_COLOR);
     draw_sys_nav();
 }
 
@@ -508,6 +508,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             dirty = true;
         }
         let ev = poll_input();
+        if ev.resized { unsafe { SNAP_BUF.resize_len(display_w() * display_h()); } dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -518,7 +519,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
         // 下拉刷新（仅会话列表页；起点在列表区、避开底部按钮）。
         let pull_ok = unsafe {
-            VIEW == u32::MAX && TOUCH_PY > LIST_TOP && TOUCH_PY < DISPLAY_H as i32 - 96
+            VIEW == u32::MAX && TOUCH_PY > LIST_TOP && TOUCH_PY < display_h() as i32 - 96
         };
         if unsafe { PULL.frame(pull_ok && TOUCH_DOWN, CUR_Y, TOUCH_PY, kit::now_us()) } {
             dirty = true;
@@ -555,8 +556,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                         break;
                     }
                     // 新建短信按钮
-                    if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= DISPLAY_H as i32 - 84
-                        && y < DISPLAY_H as i32 - 24
+                    if x >= 16 && x < display_w() as i32 - 16 && y >= display_h() as i32 - 84
+                        && y < display_h() as i32 - 24
                     {
                         unsafe {
                             snapshot_page();
@@ -590,8 +591,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                             VIEW = u32::MAX;
                         }
                         dirty = true;
-                    } else if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= DISPLAY_H as i32 - 110
-                        && y < DISPLAY_H as i32 - 46
+                    } else if x >= 16 && x < display_w() as i32 - 16 && y >= display_h() as i32 - 110
+                        && y < display_h() as i32 - 46
                     {
                         if unsafe { INPUT_NUM_LEN > 0 && INPUT_LEN > 0 } {
                             send_message();

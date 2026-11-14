@@ -20,14 +20,14 @@ const SEARCH_H: i32 = 40;
 pub fn render_list() {
     ds_nav_bar(b"\xe5\xa4\x87\xe5\xbf\x98\xe5\xbd\x95", false); // 备忘录
     // 新增按钮（导航栏右侧）
-    ds_icon(Icon::Plus, DISPLAY_W as i32 - 16 - ICON_SZ, (ds::NAV_H - ICON_SZ) / 2, ICON_SZ, ds::C_ACCENT);
+    ds_icon(Icon::Plus, display_w() as i32 - 16 - ICON_SZ, (ds::NAV_H - ICON_SZ) / 2, ICON_SZ, ds::C_ACCENT);
 
     // 搜索框（液态玻璃输入区，聚焦时补强调色描边）
     let sy = ds::NAV_H + 10;
-    draw_glass(16, sy, DISPLAY_W as i32 - 32, SEARCH_H, 14);
+    draw_glass(16, sy, display_w() as i32 - 32, SEARCH_H, 14);
     let focus = unsafe { SEARCH_FOCUS };
     if focus {
-        draw_rect(16, sy, DISPLAY_W as i32 - 32, SEARCH_H, ds::C_ACCENT);
+        draw_rect(16, sy, display_w() as i32 - 32, SEARCH_H, ds::C_ACCENT);
     }
     ds_icon(Icon::Search, 24, sy + (SEARCH_H - ICON_SZ) / 2, ICON_SZ, ds::C_DIM);
     let sl = unsafe { SEARCH_LEN };
@@ -64,8 +64,8 @@ pub fn render_list() {
         let title = unsafe { &NOTE_TITLES[i][..NOTE_TITLE_LENS[i]] };
         let preview = unsafe { &NOTE_PREVIEWS[i][..NOTE_PREVIEW_LENS[i]] };
         let title_cap = title.len().min(20);
-        ds_list_cell(0, y, DISPLAY_W as i32, Some(Icon::Note), &title[..title_cap], preview, true);
-        ds_cell_sep(0, y + CELL_H, DISPLAY_W as i32);
+        ds_list_cell(0, y, display_w() as i32, Some(Icon::Note), &title[..title_cap], preview, true);
+        ds_cell_sep(0, y + CELL_H, display_w() as i32);
         y += CELL_H;
         shown += 1;
     }
@@ -124,12 +124,12 @@ pub fn render_editor() {
     let cap = if tl > 0 { tl } else { title.len().min(24) };
     let disp: &[u8] = if tl > 0 { &tbuf[..tl] } else { &title[..cap] };
     let tw = ds_text_width_px(disp, 17.0);
-    ds_title_text((DISPLAY_W as i32 - tw) / 2, (ds::NAV_H - 20) / 2, disp, ds_text());
+    ds_title_text((display_w() as i32 - tw) / 2, (ds::NAV_H - 20) / 2, disp, ds_text());
 
     // 文本区
     let ax = 16;
     let ay = ds::NAV_H + 16;
-    let aw = DISPLAY_W as i32 - 32;
+    let aw = display_w() as i32 - 32;
     let ah = 380;
     draw_glass(ax, ay, aw, ah, 16);
     let buf = unsafe { &EDIT_BUF[..EDIT_LEN] };
@@ -155,10 +155,10 @@ pub fn render_editor() {
     // 底部提示
     let tip = b"\xe9\x94\xae\xe7\x9b\x98\xe8\xbe\x93\xe5\x85\xa5\xef\xbc\x8c\xe5\x9b\x9e\xe8\xbd\xa6\xe6\x8d\xa2\xe8\xa1\x8c";
     let tw2 = ds_text_width_px(tip, 13.0);
-    ds_text_px((DISPLAY_W as i32 - tw2) / 2, ay + ah + 14, tip, 13.0, ds::C_DIM);
+    ds_text_px((display_w() as i32 - tw2) / 2, ay + ah + 14, tip, 13.0, ds::C_DIM);
 
     // 保存 / 删除
-    let bw = (DISPLAY_W as i32 - 16 * 3) / 2;
+    let bw = (display_w() as i32 - 16 * 3) / 2;
     let bh = 52;
     let by = ay + ah + 56;
     ds_button(16, by, bw, bh, b"\xe4\xbf\x9d\xe5\xad\x98", true);
@@ -190,7 +190,7 @@ pub fn tap_list(x: i32, y: i32) {
         unsafe { exit(0); }
     }
     // 新增按钮
-    if x >= DISPLAY_W as i32 - 16 - ICON_SZ && x < DISPLAY_W as i32 - 16
+    if x >= display_w() as i32 - 16 - ICON_SZ && x < display_w() as i32 - 16
         && y >= (ds::NAV_H - ICON_SZ) / 2 && y < (ds::NAV_H + ICON_SZ) / 2
     {
         unsafe {
@@ -203,7 +203,7 @@ pub fn tap_list(x: i32, y: i32) {
     }
     // 搜索框
     let sy = ds::NAV_H + 10;
-    if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= sy && y < sy + SEARCH_H {
+    if x >= 16 && x < display_w() as i32 - 16 && y >= sy && y < sy + SEARCH_H {
         unsafe { SEARCH_FOCUS = true; }
         return;
     }
@@ -218,7 +218,7 @@ pub fn tap_list(x: i32, y: i32) {
         if !match_search(i) {
             continue;
         }
-        if x >= 0 && x < DISPLAY_W as i32 && y >= yy && y < yy + CELL_H {
+        if x >= 0 && x < display_w() as i32 && y >= yy && y < yy + CELL_H {
             unsafe {
                 EDIT_IDX = i;
                 load_into_editor(i);
@@ -255,7 +255,7 @@ pub fn tap_editor(x: i32, y: i32) {
         unsafe { PAGE = 0; }
         return;
     }
-    let bw = (DISPLAY_W as i32 - 16 * 3) / 2;
+    let bw = (display_w() as i32 - 16 * 3) / 2;
     let bh = 52;
     let by = ds::NAV_H + 16 + 380 + 56;
     if ds_button_hit(x, y, 16, by, bw, bh) {
@@ -271,7 +271,7 @@ pub fn tap_editor(x: i32, y: i32) {
         return;
     }
     // 点文本区进入键盘编辑
-    if x >= 16 && x < DISPLAY_W as i32 - 16 && y >= ds::NAV_H + 16 && y < ds::NAV_H + 16 + 380 {
+    if x >= 16 && x < display_w() as i32 - 16 && y >= ds::NAV_H + 16 && y < ds::NAV_H + 16 + 380 {
         unsafe { SEARCH_FOCUS = false; }
     }
 }

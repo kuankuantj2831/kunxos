@@ -23,6 +23,14 @@ pub use glass::*;
 pub const NAV_H: i32 = 56;
 /// 导航栏顶部 y（540x960 逻辑分辨率下 = 904）。
 pub const NAV_Y: i32 = 960 - NAV_H;
+use core::sync::atomic::{AtomicI32, Ordering};
+static VIEW_W: AtomicI32 = AtomicI32::new(540);
+static VIEW_H: AtomicI32 = AtomicI32::new(960);
+pub fn set_viewport(w: i32, h: i32) {
+    VIEW_W.store(w, Ordering::Relaxed);
+    VIEW_H.store(h, Ordering::Relaxed);
+}
+pub fn nav_y() -> i32 { VIEW_H.load(Ordering::Relaxed) - NAV_H }
 
 /// 边缘手势触发宽度（px）：距左右边缘小于该值的滑动判定为「返回」。
 pub const EDGE_W: i32 = 24;
@@ -234,17 +242,18 @@ pub const NAV_BORDER: u32 = 0x00_D9_DE_E6;
 /// 供全屏底部导航栏（`draw_nav_bar`）与设置/OOBE 预览复用。
 pub fn draw_nav_bar_at<C: NavCanvas>(c: &mut C, y: i32, mode: u8) {
     // 毛玻璃底：模糊导航栏下方的应用/桌面内容，再叠浅色着色与顶部高光描边。
-    glass::glass_rect(c, 0, y, 540, NAV_H, 0, false, true);
+    let w = VIEW_W.load(Ordering::Relaxed);
+    glass::glass_rect(c, 0, y, w, NAV_H, 0, false, true);
     let cy = y + NAV_H / 2;
     if mode == MODE_BUTTONS {
-        draw_back_icon(c, 90, cy);
-        draw_home_icon(c, 270, cy);
-        draw_recents_icon(c, 450, cy);
+        draw_back_icon(c, w / 6, cy);
+        draw_home_icon(c, w / 2, cy);
+        draw_recents_icon(c, w * 5 / 6, cy);
     } else {
         // 手势指示条（白色圆角药丸，居中偏下）
         let pill_w = 108;
         let pill_h = 4;
-        let px = (540 - pill_w) / 2;
+        let px = (w - pill_w) / 2;
         let py = y + NAV_H - 18;
         canvas_fill(c, px, py, pill_w, pill_h, ICON_WHITE);
     }
@@ -252,7 +261,7 @@ pub fn draw_nav_bar_at<C: NavCanvas>(c: &mut C, y: i32, mode: u8) {
 
 /// 绘制底部导航栏（按当前模式）：三键或手势指示条。
 pub fn draw_nav_bar<C: NavCanvas>(c: &mut C, mode: u8) {
-    draw_nav_bar_at(c, NAV_Y, mode);
+    draw_nav_bar_at(c, nav_y(), mode);
 }
 
 // ==================== 命中测试 ====================
@@ -260,15 +269,16 @@ pub fn draw_nav_bar<C: NavCanvas>(c: &mut C, mode: u8) {
 /// 三键模式下点击导航栏：按三等分区域判定动作。
 /// 手势模式下导航栏点击无动作（返回 None）。
 pub fn nav_hit(x: i32, y: i32, mode: u8) -> NavAction {
-    if y < NAV_Y {
+    if y < nav_y() {
         return NavAction::None;
     }
     if mode == MODE_GESTURE {
         return NavAction::None;
     }
-    if x < 180 {
+    let w = VIEW_W.load(Ordering::Relaxed);
+    if x < w / 3 {
         NavAction::Back
-    } else if x < 360 {
+    } else if x < w * 2 / 3 {
         NavAction::Home
     } else {
         NavAction::Recents
@@ -298,13 +308,13 @@ pub fn classify_swipe(
     let dx = cur_x - press_x;
     let dy = cur_y - press_y;
     // 底部上滑
-    if press_y >= 960 - BOTTOM_ZONE && dy <= -SWIPE_UP_DIST && dx.abs() <= dy.abs() {
+    if press_y >= VIEW_H.load(Ordering::Relaxed) - BOTTOM_ZONE && dy <= -SWIPE_UP_DIST && dx.abs() <= dy.abs() {
         if dur_ms >= HOLD_MS {
             NavAction::Recents
         } else {
             NavAction::Home
         }
-    } else if (press_x < EDGE_W || press_x >= 540 - EDGE_W)
+    } else if (press_x < EDGE_W || press_x >= VIEW_W.load(Ordering::Relaxed) - EDGE_W)
         && dx.abs() >= EDGE_SWIPE_DIST
         && dx.abs() > dy.abs()
     {

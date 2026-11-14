@@ -65,17 +65,17 @@ const ROW2_H: i32 = 42;
 const ROW3_Y: i32 = 94;     // 书签行
 const ROW3_H: i32 = 36;
 const CONTENT_Y: i32 = 136; // 内容区
-const CONTENT_BOTTOM: i32 = NAV_Y - 8; // = 896
-const VIEWPORT_H: i32 = CONTENT_BOTTOM - CONTENT_Y; // 760
+fn content_bottom() -> i32 { nav_y() - 8 } // = 896
+fn viewport_h() -> i32 { content_bottom() - CONTENT_Y } // 760
 
 const BTN_SZ: i32 = 34;
 const BTN_Y: i32 = 5;
 const URL_X: i32 = 16;
-const URL_W: i32 = DISPLAY_W as i32 - 104;
-const GO_X: i32 = DISPLAY_W as i32 - 80;
+fn url_w() -> i32 { display_w() as i32 - 104 }
+fn go_x() -> i32 { display_w() as i32 - 80 }
 const GO_W: i32 = 64;
 const SB_W: i32 = 4; // 滚动条宽
-const SB_X: i32 = DISPLAY_W as i32 - SB_W - 2;
+fn sb_x() -> i32 { display_w() as i32 - SB_W - 2 }
 
 // ==================== 书签 ====================
 
@@ -301,7 +301,7 @@ fn build_page(base: Url, bytes: &[u8], final_url: &str) {
     }
     // 钳制文档高度换算与滚动量：CSS 已限 8192px，但元素数量无上限，
     // 不设顶会回到 i32 加/乘回绕簇（滚动条 thumb 位置错乱）。
-    let max_scroll = (((lt.height as i64) - VIEWPORT_H as i64).max(0) as i32).min(1_000_000);
+    let max_scroll = (((lt.height as i64) - viewport_h() as i64).max(0) as i32).min(1_000_000);
     let cmds = paint::build_paint_list(&dom, &lt);
     let page = PageData {
         dom,
@@ -337,7 +337,7 @@ fn render() {
     draw_gradient_bg(C_BG, glass_dark());
 
     // ---- 导航行 ----
-    draw_glass(0, ROW1_Y, DISPLAY_W as i32, ROW1_H, 0);
+    draw_glass(0, ROW1_Y, display_w() as i32, ROW1_H, 0);
     // 后退 / 前进 / 主页
     draw_glass(6, BTN_Y, BTN_SZ, BTN_SZ, 10);
     draw_text(6 + 11, BTN_Y + 8, "<".as_bytes(), C_TEXT);
@@ -350,10 +350,10 @@ fn render() {
     draw_text(6 + (BTN_SZ + 4) * 3 + 12, BTN_Y + 9, title, C_TEXT);
 
     // ---- 地址栏 ----
-    draw_glass(URL_X, ROW2_Y, URL_W, ROW2_H, 12);
+    draw_glass(URL_X, ROW2_Y, url_w(), ROW2_H, 12);
     let focused = unsafe { URL_FOCUS };
     if focused {
-        draw_rect(URL_X, ROW2_Y, URL_W, ROW2_H, C_ACCENT);
+        draw_rect(URL_X, ROW2_Y, url_w(), ROW2_H, C_ACCENT);
     }
     let url = url_str();
     if url.is_empty() {
@@ -365,8 +365,8 @@ fn render() {
         let cx = URL_X + 12 + text_width(url);
         fill_rect(cx, ROW2_Y + 10, 2, 22, C_TEXT);
     }
-    draw_glass_style(GO_X, ROW2_Y + 3, GO_W, ROW2_H - 6, 10, &STYLE_ACCENT);
-    draw_text(GO_X + (GO_W - text_width("前往".as_bytes())) / 2, ROW2_Y + 14, "前往".as_bytes(), C_ON_ACCENT);
+    draw_glass_style(go_x(), ROW2_Y + 3, GO_W, ROW2_H - 6, 10, &STYLE_ACCENT);
+    draw_text(go_x() + (GO_W - text_width("前往".as_bytes())) / 2, ROW2_Y + 14, "前往".as_bytes(), C_ON_ACCENT);
 
     // ---- 书签行 ----
     let mut bx = 16;
@@ -378,7 +378,7 @@ fn render() {
     }
 
     // ---- 内容区 ----
-    fill_rect(0, CONTENT_Y, DISPLAY_W as i32, VIEWPORT_H, C_PAGE_BG);
+    fill_rect(0, CONTENT_Y, display_w() as i32, viewport_h(), C_PAGE_BG);
     if let Some(page) = unsafe { PAGE.as_ref() } {
         let scroll = page.scroll;
         let ctx = paint::PaintCtx {
@@ -393,17 +393,17 @@ fn render() {
             scroll_y: scroll,
             clip_x: 0,
             clip_y: CONTENT_Y,
-            clip_w: DISPLAY_W as i32 - SB_W - 2,
-            clip_h: VIEWPORT_H,
+            clip_w: display_w() as i32 - SB_W - 2,
+            clip_h: viewport_h(),
         };
         paint::execute(&page.cmds, &ctx);
         // 滚动条
         if page.max_scroll > 0 {
-            let thumb_h = (VIEWPORT_H * VIEWPORT_H / (page.max_scroll + VIEWPORT_H)).max(24);
+            let thumb_h = (viewport_h() * viewport_h() / (page.max_scroll + viewport_h())).max(24);
             let thumb_y = CONTENT_Y
-                + (((VIEWPORT_H - thumb_h) as i64 * scroll as i64 / page.max_scroll as i64) as i32);
-            fill_rect(SB_X, CONTENT_Y, SB_W, VIEWPORT_H, 0x00_E5_E9_F0);
-            fill_rect(SB_X, thumb_y, SB_W, thumb_h, C_ACCENT);
+                + (((viewport_h() - thumb_h) as i64 * scroll as i64 / page.max_scroll as i64) as i32);
+            fill_rect(sb_x(), CONTENT_Y, SB_W, viewport_h(), 0x00_E5_E9_F0);
+            fill_rect(sb_x(), thumb_y, SB_W, thumb_h, C_ACCENT);
         }
     } else if let Some(msg) = unsafe { ERROR_MSG.as_ref() } {
         draw_text(24, CONTENT_Y + 30, "无法打开页面".as_bytes(), 0x00_1A_1C_22);
@@ -434,7 +434,7 @@ fn btn_hit(x: i32, y: i32, x0: i32) -> bool {
 }
 
 fn in_content(x: i32, y: i32) -> bool {
-    x >= 0 && x < DISPLAY_W as i32 && y >= CONTENT_Y && y < CONTENT_BOTTOM
+    x >= 0 && x < display_w() as i32 && y >= CONTENT_Y && y < content_bottom()
 }
 
 // ==================== 表单交互 ====================
@@ -537,7 +537,7 @@ fn handle_tap(x: i32, y: i32) -> bool {
         return true;
     }
     // 地址栏聚焦
-    if x >= URL_X && x < URL_X + URL_W && y >= ROW2_Y && y < ROW2_Y + ROW2_H {
+    if x >= URL_X && x < URL_X + url_w() && y >= ROW2_Y && y < ROW2_Y + ROW2_H {
         unsafe { URL_FOCUS = true; }
         if let Some(page) = unsafe { PAGE.as_mut() } {
             page.focus = None;
@@ -545,7 +545,7 @@ fn handle_tap(x: i32, y: i32) -> bool {
         return true;
     }
     // 前往
-    if x >= GO_X && x < GO_X + GO_W && y >= ROW2_Y + 3 && y < ROW2_Y + ROW2_H - 3 {
+    if x >= go_x() && x < go_x() + GO_W && y >= ROW2_Y + 3 && y < ROW2_Y + ROW2_H - 3 {
         unsafe { URL_FOCUS = false; }
         let u = core::str::from_utf8(url_str()).unwrap_or("").to_string();
         navigate(&u, true);
@@ -565,12 +565,12 @@ fn handle_tap(x: i32, y: i32) -> bool {
         }
     }
     // 滚动条
-    if x >= SB_X && x < SB_X + SB_W && in_content(x, y) {
+    if x >= sb_x() && x < sb_x() + SB_W && in_content(x, y) {
         if let Some(page) = unsafe { PAGE.as_mut() } {
             if page.max_scroll > 0 {
-                let t = (y - CONTENT_Y).clamp(0, VIEWPORT_H) as i64;
+                let t = (y - CONTENT_Y).clamp(0, viewport_h()) as i64;
                 let max = page.max_scroll as i64;
-                page.scroll = (t * max / VIEWPORT_H as i64) as i32;
+                page.scroll = (t * max / viewport_h() as i64) as i32;
             }
         }
         return true;
@@ -736,6 +736,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             // 拖拽滚动
             let dragging = unsafe { DRAG_ACTIVE };
@@ -780,7 +781,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
         // 指针按下：记录拖拽起点
         if !unsafe { DRAG_ACTIVE } && unsafe { MOUSE_DOWN || TOUCH_DOWN } {
             let (x, y) = unsafe { (CUR_X, CUR_Y) };
-            if in_content(x, y) && !(x >= SB_X && x < SB_X + SB_W) {
+            if in_content(x, y) && !(x >= sb_x() && x < sb_x() + SB_W) {
                 unsafe {
                     DRAG_ACTIVE = true;
                     DRAG_LAST_Y = y;

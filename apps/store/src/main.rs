@@ -40,6 +40,33 @@
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
+#[path = "../../../shared/display.rs"]
+mod display;
+#[path = "../../../shared/pixel_buffer.rs"]
+mod pixel_buffer;
+use pixel_buffer::PixelBuffer;
+const INITIAL_PIXELS: usize = 540 * 960;
+static mut VIEW_W: usize = 540;
+static mut VIEW_H: usize = 960;
+fn display_w() -> usize { unsafe { VIEW_W } }
+fn display_h() -> usize { unsafe { VIEW_H } }
+fn refresh_geometry() -> bool {
+    unsafe {
+        if STORE_FB_FD < 0 { return false; }
+        if syscall3(SYS_IOCTL, STORE_FB_FD as usize, display::RESIZE_IOCTL, 0) != 0 { return false; }
+        let mut data = [0u8; display::INFO_BYTES];
+        if syscall3(SYS_IOCTL, STORE_FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) != 0 { return false; }
+        let Some(info) = display::DisplayMetrics::decode(&data) else { return false; };
+        if info.width as usize == VIEW_W && info.height as usize == VIEW_H { return false; }
+        VIEW_W = info.width as usize; VIEW_H = info.height as usize;
+        BACK_BUF.resize_len(VIEW_W * VIEW_H); SNAP_BUF.resize_len(VIEW_W * VIEW_H);
+        TRANS_T0 = 0;
+        sys_nav::set_viewport(VIEW_W as i32, VIEW_H as i32);
+        true
+    }
+}
+
+
 // ==================== 复用的加密/包/索引模块 ====================
 
 #[path = "../../../kunxpkg/src/sha512.rs"]
@@ -1274,7 +1301,7 @@ const VIEW_SETTINGS: u8 = 2;
 static mut VIEW: u8 = VIEW_LIST;
 
 // ==================== 页面切换转场（P0-2，settings/sms/files 同款整页滑动） ====================
-static mut SNAP_BUF: [u32; 540 * 960] = [0u32; 540 * 960];
+static mut SNAP_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, INITIAL_PIXELS);
 static mut TRANS_T0: u64 = 0;
 static mut TRANS_PUSH: bool = false;
 const TRANS_DUR: u64 = 240_000;
@@ -1288,7 +1315,7 @@ fn shade_px(c: u32, a: u32) -> u32 {
 
 fn snapshot_page() {
     unsafe {
-        core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), SNAP_BUF.as_mut_ptr(), 540 * 960);
+        core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), SNAP_BUF.as_mut_ptr(), display_w() * display_h());
     }
 }
 
@@ -1311,12 +1338,12 @@ fn compose_transition(e: f32) {
         return;
     }
     unsafe {
-        let w = 540usize;
+        let w = display_w();
         let off = ((1.0 - e) * w as f32) as usize;
         if off == 0 {
             return;
         }
-        for y in 0..960usize {
+        for y in 0..display_h() {
             let row = y * w;
             if TRANS_PUSH {
                 for x in (off..w).rev() {
@@ -1512,13 +1539,13 @@ fn rebuild_categories() {
 static mut STORE_FB: *mut u32 = core::ptr::null_mut();
 /// 保留的 /dev/fb0 fd：FBIO_PRESENT 提交脏区需要（mmap 后页表已指向画布，fd 仅用于 ioctl）。
 static mut STORE_FB_FD: isize = -1;
-static mut BACK_BUF: [u32; 540 * 960] = [0u32; 540 * 960];
+static mut BACK_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, INITIAL_PIXELS);
 
 fn store_pixel(x: usize, y: usize, c: u32) {
     unsafe {
-        if x < 540 && y < 960 {
-            if y < BACK_BUF.len() / 540 {
-                BACK_BUF[y * 540 + x] = c;
+        if x < display_w() && y < display_h() {
+            if y < BACK_BUF.len() / display_w() {
+                BACK_BUF[y * display_w() + x] = c;
             }
         }
     }
@@ -1532,8 +1559,8 @@ fn store_fill(x: i32, y: i32, w: i32, h: i32, c: u32) {
     let y0 = y as usize;
     let w = w as usize;
     let h = h as usize;
-    for yy in y0..(y0 + h).min(960) {
-        for xx in x0..(x0 + w).min(540) {
+    for yy in y0..(y0 + h).min(display_h()) {
+        for xx in x0..(x0 + w).min(display_w()) {
             store_pixel(xx, yy, c);
         }
     }
@@ -1544,8 +1571,8 @@ use sys_nav::glass::{GlassStyle, GlassTarget, STYLE_DANGER, glass_rect, glass_re
 struct StoreGlass;
 impl GlassTarget for StoreGlass {
     fn backdrop(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < 540 && y < 960 {
-            unsafe { BACK_BUF[y as usize * 540 + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -1569,12 +1596,12 @@ fn store_flip() {
         if STORE_FB.is_null() {
             return;
         }
-        core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), STORE_FB, 540 * 960);
+        core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), STORE_FB, display_w() * display_h());
         fb_present();
     }
 }
 
-/// 提交整屏脏区并请求呈现（FBIO_PRESENT，单矩形 (0,0,540,960)）。
+/// 提交整屏脏区并请求呈现（FBIO_PRESENT，单矩形 (0,0,display_w(),display_h())）。
 ///
 /// 内核在首次 FBIO_PRESENT 后进入应用驱动模式：不再由定时器自动翻页，
 /// 显示节奏完全由本调用驱动（与 terminal 的 present_frame 同一最小实现）。
@@ -1588,8 +1615,8 @@ fn fb_present() {
         dbuf[0..4].copy_from_slice(&1u32.to_le_bytes());
         dbuf[4..8].copy_from_slice(&0i32.to_le_bytes());
         dbuf[8..12].copy_from_slice(&0i32.to_le_bytes());
-        dbuf[12..16].copy_from_slice(&540u32.to_le_bytes());
-        dbuf[16..20].copy_from_slice(&960u32.to_le_bytes());
+        dbuf[12..16].copy_from_slice(&(display_w() as u32).to_le_bytes());
+        dbuf[16..20].copy_from_slice(&(display_h() as u32).to_le_bytes());
         // 忽略返回值：内核在应用接管模式下始终呈现（无脏区时为 no-op）。
         syscall3(SYS_IOCTL, STORE_FB_FD as usize, FBIO_PRESENT, dbuf.as_ptr() as usize);
     }
@@ -1634,8 +1661,8 @@ fn store_ttf_glyph(x: i32, y: i32, cp: u32, c: u32) -> i32 {
                 if a != 0 {
                     let px_ = gx + col as i32;
                     let py_ = gy + row as i32;
-                    if px_ >= 0 && py_ >= 0 && px_ < 540 && py_ < 960 {
-                        let bg = unsafe { *BACK_BUF.as_ptr().add(py_ as usize * 540 + px_ as usize) };
+                    if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                        let bg = unsafe { *BACK_BUF.as_ptr().add(py_ as usize * display_w() + px_ as usize) };
                         store_pixel(px_ as usize, py_ as usize, ttf_text::font_render::blend(bg, c, a));
                     }
                 }
@@ -1672,8 +1699,8 @@ fn store_ttf_glyph_bold(x: i32, y: i32, cp: u32, c: u32) -> i32 {
                 if a != 0 {
                     let px_ = gx + col as i32;
                     let py_ = gy + row as i32;
-                    if px_ >= 0 && py_ >= 0 && px_ < 540 && py_ < 960 {
-                        let bg = unsafe { *BACK_BUF.as_ptr().add(py_ as usize * 540 + px_ as usize) };
+                    if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                        let bg = unsafe { *BACK_BUF.as_ptr().add(py_ as usize * display_w() + px_ as usize) };
                         store_pixel(px_ as usize, py_ as usize, ttf_text::font_render::blend(bg, c, a));
                     }
                 }
@@ -1716,21 +1743,21 @@ fn store_text_width(s: &[u8]) -> i32 {
 
 /// 背景渐变（白色背景打底：顶部纯白 → 底部极淡冷灰的浅色渐变）。
 fn store_bg() {
-    for y in 0..960usize {
-        let t = (y as u32 * 255 / 960).min(255);
+    for y in 0..display_h() {
+        let t = (y as u32 * 255 / display_h() as u32).min(255);
         let inv = 255 - t;
         let r = (0xFFu32 * inv + 0xE9u32 * t) / 255;
         let g = (0xFFu32 * inv + 0xEDu32 * t) / 255;
         let b = (0xFFu32 * inv + 0xF3u32 * t) / 255;
         let row = (r << 16) | (g << 8) | b;
-        for x in 0..540usize {
+        for x in 0..display_w() {
             store_pixel(x, y, row);
         }
     }
 }
 
 fn draw_title_bar() {
-    store_glass(0, 0, 540, 44, 0);
+    store_glass(0, 0, display_w() as i32, 44, 0);
     store_glass(4, 4, 36, 36, 10);
     store_text(14, 14, "<".as_bytes(), 0x00_1A_1C_22);
     let (title, tw) = match unsafe { VIEW } {
@@ -1738,7 +1765,7 @@ fn draw_title_bar() {
         VIEW_DETAIL => ("应用详情".as_bytes(), store_text_width_bold("应用详情".as_bytes())),
         _ => ("应用商店".as_bytes(), store_text_width_bold("应用商店".as_bytes())),
     };
-    store_text_bold((540 - tw) / 2, 24, title, 0x00_1A_1C_22);
+    store_text_bold((display_w() as i32 - tw) / 2, 24, title, 0x00_1A_1C_22);
     // 设置入口（列表页右上）：设置页此前不可达（VIEW 从未被赋值
     // VIEW_SETTINGS），而错误提示让用户「到设置页配置」。
     if unsafe { VIEW } == VIEW_LIST {
@@ -1760,9 +1787,9 @@ fn draw_error_banner() {
     if msg.is_empty() {
         return;
     }
-    store_glass_style(0, 48, 540, 44, 0, &STYLE_DANGER);
+    store_glass_style(0, 48, display_w() as i32, 44, 0, &STYLE_DANGER);
     let w = store_text_width(msg);
-    let tx = ((540 - w) / 2).max(0);
+    let tx = ((display_w() as i32 - w) / 2).max(0);
     store_text(tx, 62, msg, 0x00_FF_FF_FF);
 }
 
@@ -1774,8 +1801,8 @@ fn draw_sys_nav() {
             store_pixel(x as usize, y as usize, color);
         }
         fn backdrop(&self, x: i32, y: i32) -> u32 {
-            if x >= 0 && y >= 0 && x < 540 && y < 960 {
-                unsafe { BACK_BUF[y as usize * 540 + x as usize] }
+            if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+                unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
             } else {
                 0
             }
@@ -1912,7 +1939,7 @@ fn render_list() {
             }
             // 右侧按钮
             let bw = 92i32;
-            let bx = 540 - 16 - bw;
+            let bx = display_w() as i32 - 16 - bw;
             let bcol = btn_color_for(st);
             store_glass_style(bx, ry + (row_h - 8 - 40) / 2, bw, 40, 14, &glass_style_acc(bcol));
             let label = btn_label_for(st);
@@ -2141,19 +2168,19 @@ fn store_input(fd: isize) -> (Option<(i32, i32)>, sys_nav::NavAction, bool) {
             match ty {
                 EV_REL => {
                     if code == REL_X {
-                        CUR_X = (CUR_X + val).clamp(0, 539);
+                        CUR_X = (CUR_X + val).clamp(0, display_w() as i32 - 1);
                         moved = true;
                     } else if code == REL_Y {
-                        CUR_Y = (CUR_Y + val).clamp(0, 959);
+                        CUR_Y = (CUR_Y + val).clamp(0, display_h() as i32 - 1);
                         moved = true;
                     }
                 }
                 EV_ABS => {
                     if code == ABS_X || code == ABS_MT_POSITION_X {
-                        CUR_X = val.clamp(0, 539);
+                        CUR_X = val.clamp(0, display_w() as i32 - 1);
                         moved = true;
                     } else if code == ABS_Y || code == ABS_MT_POSITION_Y {
-                        CUR_Y = val.clamp(0, 959);
+                        CUR_Y = val.clamp(0, display_h() as i32 - 1);
                         moved = true;
                     }
                 }
@@ -2272,7 +2299,7 @@ fn list_row_hit(x: i32, y: i32, row_h: i32, top: i32) -> Option<usize> {
 
 fn is_install_button(x: i32, y: i32, ry: i32) -> bool {
     let bw = 92i32;
-    let bx = 540 - 16 - bw;
+    let bx = display_w() as i32 - 16 - bw;
     let bh = 40i32;
     let by = ry + (84 - 8 - 40) / 2;
     x >= bx && x < bx + bw && y >= by && y < by + bh
@@ -2490,9 +2517,9 @@ fn ease_fosl(t: f32) -> f32 {
 fn cursor_overlay_redraw() {
     cursor_overlay::overlay_redraw(
         unsafe { STORE_FB },
-        540,
-        540,
-        960,
+        display_w(),
+        display_w() as i32,
+        display_h() as i32,
         unsafe { CUR_X },
         unsafe { CUR_Y },
     );
@@ -2508,9 +2535,9 @@ fn cursor_overlay_move() {
     // 移动光标并把新旧位置区以小脏矩形提交呈现（不再整屏提交）。
     let rects = cursor_overlay::overlay_move_rects(
         unsafe { STORE_FB },
-        540,
-        540,
-        960,
+        display_w(),
+        display_w() as i32,
+        display_h() as i32,
         unsafe { CUR_X },
         unsafe { CUR_Y },
     );
@@ -2567,7 +2594,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             print("[store] 无法打开 /dev/fb0\n");
             exit(1);
         }
-        let base = syscall6(SYS_MMAP, 0, 540 * 960 * 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd as usize, 0);
+        let base = syscall6(SYS_MMAP, 0, display::MAX_PIXELS * 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd as usize, 0);
         if (base as isize) < 0 {
             // mmap 失败：维持原有失败退出行为（提示后 exit(1)）。
             syscall1(SYS_CLOSE, fd as usize);
@@ -2577,6 +2604,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             // 保留 fd：FBIO_PRESENT / FBIO_PUT_DAMAGE 依赖它提交脏区（mmap 后
             // 页表已指向画布，fd 仅用于 ioctl）。
             STORE_FB_FD = fd as isize;
+            refresh_geometry();
         }
     }
     if unsafe { STORE_FB.is_null() } {
@@ -2624,6 +2652,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     }
 
     loop {
+        if refresh_geometry() { store_redraw(); store_flip(); cursor_overlay_redraw(); }
         let moved = if input >= 0 {
             let (click, nav, moved) = store_input(input);
             if moved {

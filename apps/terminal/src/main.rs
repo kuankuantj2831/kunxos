@@ -149,8 +149,28 @@ fn open(path: &str, flags: usize) -> isize {
 
 // ==================== 显示 ====================
 
-const DISPLAY_W: usize = 540;
-const DISPLAY_H: usize = 960;
+#[path = "../../../shared/display.rs"]
+mod display;
+static mut VIEW_W: usize = 540;
+static mut VIEW_H: usize = 960;
+fn display_w() -> usize { unsafe { VIEW_W } }
+fn display_h() -> usize { unsafe { VIEW_H } }
+
+fn refresh_geometry() -> bool {
+    unsafe {
+        if FB_FD < 0 { return false; }
+        if syscall3(SYS_IOCTL, FB_FD as usize, display::RESIZE_IOCTL, 0) != 0 { return false; }
+        let mut data = [0u8; display::INFO_BYTES];
+        if syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) != 0 { return false; }
+        let Some(info) = display::DisplayMetrics::decode(&data) else { return false; };
+        if info.width as usize == VIEW_W && info.height as usize == VIEW_H { return false; }
+        VIEW_W = info.width as usize; VIEW_H = info.height as usize;
+
+        sys_nav::set_viewport(VIEW_W as i32, VIEW_H as i32);
+        true
+    }
+}
+
 const TITLE_H: i32 = 44;
 const NAV_H: i32 = 48;
 
@@ -180,8 +200,8 @@ const PALETTE: [u32; 16] = [
 
 fn put_pixel(x: i32, y: i32, color: u32) {
     unsafe {
-        if x >= 0 && y >= 0 && (x as usize) < DISPLAY_W && (y as usize) < DISPLAY_H {
-            *FB_PTR.add(y as usize * DISPLAY_W + x as usize) = color;
+        if x >= 0 && y >= 0 && (x as usize) < display_w() && (y as usize) < display_h() {
+            *FB_PTR.add(y as usize * display_w() + x as usize) = color;
         }
     }
 }
@@ -194,14 +214,14 @@ fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     // 每像素 4 次边界检查降为每行一次。
     let x0 = x.max(0);
     let y0 = y.max(0);
-    let x1 = (x + w).min(DISPLAY_W as i32);
-    let y1 = (y + h).min(DISPLAY_H as i32);
+    let x1 = (x + w).min(display_w() as i32);
+    let y1 = (y + h).min(display_h() as i32);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
     unsafe {
         for yy in y0..y1 {
-            let base = yy as usize * DISPLAY_W + x0 as usize;
+            let base = yy as usize * display_w() + x0 as usize;
             core::slice::from_raw_parts_mut(FB_PTR.add(base), (x1 - x0) as usize)
                 .fill(color);
         }
@@ -210,7 +230,7 @@ fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
 
 fn fill_screen(color: u32) {
     unsafe {
-        for p in 0..DISPLAY_W * DISPLAY_H {
+        for p in 0..display_w() * display_h() {
             *FB_PTR.add(p) = color;
         }
     }
@@ -242,8 +262,8 @@ fn glyph_draw(x: i32, y: i32, cp: u32, color: u32) -> i32 {
                     if a != 0 {
                         let px = gx + col as i32;
                         let py = gy + row as i32;
-                        if px >= 0 && py >= 0 && (px as usize) < DISPLAY_W && (py as usize) < DISPLAY_H {
-                            let bg = unsafe { *FB_PTR.add(py as usize * DISPLAY_W + px as usize) };
+                        if px >= 0 && py >= 0 && (px as usize) < display_w() && (py as usize) < display_h() {
+                            let bg = unsafe { *FB_PTR.add(py as usize * display_w() + px as usize) };
                             put_pixel(px, py, ttf_text::font_render::blend(bg, color, a));
                         }
                     }
@@ -632,7 +652,7 @@ fn bg_color(idx: u8) -> u32 {
 fn draw_row(x0: i32, y: i32, row: &[Cell], len: usize) {
     let mut cx = x0;
     let mut i = 0usize;
-    while i < len && (cx as usize) < DISPLAY_W {
+    while i < len && (cx as usize) < display_w() {
         let cell = row[i];
         let ch = cell.cp;
         if ch != 0 {
@@ -660,7 +680,7 @@ fn draw_hist_row(x0: i32, y: i32, slot: usize) {
         let len = HIST_LEN[slot];
         let mut i = 0usize;
         let mut cx = x0;
-        while i < len && (cx as usize) < DISPLAY_W {
+        while i < len && (cx as usize) < display_w() {
             let (cp, n) = ttf_text::font_render::utf8_next(&HIST_BUF[slot][..len], i);
             if cp != 0 {
                 draw_cp(cx, y, &Cell { cp, fg: 7, bg: 0, bold: false });
@@ -677,9 +697,9 @@ fn draw_scrollbar() {
         if total <= TERM_ROWS_MAX && SCROLL == 0 {
             return;
         }
-        let bar_x = DISPLAY_W as i32 - 4;
-        fill_rect(bar_x, TITLE_H + 2, 3, DISPLAY_H as i32 - TITLE_H - NAV_H - 4, C_SCROLLBAR);
-        let view_h = (DISPLAY_H as i32 - TITLE_H - NAV_H - 4) as usize;
+        let bar_x = display_w() as i32 - 4;
+        fill_rect(bar_x, TITLE_H + 2, 3, display_h() as i32 - TITLE_H - NAV_H - 4, C_SCROLLBAR);
+        let view_h = (display_h() as i32 - TITLE_H - NAV_H - 4) as usize;
         let thumb_h = (view_h * TERM_ROWS_MAX / total).max(20);
         let max_scroll = total - TERM_ROWS_MAX;
         let sc = SCROLL.min(max_scroll);
@@ -691,7 +711,7 @@ fn draw_scrollbar() {
 pub fn draw_terminal() {
     unsafe {
         fill_screen(C_BG);
-        fill_rect(0, 0, DISPLAY_W as i32, TITLE_H, C_TITLE_BG);
+        fill_rect(0, 0, display_w() as i32, TITLE_H, C_TITLE_BG);
         draw_text(12, 12, b"KunxOS Terminal", C_TEXT);
         draw_text(6, 13, b"<", C_TEXT);
         let total = scrollback_total();
@@ -734,7 +754,7 @@ pub fn draw_terminal() {
             }
         }
         draw_scrollbar();
-        fill_rect(0, DISPLAY_H as i32 - NAV_H - 4, DISPLAY_W as i32, 4, C_TITLE_BG);
+        fill_rect(0, display_h() as i32 - NAV_H - 4, display_w() as i32, 4, C_TITLE_BG);
     }
 }
 
@@ -921,8 +941,8 @@ use sys_nav::glass::{GlassStyle, GlassTarget, STYLE_DANGER, glass_rect_style};
 struct TermGlass;
 impl GlassTarget for TermGlass {
     fn backdrop(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && (x as usize) < DISPLAY_W && (y as usize) < DISPLAY_H {
-            unsafe { *FB_PTR.add(y as usize * DISPLAY_W + x as usize) }
+        if x >= 0 && y >= 0 && (x as usize) < display_w() && (y as usize) < display_h() {
+            unsafe { *FB_PTR.add(y as usize * display_w() + x as usize) }
         } else {
             0
         }
@@ -944,7 +964,7 @@ fn draw_error_banner() {
     if msg.is_empty() {
         return;
     }
-    draw_glass_style(0, 48, DISPLAY_W as i32, 44, 0, &STYLE_DANGER);
+    draw_glass_style(0, 48, display_w() as i32, 44, 0, &STYLE_DANGER);
     draw_text(8, 62, msg, 0x00_FF_FF_FF);
 }
 
@@ -954,8 +974,8 @@ impl sys_nav::NavCanvas for TermCanvas {
         put_pixel(x, y, color);
     }
     fn backdrop(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && (x as usize) < DISPLAY_W && (y as usize) < DISPLAY_H {
-            unsafe { *FB_PTR.add(y as usize * DISPLAY_W + x as usize) }
+        if x >= 0 && y >= 0 && (x as usize) < display_w() && (y as usize) < display_h() {
+            unsafe { *FB_PTR.add(y as usize * display_w() + x as usize) }
         } else {
             0
         }
@@ -977,8 +997,8 @@ fn present_frame() {
         dbuf[0..4].copy_from_slice(&1u32.to_le_bytes());
         dbuf[4..8].copy_from_slice(&0i32.to_le_bytes());
         dbuf[8..12].copy_from_slice(&0i32.to_le_bytes());
-        dbuf[12..16].copy_from_slice(&(DISPLAY_W as u32).to_le_bytes());
-        dbuf[16..20].copy_from_slice(&(DISPLAY_H as u32).to_le_bytes());
+        dbuf[12..16].copy_from_slice(&(display_w() as u32).to_le_bytes());
+        dbuf[16..20].copy_from_slice(&(display_h() as u32).to_le_bytes());
         syscall3(SYS_IOCTL, FB_FD as usize, FBIO_PRESENT, dbuf.as_ptr() as usize);
     }
 }
@@ -994,9 +1014,9 @@ fn tty_attach() -> bool {
             }
             TTY_FD = fd;
             // 上报窗口尺寸（列×行）：Shell 排布与 TIOCGWINSZ 查询用。
-            let cols = (((DISPLAY_W as usize - 24) / cell_width_base() as usize).max(20))
+            let cols = (((display_w() as usize - 24) / cell_width_base() as usize).max(20))
                 .min(TERM_COLS_MAX);
-            let rows = (((DISPLAY_H as usize - TITLE_H as usize - NAV_H as usize - 10) / 16)
+            let rows = (((display_h() as usize - TITLE_H as usize - NAV_H as usize - 10) / 16)
                 .max(10))
                 .min(TERM_ROWS_MAX);
             let mut ws = [0u8; 8];
@@ -1017,7 +1037,7 @@ fn app_main() {
         }
         let mut info = [0u8; 24];
         syscall3(SYS_IOCTL, fd as usize, FBIOGET_VSCREENINFO, info.as_mut_ptr() as usize);
-        let len = DISPLAY_W * DISPLAY_H * 4;
+        let len = display::MAX_PIXELS * 4;
         let base = syscall6(SYS_MMAP, 0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd as usize, 0);
         if (base as isize) < 0 {
             write_fd(1, b"terminal: fb mmap failed\n");
@@ -1025,6 +1045,7 @@ fn app_main() {
         }
         FB_PTR = base as *mut u32;
         FB_FD = fd;
+        refresh_geometry();
     }
     if unsafe { FB_PTR.is_null() } {
         return;
@@ -1050,6 +1071,7 @@ fn app_main() {
 
     let mut frame = 0u32;
     loop {
+        if refresh_geometry() { draw_terminal(); draw_sys_nav(); present_frame(); }
         let (nav, tap) = read_event(input);
         if nav != sys_nav::NavAction::None {
             let c = sys_nav::nav_exit_code(nav);

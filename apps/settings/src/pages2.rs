@@ -25,14 +25,14 @@ pub(crate) unsafe fn render_net() {
     unsafe { CONTENT_H = 0; }
 
     let card_h = ui::card_h(5, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_row(ry, I_WIFI, b"Wi-Fi", b"", false, false);
     // Wi-Fi 状态行右侧文字。
     let state: &[u8] = if net_enabled() { b"\xE5\xB7\xB2\xE5\xBC\x80\xE5\x90\xAF" } else { b"\xE5\xB7\xB2\xE5\x85\xB3\xE9\x97\xAD" };
     let w = text_width_px(state, 14.0);
     draw_text_px(
-        DISPLAY_W as i32 - MARGIN - w,
+        display_w() as i32 - MARGIN - w,
         text_top(14.0, ry + ROW_H / 2),
         state,
         14.0,
@@ -47,7 +47,7 @@ pub(crate) unsafe fn render_net() {
     let st: &[u8] = if bt_enabled() { b"\xE5\xB7\xB2\xE5\xBC\x80\xE5\x90\xAF" } else { b"\xE5\xB7\xB2\xE5\x85\xB3\xE9\x97\xAD" };
     let w = text_width_px(st, 14.0);
     draw_text_px(
-        DISPLAY_W as i32 - MARGIN - w,
+        display_w() as i32 - MARGIN - w,
         text_top(14.0, ry + ROW_H / 2),
         st,
         14.0,
@@ -59,7 +59,7 @@ pub(crate) unsafe fn render_net() {
     let st: &[u8] = if data_enabled() { b"\xE5\xB7\xB2\xE5\xBC\x80\xE5\x90\xAF" } else { b"\xE5\xB7\xB2\xE5\x85\xB3\xE9\x97\xAD" };
     let w = text_width_px(st, 14.0);
     draw_text_px(
-        DISPLAY_W as i32 - MARGIN - w,
+        display_w() as i32 - MARGIN - w,
         text_top(14.0, ry + ROW_H / 2),
         st,
         14.0,
@@ -74,7 +74,7 @@ pub(crate) unsafe fn render_net() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -94,11 +94,11 @@ pub(crate) unsafe fn render_wifi() {
     unsafe { CONTENT_H = 0; }
 
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     // 开关行。
     ui::draw_row(ry, I_WIFI, b"Wi-Fi", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, net_enabled());
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, net_enabled());
     ui::draw_divider(ry);
     ry += ROW_H;
     ui::draw_row(ry, I_SAVE, b"\xE5\xB7\xB2\xE4\xBF\x9D\xE5\xAD\x98\xE7\xBD\x91\xE7\xBB\x9C", b"", true, false);
@@ -111,7 +111,7 @@ pub(crate) unsafe fn render_wifi() {
     ui::draw_group_header(y, b"\xE8\xBF\x9E\xE6\x8E\xA5");
     y += HEADER_H;
     let card_h2 = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_row(ry, I_WIFI, b"\xE6\x89\xAB\xE6\x8F\x8F\xE7\xBD\x91\xE7\xBB\x9C", b"", true, false);
     ui::draw_divider(ry);
@@ -124,12 +124,12 @@ pub(crate) unsafe fn render_wifi() {
     y += HEADER_H;
     if SAVED_COUNT == 0 {
         let card_h3 = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h3, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h3, CARD_R);
         ui::draw_row(y + CARD_PAD, I_INFO, b"\xE6\x97\xA0\xE5\xB7\xB2\xE4\xBF\x9D\xE5\xAD\x98\xE7\xBD\x91\xE7\xBB\x9C", b"", false, false);
         y += card_h3 + HEADER_H;
     } else {
         let card_h3 = ui::card_h(SAVED_COUNT, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h3, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h3, CARD_R);
         for i in 0..SAVED_COUNT {
             let name = &SAVED_SSIDS[i];
             let ln = name.iter().position(|&c| c == 0).unwrap_or(name.len());
@@ -153,12 +153,12 @@ pub(crate) unsafe fn render_ip() {
 
     let mode_dhcp = ip_mode_dhcp();
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_radio_row(y + CARD_PAD, b"\xE8\x87\xAA\xE5\x8A\xA8\xEF\xBC\x88DHCP\xEF\xBC\x89", mode_dhcp);
     y += card_h + HEADER_H;
 
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     let mut v0 = [0u8; 32];
     let v0l = cfg::cfg_get_str(cfg::CONF_NET, b"ip_addr", b"192.168.1.100", &mut v0);
@@ -178,7 +178,7 @@ pub(crate) unsafe fn render_ip() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h / 2),
@@ -203,14 +203,14 @@ pub(crate) unsafe fn render_bt() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_BT, b"\xE8\x93\x9D\xE7\x89\x99", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, y + CARD_PAD + (ROW_H - 28) / 2, bt_enabled());
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, y + CARD_PAD + (ROW_H - 28) / 2, bt_enabled());
     y += card_h + HEADER_H;
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -229,14 +229,14 @@ pub(crate) unsafe fn render_mobile() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_MOBILE, b"\xE7\xA7\xBB\xE5\x8A\xA8\xE6\x95\xB0\xE6\x8D\xAE", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, y + CARD_PAD + (ROW_H - 28) / 2, data_enabled());
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, y + CARD_PAD + (ROW_H - 28) / 2, data_enabled());
     y += card_h + HEADER_H;
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -255,13 +255,13 @@ pub(crate) unsafe fn render_vpn() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_VPN, b"VPN \xE9\x85\x8D\xE7\xBD\xAE\xE6\x96\x87\xE4\xBB\xB6", b"\xE6\x97\xA0", false, false);
     y += card_h + HEADER_H;
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -280,13 +280,13 @@ pub(crate) unsafe fn render_nfc() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_WIFI, b"NFC", b"\xE6\x9C\xAA\xE5\x90\xAF\xE7\x94\xA8", false, false);
     y += card_h + HEADER_H;
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -307,10 +307,10 @@ pub(crate) unsafe fn render_dnd() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_row(y + CARD_PAD, I_MOON, b"\xE5\x8B\xBF\xE6\x89\xB0\xE6\xA8\xA1\xE5\xBC\x8F", b"", false, false);
     ui::draw_switch(
-        DISPLAY_W as i32 - MARGIN - 48,
+        display_w() as i32 - MARGIN - 48,
         y + CARD_PAD + (ROW_H - 28) / 2,
         cfg::cfg_get_int(cfg::CONF_SOUND, b"dnd_enabled", 0) != 0,
     );
@@ -325,7 +325,7 @@ pub(crate) unsafe fn render_dnd() {
     v2[0] = b'0' + (en / 10) as u8;
     v2[1] = b'0' + (en % 10) as u8;
     let card_h2 = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     ui::draw_stepper_row(y + CARD_PAD, b"\xE5\xBC\x80\xE5\xA7\x8B\xE6\x97\xB6\xE9\x97\xB4", &v1[..2]);
     ui::draw_divider(y + CARD_PAD);
     ui::draw_stepper_row(y + CARD_PAD + ROW_H, b"\xE7\xBB\x93\xE6\x9D\x9F\xE6\x97\xB6\xE9\x97\xB4", &v2[..2]);
@@ -334,7 +334,7 @@ pub(crate) unsafe fn render_dnd() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h3 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h3, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h3, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h3 / 2),
@@ -362,13 +362,13 @@ pub(crate) unsafe fn render_perms() {
     unsafe { CONTENT_H = 0; }
     if APP_COUNT == 0 {
         let card_h = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
         ui::draw_row(y + CARD_PAD, I_INFO, b"\xE6\x97\xA0\xE5\xBA\x94\xE7\x94\xA8\xE6\xB8\x85\xE5\x8D\x95", b"", false, false);
         CONTENT_H = card_h;
         return;
     }
     let card_h = ui::card_h(APP_COUNT, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     for i in 0..APP_COUNT {
         let name = &APP_NAMES[i];
         let ln = name.iter().position(|&c| c == 0).unwrap_or(name.len());
@@ -393,7 +393,7 @@ pub(crate) unsafe fn render_perm() {
 
     if PERM_LEN == 0 {
         let card_h = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
         ui::draw_row(y + CARD_PAD, I_INFO, b"\xE6\x97\xA0\xE6\x9D\x83\xE9\x99\x90\xE5\xA3\xB0\xE6\x98\x8E", b"", false, false);
         CONTENT_H = card_h;
         return;
@@ -414,7 +414,7 @@ pub(crate) unsafe fn render_perm() {
         i = e + 1;
     }
     let card_h = ui::card_h(lines, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ri = 0;
     let mut i = 0;
     while i < PERM_LEN {
@@ -458,7 +458,7 @@ pub(crate) unsafe fn render_acct() {
     let lul = cfg::cfg_get_str(cfg::CONF_ACCT, b"local_user", b"user", &mut lu);
 
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_row(ry, I_USER, b"\xE8\xAE\xBE\xE5\xA4\x87\xE5\x90\x8D\xE7\xA7\xB0", &dn[..dnl], true, false);
     ui::draw_divider(ry);
@@ -468,14 +468,14 @@ pub(crate) unsafe fn render_acct() {
     ry += ROW_H;
     let on = cfg::cfg_get_int(cfg::CONF_ACCT, b"sync_enabled", 1) != 0;
     ui::draw_row(ry, I_SYNC, b"\xE8\xB4\xA6\xE6\x88\xB7\xE5\x90\x8C\xE6\xAD\xA5", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
     y += card_h + HEADER_H;
 
     // 云服务。
     ui::draw_group_header(y, b"\xE4\xBA\x91\xE6\x9C\x8D\xE5\x8A\xA1");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ca = [0u8; 64];
     let cal = cfg::cfg_get_str(cfg::CONF_ACCT, b"cloud_account", b"", &mut ca);
     let status: &[u8] = if cal > 0 { b"\xE5\xB7\xB2\xE7\x99\xBB\xE5\xBD\x95" } else { b"\xE6\x9C\xAA\xE7\x99\xBB\xE5\xBD\x95" };
@@ -491,7 +491,7 @@ pub(crate) unsafe fn render_cloud() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_row(ry, I_CLOUD, b"\xE7\x99\xBB\xE5\xBD\x95", b"\xE8\xBE\x93\xE5\x85\xA5\xE7\x94\xA8\xE6\x88\xB7\xE5\x90\x8D/\xE5\xAF\x86\xE7\xA0\x81", true, false);
     ui::draw_divider(ry);
@@ -501,7 +501,7 @@ pub(crate) unsafe fn render_cloud() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -531,7 +531,7 @@ pub(crate) unsafe fn render_system() {
         (b"\xE5\xAF\xBC\xE8\x88\xAA\xE6\x96\xB9\xE5\xBC\x8F", I_NAV),
     ];
     let card_h = ui::card_h(6, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon)) in rows.iter().enumerate() {
         let value: &[u8] = match i {
@@ -551,7 +551,7 @@ pub(crate) unsafe fn render_system() {
 
     // 应用管理 / 重置 / 开发者选项。
     let card_h2 = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_row(ry, I_APPS, b"\xE5\xBA\x94\xE7\x94\xA8\xE7\xAE\xA1\xE7\x90\x86", b"", true, false);
     ui::draw_divider(ry);
@@ -587,7 +587,7 @@ pub(crate) unsafe fn render_about() {
         (b"Android \xE7\x89\x88\xE6\x9C\xAC", b"-"),
     ];
     let card_h = ui::card_h(6, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, value)) in rows.iter().enumerate() {
         ui::draw_picker_row(ry, title, value, false);
@@ -609,12 +609,12 @@ pub(crate) unsafe fn render_update() {
 
     if OTA_COUNT == 0 {
         let card_h = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
         ui::draw_row(y + CARD_PAD, I_UPDATE, b"\xE5\xB7\xB2\xE6\x98\xAF\xE6\x9C\x80\xE6\x96\xB0\xE7\x89\x88\xE6\x9C\xAC", b"", false, false);
         y += card_h + HEADER_H;
     } else {
         let card_h = ui::card_h(1, false);
-        ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+        ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
         let name = &OTA_PKGS[0];
         let ln = name.iter().position(|&c| c == 0).unwrap_or(name.len());
         ui::draw_row(y + CARD_PAD, I_UPDATE, &name[..ln], b"\xE5\x8F\x91\xE7\x8E\xB0\xE6\x9B\xB4\xE6\x96\xB0\xE5\x8C\x85", false, false);
@@ -635,7 +635,7 @@ pub(crate) unsafe fn render_update() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h / 2),
@@ -660,14 +660,14 @@ pub(crate) unsafe fn render_dt() {
         (b"24 \xE5\xB0\x8F\xE6\x97\xB6\xE5\x88\xB6", I_CLOCK),
     ];
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon)) in rows.iter().enumerate() {
         match i {
             0 => {
                 let on = cfg::cfg_get_int(cfg::CONF_SYSTEM, b"auto_time", 1) != 0;
                 ui::draw_row(ry, *icon, title, b"", false, false);
-                ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+                ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
             }
             1 => {
                 let mut tz = [0u8; 32];
@@ -695,7 +695,7 @@ pub(crate) unsafe fn render_lang() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     ui::draw_radio_row(y + CARD_PAD, b"\xE7\xAE\x80\xE4\xBD\x93\xE4\xB8\xAD\xE6\x96\x87", !lang_is_en());
     ui::draw_divider(y + CARD_PAD);
     ui::draw_radio_row(y + CARD_PAD + ROW_H, b"English", lang_is_en());
@@ -703,7 +703,7 @@ pub(crate) unsafe fn render_lang() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -722,21 +722,21 @@ pub(crate) unsafe fn render_devops() {
     let mut y = LIST_TOP - s;
     unsafe { CONTENT_H = 0; }
     let card_h = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     let on = cfg::cfg_get_int(cfg::CONF_SYSTEM, b"usb_debug", 0) != 0;
     ui::draw_row(ry, I_GEAR, b"USB \xE8\xB0\x83\xE8\xAF\x95", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
     ui::draw_divider(ry);
     ry += ROW_H;
     let on2 = cfg::cfg_get_int(cfg::CONF_SYSTEM, b"oem_unlock", 0) != 0;
     ui::draw_row(ry, I_GEAR, b"OEM \xE8\xA7\xA3\xE9\x94\x81", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on2);
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on2);
     y += card_h + HEADER_H;
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -778,10 +778,10 @@ pub(crate) unsafe fn render_battery() {
         sn += 1;
     }
     let card_h = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let w = text_width_px(&vv[..bn + 2 + sn], 14.0);
     draw_text_px(
-        DISPLAY_W as i32 - MARGIN - w,
+        display_w() as i32 - MARGIN - w,
         text_top(14.0, y + card_h / 2),
         &vv[..bn + 2 + sn],
         14.0,
@@ -797,22 +797,22 @@ pub(crate) unsafe fn render_battery() {
     y += card_h + HEADER_H;
 
     let card_h2 = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     let mut ry = y + CARD_PAD;
     let on = cfg::cfg_get_int(cfg::CONF_BATTERY, b"show_percent", 1) != 0;
     ui::draw_row(ry, I_BATT, b"\xE7\x94\xB5\xE9\x87\x8F\xE7\x99\xBE\xE5\x88\x86\xE6\xAF\x94", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
     ui::draw_divider(ry);
     ry += ROW_H;
     let on2 = cfg::cfg_get_int(cfg::CONF_BATTERY, b"low_power", 0) != 0;
     ui::draw_row(ry, I_BATT, b"\xE4\xBD\x8E\xE7\x94\xB5\xE9\x87\x8F\xE6\xA8\xA1\xE5\xBC\x8F", b"", false, false);
-    ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on2);
+    ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on2);
     y += card_h2 + HEADER_H;
 
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h3 = ui::card_h(2, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h3, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h3, CARD_R);
     let ry = y + CARD_PAD;
     draw_text_px(
         MARGIN + 8,
@@ -894,7 +894,7 @@ pub(crate) unsafe fn render_storage() {
 
     // 总/已用/剩余。
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     ui::draw_picker_row(ry, b"\xE6\x80\xBB\xE7\xA9\xBA\xE9\x97\xB4", &tbuf[..tl], false);
     ui::draw_divider(ry);
@@ -909,7 +909,7 @@ pub(crate) unsafe fn render_storage() {
     let mut num = [0u8; 12];
     let bn = fmt_dec(&mut num, pct as u32);
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 4,
         text_top(font_px(), y + card_h2 / 2),
@@ -921,9 +921,9 @@ pub(crate) unsafe fn render_storage() {
     vv[..bn].copy_from_slice(&num[..bn]);
     vv[bn] = b'%';
     let w = text_width_px(&vv[..bn + 1], 14.0);
-    draw_text_px(DISPLAY_W as i32 - MARGIN - w, text_top(14.0, y + card_h2 / 2), &vv[..bn + 1], 14.0, C_SUB);
+    draw_text_px(display_w() as i32 - MARGIN - w, text_top(14.0, y + card_h2 / 2), &vv[..bn + 1], 14.0, C_SUB);
     let bx = MARGIN + 8;
-    let bw = CARD_W - 16;
+    let bw = card_w() - 16;
     let by = y + card_h2 - 18;
     let track = if dark_on() { T_SW_OFF_D } else { T_SW_OFF_L };
     fill_round_rect(bx, by, bw, 8, 4, track);
@@ -934,7 +934,7 @@ pub(crate) unsafe fn render_storage() {
     ui::draw_group_header(y, b"\xE7\xBC\x93\xE5\xAD\x98");
     y += HEADER_H;
     let card_h3 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h3, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h3, CARD_R);
     ui::draw_row(y + CARD_PAD, I_RESET, b"\xE6\xB8\x85\xE9\x99\xA4\xE7\xBC\x93\xE5\xAD\x98", b"", true, false);
     y += card_h3 + HEADER_H;
     unsafe { CONTENT_H = y - LIST_TOP; }
@@ -955,12 +955,12 @@ pub(crate) unsafe fn render_access() {
         (b"\xE9\xAB\x98\xE5\xAF\xB9\xE6\xAF\x94\xE5\xBA\xA6", I_EYE, b"high_contrast"),
     ];
     let card_h = ui::card_h(3, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h, CARD_R);
     let mut ry = y + CARD_PAD;
     for (i, (title, icon, key)) in rows.iter().enumerate() {
         let on = cfg::cfg_get_int(cfg::CONF_ACCESS, key, 0) != 0;
         ui::draw_row(ry, *icon, title, b"", false, false);
-        ui::draw_switch(DISPLAY_W as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
+        ui::draw_switch(display_w() as i32 - MARGIN - 48, ry + (ROW_H - 28) / 2, on);
         if i + 1 < 3 {
             ui::draw_divider(ry);
         }
@@ -970,7 +970,7 @@ pub(crate) unsafe fn render_access() {
     ui::draw_group_header(y, b"\xE8\xAF\xB4\xE6\x98\x8E");
     y += HEADER_H;
     let card_h2 = ui::card_h(1, false);
-    ui::draw_glass(MARGIN, y, CARD_W, card_h2, CARD_R);
+    ui::draw_glass(MARGIN, y, card_w(), card_h2, CARD_R);
     draw_text_px(
         MARGIN + 8,
         text_top(13.0, y + card_h2 / 2),
@@ -1194,7 +1194,7 @@ unsafe fn tap_dnd(x: i32, y: i32) -> crate::pages::TapEffect {
         let r = (dy / ROW_H) as usize;
         let key: &[u8] = if r == 0 { b"dnd_start" } else { b"dnd_end" };
         // 步进：左侧 -，右侧 +。
-        let bx = DISPLAY_W as i32 - MARGIN - 150;
+        let bx = display_w() as i32 - MARGIN - 150;
         let val = cfg::cfg_get_int(cfg::CONF_SOUND, key, 22);
         let new: i32 = if x < bx + 46 {
             if val > 0 { val - 1 } else { 23 }

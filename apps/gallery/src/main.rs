@@ -117,7 +117,7 @@ fn zoom_open(idx: u32, now: u64) {
             fh: TILE_H,
             tx: VIEW_X,
             ty: VIEW_Y,
-            tw: DISPLAY_W as i32 - VIEW_X * 2,
+            tw: display_w() as i32 - VIEW_X * 2,
             th: VIEW_H,
         };
     }
@@ -209,7 +209,7 @@ fn render_grid() {
         let c = (i as i32) % COLS;
         let x = GRID_X + c * (TILE_W + GAP);
         let y = GRID_Y + r * (TILE_H + GAP);
-        if y + TILE_H > DISPLAY_H as i32 {
+        if y + TILE_H > display_h() as i32 {
             break;
         }
         // 照片网格单元容器 → 液态玻璃面板（照片内容原样画在其上）
@@ -222,7 +222,7 @@ fn render_grid() {
 fn render_view(idx: u32) {
     draw_gradient_bg(C_BG, glass_dark());
     // 标题栏：返回 + 序号（液态玻璃）
-    draw_glass(0, 0, DISPLAY_W as i32, TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TITLE_H, 0);
     let bs = BACK_SZ - 8;
     draw_glass(BACK_X, BACK_Y, bs, bs, 10);
     draw_text(BACK_X + 10, BACK_Y + 10, b"<", C_TEXT);
@@ -238,12 +238,12 @@ fn render_view(idx: u32) {
     }
 
     // 大图（上下留边）：液态玻璃面板容器 + 照片内容原样
-    draw_glass(VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H, 24);
-    draw_photo(VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H, idx);
+    draw_glass(VIEW_X, VIEW_Y, display_w() as i32 - VIEW_X * 2, VIEW_H, 24);
+    draw_photo(VIEW_X, VIEW_Y, display_w() as i32 - VIEW_X * 2, VIEW_H, idx);
 
     // 上一张 / 下一张（液态玻璃按钮）
     draw_glass_button(30, 700, 96, 44, "上一张".as_bytes(), false);
-    draw_glass_button(DISPLAY_W as i32 - 30 - 96, 700, 96, 44, "下一张".as_bytes(), false);
+    draw_glass_button(display_w() as i32 - 30 - 96, 700, 96, 44, "下一张".as_bytes(), false);
 
     // 底部提示
     let mut hint = [0u8; 32];
@@ -259,7 +259,7 @@ fn render_view(idx: u32) {
         hint[hn..hn + tail.len()].copy_from_slice(tail);
         hn += tail.len();
     }
-    draw_text(16, DISPLAY_H as i32 - 60, &hint[..hn], C_DIM);
+    draw_text(16, display_h() as i32 - 60, &hint[..hn], C_DIM);
 
     draw_sys_nav();
 }
@@ -330,6 +330,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -349,7 +350,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                 for i in 0..PHOTO_COUNT {
                     let (tx, ty) = tile_rect(i as i32);
                     // 与 render_grid 一致：超出屏幕下缘的瓦片不参与命中。
-                    if ty + TILE_H > DISPLAY_H as i32 {
+                    if ty + TILE_H > display_h() as i32 {
                         break;
                     }
                     if x >= tx && x < tx + TILE_W && y >= ty && y < ty + TILE_H {
@@ -369,7 +370,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                     let (cx, cy, cw, ch) = if unsafe { ZOOM.active } {
                         zoom_rect()
                     } else {
-                        (VIEW_X, VIEW_Y, DISPLAY_W as i32 - VIEW_X * 2, VIEW_H)
+                        (VIEW_X, VIEW_Y, display_w() as i32 - VIEW_X * 2, VIEW_H)
                     };
                     zoom_close(viewing, now, cx, cy, cw, ch);
                     unsafe { VIEWING = u32::MAX; }
@@ -381,7 +382,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
                     } else {
                         show_error("已是第一张".as_bytes());
                     }
-                } else if x >= DISPLAY_W as i32 - 126 && x < DISPLAY_W as i32 - 30 && y >= 700 && y < 744 {
+                } else if x >= display_w() as i32 - 126 && x < display_w() as i32 - 30 && y >= 700 && y < 744 {
                     if viewing + 1 < PHOTO_COUNT {
                         unsafe { VIEWING += 1; }
                         dirty = true;

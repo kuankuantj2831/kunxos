@@ -94,8 +94,8 @@ pub fn ds_text_px(x: i32, y: i32, s: &[u8], px: f32, color: u32) {
                     if a != 0 {
                         let px_ = gx + col as i32;
                         let py_ = gy + row as i32;
-                        if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32 {
-                            let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                        if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                            let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                             put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                         }
                     }
@@ -141,8 +141,8 @@ pub fn ds_text_px_bold(x: i32, y: i32, s: &[u8], px: f32, color: u32) {
                     if a != 0 {
                         let px_ = gx + col as i32;
                         let py_ = gy + row as i32;
-                        if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32 {
-                            let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                        if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                            let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                             put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                         }
                     }
@@ -170,16 +170,16 @@ pub fn ds_title_text(x: i32, y: i32, s: &[u8], color: u32) {
 
 /// 绘制 56px 液态玻璃导航栏：模糊背景 + 可选玻璃返回键 + 居中标题 + 底部高光描边。
 pub fn ds_nav_bar(title: &[u8], back: bool) {
-    draw_glass(0, 0, DISPLAY_W as i32, NAV_H, 0);
+    draw_glass(0, 0, display_w() as i32, NAV_H, 0);
     if back {
         draw_glass(8, (NAV_H - ICON_SZ - 8) / 2, ICON_SZ + 8, ICON_SZ + 8, 12);
         ds_icon(Icon::Back, 16, (NAV_H - ICON_SZ) / 2, ICON_SZ, C_ACCENT);
         let tw = ds_text_width_px_bold(title, 17.0);
-        let tx = (DISPLAY_W as i32 - tw) / 2;
+        let tx = (display_w() as i32 - tw) / 2;
         ds_title_text(tx, (NAV_H - 20) / 2, title, ds_text());
     } else {
         let tw = ds_text_width_px_bold(title, 17.0);
-        let tx = (DISPLAY_W as i32 - tw) / 2;
+        let tx = (display_w() as i32 - tw) / 2;
         ds_title_text(tx, (NAV_H - 20) / 2, title, ds_text());
     }
 }
@@ -228,12 +228,12 @@ pub fn ds_cell_sep(_x: i32, _y: i32, _w: i32) {}
 
 /// 绘制空状态：居中 64px 图标 + 下方 17px 说明文字（#8E8E93）。
 pub fn ds_empty_state(ic: Icon, text: &[u8]) {
-    let cx = (DISPLAY_W as i32 - EMPTY_ICON_SZ) / 2;
-    let cy = (DISPLAY_H as i32 - EMPTY_ICON_SZ) / 2 - 40;
+    let cx = (display_w() as i32 - EMPTY_ICON_SZ) / 2;
+    let cy = (display_h() as i32 - EMPTY_ICON_SZ) / 2 - 40;
     ds_icon(ic, cx, cy, EMPTY_ICON_SZ, C_DIM);
     let tw = ds_text_width_px(text, EMPTY_TEXT_PX);
     ds_text_px(
-        (DISPLAY_W as i32 - tw) / 2,
+        (display_w() as i32 - tw) / 2,
         cy + EMPTY_ICON_SZ + 18,
         text,
         EMPTY_TEXT_PX,

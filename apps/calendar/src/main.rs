@@ -239,7 +239,7 @@ fn render_month() {
         let c = idx % 7;
         let x = GRID_X + c * (CELL_W + CELL_GAP);
         let y = GRID_Y + r * (CELL_H + CELL_GAP);
-        if y + CELL_H > DISPLAY_H as i32 {
+        if y + CELL_H > display_h() as i32 {
             break;
         }
         let is_today = cy == today.0 && cm == today.1 && d == today.2 as u32;
@@ -262,12 +262,12 @@ fn render_month() {
     // 同步状态提示
     unsafe {
         if SYNC_MSG_LEN > 0 {
-            draw_text(16, DISPLAY_H as i32 - 100, &SYNC_MSG[..SYNC_MSG_LEN], C_DIM);
+            draw_text(16, display_h() as i32 - 100, &SYNC_MSG[..SYNC_MSG_LEN], C_DIM);
         }
         if SYNC_BUSY {
-            draw_text(16, DISPLAY_H as i32 - 76, "同步中...".as_bytes(), C_WARN);
+            draw_text(16, display_h() as i32 - 76, "同步中...".as_bytes(), C_WARN);
         } else {
-            draw_text(16, DISPLAY_H as i32 - 76, "点日期看详情 | 新建 | 同步".as_bytes(), C_DIM);
+            draw_text(16, display_h() as i32 - 76, "点日期看详情 | 新建 | 同步".as_bytes(), C_DIM);
         }
     }
     draw_sys_nav();
@@ -301,7 +301,7 @@ fn render_day() {
     }
     for i in 0..cnt.min(12) {
         let y = 90 + i as i32 * 62;
-        draw_glass(12, y, DISPLAY_W as i32 - 24, 54, 14);
+        draw_glass(12, y, display_w() as i32 - 24, 54, 14);
         // 按 NUL 截断（160B 数组的填充区会让 utf8_next 产出 cp=0 notdef 字形）。
         let sl = sums[i]
             .iter()
@@ -686,6 +686,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }

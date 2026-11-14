@@ -37,7 +37,7 @@ ALARMD    := $(KUNXSERV)/alarmd
 RILD      := $(KUNXSERV)/rild
 WIFID     := $(KUNXSERV)/wifid
 # 用户态应用共享源码（经 #[path] 引入；任一变化都需重编所有应用）。
-SHARED_SRC := $(TOPDIR)/shared/ttf_text.rs $(TOPDIR)/shared/font_render.rs $(TOPDIR)/shared/display.rs \
+SHARED_SRC := $(TOPDIR)/shared/ttf_text.rs $(TOPDIR)/shared/font_render.rs $(TOPDIR)/shared/display.rs $(TOPDIR)/shared/pixel_buffer.rs \
               $(TOPDIR)/shared/icons.rs \
               $(TOPDIR)/shared/nav.rs $(TOPDIR)/shared/app_kit.rs $(TOPDIR)/shared/error_ui.rs \
               $(TOPDIR)/shared/cursor_overlay.rs $(TOPDIR)/shared/ds.rs \

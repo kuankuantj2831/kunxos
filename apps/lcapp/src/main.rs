@@ -272,6 +272,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     loop {
         let ev = poll_input();
+        if ev.resized { render(); flip(); }
         if ev.moved {
             cursor_overlay_move();
         }

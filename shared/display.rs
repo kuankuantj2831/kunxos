@@ -3,10 +3,17 @@
 //! A timer deadline is a pacing target, never a claim that scanout has VSYNC.
 
 pub const INFO_IOCTL: usize = 0x4604;
+/// Opt-in clients commit the latest host request between frames, then reread INFO.
+pub const RESIZE_IOCTL: usize = 0x4605;
+pub const MAX_WIDTH: usize = 1920;
+pub const MAX_HEIGHT: usize = 1200;
+pub const MAX_PIXELS: usize = MAX_WIDTH * MAX_HEIGHT;
 pub const INFO_VERSION: u32 = 1;
 pub const INFO_BYTES: usize = 40;
 pub const CAP_VSYNC: u32 = 1;
 pub const CAP_RESIZE: u32 = 2;
+/// The host draws an independent pointer; applications must suppress software sprites.
+pub const CAP_HOST_CURSOR: u32 = 4;
 pub const DEFAULT_REFRESH_MHZ: u32 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +104,12 @@ impl FrameClock {
             self.epoch = start;
             self.slot = 1;
             self.initialized = true;
+        } else {
+            let previous = self.epoch.saturating_add(self.slot.saturating_mul(1_000_000_000) / rate as u64);
+            if start >= previous {
+                self.slot = (self.slot + 1).max(start.saturating_sub(self.epoch).saturating_mul(rate as u64)
+                    / 1_000_000_000 + 1);
+            }
         }
         let deadline = self.epoch.saturating_add(self.slot.saturating_mul(1_000_000_000) / rate as u64);
         if end >= deadline {
@@ -104,7 +117,6 @@ impl FrameClock {
                 / 1_000_000_000 + 1;
             return 0;
         }
-        self.slot += 1;
         deadline - end
     }
 }
@@ -213,5 +225,12 @@ mod tests {
         let mut clock = FrameClock::new();
         for start in 0..100 { clock.wait_us(start, start + 1, 60_000); clock.reset(); }
         assert_eq!(clock.wait_us(100, 101, 60_000), 16665);
+    }
+    #[test] fn early_input_wakeup_keeps_the_same_deadline() {
+        let mut clock = FrameClock::new();
+        assert_eq!(clock.wait_us(0, 1000, 60_000), 15666);
+        // Input wakes the frame sleep at 2000us, before its deadline.
+        assert_eq!(clock.wait_us(2000, 3000, 60_000), 13666);
+        assert_eq!(clock.wait_us(16666, 17000, 60_000), 16333);
     }
 }

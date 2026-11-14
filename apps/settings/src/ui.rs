@@ -249,8 +249,8 @@ pub(crate) static ICONS: [IconDef; 32] = [
 struct SettingsGlass;
 impl GlassTarget for SettingsGlass {
     fn backdrop(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -324,16 +324,16 @@ pub(crate) fn draw_gradient_bg() {
         cg.saturating_sub(sink),
         cb.saturating_sub(sink),
     );
-    for y in 0..DISPLAY_H as i32 {
-        let t = (y as u32 * 255 / DISPLAY_H as u32).min(255);
+    for y in 0..display_h() as i32 {
+        let t = (y as u32 * 255 / display_h() as u32).min(255);
         let inv = 255 - t;
         let r = (tr * inv + br * t) / 255;
         let g = (tg * inv + bg_ * t) / 255;
         let b = (tb * inv + bb * t) / 255;
         let row = (r << 16) | (g << 8) | b;
-        let iy = y as usize * DISPLAY_W;
+        let iy = y as usize * display_w();
         unsafe {
-            for x in 0..DISPLAY_W {
+            for x in 0..display_w() {
                 BACK_BUF[iy + x] = row;
             }
         }
@@ -343,7 +343,7 @@ pub(crate) fn draw_gradient_bg() {
 // ==================== 标题栏 ====================
 
 pub(crate) fn draw_title_bar(title: &[u8]) {
-    draw_glass(0, 0, DISPLAY_W as i32, TOP_TITLE_H, 0);
+    draw_glass(0, 0, display_w() as i32, TOP_TITLE_H, 0);
     // 返回箭头：Phosphor caret-left 矢量字形（点阵兜底见 draw_bits）。
     if !draw_icon_glyph_centered(
         TOP_BACK_X + TOP_BACK_SZ / 2,
@@ -356,7 +356,7 @@ pub(crate) fn draw_title_bar(title: &[u8]) {
     }
     let px = 16.0;
     let tw = text_width_px_bold(title, px);
-    let tx = (DISPLAY_W as i32 - tw) / 2;
+    let tx = (display_w() as i32 - tw) / 2;
     draw_text_bold_px(tx, text_top(px, TOP_TITLE_H / 2), title, px, c_text());
 }
 
@@ -406,11 +406,11 @@ pub(crate) fn draw_arrow(x: i32, cy: i32) {
 }
 
 pub(crate) fn draw_divider(y: i32) {
-    fill_rect(60, y + ROW_H - 1, DISPLAY_W as i32 - MARGIN - 60, 1, c_div());
+    fill_rect(60, y + ROW_H - 1, display_w() as i32 - MARGIN - 60, 1, c_div());
 }
 
 pub(crate) fn draw_separator(y: i32) {
-    fill_rect(24, y, DISPLAY_W as i32 - 24 - MARGIN, 1, c_div());
+    fill_rect(24, y, display_w() as i32 - 24 - MARGIN, 1, c_div());
 }
 
 pub(crate) fn draw_group_header(y: i32, title: &[u8]) {
@@ -440,18 +440,18 @@ pub(crate) fn draw_row(y: i32, icon: usize, title: &[u8], value: &[u8], arrow: b
     draw_text_px(MARGIN + ICON_SZ + 12, text_top(px, y + ROW_H / 2), title, px, c_text());
     if sw {
         // 开关状态由调用方在渲染前确定；此函数仅按 开 绘制。
-        draw_switch(DISPLAY_W as i32 - MARGIN - 48, y + (ROW_H - 28) / 2, true);
+        draw_switch(display_w() as i32 - MARGIN - 48, y + (ROW_H - 28) / 2, true);
     } else if arrow {
         let w = text_width_px(value, 14.0);
-        let right = DISPLAY_W as i32 - MARGIN - 26;
+        let right = display_w() as i32 - MARGIN - 26;
         if w > 0 {
             draw_text_px(right - w, text_top(14.0, y + ROW_H / 2), value, 14.0, C_SUB);
         }
-        draw_arrow(DISPLAY_W as i32 - MARGIN - 16, y + ROW_H / 2);
+        draw_arrow(display_w() as i32 - MARGIN - 16, y + ROW_H / 2);
     } else if !value.is_empty() {
         let w = text_width_px(value, 14.0);
         draw_text_px(
-            DISPLAY_W as i32 - MARGIN - w,
+            display_w() as i32 - MARGIN - w,
             text_top(14.0, y + ROW_H / 2),
             value,
             14.0,
@@ -466,15 +466,15 @@ pub(crate) fn draw_picker_row(y: i32, title: &[u8], value: &[u8], arrow: bool) {
     draw_text_px(MARGIN + 4, text_top(px, y + ROW_H / 2), title, px, c_text());
     if arrow {
         let w = text_width_px(value, 14.0);
-        let right = DISPLAY_W as i32 - MARGIN - 26;
+        let right = display_w() as i32 - MARGIN - 26;
         if w > 0 {
             draw_text_px(right - w, text_top(14.0, y + ROW_H / 2), value, 14.0, C_SUB);
         }
-        draw_arrow(DISPLAY_W as i32 - MARGIN - 16, y + ROW_H / 2);
+        draw_arrow(display_w() as i32 - MARGIN - 16, y + ROW_H / 2);
     } else if !value.is_empty() {
         let w = text_width_px(value, 14.0);
         draw_text_px(
-            DISPLAY_W as i32 - MARGIN - w,
+            display_w() as i32 - MARGIN - w,
             text_top(14.0, y + ROW_H / 2),
             value,
             14.0,
@@ -488,11 +488,11 @@ pub(crate) fn draw_radio_row(y: i32, title: &[u8], selected: bool) {
     let px = font_px();
     draw_text_px(24, text_top(px, y + ROW_H / 2), title, px, c_text());
     if selected {
-        fill_circle(DISPLAY_W as i32 - MARGIN - 20, y + ROW_H / 2, 11, C_PRIMARY);
-        fill_circle(DISPLAY_W as i32 - MARGIN - 20, y + ROW_H / 2, 4, C_WHITE);
+        fill_circle(display_w() as i32 - MARGIN - 20, y + ROW_H / 2, 11, C_PRIMARY);
+        fill_circle(display_w() as i32 - MARGIN - 20, y + ROW_H / 2, 4, C_WHITE);
     } else {
-        fill_circle(DISPLAY_W as i32 - MARGIN - 20, y + ROW_H / 2, 11, c_field());
-        fill_circle(DISPLAY_W as i32 - MARGIN - 20, y + ROW_H / 2, 8, c_card());
+        fill_circle(display_w() as i32 - MARGIN - 20, y + ROW_H / 2, 11, c_field());
+        fill_circle(display_w() as i32 - MARGIN - 20, y + ROW_H / 2, 8, c_card());
     }
 }
 
@@ -500,7 +500,7 @@ pub(crate) fn draw_radio_row(y: i32, title: &[u8], selected: bool) {
 pub(crate) fn draw_stepper_row(y: i32, title: &[u8], value: &[u8]) {
     let px = font_px();
     draw_text_px(24, text_top(px, y + ROW_H / 2), title, px, c_text());
-    let bx = DISPLAY_W as i32 - MARGIN - 150;
+    let bx = display_w() as i32 - MARGIN - 150;
     draw_glass(bx, y + (ROW_H - 40) / 2, 40, 40, 20);
     draw_text_px(bx + 11, text_top(22.0, y + ROW_H / 2), b"-", 22.0, c_text());
     let bx2 = bx + 46;
@@ -515,11 +515,11 @@ pub(crate) fn draw_stepper_row(y: i32, title: &[u8], value: &[u8]) {
 
 pub(crate) fn draw_button(y: i32, label: &[u8], primary: bool) {
     let st = if primary { &STYLE_ACCENT } else { &STYLE_DANGER };
-    draw_glass_style(MARGIN, y, CARD_W, BTN_H, BTN_R, st);
+    draw_glass_style(MARGIN, y, card_w(), BTN_H, BTN_R, st);
     let px = font_px();
     let w = text_width_px(label, px);
     draw_text_px(
-        MARGIN + (CARD_W - w) / 2,
+        MARGIN + (card_w() - w) / 2,
         text_top(px, y + BTN_H / 2),
         label,
         px,
@@ -529,11 +529,11 @@ pub(crate) fn draw_button(y: i32, label: &[u8], primary: bool) {
 
 /// 普通玻璃按钮（返回/取消等）。
 pub(crate) fn draw_button_plain(y: i32, label: &[u8]) {
-    draw_glass(MARGIN, y, CARD_W, BTN_H, BTN_R);
+    draw_glass(MARGIN, y, card_w(), BTN_H, BTN_R);
     let px = font_px();
     let w = text_width_px(label, px);
     draw_text_px(
-        MARGIN + (CARD_W - w) / 2,
+        MARGIN + (card_w() - w) / 2,
         text_top(px, y + BTN_H / 2),
         label,
         px,
@@ -544,7 +544,7 @@ pub(crate) fn draw_button_plain(y: i32, label: &[u8]) {
 // ==================== 滑块 ====================
 
 pub(crate) fn slider_x() -> i32 {
-    DISPLAY_W as i32 / 2 - 120
+    display_w() as i32 / 2 - 120
 }
 
 pub(crate) fn draw_slider(x: i32, y: i32, val: i32) {

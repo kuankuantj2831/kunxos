@@ -1448,7 +1448,7 @@ fn render_lock() {
     draw_center(392, "输入云服务账号后可在服务器解除".as_bytes(), C_DIM);
     // 解锁按钮
     let bw = 200i32;
-    let bx = (DISPLAY_W as i32 - bw) / 2;
+    let bx = (display_w() as i32 - bw) / 2;
     let by = 460i32;
     let bh = 64i32;
     draw_glass_style(bx, by, bw, bh, (bh * 25 / 100).min(16), &STYLE_ACCENT);
@@ -1567,7 +1567,7 @@ fn append_file(path: &str, data: &[u8]) -> bool {
 
 fn unlock_hit(x: i32, y: i32) -> bool {
     let bw = 200i32;
-    let bx = (DISPLAY_W as i32 - bw) / 2;
+    let bx = (display_w() as i32 - bw) / 2;
     let by = 460i32;
     let bh = 64i32;
     x >= bx && x < bx + bw && y >= by && y < by + bh
@@ -1676,6 +1676,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     loop {
         let pr = poll_input();
+        if pr.resized { render(); flip(); cursor_overlay_redraw(); }
         // 长按解锁：按住 ≥2s 每帧检测（无需抬起）。
         unlock_hold_check();
         let tap = pr.tap;

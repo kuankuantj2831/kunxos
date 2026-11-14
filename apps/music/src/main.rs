@@ -88,10 +88,10 @@ fn render() {
     let track = &TRACKS[idx];
 
     // 当前播放卡片（液态玻璃面板）
-    draw_glass(24, 56, DISPLAY_W as i32 - 48, 408, 24);
+    draw_glass(24, 56, display_w() as i32 - 48, 408, 24);
 
     // 封面
-    let cover_x = (DISPLAY_W as i32 - 300) / 2;
+    let cover_x = (display_w() as i32 - 300) / 2;
     draw_cover(cover_x, 80, 300, track.color);
     // 音符装饰
 
@@ -109,7 +109,7 @@ fn render() {
 
     // 进度条
     let bar_x = 60;
-    let bar_w = DISPLAY_W as i32 - 120;
+    let bar_w = display_w() as i32 - 120;
     let pos = unsafe { POS_SEC };
     let frac = pos.min(TRACK_LEN_SEC) as i32 * bar_w / TRACK_LEN_SEC as i32;
     // 进度轨道：液态玻璃，进度条与时间文本照旧画在玻璃之上
@@ -140,7 +140,7 @@ fn render() {
     for (i, tr) in TRACKS.iter().enumerate() {
         let y = 710 + i as i32 * 44;
         // 歌曲行：液态玻璃面板，指示点 / 文字照旧画在玻璃之上
-        draw_glass(16, y, DISPLAY_W as i32 - 32, 44, 11);
+        draw_glass(16, y, display_w() as i32 - 32, 44, 11);
         if i == idx {
             draw_disc(32, y + 12, 4, C_ACCENT);
         }
@@ -211,6 +211,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }

@@ -163,7 +163,7 @@ fn draw_sensor_panel() {
     let mut y = MAP_BOTTOM + 8;
 
     // 面板底：玻璃面板。
-    let w = DISPLAY_W as i32 - 24;
+    let w = display_w() as i32 - 24;
     let h = 132;
     draw_glass(x, y - 6, w, h, 12);
 
@@ -187,7 +187,7 @@ fn draw_sensor_panel() {
     push_text(&mut line2, &mut i2, "方向 ".as_bytes());
     line2[i2..i2 + oname.len()].copy_from_slice(oname);
     i2 += oname.len();
-    draw_text(x + DISPLAY_W as i32 / 2 - 40, y, &line2[..i2], C_ACCENT);
+    draw_text(x + display_w() as i32 / 2 - 40, y, &line2[..i2], C_ACCENT);
     y += 24;
 
     // 步数 + 抬腕。
@@ -298,7 +298,7 @@ fn render() {
     while r < MAP_BOTTOM {
         let mut c = 0;
         let mut col = 0;
-        while c < DISPLAY_W as i32 {
+        while c < display_w() as i32 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             let v = (seed >> 24) & 0xF;
             let color = match v {
@@ -307,7 +307,7 @@ fn render() {
                 11 => C_RIVER,
                 _ => C_BLOCK,
             };
-            let bw = zoom.saturating_sub(4).min(DISPLAY_W as i32 - c);
+            let bw = zoom.saturating_sub(4).min(display_w() as i32 - c);
             let bh = zoom.saturating_sub(4).min(MAP_BOTTOM - r);
             fill_rect(c + 2, r + 2, bw.saturating_sub(4), bh.saturating_sub(4), color);
             // 河流贯穿
@@ -318,18 +318,18 @@ fn render() {
             col += 1;
         }
         // 道路横线
-        fill_rect(0, r + zoom - 2, DISPLAY_W as i32, 4, C_ROAD);
+        fill_rect(0, r + zoom - 2, display_w() as i32, 4, C_ROAD);
         r += zoom;
     }
     // 道路竖线（在块之上）
     let mut c = zoom;
-    while c < DISPLAY_W as i32 {
+    while c < display_w() as i32 {
         fill_rect(c - 2, MAP_TOP, 4, MAP_BOTTOM - MAP_TOP, C_ROAD);
         c += zoom;
     }
 
     // 定位标记（中心）：红色标记上的白色圆心（彩色表面白点保留）。
-    let cx = (DISPLAY_W / 2) as i32;
+    let cx = (display_w() / 2) as i32;
     let cy = ((MAP_TOP + MAP_BOTTOM) / 2) as i32;
     draw_disc(cx, cy, 8, C_MARKER);
     draw_circle(cx, cy, 14, C_MARKER);
@@ -339,14 +339,14 @@ fn render() {
     draw_compass(unsafe { SENSOR_HEADING });
 
     // 缩放按钮
-    draw_btn(DISPLAY_W as i32 - 64, 64, "+");
-    draw_btn(DISPLAY_W as i32 - 64, 116, "-");
+    draw_btn(display_w() as i32 - 64, 64, "+");
+    draw_btn(display_w() as i32 - 64, 116, "-");
 
     // 底部传感器面板（航向 / 方向 / 步数 / 抬腕 / GPS 定位）
     draw_sensor_panel();
 
     // 底部标签
-    draw_text(16, DISPLAY_H as i32 - 40, "KunxOS 地图（传感器融合演示）".as_bytes(), C_DIM);
+    draw_text(16, display_h() as i32 - 40, "KunxOS 地图（传感器融合演示）".as_bytes(), C_DIM);
 
     draw_sys_nav();
 }
@@ -372,6 +372,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut dirty = true;
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -389,7 +390,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 break;
             }
             // 缩放（到达边界时给出提示，此前点击无任何反馈）
-            if x >= DISPLAY_W as i32 - 64 && x < DISPLAY_W as i32 - 20 && y >= 64 && y < 104 {
+            if x >= display_w() as i32 - 64 && x < display_w() as i32 - 20 && y >= 64 && y < 104 {
                 let z = unsafe { ZOOM };
                 if z < 90 {
                     unsafe { ZOOM = z + 10; }
@@ -397,7 +398,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 } else {
                     show_error("已达最大缩放".as_bytes());
                 }
-            } else if x >= DISPLAY_W as i32 - 64 && x < DISPLAY_W as i32 - 20 && y >= 116 && y < 156 {
+            } else if x >= display_w() as i32 - 64 && x < display_w() as i32 - 20 && y >= 116 && y < 156 {
                 let z = unsafe { ZOOM };
                 if z > 30 {
                     unsafe { ZOOM = z - 10; }

@@ -411,10 +411,10 @@ fn draw_glyph(x: i32, baseline: i32, cp: u32, px: f32, color: u32, bold: bool, c
             if px_ < ctx.clip_x || px_ >= ctx.clip_x + ctx.clip_w {
                 continue;
             }
-            let bg = unsafe { crate::kit::BACK_BUF[py as usize * crate::kit::DISPLAY_W + px_ as usize] };
+            let bg = unsafe { crate::kit::BACK_BUF[py as usize * crate::kit::display_w() + px_ as usize] };
             put_pixel(px_, py, font_render::blend(bg, color, a));
             if bold && px_ + 1 < ctx.clip_x + ctx.clip_w {
-                let bg2 = unsafe { crate::kit::BACK_BUF[py as usize * crate::kit::DISPLAY_W + (px_ + 1) as usize] };
+                let bg2 = unsafe { crate::kit::BACK_BUF[py as usize * crate::kit::display_w() + (px_ + 1) as usize] };
                 put_pixel(px_ + 1, py, font_render::blend(bg2, color, a));
             }
         }

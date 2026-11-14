@@ -261,7 +261,7 @@ static mut FB_STRIDE: u32 = 0;
 pub fn fb_init(base: usize, len: usize, w: u32, h: u32, stride: u32) {
     unsafe {
         FB_BASE = base;
-        FB_LEN = len;
+        FB_LEN = len.max(crate::gpu_simple::backing_len());
         FB_W = w;
         FB_H = h;
         FB_STRIDE = stride;
@@ -315,6 +315,7 @@ fn fb_write(_minor: u32, buf: &[u8]) -> i32 {
 
 /// /dev/fb0：返回可变屏幕信息（24 字节，与 launcher 约定布局一致）。
 fn fb_ioctl(_minor: u32, request: u32, out: &mut [u8]) -> i32 {
+    if request == 0x4605 { return crate::gpu_simple::commit_resize(); }
     if request == FBIO_DISPLAY_INFO {
         let info = crate::gpu_simple::display_metrics().encode();
         if out.len() < info.len() { return -22; }

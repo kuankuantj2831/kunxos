@@ -49,7 +49,10 @@ static mut LIFD_READY: bool = false;
 /// 后台化原因（RECENTS 时返回动画结束后打开最近任务面板）。
 static mut BG_RECENTS: bool = false;
 /// 应用末帧快照（背景化时保存；恢复时回填 fb0 并作为 Resume 动画源）。
-static mut APP_SNAP: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut APP_SNAP: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
+pub fn resize_buffers() {
+    unsafe { APP_SNAP.resize_len(screen_pixels()); }
+}
 static mut SNAP_VALID: bool = false;
 /// launcher 自身 pid（写命令信箱用）。
 static mut SELF_PID: isize = -1;
@@ -120,6 +123,11 @@ pub fn launch_complete(app_idx: usize, pid: isize) {
         let mut status = 0i32;
         let r = waitpid_nohang(pid, &mut status);
         if r == pid {
+            // A fast app can exit while the placeholder/foreground handoff runs.
+            // Release foreground ownership before starting its return animation.
+            APP_STATE = ST_NONE;
+            APP_PID = -1;
+            SNAP_VALID = false;
             handle_app_exit(app_idx, pid, status);
         } else if r < 0 {
             // 子进程已被事件路径收走：按退出处理回到桌面
@@ -412,14 +420,14 @@ pub fn resume_app_at(app_idx: usize, anchor: Option<(i32, i32)>) -> bool {
             return true;
         }
         // 快照 → FRAME_BUF（Resume 动画缩放源）
-        core::ptr::copy_nonoverlapping(APP_SNAP.as_ptr(), frame_buf_ref(), DISPLAY_W * DISPLAY_H);
+        core::ptr::copy_nonoverlapping(APP_SNAP.as_ptr(), frame_buf_ref(), display_w() * display_h());
         // 动画起点：锚点（最近任务卡片）优先，否则图标原位放大到全屏
         // （与启动动画方向一致，源为应用快照）
         let (cx, cy) = anchor.unwrap_or_else(|| icon_center(app_idx));
         let need = cx
-            .max(DISPLAY_W as i32 - cx)
+            .max(display_w() as i32 - cx)
             .max(cy)
-            .max(DISPLAY_H as i32 - cy);
+            .max(display_h() as i32 - cy);
         let cover_px = (need * 2 + 16) as u32;
         let target = (cover_px * SCALE_1 / ICON_SIZE as u32).max(SCALE_1 + 1);
         let m = &mut MOTION;
@@ -575,12 +583,12 @@ pub fn snapshot_frame() {
         if FB.is_null() {
             return;
         }
-        let w = FB_W.min(DISPLAY_W);
-        let h = FB_H.min(DISPLAY_H);
+        let w = FB_W.min(display_w());
+        let h = FB_H.min(display_h());
         for y in 0..h {
             core::ptr::copy_nonoverlapping(
                 FB.add(y * FB_STRIDE_PX),
-                APP_SNAP.as_mut_ptr().add(y * DISPLAY_W),
+                APP_SNAP.as_mut_ptr().add(y * display_w()),
                 w,
             );
         }

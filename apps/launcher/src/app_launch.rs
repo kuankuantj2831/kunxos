@@ -252,21 +252,19 @@ const RETURN_MS: u64 = 300;
 const LAUNCH_DUR_S: f32 = 0.30;
 const LAUNCH_DUR_US: u64 = 300_000;
 /// 返回动画终点缩放：应用末帧缩到图标足迹大小（定点 1.0=256）。
-const RETURN_END_SCALE: u32 = {
-    let v = SCALE_1 * ICON_SIZE as u32 / DISPLAY_H as u32;
-    if v < 1 {
-        1
-    } else {
-        v
-    }
-};
+fn return_end_scale() -> u32 {
+    (SCALE_1 * ICON_SIZE as u32 / display_h() as u32).max(1)
+}
 /// 桌面快照（转场期间作为缩放源，避免转场中重绘桌面产生闪烁）。
-static mut FRAME_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut FRAME_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 
 /// 桌面预渲染存档（返回转场专用）：start_return 时把整幅桌面（BACK_BUF）
 /// 存档于此，转场各帧以它为底图合成缩回中的应用帧，转场结束整体恢复 ——
 /// 消除转场后的整屏 draw_desktop_full 尾巴（TCG 下 50~150ms）。
-static mut DESK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut DESK_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
+pub fn resize_buffers() {
+    unsafe { FRAME_BUF.resize_len(screen_pixels()); DESK_BUF.resize_len(screen_pixels()); }
+}
 /// Return 转场是否处于「桌面预渲染」模式（render_frame Return 分支据此选路）。
 static mut DESK_PRERENDERED: bool = false;
 /// 本应用会话是否已预烘焙返回桌面（防每 4ms 重烘焙；start_launch 复位）。
@@ -374,7 +372,7 @@ fn build_white_lut(f: u32) -> [u32; 256] {
 }
 
 /// 以 `(cx, cy)` 为锚点把 `FRAME_BUF` 缩放（定点 `scale`，1.0=256）绘制到 BACK_BUF，
-/// 可选白色覆盖 `fade`（0..255）。最近邻采样 + `ZOOM_BLOCK` 块采样。
+/// 可选白色覆盖 `fade`（0..255）。默认双线性采样，超预算时降级为块采样。
 pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
     if scale == SCALE_1 && fade == 0 {
         unsafe { BACK_BUF.copy_from_slice(&FRAME_BUF); }
@@ -382,9 +380,9 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
     }
     let s = scale.max(1) as i64;
     let inv = (256i64 << 16) / s;
-    let w = DISPLAY_W as i32;
-    let h = DISPLAY_H as i32;
-    let bw = DISPLAY_W as usize;
+    let w = display_w() as i32;
+    let h = display_h() as i32;
+    let bw = display_w() as usize;
     let wlut = if fade > 0 {
         Some(build_white_lut(fade.min(255)))
     } else {
@@ -393,8 +391,8 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
     let bs = zoom_block();
     // 列采样表每帧预计算一次：sx 只依赖 px，此前每行重算（240 行 × 135 列
     // 的 i64 乘移位）降为 135 次；越界列以 -1 标记（输出 COLOR_BG）。
-    let mut sx_tab = [-1i32; DISPLAY_W];
-    let mut sx_fixed = [0i64; DISPLAY_W];
+    let mut sx_tab = [-1i32; display::MAX_WIDTH];
+    let mut sx_fixed = [0i64; display::MAX_WIDTH];
     for (ci, px) in (0..w).step_by(bs).enumerate() {
         sx_fixed[ci] = ((cx as i64) << 16) + (px - cx) as i64 * inv;
         let sx = cx + (((px - cx) as i64 * inv) >> 16) as i32;
@@ -419,7 +417,7 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
                     | (lut[((c >> 8) & 0xFF) as usize] << 8)
                     | lut[(c & 0xFF) as usize];
             }
-            // ZOOM_BLOCK × ZOOM_BLOCK 整块填充（块尺寸与 step_by 必须一致，
+            // bs × bs 整块填充（块尺寸与 step_by 必须一致，
             // 否则块间留缝隙 → 转场画面残留上一帧内容）。
             let px_u = px as usize;
             let py_u = py as usize;
@@ -440,7 +438,7 @@ pub fn zoom_blit(scale: u32, cx: i32, cy: i32, fade: u32) {
 /// 1.0=256）以 (cx, cy) 为锚点缩小后叠加到 BACK_BUF 的桌面上。缩小的矩形
 /// 之外不再填 COLOR_BG（预渲染桌面就是背景），也无需白闪 —— ColorOS 式
 /// 「应用缩回图标、桌面在四周浮现」。采样映射与 zoom_blit 一致（定点逆
-/// 变换 + ZOOM_BLOCK 块采样），矩形边界取源映射落入画面的精确范围。
+/// 变换 + 自适应采样），矩形边界取源映射落入画面的精确范围。
 ///
 /// 每帧先用 DESK_BUF 恢复上一帧矩形（EaseOut 单调缩小，取两帧矩形包围盒
 /// 防御非单调），再合成当前矩形 —— 否则缩小的矩形四周会留下应用像素拖尾。
@@ -448,9 +446,9 @@ pub fn return_blit_over_desktop(scale: u32, cx: i32, cy: i32) {
     unsafe {
         let s = scale.max(1) as i64;
         let inv = (256i64 << 16) / s;
-        let w = DISPLAY_W as i32;
-        let h = DISPLAY_H as i32;
-        let bw = DISPLAY_W as usize;
+        let w = display_w() as i32;
+        let h = display_h() as i32;
+        let bw = display_w() as usize;
         // 与 zoom_blit 的 sx/sy 判定互逆：源 [0..w) 映射回目标轴的落点范围。
         let x0 = (cx - ((cx as i64 * s) >> 8) as i32).max(0);
         let x1 = (cx + ((((w - 1 - cx) as i64) * s) >> 8) as i32).min(w - 1);
@@ -543,11 +541,30 @@ fn white_pixel(lut: &[u32; 256], c: u32) -> u32 {
         | lut[(v & 0xFF) as usize]
 }
 
+const LAUNCH_TILE_DIM: usize = 112;
+static mut LAUNCH_PAINTS: u32 = 0;
+static mut LAUNCH_TILE: [u32; LAUNCH_TILE_DIM * LAUNCH_TILE_DIM] = [0; LAUNCH_TILE_DIM * LAUNCH_TILE_DIM];
+
+fn prepare_launch_tile() {
+    unsafe {
+        for y in 0..LAUNCH_TILE_DIM {
+            for x in 0..LAUNCH_TILE_DIM {
+                LAUNCH_TILE[y * LAUNCH_TILE_DIM + x] = sample_icon_bilinear_stride(
+                    &ICON_TILE, ICON_SIZE as usize, ICON_SIZE as usize,
+                    (x as f32 + 0.5) * ICON_SIZE as f32 / LAUNCH_TILE_DIM as f32 - 0.5,
+                    (y as f32 + 0.5) * ICON_SIZE as f32 / LAUNCH_TILE_DIM as f32 - 0.5);
+            }
+        }
+    }
+}
+
 pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
     unsafe {
-        let w = DISPLAY_W as i32;
-        let h = DISPLAY_H as i32;
-        let total = DISPLAY_W * DISPLAY_H;
+        let w = display_w() as i32;
+        let h = display_h() as i32;
+        let total = display_w() * display_h();
+        let back = &mut BACK_BUF[..total];
+        let frame = &FRAME_BUF[..total];
         // 白闪 LUT 整场只建一次；激活时熔进背景拷贝与瓦片采样（单趟完成
         // 「拷贝 + 变白」，替代原先拷贝后对整屏的第二趟扫描 —— 转场后段
         // 每帧少穿行 ~2MB，TCG 慢宿主下每帧省数十毫秒）。
@@ -558,19 +575,7 @@ pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
         };
         // 1. 已压暗的桌面快照作为背景（转场开始时 darken_frame_buf 压暗一次）；
         //    白闪激活时同趟完成变白。
-        match &wlut {
-            Some(lut) => {
-                for i in 0..total {
-                    let v = FRAME_BUF[i];
-                    BACK_BUF[i] = (lut[((v >> 16) & 0xFF) as usize] << 16)
-                        | (lut[((v >> 8) & 0xFF) as usize] << 8)
-                        | lut[(v & 0xFF) as usize];
-                }
-            }
-            None => {
-                BACK_BUF[..total].copy_from_slice(&FRAME_BUF);
-            }
-        }
+        back.copy_from_slice(frame);
         // 2. 图标方块放大：ICON_TILE（ICON_SIZE x ICON_SIZE 圆角图标）按当前边长缩放，
         //    以图标中心 (cx, cy) 为锚点。2px 块 + 块中心预乘双线性采样：放大途中
         //    图标边缘平滑（最近邻 + 4px 块会呈现明显马赛克），迭代数仍远低于逐像素。
@@ -583,48 +588,52 @@ pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
         let y0 = (cy - half_y).max(0);
         let x1 = (cx + half).min(w - 1);
         let y1 = (cy + half_y).min(h - 1);
-        let bs = 2usize;
-        let isz = ICON_SIZE as u32;
-        let sf = isz as f32 / s.max(1) as f32;
-        let sfy = isz as f32 / sy.max(1) as f32;
-        let mut py = y0;
-        while py <= y1 {
-            let mut px = x0;
-            while px <= x1 {
-                let dx = px - (cx - half); // 0..s
-                let dy = py - (cy - half_y); // 0..sy
-                // 块中心 (+0.5) 映射回源贴图连续坐标（横纵独立缩放）。
-                let fx = (dx as f32 + 0.5) * sf - 0.5;
-                let fy = (dy as f32 + 0.5) * sfy - 0.5;
-                let c0 = sample_icon_bilinear_stride(
-                    &ICON_TILE,
-                    ICON_SIZE as usize,
-                    ICON_SIZE as usize,
-                    fx,
-                    fy,
-                );
-                let c = match &wlut {
-                    Some(lut) => white_pixel(lut, c0),
-                    None => c0,
-                };
-                // bs×bs 整块填充（步进=块尺寸）。
-                let bx_end = (px as usize + bs).min(w as usize);
-                let by_end = (py as usize + bs).min(h as usize);
-                let mut yy = py as usize;
-                while yy < by_end {
-                    let iy = yy * DISPLAY_W;
-                    let mut xx = px as usize;
-                    while xx < bx_end {
-                        zoom_put(iy + xx, c);
-                        xx += 1;
-                    }
-                    yy += 1;
+        let width = display_w();
+        let count = (x1 - x0 + 1).max(0) as usize;
+        let mut xs = [0usize; display::MAX_WIDTH];
+        let mut row = [0u32; display::MAX_WIDTH];
+        for i in 0..count {
+            xs[i] = (((x0 + i as i32 - (cx - half)) as i64 * LAUNCH_TILE_DIM as i64 / s.max(1) as i64) as usize)
+                .min(LAUNCH_TILE_DIM - 1);
+        }
+        let mut previous_y = usize::MAX;
+        let mut opaque = false;
+        for y in y0..=y1 {
+            let source_y = (((y - (cy - half_y)) as i64 * LAUNCH_TILE_DIM as i64 / sy as i64) as usize)
+                .min(LAUNCH_TILE_DIM - 1);
+            if source_y != previous_y {
+                opaque = true;
+                for i in 0..count {
+                    let source = LAUNCH_TILE[source_y * LAUNCH_TILE_DIM + xs[i]];
+                    let c = if let Some(lut) = &wlut { white_pixel(lut, source) } else { source };
+                    row[i] = c;
+                    if c == 0 || (c >> 24 != 0 && c >> 24 != 255) { opaque = false; }
                 }
-                px += bs as i32;
+                previous_y = source_y;
             }
-            py += bs as i32;
+            let output = &mut back[y as usize * width + x0 as usize..][..count];
+            if opaque {
+                output.copy_from_slice(&row[..count]);
+            } else {
+                for (pixel, &c) in output.iter_mut().zip(&row[..count]) {
+                    if c != 0 {
+                        let alpha = c >> 24;
+                        *pixel = if alpha != 0 { blend(*pixel, c & 0x00ff_ffff, alpha) } else { c };
+                    }
+                }
+            }
         }
         // 3. 白色覆盖已熔进第 1/2 步（见 wlut）—— 无独立整屏扫描。
+    }
+    unsafe {
+        // The first visible frame starts the animation clock. Fork/COW and first-use
+        // cache faults must not consume the transition before it reaches the display.
+        if LAUNCH_PAINTS == 0 {
+            let now = now_us();
+            MOTION.t0 = now;
+            MOTION.launch_t = now;
+        }
+        LAUNCH_PAINTS += 1;
     }
 }
 
@@ -637,8 +646,8 @@ pub fn blit_tile_fly_split(cx: i32, cy: i32, scale: u32, split: i32, fade: u32) 
     unsafe {
         let s = ((ICON_SIZE as u32 * scale) / SCALE_1).max(1) as i32;
         let half = s / 2;
-        let w = DISPLAY_W as i32;
-        let h = DISPLAY_H as i32;
+        let w = display_w() as i32;
+        let h = display_h() as i32;
         let wlut = if fade > 0 {
             Some(build_white_lut(fade.min(255)))
         } else {
@@ -673,7 +682,7 @@ pub fn blit_tile_fly_split(cx: i32, cy: i32, scale: u32, split: i32, fade: u32) 
                     let by_end = (py as usize + bs).min(h as usize);
                     let mut yy = py as usize;
                     while yy < by_end {
-                        let iy = yy * DISPLAY_W;
+                        let iy = yy * display_w();
                         let mut xx = px as usize;
                         while xx < bx_end {
                             zoom_put(iy + xx, c);
@@ -956,11 +965,12 @@ pub fn start_launch(app_idx: usize) {
         }
         // 快照当前桌面（此刻仍为普通桌面渲染路径；打断路径 MOTION.phase 仍
         // 是 Return，render_frame 走桌面预渲染合成路径定格返回中的画面）
-        render_frame();
+        // The displayed desktop is already in BACK_BUF, without a cursor overlay.
+        if interrupt_return { render_frame(); }
         core::ptr::copy_nonoverlapping(
             BACK_BUF.as_ptr(),
             FRAME_BUF.as_mut_ptr(),
-            DISPLAY_W * DISPLAY_H,
+            display_w() * display_h(),
         );
         // 快照已定格，Return 阶段结束：退出桌面预渲染模式（新启动转场
         // 使用自己的快照路径，不受 Return 标志影响）。
@@ -973,6 +983,8 @@ pub fn start_launch(app_idx: usize) {
         TILE_MODE = true;
         draw_app_icon(app, 0, 0, ICON_SIZE);
         TILE_MODE = false;
+        prepare_launch_tile();
+        LAUNCH_PAINTS = 0;
         LAUNCH_PID = pid;
         LAUNCH_IDX = app_idx;
         // 生命周期：登记应用（lifd 建立注册表）并置启动中状态。
@@ -982,9 +994,9 @@ pub fn start_launch(app_idx: usize) {
         let (cx, cy) = anchor.unwrap_or_else(|| icon_center(app_idx));
         // 目标缩放：图标方块边长放大到覆盖全屏所需的值（以图标中心为锚点）。
         let need = cx
-            .max(DISPLAY_W as i32 - cx)
+            .max(display_w() as i32 - cx)
             .max(cy)
-            .max(DISPLAY_H as i32 - cy);
+            .max(display_h() as i32 - cy);
         let cover_px = (need * 2 + 16) as u32; // 覆盖全屏的边长（px）
         let target = (cover_px * SCALE_1 / ICON_SIZE as u32).max(SCALE_1 + 1);
         MOTION.phase = Phase::Launch;
@@ -1023,12 +1035,12 @@ pub fn start_return(app_idx: usize) {
     unsafe {
         let t_sr0 = now_us();
         if !FB.is_null() {
-            let w = FB_W.min(DISPLAY_W);
-            let h = FB_H.min(DISPLAY_H);
+            let w = FB_W.min(display_w());
+            let h = FB_H.min(display_h());
             for y in 0..h {
                 core::ptr::copy_nonoverlapping(
                     FB.add(y * FB_STRIDE_PX),
-                    FRAME_BUF.as_mut_ptr().add(y * DISPLAY_W),
+                    FRAME_BUF.as_mut_ptr().add(y * display_w()),
                     w,
                 );
             }
@@ -1054,7 +1066,7 @@ pub fn start_return(app_idx: usize) {
             print("ms（未命中预烘焙）\n");
         }
         // 恢复基准 = 全屏：首帧先把整幅桌面恢复进 BACK_BUF 再合成应用帧。
-        DESK_RET_PREV = [0, 0, DISPLAY_W as i32 - 1, DISPLAY_H as i32 - 1];
+        DESK_RET_PREV = [0, 0, display_w() as i32 - 1, display_h() as i32 - 1];
         let (hx, hy) = icon_center(app_idx);
         MOTION.phase = Phase::Return;
         MOTION.t0 = now_us();
@@ -1231,12 +1243,17 @@ pub fn motion_advance(now: u64) -> bool {
             Phase::Launch => {
                 // spring(300ms, bounce≈0.07) 真实 dt 积分；
                 // 300ms 弹簧时长到点即完成（弹簧已收敛到 1% 内，图标已覆盖全屏）。
-                let dt_ms = now.saturating_sub(m.launch_t) as f32 / 1000.0;
+                let elapsed = now.saturating_sub(m.launch_t);
+                // Bound catch-up after preemption: a delayed frame must not turn a
+                // visible expansion into a single jump to the completed state.
+                let step = elapsed.min(50_000);
+                m.t0 = m.t0.saturating_add(elapsed.saturating_sub(step));
+                let dt_ms = step as f32 / 1000.0;
                 m.launch_t = now;
                 let settled = m.launch_spring.step_ms(dt_ms);
                 if settled || now.saturating_sub(m.t0) >= LAUNCH_DUR_US {
                     print(" [motion] 启动过渡：");
-                    print_dec(TRANS_FRAMES);
+                    print_dec(LAUNCH_PAINTS);
                     print(" frames\n");
                     TRANS_FRAMES = 0;
                     m.phase = Phase::Idle;
@@ -1303,13 +1320,13 @@ pub fn motion_advance(now: u64) -> bool {
                     print(" frames\n");
                     TRANS_FRAMES = 0;
                     m.phase = Phase::Idle;
-                    m.cur_scale = RETURN_END_SCALE;
+                    m.cur_scale = return_end_scale();
                     m.cur_fade = 255;
                     // 桌面预渲染模式：BACK_BUF 整体恢复为纯桌面并直接提交，
                     // 不置 NEEDS_REDRAW —— 跳过转场后的整屏 draw_desktop_full
                     // （TCG 下 50~150ms），退出尾巴归零（ColorOS 无缝回桌面）。
                     if DESK_PRERENDERED {
-                        let total = DISPLAY_W * DISPLAY_H;
+                        let total = display_w() * display_h();
                         BACK_BUF[..total].copy_from_slice(&DESK_BUF);
                         flip();
                         draw_cursor_overlay();
@@ -1324,7 +1341,7 @@ pub fn motion_advance(now: u64) -> bool {
                 // ease-out：从全屏（1:1 应用末帧）缩回图标原位，白闪淡入收尾
                 let p = Easing::ColorOSStandard.sample(t);
                 m.cur_scale =
-                    (SCALE_1 as f32 + (RETURN_END_SCALE as f32 - SCALE_1 as f32) * p) as u32;
+                    (SCALE_1 as f32 + (return_end_scale() as f32 - SCALE_1 as f32) * p) as u32;
                 m.cur_fade = (255.0 * p) as u32;
                 true
             }
@@ -1464,12 +1481,12 @@ fn draw_placeholder(app_idx: usize, baseline: &[u32; 12]) {
             return; // 应用已绘制首帧，不再覆盖
         }
         let app = &APPS[app_idx];
-        for i in 0..DISPLAY_W * DISPLAY_H {
+        for i in 0..display_w() * display_h() {
             BACK_BUF[i] = app.color;
         }
         let s = PLACE_ICON_S;
-        let ox = (DISPLAY_W as i32 - s) / 2;
-        let oy = (DISPLAY_H as i32 - s) / 2;
+        let ox = (display_w() as i32 - s) / 2;
+        let oy = (display_h() as i32 - s) / 2;
         draw_app_icon(app, ox, oy, s);
         flip();
         // B10：武装呼吸态。基线在占位页上屏**之后**采样（12 个采样点均在
@@ -1543,8 +1560,8 @@ pub fn placeholder_breathe(now: u64) -> bool {
         let br = super::motion::triangle(now.saturating_sub(PLACE_T0), PLACE_PERIOD_US);
         let a = PLACE_SK_MIN + ((PLACE_SK_MAX - PLACE_SK_MIN) as f32 * br) as u32;
         let sk = blend(app.color, 0x00_FF_FF_FF, a.min(255));
-        let cx = DISPLAY_W as i32 / 2;
-        let y0 = (DISPLAY_H as i32 - PLACE_ICON_S) / 2 + PLACE_ICON_S + 28;
+        let cx = display_w() as i32 / 2;
+        let y0 = (display_h() as i32 - PLACE_ICON_S) / 2 + PLACE_ICON_S + 28;
         // 三行骨架：标题宽块 + 两行文本块（ColorOS 加载占位层次）。
         fill_rect(cx - PLACE_SK_HALF_W, y0, PLACE_SK_HALF_W * 2, 12, sk);
         fill_rect(cx - PLACE_SK_HALF_W, y0 + 20, PLACE_SK_HALF_W * 2, 12, sk);

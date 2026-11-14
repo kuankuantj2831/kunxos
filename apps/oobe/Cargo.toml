@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fontdue = "0.9.4"
+fontdue = { path = "../../third_party/fontdue", features = ["lazy"] }
 
 [profile.release]
 opt-level = "z"

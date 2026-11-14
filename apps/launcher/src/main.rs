@@ -158,14 +158,63 @@ const PATH_CAP: usize = 96;
 // ==================== 显示参数 ====================
 
 /// 逻辑分辨率（与 displayd / ramfb 默认一致）。
-const DISPLAY_W: usize = 540;
-const DISPLAY_H: usize = 960;
+#[path = "../../../shared/pixel_buffer.rs"]
+mod pixel_buffer;
+use pixel_buffer::PixelBuffer;
+fn display_w() -> usize { unsafe { FB_W } }
+fn display_h() -> usize { unsafe { FB_H } }
+fn screen_pixels() -> usize { display_w() * display_h() }
+
+fn refresh_geometry() {
+    unsafe {
+        if FB_FD < 0 { return; }
+        if !app_life::app_active() && MOTION.phase == Phase::Idle {
+            if syscall3(SYS_IOCTL, FB_FD as usize, display::RESIZE_IOCTL, 0) != 0 { return; }
+        }
+        let mut data = [0u8; display::INFO_BYTES];
+        if syscall3(SYS_IOCTL, FB_FD as usize, display::INFO_IOCTL, data.as_mut_ptr() as usize) != 0 { return; }
+        let Some(info) = display::DisplayMetrics::decode(&data) else { return; };
+        if info.width as usize == FB_W && info.height as usize == FB_H { return; }
+        if info.width as usize > display::MAX_WIDTH || info.height as usize > display::MAX_HEIGHT { return; }
+        FB_W = info.width as usize;
+        FB_H = info.height as usize;
+        FB_STRIDE_PX = info.stride_bytes as usize / 4;
+        BACK_BUF.resize_len(screen_pixels());
+        BG_BUF.resize_len(screen_pixels());
+        FOLDER_DIM_BUF.resize_len(screen_pixels());
+        REC_BG_BUF.resize_len(screen_pixels());
+        GLASS_SB_BUF.resize_len(status_pixels());
+        GLASS_DOCK_BUF.resize_len(dock_pixels());
+        app_launch::resize_buffers();
+        app_life::resize_buffers();
+        sys_nav::set_viewport(FB_W as i32, FB_H as i32);
+        GRID_COLS = (((FB_W as i32 - 32) / CELL_W) - 2).clamp(4, 8);
+        BG_KEY = (u32::MAX, u32::MAX, u32::MAX);
+        GLASS_SB_KEY = (BG_KEY, false);
+        GLASS_DOCK_KEY = (BG_KEY, false);
+        FOLDER_DIM_OK = false;
+        REC_BG_OK = false;
+        for key in WGT_GLASS_KEY.iter_mut() { key.0 = BG_KEY; }
+        control_center::invalidate_geometry();
+        app_launch::desk_bake_reset();
+        CUR_UNDER_X = -1;
+        CUR_UNDER_Y = -1;
+        CURSOR_X = CURSOR_X.clamp(0, FB_W as i32 - 1);
+        CURSOR_Y = CURSOR_Y.clamp(0, FB_H as i32 - 1);
+        layout_current();
+        NEEDS_REDRAW = true;
+        DIRTY_FULL = true;
+        print("[launcher] resize "); print_dec(FB_W as u32); print("x");
+        print_dec(FB_H as u32); print(" columns="); print_dec(GRID_COLS as u32); print("\n");
+        dump_layout();
+    }
+}
 
 /// 状态栏高度（顶部）。
 const STATUS_H: i32 = 24;
 
 /// 网格系统：默认 4 列 x 6 行，可切换 5 列 x 6 行。
-const GRID_ROWS: i32 = 6;
+fn grid_rows() -> i32 { ((dock_y() - STATUS_H - 24) / CELL_H).clamp(2, 6) }
 const GRID_COLS_DEFAULT: i32 = 4;
 /// 图标 56x56，圆角 14px（ColorOS 风格圆角矩形）。
 const ICON_SIZE: i32 = 56;
@@ -178,15 +227,15 @@ const CELL_H: i32 = ICON_SIZE + LABEL_H + ICON_V_GAP; // 94
 
 /// 底部固定 Dock（导航栏之上）。
 const DOCK_H: i32 = 64;
-const DOCK_Y: i32 = NAV_Y - DOCK_H;
+fn dock_y() -> i32 { sys_nav::nav_y() - DOCK_H }
 const DOCK_ICON: i32 = 52;
 const DOCK_GAP: i32 = 22;
 
 /// 网格顶边：状态栏与 Dock 之间垂直居中。
-const GRID_Y: i32 = STATUS_H + (DOCK_Y - STATUS_H - GRID_ROWS * CELL_H) / 2;
+fn grid_y() -> i32 { STATUS_H + (dock_y() - STATUS_H - grid_rows() * CELL_H) / 2 }
 
 fn grid_x(cols: i32) -> i32 {
-    (DISPLAY_W as i32 - (cols * CELL_W - ICON_H_GAP)) / 2
+    (display_w() as i32 - (cols * CELL_W - ICON_H_GAP)) / 2
 }
 
 /// 模拟点击延迟（微秒）：输入设备未就绪时的固定坐标模拟点击。
@@ -691,10 +740,10 @@ fn glyph(c: u8) -> &'static [u8; 8] {
 /// 映射到用户空间的帧缓冲指针（由 `fb_init` 经 open/mmap /dev/fb0 建立）。
 static mut FB: *mut u32 = core::ptr::null_mut();
 /// 实际分辨率（默认 540x960，可被 ioctl 结果覆盖）。
-static mut FB_W: usize = DISPLAY_W;
-static mut FB_H: usize = DISPLAY_H;
+static mut FB_W: usize = 540;
+static mut FB_H: usize = 960;
 /// 每行像素数（stride / 4）。
-static mut FB_STRIDE_PX: usize = DISPLAY_W;
+static mut FB_STRIDE_PX: usize = 540;
 
 // ---- 脏区域追踪（应用直绘 → 内核脏区域合成器） ----
 /// 保持打开的 /dev/fb0 fd（FBIO_PRESENT 提交脏区用）。
@@ -775,7 +824,7 @@ fn fb_submit_present() {
 
 /// 双缓冲 back buffer：所有绘制先写入这里，`flip()` 一次性拷贝到显存，
 /// 避免逐像素直写显存导致的撕裂与闪烁。
-static mut BACK_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut BACK_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 /// 是否需要整屏重绘（初始为 true；输入 / 窗口变化 / 手势动画时置位）。
 static mut NEEDS_REDRAW: bool = true;
 /// 仅状态栏失效：分钟变化时只重绘 24px 状态栏行（局部脏矩形 + flip），
@@ -831,7 +880,7 @@ fn call_banner_layout() -> ([u8; 44], usize, i32) {
 fn draw_banner_at(y: i32, alpha: u32) {
     unsafe {
         let (s, total, w) = call_banner_layout();
-        let x = (DISPLAY_W as i32 - w) / 2;
+        let x = (display_w() as i32 - w) / 2;
         // 来电 = 强调绿玻璃（白字）；"通话中" = 浅色磨砂玻璃（深字）。
         let style = if CALL_BANNER == 1 {
             &STYLE_ACCENT
@@ -1044,7 +1093,7 @@ fn draw_health_banner() {
         let w1 = text_width(&l1[..n1]);
         let w2 = text_width(&l2[..n2]);
         let w = w1.max(w2) + 40;
-        let x = (DISPLAY_W as i32 - w) / 2;
+        let x = (display_w() as i32 - w) / 2;
         let y = BANNER_Y;
         // 琥珀玻璃药丸 + 双行文本（问题=白，修复=琥珀）
         let prev = PIX_ALPHA;
@@ -1599,7 +1648,7 @@ fn call_banner_hit(x: i32, y: i32) -> bool {
             return false;
         }
         let (_s, _total, w) = call_banner_layout();
-        let bx = (DISPLAY_W as i32 - w) / 2;
+        let bx = (display_w() as i32 - w) / 2;
         x >= bx && x < bx + w && y >= BANNER_Y && y < BANNER_Y + BANNER_H
     }
 }
@@ -1838,8 +1887,8 @@ fn lock_now() {
         SHADE_OPEN = false;
         // 锁定转场（ColorOS 风格）：锁屏整层从屏幕上方下滑入位，
         // 完成后由 lock_advance 收尾（转场期间输入已被屏蔽）。
-        LOCK_FROM = -(DISPLAY_H as f32);
-        LOCK_LAYER_OFF = -(DISPLAY_H as f32);
+        LOCK_FROM = -(display_h() as f32);
+        LOCK_LAYER_OFF = -(display_h() as f32);
         LOCK_PHASE = LockPhase::Locking;
         LOCK_T0 = now_us();
         NEEDS_REDRAW = true;
@@ -1856,7 +1905,7 @@ fn lock_advance(now: u64) -> bool {
                 // 锁屏层上滑出屏（300ms FastOutSlowIn）。
                 let t = (now.saturating_sub(LOCK_T0)) as f32 / 300_000.0;
                 let e = Easing::FastOutSlowIn.sample(t.min(1.0));
-                LOCK_LAYER_OFF = LOCK_FROM + (-(DISPLAY_H as f32) - LOCK_FROM) * e;
+                LOCK_LAYER_OFF = LOCK_FROM + (-(display_h() as f32) - LOCK_FROM) * e;
                 if t >= 1.0 {
                     LOCKED = false;
                     LOCK_PHASE = LockPhase::None;
@@ -1908,7 +1957,7 @@ fn lock_swipe_settle(dy: i32, dur_ms: u64) {
         if LOCK_PHASE != LockPhase::None {
             return;
         }
-        let h = DISPLAY_H as f32;
+        let h = display_h() as f32;
         if !LOCK_DRAG {
             // 未进入跟手（快速轻扫直接抬起）：与跟手结算同一阈值
             // （>18% 屏高或上滑速度 >600px/s 才解锁）—— 此前任何 dy<0 的
@@ -2004,7 +2053,7 @@ const SPARK_LIFE_US: u64 = 290_000;
 
 /// 触发一次迸发（unlock_success 调用）。中心取锁图标位置 (W/2, 308)。
 unsafe fn unlock_sparks_burst() {
-    let cx = DISPLAY_W as f32 / 2.0;
+    let cx = display_w() as f32 / 2.0;
     let cy = 308.0;
     // 无 sin：按黄金角均匀铺开 24 个方向，速度 120..300 px/s 分档。
     let mut ang = 0.0f32;
@@ -2454,7 +2503,7 @@ fn fb_init() -> bool {
                 print("，保留默认\n");
             }
         }
-        let len = FB_W * FB_H * 4;
+        let len = display::MAX_PIXELS * 4;
         let base = syscall6(
             SYS_MMAP,
             0,
@@ -2532,7 +2581,7 @@ static mut WIDGET_SCRATCH: [u32; WIDGET_SCRATCH_W * WIDGET_SCRATCH_H] =
 static mut DIM_LUT: [u32; 256] = [0; 256];
 static mut DIM_LUT_READY: bool = false;
 /// 已压暗桌面缓存（文件夹打开期间桌面静止，整块 memcpy 替代逐像素 LUT）。
-static mut FOLDER_DIM_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0; DISPLAY_W * DISPLAY_H];
+static mut FOLDER_DIM_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 static mut FOLDER_DIM_OK: bool = false;
 
 /// 星期「周X」组合缓冲。
@@ -2643,7 +2692,7 @@ fn boot_fade_bake_back_buf() {
         for v in 0..256usize {
             lut[v] = v as u32 * lvl / 100;
         }
-        for i in 0..DISPLAY_W * DISPLAY_H {
+        for i in 0..display_w() * display_h() {
             let p = BACK_BUF[i];
             let r = lut[((p >> 16) & 0xFF) as usize];
             let g = lut[((p >> 8) & 0xFF) as usize];
@@ -2688,10 +2737,10 @@ fn put_pixel(x: i32, y: i32, color: u32) {
             }
             return;
         }
-        if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+        if x < 0 || y < 0 || x >= display_w() as i32 || y >= display_h() as i32 {
             return;
         }
-        let idx = y as usize * DISPLAY_W + x as usize;
+        let idx = y as usize * display_w() + x as usize;
         BACK_BUF[idx] = if a > 0 {
             let base = blend(BACK_BUF[idx], color & 0x00_FF_FF_FF, a);
             if PIX_ALPHA >= 255 {
@@ -2718,8 +2767,8 @@ fn current_pixel(x: i32, y: i32) -> u32 {
             }
             return 0;
         }
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            BACK_BUF[y as usize * DISPLAY_W + x as usize]
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            BACK_BUF[y as usize * display_w() + x as usize]
         } else {
             0
         }
@@ -2761,12 +2810,19 @@ fn flip() {
         if DIRTY_COUNT == 0 && !DIRTY_FULL {
             DIRTY_FULL = true;
         }
+        // Erase the old overlay before a partial/full copy, then publish content and
+        // pointer together. Never back up an already drawn pointer as its own background.
+        if CURSOR_DRAWN {
+            let (ox, oy) = (CUR_UNDER_X, CUR_UNDER_Y);
+            restore_cursor_under();
+            mark_dirty(ox, oy, CUR_UW as u32, CUR_UH as u32);
+        }
         if DIRTY_FULL {
-            if FB_W == DISPLAY_W && FB_H == DISPLAY_H && FB_STRIDE_PX == DISPLAY_W {
+            if FB_W == display_w() && FB_H == display_h() && FB_STRIDE_PX == display_w() {
                 if lvl >= 100 {
-                    core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB, DISPLAY_W * DISPLAY_H);
+                    core::ptr::copy_nonoverlapping(BACK_BUF.as_ptr(), FB, display_w() * display_h());
                 } else {
-                    for i in 0..DISPLAY_W * DISPLAY_H {
+                    for i in 0..display_w() * display_h() {
                         let p = BACK_BUF[i];
                         let r = BRIGHTNESS_LUT[((p >> 16) & 0xFF) as usize];
                         let g = BRIGHTNESS_LUT[((p >> 8) & 0xFF) as usize];
@@ -2775,11 +2831,11 @@ fn flip() {
                     }
                 }
             } else {
-                let w = FB_W.min(DISPLAY_W);
-                let h = FB_H.min(DISPLAY_H);
+                let w = FB_W.min(display_w());
+                let h = FB_H.min(display_h());
                 for y in 0..h {
                     for x in 0..w {
-                        let p = BACK_BUF[y * DISPLAY_W + x];
+                        let p = BACK_BUF[y * display_w() + x];
                         let r = BRIGHTNESS_LUT[((p >> 16) & 0xFF) as usize];
                         let g = BRIGHTNESS_LUT[((p >> 8) & 0xFF) as usize];
                         let b = BRIGHTNESS_LUT[(p & 0xFF) as usize];
@@ -2794,10 +2850,10 @@ fn flip() {
                 let x0 = d.0.max(0);
                 let y0 = d.1.max(0);
                 // ★ 两边都要钳制：只钳 FB_W/FB_H 不够 —— 内核帧缓冲可能大于
-                // BACK_BUF（DISPLAY_W×DISPLAY_H），此时矩形越出 BACK_BUF 行尾/
+                // BACK_BUF（display_w()×display_h()），此时矩形越出 BACK_BUF 行尾/
                 // 末行，copy_nonoverlapping 静默越界读（同 app_kit flip 的修法）
-                let x1 = (d.0 + d.2 as i32).min(FB_W as i32).min(DISPLAY_W as i32);
-                let y1 = (d.1 + d.3 as i32).min(FB_H as i32).min(DISPLAY_H as i32);
+                let x1 = (d.0 + d.2 as i32).min(FB_W as i32).min(display_w() as i32);
+                let y1 = (d.1 + d.3 as i32).min(FB_H as i32).min(display_h() as i32);
                 if x1 <= x0 || y1 <= y0 {
                     continue;
                 }
@@ -2805,7 +2861,7 @@ fn flip() {
                 if lvl >= 100 {
                     for y in y0..y1 {
                         core::ptr::copy_nonoverlapping(
-                            BACK_BUF.as_ptr().add(y as usize * DISPLAY_W + x0 as usize),
+                            BACK_BUF.as_ptr().add(y as usize * display_w() + x0 as usize),
                             FB.add(y as usize * FB_STRIDE_PX + x0 as usize),
                             rw,
                         );
@@ -2813,7 +2869,7 @@ fn flip() {
                 } else {
                     for y in y0..y1 {
                         for x in 0..rw {
-                            let p = BACK_BUF[y as usize * DISPLAY_W + (x0 as usize + x)];
+                            let p = BACK_BUF[y as usize * display_w() + (x0 as usize + x)];
                             let r = BRIGHTNESS_LUT[((p >> 16) & 0xFF) as usize];
                             let g = BRIGHTNESS_LUT[((p >> 8) & 0xFF) as usize];
                             let b = BRIGHTNESS_LUT[(p & 0xFF) as usize];
@@ -2823,6 +2879,11 @@ fn flip() {
                     }
                 }
             }
+        }
+        if MOUSE_SEEN && !cursor_sprite::host_cursor() {
+            save_cursor_under(CURSOR_X, CURSOR_Y);
+            draw_cursor_fb();
+            mark_dirty(CUR_UNDER_X, CUR_UNDER_Y, CUR_UW as u32, CUR_UH as u32);
         }
         fb_submit_present();
     }
@@ -2836,14 +2897,14 @@ fn fill_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
     // 按钮底等每帧万级 put_pixel 的逐像素边界检查降为每行一次。
     let x0 = x.max(0);
     let y0 = y.max(0);
-    let x1 = (x + w).min(DISPLAY_W as i32);
-    let y1 = (y + h).min(DISPLAY_H as i32);
+    let x1 = (x + w).min(display_w() as i32);
+    let y1 = (y + h).min(display_h() as i32);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
     unsafe {
         for yy in y0..y1 {
-            let base = yy as usize * DISPLAY_W + x0 as usize;
+            let base = yy as usize * display_w() + x0 as usize;
             BACK_BUF[base..base + (x1 - x0) as usize].fill(color);
         }
     }
@@ -2928,14 +2989,14 @@ fn draw_background_rect(x0: i32, y0: i32, rw: u32, rh: u32) {
     let key = wallpaper_colors();
     let xa = x0.max(0);
     let ya = y0.max(0);
-    let xb = (x0 + rw as i32).min(DISPLAY_W as i32);
-    let yb = (y0 + rh as i32).min(DISPLAY_H as i32);
+    let xb = (x0 + rw as i32).min(display_w() as i32);
+    let yb = (y0 + rh as i32).min(display_h() as i32);
     unsafe {
         // 缓存命中：按行整行 memcpy（与整屏渲染逐位一致），免去逐像素渐变
         // +波形混合（时钟小组件每秒局部刷新从此走纯拷贝）。
         if BG_KEY == key {
             for y in ya..yb {
-                let src = y as usize * DISPLAY_W + xa as usize;
+                let src = y as usize * display_w() + xa as usize;
                 core::ptr::copy_nonoverlapping(
                     BG_BUF.as_ptr().add(src),
                     BACK_BUF.as_mut_ptr().add(src),
@@ -2947,10 +3008,10 @@ fn draw_background_rect(x0: i32, y0: i32, rw: u32, rh: u32) {
         let (top, bottom, accent) = key;
         for y in ya..yb {
             let t = y as u32;
-            let inv = DISPLAY_H as u32 - t;
-            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / DISPLAY_H as u32;
-            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / DISPLAY_H as u32;
-            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / DISPLAY_H as u32;
+            let inv = display_h() as u32 - t;
+            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / display_h() as u32;
+            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / display_h() as u32;
+            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / display_h() as u32;
             let row = (r << 16) | (g << 8) | b;
             for x in xa..xb {
                 let wave = if ((x as u32 / 72 + t / 96) & 1) == 0 {
@@ -2975,28 +3036,28 @@ fn draw_background_rect(x0: i32, y0: i32, rw: u32, rh: u32) {
 /// 背景，逐像素数学是动画帧率的最大单项开销（TCG 下 50~150ms/帧）。
 /// 调色板键不变时（绝大多数动画帧）直接整块 memcpy，调色板变化（换壁纸
 /// 交叉淡化期间每帧键都不同）才重新渲染并更新缓存。
-static mut BG_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0u32; DISPLAY_W * DISPLAY_H];
+static mut BG_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 /// 缓存对应的调色板键（初始值不可由 blend 产出，强制首帧全量渲染）。
 static mut BG_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 
 fn draw_background() {
     let key = wallpaper_colors();
     unsafe {
-        let n = DISPLAY_W * DISPLAY_H;
+        let n = display_w() * display_h();
         if BG_KEY == key {
             BACK_BUF[..n].copy_from_slice(&BG_BUF);
             return;
         }
         let (top, bottom, accent) = key;
-        for y in 0..DISPLAY_H {
+        for y in 0..display_h() {
             let t = y as u32;
-            let inv = DISPLAY_H as u32 - t;
-            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / DISPLAY_H as u32;
-            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / DISPLAY_H as u32;
-            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / DISPLAY_H as u32;
+            let inv = display_h() as u32 - t;
+            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / display_h() as u32;
+            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / display_h() as u32;
+            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / display_h() as u32;
             let row = (r << 16) | (g << 8) | b;
-            let base = y * DISPLAY_W;
-            for x in 0..DISPLAY_W {
+            let base = y * display_w();
+            for x in 0..display_w() {
                 let wave = if ((x / 72 + y / 96) & 1) == 0 {
                     accent
                 } else {
@@ -3142,9 +3203,9 @@ fn ttf_glyph(x: i32, y: i32, cp: u32, color: u32) -> i32 {
                     // FB 是上一帧 flip 的结果，用它做 alpha 混合会把上一帧的内容
                     // 混进本帧文字，产生「鬼画符」与错位。
                     let in_b =
-                        px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32;
+                        px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32;
                     if in_b {
-                        let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                        let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                         put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                     }
                 }
@@ -3208,7 +3269,7 @@ fn ttf_glyph_px(x: i32, y: i32, cp: u32, px: f32, color: u32) -> i32 {
                     if a != 0 {
                         let px_ = gx + col as i32;
                         let py_ = gy + row as i32;
-                        if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32
+                        if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32
                         {
                             let bg = current_pixel(px_, py_);
                             put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
@@ -3386,11 +3447,11 @@ struct LauncherSmooth;
 
 impl glass::SmoothTarget for LauncherSmooth {
     fn put_aa(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
-        if x < 0 || y < 0 || x >= DISPLAY_W as i32 || y >= DISPLAY_H as i32 {
+        if x < 0 || y < 0 || x >= display_w() as i32 || y >= display_h() as i32 {
             return;
         }
         unsafe {
-            let idx = y as usize * DISPLAY_W + x as usize;
+            let idx = y as usize * display_w() + x as usize;
             // 与 put_pixel 一致地乘上全局 PIX_ALPHA：编辑选择卡等入场淡入
             // 期间白卡本体（smooth_fill_rr 经 put_aa 直写）才跟着渐显，
             // 否则第 1 帧全不透明「弹出」而遮罩/文字仍在渐显。
@@ -3625,11 +3686,11 @@ fn blit_icon(idx: usize, x: i32, y: i32) {
         let n = ICON_SIZE as usize;
         for row in 0..ICON_SIZE {
             let py = y + row;
-            if py < 0 || py >= DISPLAY_H as i32 {
+            if py < 0 || py >= display_h() as i32 {
                 continue;
             }
             let src = &ICON_CACHE[idx][row as usize * n..row as usize * n + n];
-            let base = py as usize * DISPLAY_W;
+            let base = py as usize * display_w();
             let mut col = 0usize;
             while col < n {
                 let c = src[col];
@@ -3645,7 +3706,7 @@ fn blit_icon(idx: usize, x: i32, y: i32) {
                     }
                     let px0 = x + col as i32;
                     let px1 = x + end as i32;
-                    if px0 >= 0 && px1 <= DISPLAY_W as i32 {
+                    if px0 >= 0 && px1 <= display_w() as i32 {
                         let dst = base + px0 as usize..base + px1 as usize;
                         BACK_BUF[dst].copy_from_slice(&src[col..end]);
                     } else {
@@ -3673,7 +3734,7 @@ fn blit_icon_split(idx: usize, x: i32, y: i32, split: i32, fade: u32) {
         let dyd = (split + 1) / 2;
         for row in 0..mid {
             let py = y + row - dyu;
-            if py < -4 || py >= DISPLAY_H as i32 + 4 {
+            if py < -4 || py >= display_h() as i32 + 4 {
                 continue;
             }
             for col in 0..ICON_SIZE {
@@ -3691,7 +3752,7 @@ fn blit_icon_split(idx: usize, x: i32, y: i32, split: i32, fade: u32) {
         }
         for row in mid..ICON_SIZE {
             let py = y + row + dyd;
-            if py < -4 || py >= DISPLAY_H as i32 + 4 {
+            if py < -4 || py >= display_h() as i32 + 4 {
                 continue;
             }
             for col in 0..ICON_SIZE {
@@ -3825,8 +3886,8 @@ fn time_hhmm(buf: &mut [u8; 5]) {
 /// 状态栏玻璃带缓存：玻璃源只是壁纸（网格内容不落入该带），键 =
 /// (调色板, 主题)。玻璃渲染是逐像素降采样+模糊+着色（~1.3 万重像素），
 /// 翻页/最近任务等动画每帧都经 draw_desktop_full 重画，命中时按行 memcpy。
-static mut GLASS_SB_BUF: [u32; STATUS_H as usize * DISPLAY_W] =
-    [0; STATUS_H as usize * DISPLAY_W];
+fn status_pixels() -> usize { STATUS_H as usize * display_w() }
+static mut GLASS_SB_BUF: PixelBuffer = PixelBuffer::new(STATUS_H as usize * display::MAX_WIDTH, STATUS_H as usize * 540);
 static mut GLASS_SB_KEY: ((u32, u32, u32), bool) =
     ((u32::MAX, u32::MAX, u32::MAX), false);
 
@@ -3834,12 +3895,12 @@ static mut GLASS_SB_KEY: ((u32, u32, u32), bool) =
 fn draw_glass_status_band() {
     unsafe {
         let key = (wallpaper_colors(), THEME_DARK);
-        let rows = STATUS_H as usize * DISPLAY_W;
+        let rows = STATUS_H as usize * display_w();
         if GLASS_SB_KEY == key {
             BACK_BUF[..rows].copy_from_slice(&GLASS_SB_BUF[..rows]);
             return;
         }
-        draw_glass(0, 0, DISPLAY_W as i32, STATUS_H, 0);
+        draw_glass(0, 0, display_w() as i32, STATUS_H, 0);
         GLASS_SB_BUF[..rows].copy_from_slice(&BACK_BUF[..rows]);
         GLASS_SB_KEY = key;
     }
@@ -3855,14 +3916,14 @@ fn draw_status_bar() {
     // 右侧：WiFi + 电量
     unsafe {
         if WIFI_ENABLED {
-            draw_wifi(486, (STATUS_H - 14) / 2, COLOR_TEXT_MAIN);
+            draw_wifi(display_w() as i32 - 54, (STATUS_H - 14) / 2, COLOR_TEXT_MAIN);
         } else {
-            draw_line(486, 5, 500, 18, COLOR_WARN);
-            draw_line(500, 5, 486, 18, COLOR_WARN);
+            draw_line(display_w() as i32 - 54, 5, display_w() as i32 - 40, 18, COLOR_WARN);
+            draw_line(display_w() as i32 - 40, 5, display_w() as i32 - 54, 18, COLOR_WARN);
         }
     }
     // 电量（B12：真实电量 + 充电呼吸闪电 + 插电弹跳百分比，见 draw_battery）
-    draw_battery(512, (STATUS_H - 10) / 2, COLOR_TEXT_MAIN);
+    draw_battery(display_w() as i32 - 28, (STATUS_H - 10) / 2, COLOR_TEXT_MAIN);
 }
 
 /// 音量 HUD 绘制（P0-4）：顶部居中玻璃药丸 + 弹簧跟随的音量条。
@@ -3890,7 +3951,7 @@ unsafe fn draw_volume_hud(now: u64) {
     let scale = 0.9 + 0.1 * e_in;
     let pw = (232.0 * scale) as i32;
     let ph = (44.0 * scale) as i32;
-    let px = (DISPLAY_W as i32 - pw) / 2;
+    let px = (display_w() as i32 - pw) / 2;
     let py = 64 + ((44 - ph) / 2);
     let prev = PIX_ALPHA;
     PIX_ALPHA = alpha;
@@ -3940,9 +4001,9 @@ fn draw_overlay() {
                 w = w.max(text_width(&TOAST[s..e]));
             }
             let w = w.min(420) + 24;
-            let x = (DISPLAY_W as i32 - w) / 2;
+            let x = (display_w() as i32 - w) / 2;
             // Toast 显示在 Dock 与导航栏之上方，避免被遮挡。
-            let base_ty = DOCK_Y - 96;
+            let base_ty = dock_y() - 96;
             // 入场 180ms：底部上滑 16px + 淡入（FastOutSlowIn）；
             // 结束前 150ms 淡出 + 上滑 8px（入场的反向完整性）。
             // 保持期 PIX_ALPHA = 255，零混合开销。
@@ -3993,9 +4054,9 @@ fn draw_ripple() {
             for dx in -radius..=radius {
                 let d = isqrt(dx * dx + dy * dy);
                 if d >= radius - 2 && d <= radius {
-                    let px = (RIPPLE_X + dx).clamp(0, DISPLAY_W as i32 - 1) as usize;
-                    let py = (RIPPLE_Y + dy).clamp(0, DISPLAY_H as i32 - 1) as usize;
-                    let idx = py * DISPLAY_W + px;
+                    let px = (RIPPLE_X + dx).clamp(0, display_w() as i32 - 1) as usize;
+                    let py = (RIPPLE_Y + dy).clamp(0, display_h() as i32 - 1) as usize;
+                    let idx = py * display_w() + px;
                     BACK_BUF[idx] = blend(BACK_BUF[idx], COLOR_TEXT_MAIN, alpha);
                 }
             }
@@ -4005,11 +4066,11 @@ fn draw_ripple() {
 
 /// 行优先自动布局：把一页的项目填入网格（不越界、不重叠）。
 fn layout_page(items: &PageItems, cols: i32, out: &mut [PlacedItem; MAX_PAGE_ITEMS]) -> usize {
-    let mut grid = [0u8; (GRID_ROWS as usize) * 8];
+    let mut grid = [0u8; 6 * 8];
     let mut n = 0usize;
     for idx in 0..items.count {
         let (w, h) = item_size(items.items[idx].kind);
-        'scan: for row in 0..=GRID_ROWS - h {
+        'scan: for row in 0..=grid_rows() - h {
             for col in 0..=cols - w {
                 let mut ok = true;
                 for dy in 0..h {
@@ -4074,7 +4135,7 @@ fn widget_radius(w: i32, h: i32) -> i32 {
 /// 项目在屏幕上的矩形（应用/文件夹为图标区，小组件为整块）。
 fn item_rect(p: &PlacedItem, cols: i32) -> (i32, i32, i32, i32) {
     let x = grid_x(cols) + p.col * CELL_W;
-    let y = GRID_Y + p.row * CELL_H;
+    let y = grid_y() + p.row * CELL_H;
     match p.kind {
         ItemKind::App(_) | ItemKind::Folder => (x, y, ICON_SIZE, ICON_SIZE),
         ItemKind::Widget(_) => (
@@ -4246,7 +4307,7 @@ fn draw_icon_rot_folder(cx: i32, cy: i32, ang_deg: f32) {
 /// 焦点处（frame=0）与满屏外（|frame|=屏宽）都精确归零 —— 相邻页滑到
 /// 焦点时内容恰好对齐、翻页提交/回弹瞬间无跳变，也绝不与焦点页重叠。
 fn page_parallax_shift(frame: f32) -> f32 {
-    let w = DISPLAY_W as f32;
+    let w = display_w() as f32;
     let x = frame / w;
     let ax = if x < 0.0 { -x } else { x };
     if ax >= 1.0 {
@@ -4263,7 +4324,7 @@ fn draw_page() {
             // 保证可视区域始终有页面覆盖；出屏的页由 draw_page_at 跳过。
             // 非焦点页（k≠0）叠加视差位移（图标滞后 + 到位对齐，B5），
             // 焦点页保持 1:1 跟手。
-            let w = DISPLAY_W as f32;
+            let w = display_w() as f32;
             let cur = CURRENT_PAGE as i32;
             let mut k = -2i32;
             while k <= 2 {
@@ -4295,7 +4356,7 @@ fn draw_page() {
 /// 翻页动画期间相邻页各按 ±屏宽 排布；整页出屏时直接跳过。
 /// 逐像素绘制经 put_pixel 边界剪裁，部分可见的图标/小组件无需特殊处理。
 fn draw_page_at(page: usize, offset: i32) {
-    if offset <= -(DISPLAY_W as i32) || offset >= DISPLAY_W as i32 {
+    if offset <= -(display_w() as i32) || offset >= display_w() as i32 {
         return;
     }
     unsafe {
@@ -4313,7 +4374,7 @@ fn draw_page_at(page: usize, offset: i32) {
             let p = placed[i];
             let (mut px, py, pw, ph) = item_rect(&p, cols);
             px += offset;
-            if px + pw <= 0 || px >= DISPLAY_W as i32 {
+            if px + pw <= 0 || px >= display_w() as i32 {
                 continue; // 整项出屏
             }
             match p.kind {
@@ -4350,7 +4411,7 @@ fn draw_edit_hud() {
 }
 
 fn grid_toggle_hit(x: i32, y: i32) -> bool {
-    let bx = DISPLAY_W as i32 - 128;
+    let bx = display_w() as i32 - 128;
     x >= bx && x < bx + 112 && y >= 32 && y < 66
 }
 
@@ -4374,9 +4435,9 @@ fn draw_dragged_icon() {
         let app = &APPS[DRAG_APP];
         let cols = GRID_COLS;
         let gx0 = grid_x(cols);
-        let gy0 = GRID_Y;
+        let gy0 = grid_y();
         let gx1 = gx0 + cols * CELL_W - ICON_H_GAP;
-        let gy1 = gy0 + GRID_ROWS * CELL_H;
+        let gy1 = gy0 + grid_rows() * CELL_H;
         let half = (ICON_SIZE as f32 * 1.12 * 0.5) as i32;
         let cx = DRAG_X.clamp(gx0 + half, gx1 - half);
         let cy = DRAG_Y.clamp(gy0 + half, gy1 - half);
@@ -4401,21 +4462,21 @@ fn draw_page_dots() {
     }
     unsafe {
         let gap = 16;
-        let start = DISPLAY_W as i32 / 2 - ((pages as i32 - 1) * gap) / 2;
+        let start = display_w() as i32 / 2 - ((pages as i32 - 1) * gap) / 2;
         // 翻页吸附段页码在到位瞬间才提交（B5）：吸附期间按「已提交」视点
         // 取显示页码/偏移（新页码 + 偏移±屏宽），页码点行为与到位后连续。
         let (disp_page, disp_off) = if PAGE_ANIM && PAGE_TWEEN_DIR != 0 {
             (
                 (CURRENT_PAGE as i32 + PAGE_TWEEN_DIR).clamp(0, pages as i32 - 1) as usize,
-                PAGE_OFFSET + DISPLAY_W as f32 * PAGE_TWEEN_DIR as f32,
+                PAGE_OFFSET + display_w() as f32 * PAGE_TWEEN_DIR as f32,
             )
         } else {
             (CURRENT_PAGE, PAGE_OFFSET)
         };
         // 翻页进度（0..1）：页码点整体随偏移平移，当前页与目标页的颜色
         // 按进度交叉过渡（ColorOS 指示点跟随手感）。
-        let t = (disp_off.abs() / DISPLAY_W as f32).min(1.0);
-        let shift = (disp_off / DISPLAY_W as f32) * gap as f32;
+        let t = (disp_off.abs() / display_w() as f32).min(1.0);
+        let shift = (disp_off / display_w() as f32) * gap as f32;
         let dir = if disp_off > 0.0 { -1i32 } else { 1 };
         let other = disp_page as i32 + dir;
         let active = COLOR_TEXT_MAIN;
@@ -4432,7 +4493,7 @@ fn draw_page_dots() {
             }
             fill_rect(
                 start + i as i32 * gap - 3 + shift as i32,
-                DOCK_Y - 24,
+                dock_y() - 24,
                 7,
                 7,
                 c,
@@ -4468,7 +4529,7 @@ fn page_drag_allowed() -> bool {
 /// 跟手翻页：把本轮手势的水平位移映射为页面偏移（页界外 0.35x 橡皮筋）。
 fn page_drag_update(dx: i32) {
     unsafe {
-        let w = DISPLAY_W as f32;
+        let w = display_w() as f32;
         let o = dx as f32;
         PAGE_OFFSET = if o > w {
             w + (o - w) * 0.35
@@ -4500,7 +4561,7 @@ fn page_settle(dir: i32, vel: f32) {
                 dir = 0;
             }
         }
-        let w = DISPLAY_W as f32;
+        let w = display_w() as f32;
         let target = if dir > 0 {
             -w
         } else if dir < 0 {
@@ -4594,18 +4655,19 @@ fn pressed_scale_for_app(key: &'static str) -> Option<u32> {
 fn dock_rect(i: usize) -> (i32, i32) {
     unsafe {
         let total_w = DOCK_COUNT as i32 * DOCK_ICON + (DOCK_COUNT as i32 - 1) * DOCK_GAP;
-        let start_x = (DISPLAY_W as i32 - total_w) / 2;
-        let dy = DOCK_Y + (DOCK_H - DOCK_ICON) / 2;
+        let start_x = (display_w() as i32 - total_w) / 2;
+        let dy = dock_y() + (DOCK_H - DOCK_ICON) / 2;
         (start_x + i as i32 * (DOCK_ICON + DOCK_GAP), dy)
     }
 }
 
-/// Dock 玻璃带缓存（同状态栏规则）：带区 = [12, 12+516) × [DOCK_Y+2,
-/// DOCK_Y+2+56)，516×56 ≈ 2.9 万重像素/帧。
+/// Dock 玻璃带缓存（同状态栏规则）：带区 = [12, 12+516) × [dock_y()+2,
+/// dock_y()+2+56)，516×56 ≈ 2.9 万重像素/帧。
 const DOCK_GX: i32 = 12;
-const DOCK_GW: usize = (DISPLAY_W as i32 - 24) as usize;
+fn dock_gw() -> usize { (display_w() as i32 - 24) as usize }
 const DOCK_GH: usize = (DOCK_H - 4) as usize;
-static mut GLASS_DOCK_BUF: [u32; DOCK_GH * DOCK_GW] = [0; DOCK_GH * DOCK_GW];
+fn dock_pixels() -> usize { DOCK_GH * dock_gw() }
+static mut GLASS_DOCK_BUF: PixelBuffer = PixelBuffer::new(DOCK_GH * display::MAX_WIDTH, DOCK_GH * 516);
 static mut GLASS_DOCK_KEY: ((u32, u32, u32), bool) =
     ((u32::MAX, u32::MAX, u32::MAX), false);
 
@@ -4613,26 +4675,26 @@ static mut GLASS_DOCK_KEY: ((u32, u32, u32), bool) =
 fn draw_glass_dock_band() {
     unsafe {
         let key = (wallpaper_colors(), THEME_DARK);
-        let y0 = (DOCK_Y + 2) as usize;
+        let y0 = (dock_y() + 2) as usize;
         if GLASS_DOCK_KEY == key {
             for r in 0..DOCK_GH {
-                let base = (y0 + r) * DISPLAY_W + DOCK_GX as usize;
-                BACK_BUF[base..base + DOCK_GW]
-                    .copy_from_slice(&GLASS_DOCK_BUF[r * DOCK_GW..(r + 1) * DOCK_GW]);
+                let base = (y0 + r) * display_w() + DOCK_GX as usize;
+                BACK_BUF[base..base + dock_gw()]
+                    .copy_from_slice(&GLASS_DOCK_BUF[r * dock_gw()..(r + 1) * dock_gw()]);
             }
             return;
         }
         draw_glass(
             DOCK_GX,
-            DOCK_Y + 2,
-            DOCK_GW as i32,
+            dock_y() + 2,
+            dock_gw() as i32,
             DOCK_GH as i32,
             30,
         );
         for r in 0..DOCK_GH {
-            let base = (y0 + r) * DISPLAY_W + DOCK_GX as usize;
-            GLASS_DOCK_BUF[r * DOCK_GW..(r + 1) * DOCK_GW]
-                .copy_from_slice(&BACK_BUF[base..base + DOCK_GW]);
+            let base = (y0 + r) * display_w() + DOCK_GX as usize;
+            GLASS_DOCK_BUF[r * dock_gw()..(r + 1) * dock_gw()]
+                .copy_from_slice(&BACK_BUF[base..base + dock_gw()]);
         }
         GLASS_DOCK_KEY = key;
     }
@@ -4740,8 +4802,8 @@ fn draw_widget_glass_cached(kind: WidgetKind, x: i32, y: i32, w: i32, h: i32, r:
             || h as usize > WG_CACHE_H
             || x < 0
             || y < 0
-            || x + w > DISPLAY_W as i32
-            || y + h > DISPLAY_H as i32
+            || x + w > display_w() as i32
+            || y + h > display_h() as i32
         {
             draw_glass(x, y, w, h, r);
             return;
@@ -4752,7 +4814,7 @@ fn draw_widget_glass_cached(kind: WidgetKind, x: i32, y: i32, w: i32, h: i32, r:
         if WGT_GLASS_KEY[slot] == key {
             for row in 0..h as usize {
                 let src = row * wu;
-                let dst = (y as usize + row) * DISPLAY_W + x as usize;
+                let dst = (y as usize + row) * display_w() + x as usize;
                 BACK_BUF[dst..dst + wu].copy_from_slice(&WGT_GLASS_BUF[slot][src..src + wu]);
             }
             return;
@@ -4760,7 +4822,7 @@ fn draw_widget_glass_cached(kind: WidgetKind, x: i32, y: i32, w: i32, h: i32, r:
         draw_glass(x, y, w, h, r);
         for row in 0..h as usize {
             let src = row * wu;
-            let dst = (y as usize + row) * DISPLAY_W + x as usize;
+            let dst = (y as usize + row) * display_w() + x as usize;
             WGT_GLASS_BUF[slot][src..src + wu].copy_from_slice(&BACK_BUF[dst..dst + wu]);
         }
         WGT_GLASS_KEY[slot] = key;
@@ -4776,8 +4838,8 @@ fn draw_boot_progress() {
         let total = BOOT_TOTAL.max(1);
         let pct = BOOT_LIMIT.min(total) * 100 / total;
         let bw = 240i32;
-        let bx = (DISPLAY_W as i32 - bw) / 2;
-        let by = DOCK_Y - 56;
+        let bx = (display_w() as i32 - bw) / 2;
+        let by = dock_y() - 56;
         // 液态玻璃启动进度面板（浅色玻璃 + 深字，浅灰轨道 + 强调绿进度）。
         draw_glass(bx - 10, by, bw + 20, 52, 16);
         let label = txt("LOADING", "正在进入桌面");
@@ -4858,8 +4920,8 @@ fn draw_frost_round_rect(x: i32, y: i32, w: i32, h: i32, r: i32) {
         for dx in 0..wu {
             let sx = x + dx as i32;
             let sy = y + dy as i32;
-            let c = if sx >= 0 && sy >= 0 && sx < DISPLAY_W as i32 && sy < DISPLAY_H as i32 {
-                unsafe { BACK_BUF[sy as usize * DISPLAY_W + sx as usize] }
+            let c = if sx >= 0 && sy >= 0 && sx < display_w() as i32 && sy < display_h() as i32 {
+                unsafe { BACK_BUF[sy as usize * display_w() + sx as usize] }
             } else {
                 0
             };
@@ -4871,8 +4933,8 @@ fn draw_frost_round_rect(x: i32, y: i32, w: i32, h: i32, r: i32) {
     unsafe {
         blur_region(
             &mut BACK_BUF,
-            DISPLAY_W,
-            DISPLAY_H,
+            display_w(),
+            display_h(),
             x as usize,
             y as usize,
             wu,
@@ -4881,7 +4943,7 @@ fn draw_frost_round_rect(x: i32, y: i32, w: i32, h: i32, r: i32) {
     }
     for dy in 0..hu {
         for dx in 0..wu {
-            let idx = (y + dy as i32) as usize * DISPLAY_W + (x + dx as i32) as usize;
+            let idx = (y + dy as i32) as usize * display_w() + (x + dx as i32) as usize;
             let orig = unsafe { WIDGET_SCRATCH[dy * WIDGET_SCRATCH_W + dx] };
             // 覆盖度：仅四个圆角盒超采样，内部恒为不透明（抗锯齿轮廓）。
             let cov = if (dx < r as usize || dx >= w as usize - r as usize)
@@ -4921,8 +4983,8 @@ fn draw_glass_solid(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, alpha: u
             if cov > 0 {
                 let sx = x + dx;
                 let sy = y + dy;
-                if sx >= 0 && sy >= 0 && sx < DISPLAY_W as i32 && sy < DISPLAY_H as i32 {
-                    let idx = sy as usize * DISPLAY_W + sx as usize;
+                if sx >= 0 && sy >= 0 && sx < display_w() as i32 && sy < display_h() as i32 {
+                    let idx = sy as usize * display_w() + sx as usize;
                     unsafe {
                         BACK_BUF[idx] = blend(BACK_BUF[idx], color, alpha * cov / 255);
                     }
@@ -4938,8 +5000,8 @@ fn draw_glass_solid(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, alpha: u
 struct LauncherGlass;
 impl GlassTarget for LauncherGlass {
     fn backdrop(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -5387,7 +5449,7 @@ fn widget_launch(kind: WidgetKind) {
 
 const EDIT_BAR_W: i32 = 444;
 const EDIT_BAR_H: i32 = 104;
-const EDIT_BAR_X: i32 = (DISPLAY_W as i32 - EDIT_BAR_W) / 2;
+fn edit_bar_x() -> i32 { (display_w() as i32 - EDIT_BAR_W) / 2 }
 const EDIT_ITEM_NUM: usize = 3;
 /// 编辑条入场 200ms（上滑 14px + 淡入）。
 const EDIT_MENU_IN_US: u64 = 200_000;
@@ -5395,13 +5457,13 @@ const EDIT_MENU_IN_US: u64 = 200_000;
 const EDIT_SHEET_IN_US: u64 = 180_000;
 
 fn edit_bar_y() -> i32 {
-    DOCK_Y - EDIT_BAR_H - 14
+    dock_y() - EDIT_BAR_H - 14
 }
 
 fn edit_item_center(i: usize) -> (i32, i32) {
     let seg = EDIT_BAR_W / EDIT_ITEM_NUM as i32;
     (
-        EDIT_BAR_X + seg * i as i32 + seg / 2,
+        edit_bar_x() + seg * i as i32 + seg / 2,
         edit_bar_y() + 36,
     )
 }
@@ -5638,7 +5700,7 @@ fn edit_sheet_tap(x: i32, y: i32) {
         let w = dialog::DLG_W;
         let h =
             dialog::DLG_TITLE_H + n as i32 * dialog::DLG_OPT_H + dialog::DLG_BTN_H;
-        let (px, py) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let (px, py) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
         let opts_top = py + dialog::DLG_TITLE_H;
         if let Some(idx) = dialog::hit_options(x, y, px, opts_top, w, n) {
             match EDIT_SHEET {
@@ -5728,7 +5790,7 @@ fn draw_edit_menu() {
         let prev = PIX_ALPHA;
         PIX_ALPHA = (255.0 * e) as u32;
         let by = edit_bar_y() + dy;
-        draw_glass(EDIT_BAR_X, by, EDIT_BAR_W, EDIT_BAR_H, 26);
+        draw_glass(edit_bar_x(), by, EDIT_BAR_W, EDIT_BAR_H, 26);
         let labels: [&[u8]; EDIT_ITEM_NUM] = [
             txt("Wallpaper", "壁纸"),
             txt("Widgets", "小组件"),
@@ -5755,8 +5817,8 @@ impl dialog::DialogUi for DlgUi {
         put_pixel(x, y, color);
     }
     fn back(&self, x: i32, y: i32) -> u32 {
-        if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-            unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+        if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+            unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
         } else {
             0
         }
@@ -5774,11 +5836,11 @@ impl dialog::DialogUi for DlgUi {
         cy - (px as i32 + 1) / 2
     }
     fn fill_row(&mut self, y: i32, x0: i32, x1: i32, color: u32, alpha: u32) {
-        if y < 0 || y >= DISPLAY_H as i32 || x1 <= x0 {
+        if y < 0 || y >= display_h() as i32 || x1 <= x0 {
             return;
         }
         let xa = x0.max(0);
-        let xb = x1.min(DISPLAY_W as i32);
+        let xb = x1.min(display_w() as i32);
         if xb <= xa {
             return;
         }
@@ -5788,7 +5850,7 @@ impl dialog::DialogUi for DlgUi {
             if a == 0 {
                 return;
             }
-            let base = y as usize * DISPLAY_W;
+            let base = y as usize * display_w();
             for idx in base + xa as usize..base + xb as usize {
                 BACK_BUF[idx] = blend(BACK_BUF[idx], color, a);
             }
@@ -5834,11 +5896,11 @@ fn draw_edit_sheet() {
         let (title, items, n, _multi) = edit_sheet_spec();
         let w = dialog::DLG_W;
         let h = dialog::DLG_TITLE_H + n as i32 * dialog::DLG_OPT_H + dialog::DLG_BTN_H;
-        let (x, y) = dialog::center_rect(DISPLAY_W as i32, DISPLAY_H as i32, w, h);
+        let (x, y) = dialog::center_rect(display_w() as i32, display_h() as i32, w, h);
         let prev = PIX_ALPHA;
         PIX_ALPHA = (255.0 * e) as u32;
         let mut ui = DlgUi;
-        dialog::scrim(&mut ui, DISPLAY_W as i32, DISPLAY_H as i32, 115);
+        dialog::scrim(&mut ui, display_w() as i32, display_h() as i32, 115);
         dialog::draw_card(&mut ui, dlg_fill, dlg_stroke, x, y, w, h);
         dialog::draw_title(&mut ui, x, y, w, title);
         let sel = edit_sheet_sel(n);
@@ -5859,8 +5921,8 @@ fn draw_edit_sheet() {
 
 fn folder_panel_rect() -> (i32, i32, i32, i32) {
     (
-        (DISPLAY_W as i32 - FOLDER_PANEL_W as i32) / 2,
-        (NAV_Y - FOLDER_PANEL_H as i32) / 2,
+        (display_w() as i32 - FOLDER_PANEL_W as i32) / 2,
+        (sys_nav::nav_y() - FOLDER_PANEL_H as i32) / 2,
         FOLDER_PANEL_W as i32,
         FOLDER_PANEL_H as i32,
     )
@@ -5880,7 +5942,7 @@ fn folder_icon_center() -> (i32, i32) {
             }
         }
     }
-    (DISPLAY_W as i32 / 2, DISPLAY_H as i32 / 2)
+    (display_w() as i32 / 2, display_h() as i32 / 2)
 }
 
 /// 全屏压暗（blend(c, 0x00050A14, 150)），文件夹打开时使用。
@@ -5894,7 +5956,7 @@ fn dim_screen() {
             }
             DIM_LUT_READY = true;
         }
-        for i in 0..DISPLAY_W * DISPLAY_H {
+        for i in 0..display_w() * display_h() {
             let c = BACK_BUF[i];
             BACK_BUF[i] = (DIM_LUT[((c >> 16) & 0xFF) as usize] << 16)
                 | (DIM_LUT[((c >> 8) & 0xFF) as usize] << 8)
@@ -5914,8 +5976,8 @@ fn folder_build_tile() {
             for dx in 0..pw {
                 let sx = px + dx;
                 let sy = py + dy;
-                let c = if sx >= 0 && sy >= 0 && sx < DISPLAY_W as i32 && sy < DISPLAY_H as i32 {
-                    BACK_BUF[sy as usize * DISPLAY_W + sx as usize]
+                let c = if sx >= 0 && sy >= 0 && sx < display_w() as i32 && sy < display_h() as i32 {
+                    BACK_BUF[sy as usize * display_w() + sx as usize]
                 } else {
                     0
                 };
@@ -6139,12 +6201,12 @@ fn rename_key_hit(x: i32, y: i32) {
 
 fn draw_rename_panel() {
     // 液态玻璃重命名面板（模糊桌面 + 浅色着色，深字浅玻璃按键）。
-    draw_glass(0, 640, DISPLAY_W as i32, 264, 0);
+    draw_glass(0, 640, display_w() as i32, 264, 0);
     let title = txt("Rename folder", "重命名文件夹");
     draw_text_px(16, 616, title, 13.0, COLOR_TEXT_MAIN);
     let name = unsafe { &RENAME_BUF[..RENAME_LEN] };
     let w = text_width_px(name, 20.0);
-    let nx = (DISPLAY_W as i32 - w) / 2;
+    let nx = (display_w() as i32 - w) / 2;
     draw_text_px(nx, 650, name, 20.0, COLOR_TEXT_MAIN);
     draw_line(nx + w + 2, 654, nx + w + 2, 672, COLOR_ACCENT);
     for row in 0..4 {
@@ -6316,7 +6378,7 @@ fn mouse_long_press(x: i32, y: i32) {
         }
         let on_blank = match hit_item(x, y) {
             Some(p) => matches!(p.kind, ItemKind::App(_)),
-            None => hit_dock(x, y).is_none() && y >= STATUS_H && y < DOCK_Y,
+            None => hit_dock(x, y).is_none() && y >= STATUS_H && y < dock_y(),
         };
         if on_blank {
             enter_edit_mode();
@@ -6433,12 +6495,12 @@ fn push_dec(buf: &mut [u8], mut v: u32) -> usize {
 const LOCK_KEY_W: i32 = 76;
 const LOCK_KEY_H: i32 = 58;
 const LOCK_KEY_GAP: i32 = 14;
-const LOCK_PAD_X: i32 = (DISPLAY_W as i32 - (3 * LOCK_KEY_W + 2 * LOCK_KEY_GAP)) / 2;
+fn lock_pad_x() -> i32 { (display_w() as i32 - (3 * LOCK_KEY_W + 2 * LOCK_KEY_GAP)) / 2 }
 const LOCK_PAD_Y: i32 = 560;
 /// 图案 3x3 点阵布局。
 const LOCK_PAT_R: i32 = 20;
 const LOCK_PAT_GAP: i32 = 84;
-const LOCK_PAT_X0: i32 = (DISPLAY_W as i32 - 2 * LOCK_PAT_GAP) / 2;
+fn lock_pat_x0() -> i32 { (display_w() as i32 - 2 * LOCK_PAT_GAP) / 2 }
 const LOCK_PAT_Y0: i32 = 430;
 
 /// 图案点 (i:0..=8) 的屏幕坐标。
@@ -6446,7 +6508,7 @@ fn lock_pat_center(i: usize) -> (i32, i32) {
     let row = (i / 3) as i32;
     let col = (i % 3) as i32;
     (
-        LOCK_PAT_X0 + col * LOCK_PAT_GAP,
+        lock_pat_x0() + col * LOCK_PAT_GAP,
         LOCK_PAT_Y0 + row * LOCK_PAT_GAP,
     )
 }
@@ -6473,7 +6535,7 @@ fn draw_lock_background(off: i32) {
             (0xF7u32, 0xFAu32, 0xFDu32, 0xE7u32, 0xEFu32, 0xF7u32)
         };
         // 层上移 |off| 时：屏幕可见行 0..(H+off) 对应渐变行 (-off)..H。
-        let end = (DISPLAY_H as i32 + off).min(DISPLAY_H as i32);
+        let end = (display_h() as i32 + off).min(display_h() as i32);
         // off > 0（跟手上滑后往回下拖）：层整体下移，顶部 y<off 的行不再属于
         // 锁屏层（露出下方桌面）——跳过这些行；否则 gy<0 经 as u32 回绕成
         // ~4×10⁹，乘 255 再回绕，渐变顶行变成垃圾色。
@@ -6481,14 +6543,14 @@ fn draw_lock_background(off: i32) {
         let mut y = start;
         while y < end {
             let gy = y - off;
-            let t = (gy as u32 * 255 / DISPLAY_H as u32).min(255);
+            let t = (gy as u32 * 255 / display_h() as u32).min(255);
             let inv = 255 - t;
             let r = (top_r * inv + bot_r * t) / 255;
             let g = (top_g * inv + bot_g * t) / 255;
             let b = (top_b * inv + bot_b * t) / 255;
             let row = (r << 16) | (g << 8) | b;
-            let iy = y as usize * DISPLAY_W;
-            for x in 0..DISPLAY_W {
+            let iy = y as usize * display_w();
+            for x in 0..display_w() {
                 BACK_BUF[iy + x] = row;
             }
             y += 1;
@@ -6529,7 +6591,7 @@ fn draw_lock_content(off: i32) {
         time_hhmm(&mut hhmm);
         let base_y = 150 + off;
         if LOCK_PHASE == LockPhase::Unlocking {
-            let span = DISPLAY_H as f32 + LOCK_FROM;
+            let span = display_h() as f32 + LOCK_FROM;
             let e = if span > 0.0 {
                 ((LOCK_FROM - off as f32) / span).clamp(0.0, 1.0)
             } else {
@@ -6538,7 +6600,7 @@ fn draw_lock_content(off: i32) {
             let pa = PIX_ALPHA;
             PIX_ALPHA = ((255.0 * (1.0 - e)) as u32).min(255);
             draw_big_text_f(
-                DISPLAY_W as i32 / 2,
+                display_w() as i32 / 2,
                 base_y,
                 &hhmm,
                 5.0 * (1.0 + 0.12 * e),
@@ -6555,7 +6617,7 @@ fn draw_lock_content(off: i32) {
             let pa = PIX_ALPHA;
             PIX_ALPHA = ((255.0 * (1.0 - e)) as u32).min(255);
             draw_big_text_f(
-                DISPLAY_W as i32 / 2,
+                display_w() as i32 / 2,
                 base_y - (12.0 * e) as i32,
                 &LOCK_PREV_HHMM,
                 5.0,
@@ -6563,7 +6625,7 @@ fn draw_lock_content(off: i32) {
             );
             PIX_ALPHA = ((255.0 * e) as u32).min(255);
             draw_big_text_f(
-                DISPLAY_W as i32 / 2,
+                display_w() as i32 / 2,
                 base_y - (12.0 * (1.0 - e)) as i32,
                 &hhmm,
                 5.0,
@@ -6571,7 +6633,7 @@ fn draw_lock_content(off: i32) {
             );
             PIX_ALPHA = pa;
         } else {
-            draw_big_text(DISPLAY_W as i32 / 2, base_y, &hhmm, 5, clock_col);
+            draw_big_text(display_w() as i32 / 2, base_y, &hhmm, 5, clock_col);
             LOCK_SHOWN_HHMM = hhmm;
         }
         // 日期行（YYYY-MM-DD，8x8 字形 1 倍）。
@@ -6586,16 +6648,16 @@ fn draw_lock_content(off: i32) {
         date[n] = b'-';
         n += 1;
         n += push_dec(&mut date[n..], d);
-        draw_big_text(DISPLAY_W as i32 / 2, 240 + off, &date[..n], 1, sub_col);
+        draw_big_text(display_w() as i32 / 2, 240 + off, &date[..n], 1, sub_col);
         // 锁图标（液态玻璃圆角方块 + 锁梁）。
-        let (lx, ly) = (DISPLAY_W as i32 / 2 - 10, 300 + off);
+        let (lx, ly) = (display_w() as i32 / 2 - 10, 300 + off);
         draw_glass(lx, ly, 20, 16, 6);
         fill_rect(lx + 6, ly - 7, 8, 7, COLOR_ACCENT);
         fill_rect(lx, ly, 20, 16, COLOR_ACCENT);
         // 解锁提示 / 错误提示。
         if LOCK_FAIL_TICKS > 0 {
             draw_big_text(
-                DISPLAY_W as i32 / 2,
+                display_w() as i32 / 2,
                 340 + off,
                 txt("WRONG PASSCODE", "密码错误"),
                 1,
@@ -6604,28 +6666,28 @@ fn draw_lock_content(off: i32) {
         } else {
             match LOCK_SEC_TYPE {
                 0 => draw_big_text(
-                    DISPLAY_W as i32 / 2,
+                    display_w() as i32 / 2,
                     340 + off,
                     txt("Swipe up to unlock", "上滑解锁"),
                     1,
                     sub_col,
                 ),
                 1 => draw_big_text(
-                    DISPLAY_W as i32 / 2,
+                    display_w() as i32 / 2,
                     340 + off,
                     txt("Enter PIN", "输入 PIN"),
                     1,
                     sub_col,
                 ),
                 2 => draw_big_text(
-                    DISPLAY_W as i32 / 2,
+                    display_w() as i32 / 2,
                     340 + off,
                     txt("Draw pattern", "绘制图案"),
                     1,
                     sub_col,
                 ),
                 _ => draw_big_text(
-                    DISPLAY_W as i32 / 2,
+                    display_w() as i32 / 2,
                     340 + off,
                     txt("Enter password", "输入密码"),
                     1,
@@ -6642,7 +6704,7 @@ fn draw_lock_content(off: i32) {
         };
         let gap = 18;
         let total = dots as i32 * gap;
-        let x0 = DISPLAY_W as i32 / 2 - total / 2 + gap / 2;
+        let x0 = display_w() as i32 / 2 - total / 2 + gap / 2;
         for d in 0..dots {
             let filled = (d as usize) < len;
             let c = if filled { COLOR_ACCENT } else { dot_empty };
@@ -6652,7 +6714,7 @@ fn draw_lock_content(off: i32) {
         match LOCK_SEC_TYPE {
             0 => {
                 // 滑动解锁：液态玻璃提示条（上滑手势由 handle_lock_input 处理）。
-                draw_glass(DISPLAY_W as i32 / 2 - 60, 754 + off, 120, 16, 8);
+                draw_glass(display_w() as i32 / 2 - 60, 754 + off, 120, 16, 8);
             }
             1 | 3 => {
                 // 3x4 键盘：1-9 * 0 #（* 为删除，# 为确认）—— 液态玻璃按键。
@@ -6662,7 +6724,7 @@ fn draw_lock_content(off: i32) {
                 for i in 0..12 {
                     let row = (i / 3) as i32;
                     let col = (i % 3) as i32;
-                    let x = LOCK_PAD_X + col * (LOCK_KEY_W + LOCK_KEY_GAP);
+                    let x = lock_pad_x() + col * (LOCK_KEY_W + LOCK_KEY_GAP);
                     let y = LOCK_PAD_Y + off + row * (LOCK_KEY_H + LOCK_KEY_GAP);
                     draw_glass_key(x, y, LOCK_KEY_W, LOCK_KEY_H);
                     let ch = keys[i];
@@ -6699,9 +6761,9 @@ fn draw_lock_content(off: i32) {
                     draw_line(a.0, a.1 + off, b.0, b.1 + off, COLOR_ACCENT);
                 }
                 // 下方删除键 —— 液态玻璃。
-                draw_glass(DISPLAY_W as i32 / 2 - 40, 720 + off, 80, 44, 12);
+                draw_glass(display_w() as i32 / 2 - 40, 720 + off, 80, 44, 12);
                 draw_big_text(
-                    DISPLAY_W as i32 / 2,
+                    display_w() as i32 / 2,
                     736 + off,
                     txt("CLEAR", "清除"),
                     1,
@@ -6740,8 +6802,8 @@ unsafe fn blend_ring(cx: i32, cy: i32, r: i32, color: u32, alpha: u32) {
     if r <= 0 || alpha == 0 {
         return;
     }
-    let w = DISPLAY_W as i32;
-    let h = DISPLAY_H as i32;
+    let w = display_w() as i32;
+    let h = display_h() as i32;
     let a = alpha.min(255);
     let mut px: i32 = 0;
     let mut py: i32 = r;
@@ -6759,7 +6821,7 @@ unsafe fn blend_ring(cx: i32, cy: i32, r: i32, color: u32, alpha: u32) {
         ];
         for (x, y) in pts {
             if x >= 0 && x < w && y >= 0 && y < h {
-                let idx = y as usize * DISPLAY_W + x as usize;
+                let idx = y as usize * display_w() + x as usize;
                 BACK_BUF[idx] = blend(BACK_BUF[idx], color, a);
             }
         }
@@ -6781,7 +6843,7 @@ unsafe fn draw_lock_charging(off: i32) {
         return;
     }
     let level = read_number_cached(3, BATTERY_PATH, 85).min(100);
-    let cx = DISPLAY_W as i32 / 2;
+    let cx = display_w() as i32 / 2;
     let cy = 620 + off;
     let now = now_us();
     for k in 0..2u64 {
@@ -6890,7 +6952,7 @@ fn status_charging_anim(now: u64) {
 /// 锁屏整层（背景 + 内容）垂直平移绘制，供解锁/锁定转场使用：
 /// 调用前先绘制桌面内容，层滑出/滑入即露出/覆盖桌面。
 fn draw_lock_layer(off: i32) {
-    if off <= -(DISPLAY_H as i32) {
+    if off <= -(display_h() as i32) {
         return;
     }
     draw_lock_background(off);
@@ -6904,8 +6966,8 @@ fn lock_key_hit(x: i32, y: i32) -> bool {
         match LOCK_SEC_TYPE {
             0 => {
                 // 无安全：点提示条区域也解锁。
-                if x >= DISPLAY_W as i32 / 2 - 60
-                    && x < DISPLAY_W as i32 / 2 + 60
+                if x >= display_w() as i32 / 2 - 60
+                    && x < display_w() as i32 / 2 + 60
                     && y >= 750
                     && y < 780
                 {
@@ -6918,7 +6980,7 @@ fn lock_key_hit(x: i32, y: i32) -> bool {
                 for i in 0..12 {
                     let row = (i / 3) as i32;
                     let col = (i % 3) as i32;
-                    let kx = LOCK_PAD_X + col * (LOCK_KEY_W + LOCK_KEY_GAP);
+                    let kx = lock_pad_x() + col * (LOCK_KEY_W + LOCK_KEY_GAP);
                     let ky = LOCK_PAD_Y + row * (LOCK_KEY_H + LOCK_KEY_GAP);
                     if x >= kx && x < kx + LOCK_KEY_W && y >= ky && y < ky + LOCK_KEY_H {
                         match i {
@@ -6969,8 +7031,8 @@ fn lock_key_hit(x: i32, y: i32) -> bool {
                     }
                 }
                 // 清除键
-                if x >= DISPLAY_W as i32 / 2 - 40
-                    && x < DISPLAY_W as i32 / 2 + 40
+                if x >= display_w() as i32 / 2 - 40
+                    && x < display_w() as i32 / 2 + 40
                     && y >= 720
                     && y < 764
                 {
@@ -7145,7 +7207,7 @@ fn draw_desktop_full() {
                 for v in 0..256u32 {
                     lut[v as usize] = (v * inv) / 255;
                 }
-                let total = DISPLAY_W * DISPLAY_H;
+                let total = display_w() * display_h();
                 for i in 0..total {
                     let v = BACK_BUF[i];
                     BACK_BUF[i] = (lut[((v >> 16) & 0xFF) as usize] << 16)
@@ -7193,6 +7255,7 @@ fn draw_desktop_full() {
 /// BACK_BUF/flip），颜色先过亮度 LUT 与整屏亮度匹配。
 fn draw_cursor_fb() {
     unsafe {
+        if cursor_sprite::host_cursor() { return; }
         cursor_sprite::draw_at(
             FB,
             FB_STRIDE_PX,
@@ -7202,6 +7265,7 @@ fn draw_cursor_fb() {
             CURSOR_Y,
             Some(apply_lut),
         );
+        CURSOR_DRAWN = true;
     }
 }
 
@@ -7210,6 +7274,7 @@ const CUR_UH: usize = cursor_sprite::CUR_UH as usize;
 
 /// 光标下 26x26 区域的备份（贴图 24x24 + 1px 边距），用于 overlay 移动时擦除旧光标。
 static mut CURSOR_UNDER: [u32; CUR_UW * CUR_UH] = [0u32; CUR_UW * CUR_UH];
+static mut CURSOR_DRAWN: bool = false;
 static mut CUR_UNDER_X: i32 = -1;
 static mut CUR_UNDER_Y: i32 = -1;
 
@@ -7238,6 +7303,8 @@ fn save_cursor_under(x: i32, y: i32) {
 /// 把 CURSOR_UNDER 写回 FB（擦除旧光标，恢复桌面像素）。
 fn restore_cursor_under() {
     unsafe {
+        if !CURSOR_DRAWN { return; }
+        CURSOR_DRAWN = false;
         let x = CUR_UNDER_X;
         let y = CUR_UNDER_Y;
         for dy in 0..CUR_UH as i32 {
@@ -7264,14 +7331,32 @@ fn move_cursor_fb() {
             CURSOR_DIRTY = false;
             return;
         }
-        // dock 悬浮进出检测（R6-M）：光标移动本不触发整屏重绘，悬浮放大
-        // 在空闲桌面永不出现。廉价检测光标所处 dock 图标下标，仅在
-        // 进/出翻转时置 NEEDS_REDRAW（一次整屏重绘换取放大/还原即时性）。
+        // Hover changes redraw only the Dock band on an unobstructed, idle desktop.
+        // Repainting wallpaper, widgets and text here stalls input at wide resolutions.
         let hover_idx = dock_hover_index(CURSOR_X, CURSOR_Y);
-        if hover_idx != DOCK_HOVER_IDX {
-            DOCK_HOVER_IDX = hover_idx;
-            NEEDS_REDRAW = true;
+        let dock_changed = hover_idx != DOCK_HOVER_IDX;
+        DOCK_HOVER_IDX = hover_idx;
+        if dock_changed && !LOCKED && MOTION.phase == Phase::Idle
+            && !BOOT_ACTIVE && !PAGE_ANIM && !PAGE_DRAG && !DRAG_ACTIVE
+            && !EDIT_MODE && !EDIT_MENU && EDIT_SHEET == 0
+            && FOLDER_PHASE == FolderPhase::Closed && !RENAME_OPEN && !RECENTS_OPEN
+            && !SHADE_OPEN && !control_center::cc_visible() && !control_center::notif_visible()
+            && !wallpaper_fade_active() && !boot_fade_active()
+        {
+            let (ox, oy) = (CUR_UNDER_X, CUR_UNDER_Y);
+            restore_cursor_under();
+            if ox >= 0 {
+                mark_dirty(ox, oy, cursor_sprite::CUR_UW as u32, cursor_sprite::CUR_UH as u32);
+            }
+            draw_background_rect(0, dock_y(), display_w() as u32, DOCK_H as u32);
+            draw_dock();
+            mark_dirty(0, dock_y(), display_w() as u32, DOCK_H as u32);
+            flip();
+            draw_cursor_overlay();
+            CURSOR_DIRTY = false;
+            return;
         }
+        if cursor_sprite::host_cursor() { CURSOR_DIRTY = false; return; }
         let (ox, oy) = (CUR_UNDER_X, CUR_UNDER_Y);
         if ox >= 0 {
             mark_dirty(
@@ -7305,9 +7390,12 @@ fn move_cursor_fb() {
 fn redraw_status_bar_fast() {
     unsafe {
         draw_status_bar();
-        mark_dirty(0, 0, DISPLAY_W as u32, STATUS_H as u32);
+        mark_dirty(0, 0, display_w() as u32, STATUS_H as u32);
         flip();
-        draw_cursor_overlay();
+        let uy = cursor_sprite::under_y(CURSOR_Y);
+        if uy < STATUS_H && uy + cursor_sprite::CUR_UH > 0 {
+            draw_cursor_overlay();
+        }
         STATUS_DIRTY = false;
     }
 }
@@ -7357,6 +7445,7 @@ fn redraw_clock_widget_fast() -> bool {
 
 fn draw_cursor_overlay() {
     unsafe {
+        if CURSOR_DRAWN || cursor_sprite::host_cursor() { return; }
         if !MOUSE_SEEN || FB.is_null() {
             return;
         }
@@ -7389,7 +7478,7 @@ fn apply_lut(c: u32) -> u32 {
 fn count_pixels() -> usize {
     let mut n = 0usize;
     unsafe {
-        for i in 0..(DISPLAY_W * DISPLAY_H) {
+        for i in 0..(display_w() * display_h()) {
             if BACK_BUF[i] != 0 {
                 n += 1;
             }
@@ -7505,7 +7594,7 @@ fn recents_card_rect(i: usize) -> (i32, i32) {
     const RECENTS_GAP_X: i32 = 24;
     let col = (i as i32) % RECENTS_COLS;
     let row = (i as i32) / RECENTS_COLS;
-    let x = (DISPLAY_W as i32
+    let x = (display_w() as i32
         - (RECENTS_COLS * RECENTS_CARD_W + (RECENTS_COLS - 1) * RECENTS_GAP_X))
         / 2
         + col * (RECENTS_CARD_W + RECENTS_GAP_X);
@@ -7532,7 +7621,7 @@ fn recents_hit(x: i32, y: i32) -> Option<usize> {
 /// 最近任务压暗底图缓存：面板打开期间桌面背景静止（仅卡片运动），打开后
 /// 首帧把「已绘桌面 + 全屏压暗」存入 REC_BG_BUF，动画帧整块 memcpy 替代
 /// 52 万像素的逐像素 blend。失效：壁纸交叉淡化期间（背景逐帧变化）。
-static mut REC_BG_BUF: [u32; DISPLAY_W * DISPLAY_H] = [0; DISPLAY_W * DISPLAY_H];
+static mut REC_BG_BUF: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 static mut REC_BG_OK: bool = false;
 
 fn draw_recents() {
@@ -7551,11 +7640,11 @@ fn draw_recents() {
         if dim > 0 {
             if REC_BG_OK && !RECENTS_CLOSING && close_e == 0.0 {
                 // 缓存命中：整块恢复「桌面 + 压暗」底图。
-                BACK_BUF[..DISPLAY_W * DISPLAY_H].copy_from_slice(&REC_BG_BUF);
+                BACK_BUF[..display_w() * display_h()].copy_from_slice(&REC_BG_BUF);
             } else {
                 // 全屏压暗（在已绘制的桌面上混合，随关闭淡出），并存入缓存
                 // （关闭动画期间进度变化，不缓存）。
-                for i in 0..DISPLAY_W * DISPLAY_H {
+                for i in 0..display_w() * display_h() {
                     let c = blend(BACK_BUF[i], 0x00_05_0A_14, dim);
                     BACK_BUF[i] = c;
                     REC_BG_BUF[i] = c;
@@ -7815,8 +7904,8 @@ fn draw_nav_bar() {
             put_pixel(x, y, color);
         }
         fn backdrop(&self, x: i32, y: i32) -> u32 {
-            if x >= 0 && y >= 0 && x < DISPLAY_W as i32 && y < DISPLAY_H as i32 {
-                unsafe { BACK_BUF[y as usize * DISPLAY_W + x as usize] }
+            if x >= 0 && y >= 0 && x < display_w() as i32 && y < display_h() as i32 {
+                unsafe { BACK_BUF[y as usize * display_w() + x as usize] }
             } else {
                 0
             }
@@ -7944,9 +8033,7 @@ enum Gesture {
 
 /// 触摸面板物理坐标 → 屏幕像素坐标（540x960）。
 fn map_screen(dev_x: i32, dev_y: i32) -> (i32, i32) {
-    let sx = (dev_x * DISPLAY_W as i32 + TOUCH_MAX_X / 2) / TOUCH_MAX_X;
-    let sy = (dev_y * DISPLAY_H as i32 + TOUCH_MAX_Y / 2) / TOUCH_MAX_Y;
-    (sx, sy)
+    (dev_x.clamp(0, display_w() as i32 - 1), dev_y.clamp(0, display_h() as i32 - 1))
 }
 
 /// 非阻塞读取：返回读到的字节数（isize，负值为 errno）。
@@ -7985,14 +8072,14 @@ fn process_events(buf: &[u8]) -> (Option<Gesture>, bool) {
                 // 鼠标相对移动：累积到指针位置并钳制在屏幕内。
                 if code == REL_X {
                     unsafe {
-                        CURSOR_X = (CURSOR_X + value).clamp(0, DISPLAY_W as i32 - 1);
+                        CURSOR_X = (CURSOR_X + value).clamp(0, display_w() as i32 - 1);
                         MOUSE_SEEN = true;
                         CURSOR_DIRTY = true;
                     }
                     moved = true;
                 } else if code == REL_Y {
                     unsafe {
-                        CURSOR_Y = (CURSOR_Y + value).clamp(0, DISPLAY_H as i32 - 1);
+                        CURSOR_Y = (CURSOR_Y + value).clamp(0, display_h() as i32 - 1);
                         MOUSE_SEEN = true;
                         CURSOR_DIRTY = true;
                     }
@@ -8024,13 +8111,13 @@ fn process_events(buf: &[u8]) -> (Option<Gesture>, bool) {
                 if code == ABS_X {
                     LAST_ABS_X = value;
                     // 绝对定位指针（virtio-tablet）：光标跟随到该位置
-                    CURSOR_X = value.clamp(0, DISPLAY_W as i32 - 1);
+                    CURSOR_X = value.clamp(0, display_w() as i32 - 1);
                     MOUSE_SEEN = true;
                     CURSOR_DIRTY = true;
                     moved = true;
                 } else if code == ABS_Y {
                     LAST_ABS_Y = value;
-                    CURSOR_Y = value.clamp(0, DISPLAY_H as i32 - 1);
+                    CURSOR_Y = value.clamp(0, display_h() as i32 - 1);
                     MOUSE_SEEN = true;
                     CURSOR_DIRTY = true;
                     moved = true;
@@ -8327,7 +8414,7 @@ fn handle_gesture(g: Gesture) -> bool {
                         return true;
                     }
                     let by = edit_bar_y();
-                    if x >= EDIT_BAR_X && x < EDIT_BAR_X + EDIT_BAR_W && y >= by && y < by + EDIT_BAR_H {
+                    if x >= edit_bar_x() && x < edit_bar_x() + EDIT_BAR_W && y >= by && y < by + EDIT_BAR_H {
                         // 点编辑条空白（非按钮）不退出编辑。
                         return true;
                     }
@@ -8383,7 +8470,7 @@ fn handle_gesture(g: Gesture) -> bool {
                 } else {
                     0.0
                 };
-                let (off, w) = unsafe { (PAGE_OFFSET, DISPLAY_W as f32) };
+                let (off, w) = unsafe { (PAGE_OFFSET, display_w() as f32) };
                 let dir = if off < -w * 0.25 || vel < -600.0 {
                     1
                 } else if off > w * 0.25 || vel > 600.0 {
@@ -8449,7 +8536,7 @@ fn handle_gesture(g: Gesture) -> bool {
                         Some(p) => matches!(p.kind, ItemKind::App(_)),
                         None => hit_dock(x, y).is_none()
                             && y >= STATUS_H
-                            && y < DOCK_Y
+                            && y < dock_y()
                             && !control_center::cc_visible(),
                     };
                     if on_blank {
@@ -8566,7 +8653,7 @@ fn settings_icon_center() -> (i32, i32) {
             }
         }
     }
-    (DISPLAY_W as i32 / 2, DISPLAY_H as i32 / 2)
+    (display_w() as i32 / 2, display_h() as i32 / 2)
 }
 
 // ==================== 运动 / 动画（对标 iOS + Android） ====================
@@ -8721,7 +8808,7 @@ fn icon_center(app_idx: usize) -> (i32, i32) {
             }
         }
     }
-    (DISPLAY_W as i32 / 2, DISPLAY_H as i32 / 2)
+    (display_w() as i32 / 2, display_h() as i32 / 2)
 }
 
 // ==================== 渐进式启动 ====================
@@ -8852,6 +8939,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     let mut sim_clicked = false;
     let mut frame_clock = display::FrameClock::new();
     let mut display_query_at = 0u64;
+    let mut geometry_query_at = 0u64;
 
     // 打开真实输入设备（非阻塞）；失败则回退为固定坐标模拟点击。
     let input_fd = unsafe { open(INPUT_PATH, O_RDONLY | O_NONBLOCK) };
@@ -8865,6 +8953,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         // 帧开始时刻（µs）：既是本帧时间戳，也是帧预算的起点
         let frame_start = now_us();
         let now = frame_start;
+        if now >= geometry_query_at {
+            refresh_geometry();
+            geometry_query_at = now.saturating_add(33_000);
+        }
         if now >= display_query_at {
             refresh_display_target();
             display_query_at = now.saturating_add(1_000_000);
@@ -9121,7 +9213,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 && unsafe { control_center::shade_drag_allowed() }
             {
                 let px = unsafe { TOUCH.press_x };
-                let w = DISPLAY_W as i32;
+                let w = display_w() as i32;
                 if px < 120 || px >= w - 50 {
                     if control_center::shade_drag_start(px < 120) {
                         control_center::shade_drag_update(dy);
@@ -9176,7 +9268,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
             // 抬手兜底：导航手势等路径未结算的拖动状态在此收敛。
             if unsafe { PAGE_DRAG } {
                 let off = unsafe { PAGE_OFFSET };
-                let w = DISPLAY_W as f32;
+                let w = display_w() as f32;
                 let dir = if off < -w * 0.25 {
                     1
                 } else if off > w * 0.25 {
@@ -9288,14 +9380,11 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         if high_refresh {
             unsafe { ANIMATION_QUALITY.observe(elapsed, 1_000_000_000 / rate as u64); }
         }
-        // 光标流畅优先（与 OOBE 同款，R7-D 修正为真生效条件）：本帧有
-        // 输入（CURSOR_DIRTY 多在帧内已被消费，静态判定是死条件）时跳过
-        // 帧预算睡眠，光标下一帧即刻处理，不叠 16ms 预算。
-        let had_input = unsafe { FRAME_INPUT };
+        // Input's poller wake interrupts this sleep; FrameClock retains the
+        // original deadline across an early wake instead of adding another slot.
         unsafe { FRAME_INPUT = false };
         let wait = frame_clock.wait_us(frame_start, now_us(), rate);
-        if had_input { frame_clock.reset(); }
-        else if wait > 0 { sleep_us(wait); }
+        if wait > 0 { sleep_us(wait); }
     }
 }
 

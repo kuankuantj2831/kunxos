@@ -13,6 +13,32 @@
 // `under_x()/under_y()/CUR_UW/CUR_UH` 计算（贴图外扩 1px，与旧
 // 9x9+描边 = 11x11 的约定相同）。
 
+/// Query once per process. The Windows runner opts into a host-rendered pointer.
+pub fn host_cursor() -> bool {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static MODE: AtomicU8 = AtomicU8::new(0);
+        let cached = MODE.load(Ordering::Relaxed);
+        if cached != 0 { return cached == 2; }
+        let fd: isize;
+        core::arch::asm!("ecall", in("a7") 56usize,
+            inlateout("a0") (-100isize as usize) => fd, in("a1") b"/dev/fb0\0".as_ptr(),
+            in("a2") 0usize, options(nostack));
+        if fd < 0 { return false; }
+        let mut info = [0u32; 10];
+        let result: isize;
+        core::arch::asm!("ecall", in("a7") 29usize, inlateout("a0") fd => result,
+            in("a1") 0x4604usize, in("a2") info.as_mut_ptr(), options(nostack));
+        core::arch::asm!("ecall", in("a7") 57usize, inlateout("a0") fd => _, options(nostack));
+        let external = result == 0 && info[0] == 1 && info[8] & 4 != 0;
+        MODE.store(if external { 2 } else { 1 }, Ordering::Relaxed);
+        return external;
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    false
+}
+
 /// 贴图宽（必须与 tools/make_cursor.py 的 DST_SIZE 一致）。
 pub const CUR_W: i32 = 24;
 /// 贴图高（必须与 tools/make_cursor.py 的 DST_SIZE 一致）。
@@ -64,7 +90,7 @@ pub fn blit(
     y: i32,
     lut: Option<fn(u32) -> u32>,
 ) {
-    if dst.is_null() {
+    if dst.is_null() || host_cursor() {
         return;
     }
     for cy in 0..CUR_H {

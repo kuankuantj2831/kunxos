@@ -489,8 +489,8 @@ fn ttf_glyph_px(x: i32, y: i32, cp: u32, px: f32, color: u32) -> i32 {
                 if a != 0 {
                     let px_ = gx + col as i32;
                     let py_ = y + row as i32;
-                    if px_ >= 0 && py_ >= 0 && px_ < DISPLAY_W as i32 && py_ < DISPLAY_H as i32 {
-                        let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+                    if px_ >= 0 && py_ >= 0 && px_ < display_w() as i32 && py_ < display_h() as i32 {
+                        let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                         put_pixel(px_, py_, ttf_text::font_render::blend(bg, color, a));
                     }
                 }
@@ -524,7 +524,7 @@ fn text_top(px: f32, cy: i32) -> i32 {
 }
 
 fn draw_center_text(y: i32, s: &[u8], px: f32, color: u32) {
-    let tx = (DISPLAY_W as i32 - text_width_px(s, px)) / 2;
+    let tx = (display_w() as i32 - text_width_px(s, px)) / 2;
     draw_text_px(tx, y, s, px, color);
 }
 
@@ -551,7 +551,7 @@ fn draw_sdigits(x: i32, y: i32, s: &[u8], scale: i32, color: u32) -> i32 {
 
 fn draw_center_digits(y: i32, s: &[u8], scale: i32, color: u32) {
     let w = (s.len() as i32) * 8 * scale;
-    draw_sdigits((DISPLAY_W as i32 - w) / 2, y, s, scale, color);
+    draw_sdigits((display_w() as i32 - w) / 2, y, s, scale, color);
 }
 
 // ==================== 选项卡 ====================
@@ -611,7 +611,7 @@ fn draw_tabs() {
         "计时".as_bytes(),
         "秒表".as_bytes(),
     ];
-    let w = DISPLAY_W as i32 / 4;
+    let w = display_w() as i32 / 4;
     let px = tab_pill_x(w);
     for i in 0..4 {
         let x = i as i32 * w;
@@ -624,7 +624,7 @@ fn draw_tabs() {
             fill_rect(x + w - 1, TAB_Y + 10, 1, TAB_H - 20, C_DIV);
         }
     }
-    fill_rect(0, TAB_Y + TAB_H - 1, DISPLAY_W as i32, 1, C_DIV);
+    fill_rect(0, TAB_Y + TAB_H - 1, display_w() as i32, 1, C_DIV);
 }
 
 // ==================== 世界时钟 ====================
@@ -703,7 +703,7 @@ fn draw_world() {
         }
         let c = CITIES[i];
         let is_home = c.0 == zone;
-        fill_round_rect(12, y + 4, DISPLAY_W as i32 - 24, row_h - 8, 12, C_CARD);
+        fill_round_rect(12, y + 4, display_w() as i32 - 24, row_h - 8, 12, C_CARD);
         // 城市名。
         draw_text_px(26, text_top(16.0, y + row_h / 2), c.1, 16.0, C_TEXT);
         // 本地时间。
@@ -718,7 +718,7 @@ fn draw_world() {
             // HH:MM 共 5 字节（ts[5] 不绘制；此前误写分钟个位两遍，
             // 城市行时间显示成「00:488」）。
             let w = text_width_px(&ts[..5], 22.0);
-            draw_text_px(DISPLAY_W as i32 - 30 - w, text_top(22.0, y + row_h / 2), &ts[..5], 22.0, if is_home { C_ACC } else { C_TEXT });
+            draw_text_px(display_w() as i32 - 30 - w, text_top(22.0, y + row_h / 2), &ts[..5], 22.0, if is_home { C_ACC } else { C_TEXT });
             // 偏移。
             let off = l2.offset_min;
             let mut ob = [0u8; 10];
@@ -742,7 +742,7 @@ fn draw_world() {
             // 「本地」角标。
             let lbl = "本地".as_bytes();
             let w = text_width_px(lbl, 12.0);
-            draw_text_px(DISPLAY_W as i32 - 26 - w, text_top(12.0, y + row_h / 2) - 24, lbl, 12.0, C_ACC);
+            draw_text_px(display_w() as i32 - 26 - w, text_top(12.0, y + row_h / 2) - 24, lbl, 12.0, C_ACC);
         }
     }
 }
@@ -854,7 +854,7 @@ fn draw_alarm_list() {
         }
         let a = unsafe { ALARMS[i] };
         let dim = if a.on { C_TEXT } else { C_DIM };
-        fill_round_rect(12, y + 4, DISPLAY_W as i32 - 24, row_h - 8, 14, C_CARD);
+        fill_round_rect(12, y + 4, display_w() as i32 - 24, row_h - 8, 14, C_CARD);
         // 时间。
         let mut ts = [0u8; 5];
         ts[0] = b'0' + (a.hh / 10) as u8;
@@ -879,9 +879,9 @@ fn draw_alarm_list() {
             draw_text_px(28, y + row_h - 2, &sub[..sn], 12.0, C_DIM);
         }
         // 开关。
-        draw_switch(DISPLAY_W as i32 - 26 - 48, y + (row_h - 28) / 2 - 12, a.on);
+        draw_switch(display_w() as i32 - 26 - 48, y + (row_h - 28) / 2 - 12, a.on);
         // 删除：危险红玻璃圆角块（与实色红圆等大小）。
-        draw_glass_style(DISPLAY_W as i32 - 26 - 16 - 12, y + row_h - 22 - 12, 24, 24, 12, &STYLE_DANGER);
+        draw_glass_style(display_w() as i32 - 26 - 16 - 12, y + row_h - 22 - 12, 24, 24, 12, &STYLE_DANGER);
         // 危险玻璃上的 × 保持白色。
         draw_center_text(y + row_h - 28, "×".as_bytes(), 16.0, C_ON_ACCENT);
     }
@@ -889,7 +889,7 @@ fn draw_alarm_list() {
     // 新建按钮（右下角悬浮）：强调绿玻璃胶囊。
     let add = "＋ 新建".as_bytes();
     let w = text_width_px(add, 15.0);
-    draw_glass_style(DISPLAY_W as i32 - w - 42, bottom - 52, w + 30, 40, 20, &STYLE_ACCENT);
+    draw_glass_style(display_w() as i32 - w - 42, bottom - 52, w + 30, 40, 20, &STYLE_ACCENT);
     // 强调玻璃底上保持白字。
     draw_center_text(bottom - 42, add, 15.0, C_ON_ACCENT);
 }
@@ -917,7 +917,7 @@ fn draw_edit() {
     // 周重复。
     let cy = 300;
     draw_text_px(26, text_top(14.0, cy), "重复".as_bytes(), 14.0, C_DIM);
-    let chip_w = (DISPLAY_W as i32 - 52) / 7;
+    let chip_w = (display_w() as i32 - 52) / 7;
     for i in 0..7 {
         let x = 26 + i as i32 * chip_w;
         let on = (unsafe { EDIT_REP } >> i) & 1 != 0;
@@ -939,7 +939,7 @@ fn draw_edit() {
     draw_text_px(26, text_top(14.0, ly), "标签".as_bytes(), 14.0, C_DIM);
     let focused = unsafe { EDIT_FOCUS } == 1;
     // 标签输入框：聚焦白底、未聚焦极浅灰（浅色输入框规范）。
-    fill_round_rect(26, ly + 12, DISPLAY_W as i32 - 52, 42, 12, if focused { C_CARD } else { 0x00_F7_F8_FA });
+    fill_round_rect(26, ly + 12, display_w() as i32 - 52, 42, 12, if focused { C_CARD } else { 0x00_F7_F8_FA });
     let label = unsafe { &EDIT_LABEL[..EDIT_LABEL_LEN] };
     if label.is_empty() {
         draw_text_px(40, text_top(15.0, ly + 33), "输入标签（可选）".as_bytes(), 15.0, C_DIM);
@@ -954,7 +954,7 @@ fn draw_edit() {
     // 保存 / 取消。
     let by = bottom - 54;
     draw_text_button(26, by, 180, 44, "取消".as_bytes(), false);
-    draw_text_button(DISPLAY_W as i32 - 26 - 180, by, 180, 44, "保存".as_bytes(), true);
+    draw_text_button(display_w() as i32 - 26 - 180, by, 180, 44, "保存".as_bytes(), true);
 }
 
 fn weekday_char(i: u32) -> char {
@@ -983,7 +983,7 @@ fn draw_plus_minus(x: i32, y: i32, hour: bool) {
 
 fn draw_quick_chips(y: i32) {
     let labels: [&[u8]; 3] = ["每天".as_bytes(), "工作日".as_bytes(), "仅一次".as_bytes()];
-    let cw = (DISPLAY_W as i32 - 52 - 12) / 3;
+    let cw = (display_w() as i32 - 52 - 12) / 3;
     for i in 0..3 {
         let x = 26 + i as i32 * (cw + 6);
         let rep = unsafe { EDIT_REP };
@@ -1064,7 +1064,7 @@ fn draw_timer() {
     // 预设。
     draw_text_px(26, text_top(14.0, 320), "预设".as_bytes(), 14.0, C_DIM);
     let presets: [u32; 6] = [1, 3, 5, 10, 15, 30];
-    let pw = (DISPLAY_W as i32 - 52 - 30) / 6;
+    let pw = (display_w() as i32 - 52 - 30) / 6;
     for i in 0..6 {
         let x = 26 + i as i32 * (pw + 6);
         let val = presets[i];
@@ -1191,12 +1191,12 @@ fn draw_stopwatch() {
         let mut tb = [0u8; 12];
         let mut tn = 0usize;
         push_ms(&mut tb, &mut tn, total as u64);
-        draw_text_px(DISPLAY_W as i32 - 30 - text_width_px(&tb[..tn], 15.0), text_top(15.0, y + 20), &tb[..tn], 15.0, C_TEXT);
+        draw_text_px(display_w() as i32 - 30 - text_width_px(&tb[..tn], 15.0), text_top(15.0, y + 20), &tb[..tn], 15.0, C_TEXT);
         let mut lpb = [0u8; 12];
         let mut lp = 0usize;
         push_ms(&mut lpb, &mut lp, lap as u64);
-        draw_text_px(DISPLAY_W as i32 - 30 - text_width_px(&lpb[..lp], 13.0), text_top(13.0, y + 40), &lpb[..lp], 13.0, C_DIM);
-        fill_rect(30, y + 39, DISPLAY_W as i32 - 60, 1, C_DIV);
+        draw_text_px(display_w() as i32 - 30 - text_width_px(&lpb[..lp], 13.0), text_top(13.0, y + 40), &lpb[..lp], 13.0, C_DIM);
+        fill_rect(30, y + 39, display_w() as i32 - 60, 1, C_DIV);
     }
 }
 
@@ -1221,14 +1221,14 @@ fn draw_ringing_overlay() {
     let top = 92;
     let bottom = content_bottom();
     // 半透明底。
-    let cx = DISPLAY_W as i32 / 2;
+    let cx = display_w() as i32 / 2;
     let cy = (top + bottom) / 2;
     for dy in -220..220 {
         for dx in -230..230 {
             let px_ = cx + dx;
             let py_ = cy + dy;
-            if px_ >= 0 && px_ < DISPLAY_W as i32 && py_ >= top && py_ < bottom {
-                let bg = unsafe { BACK_BUF[py_ as usize * DISPLAY_W + px_ as usize] };
+            if px_ >= 0 && px_ < display_w() as i32 && py_ >= top && py_ < bottom {
+                let bg = unsafe { BACK_BUF[py_ as usize * display_w() + px_ as usize] };
                 let r = ((bg >> 16) & 0xFF) as u32 * 3 / 4;
                 let g = ((bg >> 8) & 0xFF) as u32 * 3 / 4;
                 let b = (bg & 0xFF) as u32 * 3 / 4;
@@ -1339,7 +1339,7 @@ fn tap_alarm_list(x: i32, y: i32) {
     // 新建按钮。
     let add = "＋ 新建".as_bytes();
     let w = text_width_px(add, 15.0);
-    let ax = DISPLAY_W as i32 - w - 42;
+    let ax = display_w() as i32 - w - 42;
     let ay = bottom - 52;
     if x >= ax && x < ax + w + 30 && y >= ay && y < ay + 40 {
         unsafe {
@@ -1364,7 +1364,7 @@ fn tap_alarm_list(x: i32, y: i32) {
         }
         // 开关（x 限定在开关绘制区：此前只判 y，行上半部任意 x 都会翻转
         // 开关并落盘，行内「点击 = 编辑」永远不可达）。
-        let sx = DISPLAY_W as i32 - 26 - 48;
+        let sx = display_w() as i32 - 26 - 48;
         if x >= sx
             && x < sx + 48
             && y < yy + (row_h - 28) / 2 - 12 + 28
@@ -1377,7 +1377,7 @@ fn tap_alarm_list(x: i32, y: i32) {
             return;
         }
         // 删除。
-        let dx = DISPLAY_W as i32 - 26 - 16;
+        let dx = display_w() as i32 - 26 - 16;
         let dy = yy + row_h - 22;
         if (x - dx).abs() <= 12 && (y - dy).abs() <= 12 {
             unsafe {
@@ -1428,7 +1428,7 @@ fn tap_edit(x: i32, y: i32) {
         return;
     }
     // 周重复。
-    let chip_w = (DISPLAY_W as i32 - 52) / 7;
+    let chip_w = (display_w() as i32 - 52) / 7;
     let cy = 316;
     if y >= cy && y < cy + 38 {
         for i in 0..7 {
@@ -1443,7 +1443,7 @@ fn tap_edit(x: i32, y: i32) {
         return;
     }
     // 快速选项。
-    let cw = (DISPLAY_W as i32 - 52 - 12) / 3;
+    let cw = (display_w() as i32 - 52 - 12) / 3;
     let qy = 370;
     if y >= qy && y < qy + 36 {
         for i in 0..3 {
@@ -1474,7 +1474,7 @@ fn tap_edit(x: i32, y: i32) {
             unsafe { APAGE = APAGE_LIST };
             return;
         }
-        if x >= DISPLAY_W as i32 - 206 && x < DISPLAY_W as i32 - 26 {
+        if x >= display_w() as i32 - 206 && x < display_w() as i32 - 26 {
             save_alarm();
             return;
         }
@@ -1518,7 +1518,7 @@ fn save_alarm() {
 fn tap_timer(x: i32, y: i32) {
     let by = content_bottom() - 60;
     // 预设。
-    let pw = (DISPLAY_W as i32 - 52 - 30) / 6;
+    let pw = (display_w() as i32 - 52 - 30) / 6;
     for i in 0..6 {
         let x0 = 26 + i as i32 * (pw + 6);
         if x >= x0 && x < x0 + pw - 6 && y >= 336 && y < 376 {
@@ -1635,7 +1635,7 @@ fn tap_stopwatch(x: i32, y: i32) {
 }
 
 fn tap_ringing(x: i32, y: i32) {
-    let cx = DISPLAY_W as i32 / 2;
+    let cx = display_w() as i32 / 2;
     let cy = (92 + content_bottom()) / 2;
     let id = unsafe { ARING_ID };
     if y >= cy + 70 && y < cy + 118 {
@@ -1706,6 +1706,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
     loop {
         let ev = poll_input();
+        if ev.resized { dirty = true; }
         if ev.moved {
             cursor_overlay_move();
         }
@@ -1750,7 +1751,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                     tap_ringing(x, y);
                 } else if y >= TAB_Y && y < TAB_Y + TAB_H {
                     unsafe {
-                        let nt = (x / (DISPLAY_W as i32 / 4)).min(3) as u8;
+                        let nt = (x / (display_w() as i32 / 4)).min(3) as u8;
                         if nt != TAB {
                             // 标签切换：指示药丸从旧位滑向新位
                             TAB_PREV = TAB;

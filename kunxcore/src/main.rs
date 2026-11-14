@@ -2277,7 +2277,8 @@ fn gfx_boot(fwcfg_base: usize) {
             // bootloader 启动画面交接：沿用其帧缓冲（不重新翻转，画面保持显示），
             // 直到用户态渲染出桌面首帧后由 splash_fade 线性淡出
             if let Some(ho) = splash_handoff() {
-                if ho.fb_addr != 0 && ho.width == w && ho.height == h {
+                if ho.fb_addr != 0 && ho.width == w && ho.height == h
+                    && gpu_simple::backing_len() == gpu_simple::fb_len() {
                     let fb_base = gpu_simple::fb_adopt(ho.fb_addr as usize);
                     allocator::reserve_region(ho.fb_addr as usize, gpu_simple::fb_len());
                     allocator::reserve_region(SPLASH_HANDOFF_ADDR, 4096);

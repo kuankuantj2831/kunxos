@@ -1,4 +1,5 @@
 # Rust build artifacts
+build/windows/
 target/
 **/target/
 

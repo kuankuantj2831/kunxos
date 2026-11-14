@@ -2,8 +2,8 @@
 //!
 //! 设计：
 //!   - `canvas`：持久化的完整画面（始终保存正确帧），脏区域只在这里重合成；
-//!   - `front` / `back`：两块扫描输出缓冲，`present` 把 canvas 拷贝到 back
-//!     再页翻转（`gpu_simple::present`），实现双缓冲无撕裂；
+//!   - `back`：合成缓冲；`front`：固定扫描输出缓冲。呈现只拷贝完成的脏区，
+//!     避免每帧重建 QEMU 显示表面。ramfb 不提供硬件 VSYNC。
 //!   - 窗口像素格式为 `0x00RRGGBB`（与 XRGB8888 帧缓冲一致），
 //!     窗口透明度是每窗口独立的 `alpha`（0..255），混合采用直通 alpha 公式。
 
@@ -298,7 +298,7 @@ impl Window {
 
 // ==================== 合成器状态 ====================
 
-/// 合成器：持久画布 + 双缓冲扫描输出。
+/// 合成器：持久画布、合成缓冲与固定扫描输出。
 ///
 /// - `canvas`：**持久化应用画布**（`/dev/fb0` 的 mmap 目标，固定物理页、
 ///   不随翻转旋转）。应用把整帧画进 canvas，合成器按**脏矩形**把变更部分
@@ -455,7 +455,7 @@ fn blend_pixel(dst: u32, src: u32, alpha: u8) -> u32 {
 /// （保持画面不中断），另分配 `back`（翻转目标）与 `canvas`（应用直绘画布）。
 /// `/dev/fb0` 的 mmap 目标固定为 **canvas**（`fb_target`）：应用直接写入
 /// canvas，`fb_present` 把脏区拷贝到 back、混合覆盖窗口后页翻转 ——
-/// 应用直绘零整屏拷贝接入双缓冲翻转。
+/// 应用直绘通过脏区复制接入固定扫描缓冲。
 ///
 /// 初始化时三块缓冲都填背景色，保证任意时刻任一缓冲都持有正确帧。
 pub fn init(adopt_front: usize) {
@@ -471,8 +471,18 @@ pub fn init(adopt_front: usize) {
     };
     let back = gpu_simple::alloc_fb();
     let canvas = gpu_simple::alloc_fb();
+    if front == 0 || back == 0 || canvas == 0 {
+        for pa in [if adopt_front == 0 { front } else { 0 }, back, canvas] {
+            if pa != 0 {
+                for offset in (0..gpu_simple::backing_len()).step_by(crate::allocator::PAGE_SIZE) {
+                    crate::allocator::free_page(pa + offset);
+                }
+            }
+        }
+        return;
+    }
     // 缩放查表按屏宽分配（见 SX_TABLE 注释）；失败保留空表 → 逐像素回退
-    let cols = w as usize;
+    let cols = (gpu_simple::backing_len() / 4 / 1200).max(w as usize);
     let tbl = heap::kmalloc(cols * 4) as *mut u32;
     unsafe {
         SX_TABLE = tbl;
@@ -527,6 +537,31 @@ pub fn height() -> u32 {
     unsafe { C.height }
 }
 
+/// Called only by a cooperating foreground app between frames. The three
+/// backing allocations and canvas mapping stay fixed for the entire boot.
+pub fn resize(w: u32, h: u32) -> bool {
+    unsafe {
+        let saved = irq_save();
+        if C.canvas.is_null() || BUSY_TID != 0
+            || w as usize * h as usize * 4 > gpu_simple::backing_len() {
+            irq_restore(saved);
+            return false;
+        }
+        C.width = w;
+        C.height = h;
+        C.dirty_count = 0;
+        C.last_dirty_count = 0;
+        C.app_dirty_count = 0;
+        C.prev_app_count = 0;
+        gpu_simple::set_geometry(w, h);
+        crate::input::set_display_geometry(w, h);
+        crate::devfs::fb_init(C.canvas as usize, gpu_simple::backing_len(), w, h, w * 4);
+        // Do not display the resized backing until the app has repainted it.
+        irq_restore(saved);
+        true
+    }
+}
+
 // ==================== 应用直绘接入（/dev/fb0 → 脏区域合成器） ====================
 //
 // 迁移路径：launcher 等应用不再「整屏 memcpy 到单缓冲」，而是
@@ -534,7 +569,7 @@ pub fn height() -> u32 {
 //   2. `FBIO_PUT_DAMAGE` 提交变更矩形（合并进 `app_dirty`）；
 //   3. `FBIO_PRESENT` 触发 `fb_present`：把「本帧 ∪ 上一帧」应用脏区从
 //      canvas 拷贝到 back（脏区拷贝，非整屏），混合内核覆盖窗口（Home
-//      Indicator 等），页翻转（消除撕裂）。
+//      Indicator 等），再将完成的脏区复制到固定扫描缓冲。
 
 /// 持久应用画布物理地址 —— `/dev/fb0` mmap 的目标（固定，不随翻转旋转）。
 pub fn fb_target() -> usize {
@@ -737,11 +772,8 @@ pub fn fb_present(rects: &[Rect]) -> bool {
         C.dirty_count = comp_count;
         C.dirty[..comp_count].copy_from_slice(&comp[..comp_count]);
         composite_locked();
-        // ★ prev_app 只取「本帧新变更」（上面维护的 newd = 应用脏区 ∪ 本帧
-        // 内核失效区），维持 2 帧并集语义：present() 交换后下一次呈现写入的
-        // back 是 2 帧前的旧缓冲，dirty_{N-1} ∪ dirty_N 恰好补齐这两帧间的
-        // 全部变化；更早的变更已存在于该缓冲（清空 prev_app 才会全屏闪烁/
-        // 光标残影）。累积历史并集则会把一次整屏事件放大为永久整屏拷贝。
+        // Retain one frame of damage conservatively, without accumulating older
+        // history. The scanout and composition buffers now retain fixed roles.
         C.prev_app_count = newd_count;
         C.prev_app[..newd_count].copy_from_slice(&newd[..newd_count]);
         let t4 = crate::timer::now_us();
@@ -1363,35 +1395,30 @@ pub fn restore_back_from_canvas(x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
-/// 呈现：把 `back` 翻转为扫描输出并交换 front/back（无整屏拷贝）。
-///
-/// 双缓冲语义：交换后 `back` 即上一帧完整正确的 `front`，下一帧合成只改脏区。
-/// 翻转前按**脏矩形** clean 对应缓存行（整屏脏区时退化为整屏 clean）。
+/// 将已合成的脏区复制到固定扫描缓冲。ramfb 配置只在绑定或模式改变时更新。
 pub fn present() {
     unsafe {
         if C.width == 0 {
             return;
         }
-        // [perf] 性能 overlay：在待翻转的 back 上绘制（随每帧上屏），并计数
         crate::perf::draw_overlay();
-        // overlay 直写 back 但不在合成脏区集内：把其矩形并入 clean 集，
-        // 否则真机上 overlay 像素滞留缓存不上屏（QEMU 无缓存一致性影响）。
-        let overlay_clean = unsafe { crate::perf::OVERLAY_RECT }
-            .map(|(x, y, w, h)| Rect::new(x, y, w, h));
-        if let Some(r) = overlay_clean {
-            let mut rects: [Rect; MAX_DIRTY] = [Rect::empty(); MAX_DIRTY];
-            let cnt = C.last_dirty_count.min(MAX_DIRTY - 1);
-            rects[..cnt].copy_from_slice(&C.last_dirty[..cnt]);
-            let mut rc = cnt;
-            merge_rect(&mut rects, &mut rc, r);
-            gpu_simple::present_rects(C.back as usize, &rects[..rc]);
-        } else {
-            gpu_simple::present_rects(
-                C.back as usize,
-                &C.last_dirty[..C.last_dirty_count],
-            );
+        let mut rects = [Rect::empty(); MAX_DIRTY];
+        let mut count = 0;
+        for i in 0..C.last_dirty_count {
+            merge_rect(&mut rects, &mut count, C.last_dirty[i]);
         }
-        core::mem::swap(&mut C.front, &mut C.back);
+        if let Some((x, y, w, h)) = crate::perf::OVERLAY_RECT {
+            merge_rect(&mut rects, &mut count, Rect::new(x, y, w, h));
+        }
+        // An empty damage list historically means a full-buffer present.
+        if count == 0 {
+            rects[0] = Rect::new(0, 0, C.width, C.height);
+            count = 1;
+        }
+        for r in &rects[..count] {
+            copy_rect_pixels(C.back, C.front, *r, C.width as usize);
+        }
+        gpu_simple::present_rects(C.front as usize, &rects[..count]);
         crate::perf::note_frame();
     }
 }

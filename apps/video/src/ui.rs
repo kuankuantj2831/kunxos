@@ -35,8 +35,8 @@ pub fn render_library() {
         sub[n] = b' ';
         n += 1;
         n = push_dur(&mut sub, n, duration_of(i));
-        ds_list_cell(0, y, DISPLAY_W as i32, Some(Icon::Video), &name[..name_cap], &sub[..n], true);
-        ds_cell_sep(0, y + CELL_H, DISPLAY_W as i32);
+        ds_list_cell(0, y, display_w() as i32, Some(Icon::Video), &name[..name_cap], &sub[..n], true);
+        ds_cell_sep(0, y + CELL_H, display_w() as i32);
     }
 }
 
@@ -47,22 +47,22 @@ pub fn render_player() {
     let name = unsafe { &VIDEOS[idx][..VIDEO_LENS[idx]] };
 
     // 模拟画面：玻璃面板容器（16px 圆角），画面内容绘制在玻璃之上
-    draw_glass(16, ds::NAV_H + 16, DISPLAY_W as i32 - 32, 360, 16);
+    draw_glass(16, ds::NAV_H + 16, display_w() as i32 - 32, 360, 16);
     let icon_size = 64;
     ds_icon(
         Icon::Video,
-        (DISPLAY_W as i32 - icon_size) / 2,
+        (display_w() as i32 - icon_size) / 2,
         ds::NAV_H + 16 + (360 - icon_size) / 2,
         icon_size,
         ds::C_DIM,
     );
     let name_cap = name.len().min(24);
     let tw = ds_text_width_px(&name[..name_cap], 17.0);
-    ds_title_text((DISPLAY_W as i32 - tw) / 2, ds::NAV_H + 396, &name[..name_cap], ds_text());
+    ds_title_text((display_w() as i32 - tw) / 2, ds::NAV_H + 396, &name[..name_cap], ds_text());
 
     // 进度条：玻璃轨道 + 强调色进度填充（绘制于玻璃之上）
     let bx = 32;
-    let bw = DISPLAY_W as i32 - 64;
+    let bw = display_w() as i32 - 64;
     let by = ds::NAV_H + 440;
     draw_glass(bx, by, bw, 6, 3);
     let d = unsafe { DURATION }.max(1) as i32;
@@ -82,12 +82,12 @@ pub fn render_player() {
     n += 1;
     n = push_time(&mut t, n, unsafe { DURATION });
     let tw2 = ds_text_width_px(&t[..n], 13.0);
-    ds_text_px((DISPLAY_W as i32 - tw2) / 2, by + 16, &t[..n], 13.0, ds::C_DIM);
+    ds_text_px((display_w() as i32 - tw2) / 2, by + 16, &t[..n], 13.0, ds::C_DIM);
 
     // 播放/暂停按钮
     let bw2 = 160;
     let bh = 52;
-    let bxx = (DISPLAY_W as i32 - bw2) / 2;
+    let bxx = (display_w() as i32 - bw2) / 2;
     let byy = by + 56;
     let label: &[u8] = if unsafe { PLAYING } {
         b"\xe6\x9a\x82\xe5\x81\x9c"
@@ -117,7 +117,7 @@ pub fn tap_library(x: i32, y: i32) {
         if cy + CELL_H > content_bottom() {
             break;
         }
-        if x >= 0 && x < DISPLAY_W as i32 && y >= cy && y < cy + CELL_H {
+        if x >= 0 && x < display_w() as i32 && y >= cy && y < cy + CELL_H {
             unsafe {
                 PLAY_IDX = i;
                 PROGRESS = 0;
@@ -143,7 +143,7 @@ pub fn tap_player(x: i32, y: i32) {
     // 播放/暂停按钮
     let bw = 160;
     let bh = 52;
-    let bx = (DISPLAY_W as i32 - bw) / 2;
+    let bx = (display_w() as i32 - bw) / 2;
     let by = ds::NAV_H + 440 + 56;
     if ds_button_hit(x, y, bx, by, bw, bh) {
         unsafe {
