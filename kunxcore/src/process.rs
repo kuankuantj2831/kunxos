@@ -1154,18 +1154,27 @@ pub fn root_page_recorded(root: usize, page: usize) -> bool {
         if ci < pt.count {
             let r = pt.user_pages[ci];
             if r.vaddr == page {
-                return r.paddr != 0 && r.paddr != vm::LAZY_PAGE;
+                return r.paddr != 0 && r.paddr != vm::LAZY_PAGE && vm::user_readable(r.flags);
             }
         }
         for i in 0..pt.count {
             let r = pt.user_pages[i];
-            if r.vaddr == page && r.paddr != 0 && r.paddr != vm::LAZY_PAGE {
+            if r.vaddr == page && r.paddr != 0 && r.paddr != vm::LAZY_PAGE && vm::user_readable(r.flags) {
                 pt.cache_idx = i;
                 return true;
             }
         }
     }
     false
+}
+
+pub fn root_page_reserved(root: usize, page: usize) -> bool {
+    let pid = pid_by_root(root);
+    if pid < 0 { return false; }
+    unsafe {
+        let pt = &PROCESSES[pid as usize].pt;
+        pt.user_pages[..pt.count].iter().any(|r| r.vaddr == page && r.paddr != 0)
+    }
 }
 
 /// 当前进程的地址空间根表（物理地址）。
@@ -1970,9 +1979,13 @@ pub fn map_user_page_owned(vaddr: usize, paddr: usize) -> bool {
 /// 由 `sys_mmap` / brk 的按需路径调用；首次访问时经 page fault 落地。
 /// 返回是否成功；失败时调用方必须回滚已预留的页。
 pub fn reserve_user_page(vaddr: usize) -> bool {
+    reserve_user_page_with_flags(vaddr, vm::FLAG_USER_DATA)
+}
+
+pub fn reserve_user_page_with_flags(vaddr: usize, flags: vm::MapFlags) -> bool {
     let pid = current_pid();
     unsafe {
-        PROCESSES[pid as usize].pt.reserve_page(vaddr, vm::FLAG_USER_DATA)
+        PROCESSES[pid as usize].pt.reserve_page(vaddr, flags)
     }
 }
 
@@ -1992,6 +2005,7 @@ pub fn page_fault_resolve(vaddr: usize) -> bool {
         for i in 0..p.pt.count {
             let rec = p.pt.user_pages[i];
             if rec.vaddr == page && rec.paddr == vm::LAZY_PAGE {
+                if !vm::user_readable(rec.flags) { return false; }
                 // 落地：分配物理页 + 清零 + 建立映射 + 更新记录
                 let Some(pa) = allocator::alloc_page() else { return false };
                 core::ptr::write_bytes(pa as *mut u8, 0, vm::PAGE_SIZE);
@@ -2002,6 +2016,7 @@ pub fn page_fault_resolve(vaddr: usize) -> bool {
                     crate::uart_send_str("[fault] 页表 OOM\n");
                     return false;
                 }
+                if vm::is_user_ro(rec.flags) { allocator::mark_shared_page(pa); }
                 p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: pa, flags: rec.flags };
                 PAGE_FAULTS_RESOLVED += 1;
                 return true;
@@ -2046,7 +2061,7 @@ pub fn cow_break(vaddr: usize) -> bool {
         let p = &mut PROCESSES[pid as usize];
         for i in 0..p.pt.count {
             let rec = p.pt.user_pages[i];
-            if rec.vaddr == page && vm::is_cow(rec.flags) && rec.paddr != vm::LAZY_PAGE {
+            if rec.vaddr == page && vm::is_cow(rec.flags) && vm::user_writable(rec.flags) && rec.paddr != vm::LAZY_PAGE {
                 // 1) 分配新物理页 + 拷贝共享内容
                 let Some(new_pa) = allocator::alloc_page() else { return false };
                 core::ptr::copy_nonoverlapping(
@@ -2056,7 +2071,7 @@ pub fn cow_break(vaddr: usize) -> bool {
                 );
                 // 2) 本进程映射切到新页（RW，清 COW）；map_page_in 覆盖已有
                 //    映射会做 TLB 失效，之后 eret 重试的写指令命中新页
-                let new_flags = rec.flags & !vm::FLAG_COW;
+                let new_flags = vm::data_permissions(rec.flags, vm::AP_USER_RW);
                 // 页表 OOM：归还新页并返回 false（SIGSEGV），
                 // 避免记录指向新页而 PTE 仍是旧共享页的不一致状态。
                 if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
@@ -2106,16 +2121,9 @@ pub fn ensure_user_range_mapped(va: usize, len: usize) -> bool {
     true
 }
 
-/// 确保 `[va, va+len)` 范围内所有页均已落地**且可写**：LAZY 页落地、
-/// COW 共享页 break 出私有副本、共享只读页（ELF 代码/rodata、信号蹦床，
-/// `AP_USER_RO`=0b11 在 **EL1 同样只读**）复制出私有可写副本。
-///
-/// 供内核态**写入**用户缓冲区前调用（`copy_to_user` 等路径）。COW 页在页表
-/// 中映射为只读，EL1 直接写会触发 permission fault → 同步异常处理器 panic
-/// （整机挂死）；共享只读池页同理。因此写前必须把两类页全部处理为私有可写。
-///
-/// 返回是否成功；范围非法、任一页落地失败或复制失败（OOM）返回 `false`
-/// （调用方按 EFAULT/SIGSEGV 语义处理，**绝不能**带着只读映射继续写）。
+/// Prepare a syscall output buffer: materialize writable lazy pages and break
+/// COW pages. Read-only code/rodata and PROT_NONE are rejected, never promoted.
+/// Returns false for invalid ranges, denied permissions or allocation failure.
 pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
     if !vm::user_va_range_ok(va, len) {
         return false;
@@ -2130,19 +2138,21 @@ pub fn ensure_user_range_writable(va: usize, len: usize) -> bool {
         // 与 user_range_mapped 的共享映射路径同语义）。
         match lookup_page_idx(cur) {
             Some((idx, rec)) => {
+                // Only COW records with original write permission may be broken.
+                // A syscall output pointer must never grant write access to text,
+                // rodata, a read-only mmap, or PROT_NONE memory.
+                if !vm::user_writable(rec.flags) { return false; }
                 if rec.paddr == vm::LAZY_PAGE && !page_fault_resolve_at(cur, idx) {
                     return false;
                 }
-                // COW 共享页 → break；AP_USER_RO 页（ELF text/rodata、蹦床）
-                // → 复制私有副本。LAZY 落地保留原 flags，rec.flags 仍有效。
-                if vm::is_cow(rec.flags) || vm::is_user_ro(rec.flags) {
+                if vm::is_cow(rec.flags) {
                     if !mprotect_page(cur, vm::AP_USER_RW) {
                         return false;
                     }
                 }
             }
             None => {
-                if !vm::user_page_pte_u(current_root(), cur) {
+                if !vm::user_page_pte_writable(current_root(), cur) {
                     return false;
                 }
             }
@@ -2185,7 +2195,7 @@ fn page_fault_resolve_at(vaddr: usize, idx: usize) -> bool {
     unsafe {
         let p = &mut PROCESSES[pid as usize];
         let rec = p.pt.user_pages[idx];
-        if rec.vaddr != page || rec.paddr != vm::LAZY_PAGE {
+        if rec.vaddr != page || rec.paddr != vm::LAZY_PAGE || !vm::user_readable(rec.flags) {
             // 下标失效（并发变异防御）：退回全表路径
             return page_fault_resolve(page);
         }
@@ -2196,6 +2206,7 @@ fn page_fault_resolve_at(vaddr: usize, idx: usize) -> bool {
             crate::uart_send_str("[fault] 页表 OOM\n");
             return false;
         }
+        if vm::is_user_ro(rec.flags) { allocator::mark_shared_page(pa); }
         p.pt.user_pages[idx] = vm::UserPage { vaddr: page, paddr: pa, flags: rec.flags };
         PAGE_FAULTS_RESOLVED += 1;
         true
@@ -2242,30 +2253,30 @@ pub fn mprotect_page(vaddr: usize, ap: vm::MapFlags) -> bool {
             if p.pt.user_pages[i].vaddr != page {
                 continue;
             }
+            if ap == vm::FLAG_NO_ACCESS {
+                let rec = &mut p.pt.user_pages[i];
+                rec.flags |= vm::FLAG_NO_ACCESS;
+                if rec.paddr != vm::LAZY_PAGE {
+                    vm::unmap_page_in(p.pt.ttbr0, page);
+                }
+                return true;
+            }
             // LAZY 预留页：只改记录，落地时生效
             if p.pt.user_pages[i].paddr == vm::LAZY_PAGE {
                 let rec = &mut p.pt.user_pages[i];
-                rec.flags = (rec.flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+                rec.flags = vm::data_permissions(rec.flags, ap);
                 return true;
             }
             let wants_rw = ap == vm::AP_USER_RW;
             if wants_rw && (vm::is_cow(p.pt.user_pages[i].flags) || vm::is_user_ro(p.pt.user_pages[i].flags))
             {
-                // COW 页：break 出私有副本（记录被更新为私有 RW）
-                if vm::is_cow(p.pt.user_pages[i].flags) {
-                    if !cow_break(page) {
-                        return false;
-                    }
-                    // cow_break 后记录已是私有 RW，权限目标即达成
-                    if ap == vm::AP_USER_RW {
-                        return true;
-                    }
-                } else {
-                    // 共享只读池页：手动复制出私有页并解除共享
+                    // COW and shared read-only pages both need a private copy.
+                    // This also restores PROT_NONE without relaxing permissions
+                    // through the page-fault-only cow_break entry point.
                     let old_pa = p.pt.user_pages[i].paddr;
                     let Some(new_pa) = allocator::alloc_page() else { return false };
                     core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, vm::PAGE_SIZE);
-                    let new_flags = (p.pt.user_pages[i].flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+                    let new_flags = vm::data_permissions(p.pt.user_pages[i].flags, ap);
                     // 先映射新页（覆盖旧 PTE），成功后再解除旧页共享：
                     // 映射失败时旧页仍完好，不会留下指向已释放页的 PTE。
                     if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
@@ -2278,15 +2289,19 @@ pub fn mprotect_page(vaddr: usize, ap: vm::MapFlags) -> bool {
                     }
                     p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: new_pa, flags: new_flags };
                     return true;
-                }
             }
             // 普通路径：更新 AP（清除 COW 标记；只读页保持共享池语义）
             let rec = p.pt.user_pages[i];
-            let new_flags = (rec.flags & !vm::AP_MASK & !vm::FLAG_COW) | ap;
+            let new_flags = vm::data_permissions(rec.flags, ap);
             // 页表 OOM：保持旧映射与记录一致，mprotect 失败返回 false。
             if !vm::map_page_in(p.pt.ttbr0, page, rec.paddr, vm::cow_pte_flags(new_flags)) {
                 crate::uart_send_str("[mprotect] 页表 OOM\n");
                 return false;
+            }
+            if vm::is_user_ro(new_flags) && !vm::is_user_ro(rec.flags) && !vm::is_cow(rec.flags) {
+                // A newly read-only private page enters shared ownership before
+                // fork can increment it. Otherwise the first child exit frees it.
+                allocator::mark_shared_page(rec.paddr);
             }
             p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: rec.paddr, flags: new_flags };
             return true;

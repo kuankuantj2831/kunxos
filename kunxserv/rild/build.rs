@@ -8,17 +8,24 @@ use std::process::Command;
 /// 返回候选命令中第一个存在于 PATH 且可执行的（都没找到则取末位，让
 /// Command 报原始 NotFound）。
 fn first_in_path(candidates: &[&str]) -> String {
-    use std::os::unix::fs::PermissionsExt;
     for name in candidates {
         if let Some(paths) = env::var_os("PATH") {
             for dir in env::split_paths(&paths) {
-                let p = dir.join(name);
-                if p.is_file()
-                    && p.metadata()
-                        .map(|m| m.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false)
-                {
-                    return name.to_string();
+                let mut names = vec![name.to_string()];
+                if cfg!(windows) {
+                    for ext in env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into()).split(';') {
+                        names.push(format!("{name}{ext}"));
+                    }
+                }
+                for file in names {
+                    let p = dir.join(file);
+                    if !p.is_file() { continue; }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if !p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) { continue; }
+                    }
+                    return p.to_string_lossy().into_owned();
                 }
             }
         }
@@ -42,7 +49,7 @@ fn main() {
         // ar 只做归档（架构无关）：优先 llvm-ar；发行版常只有带版本号的
         // llvm-ar-XX 而无通用链接（如 CI 的 ubuntu），回退 binutils ar。
         let ar = env::var("KUNXOS_AR").unwrap_or_else(|_| first_in_path(&["llvm-ar", "ar"]));
-        ("clang".to_string(), ar)
+        (env::var("KUNXOS_CC").unwrap_or_else(|_| first_in_path(&["clang"])), ar)
     } else {
         (
             env::var("KUNXOS_CC").unwrap_or_else(|_| "aarch64-linux-gnu-gcc".to_string()),
@@ -73,7 +80,7 @@ fn main() {
         .arg("-o")
         .arg(&obj)
         .status()
-        .expect("failed to run C compiler (aarch64-linux-gnu-gcc)");
+        .unwrap_or_else(|e| panic!("failed to run C compiler {cc}: {e}; set KUNXOS_CC"));
     assert!(status.success(), "pdu.c compile failed");
 
     let status = Command::new(&ar)
@@ -88,4 +95,8 @@ fn main() {
     println!("cargo:rustc-link-lib=static=pdu");
     println!("cargo:rerun-if-changed=src/pdu/pdu.c");
     println!("cargo:rerun-if-changed=src/pdu/pdu.h");
+    println!("cargo:rerun-if-env-changed=KUNXOS_CC");
+    println!("cargo:rerun-if-env-changed=KUNXOS_AR");
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=PATHEXT");
 }

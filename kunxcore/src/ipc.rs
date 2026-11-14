@@ -34,6 +34,44 @@ const MAX_SHMS: usize = 8;
 pub const FD_READ: u32 = 0x1;
 pub const FD_WRITE: u32 = 0x2;
 
+/// Nonblocking readiness snapshot. Preserve the caller's IRQ state.
+pub fn poll_events(e: process::FdEntry) -> i16 {
+    let saved: u64;
+    unsafe { asm!("csrrc {}, sstatus, {}", out(reg) saved, in(reg) 2u64); }
+    let events = unsafe {
+        match e.kind {
+            FdKind::Pipe if e.index < MAX_PIPES => {
+                let p = &PIPES[e.index];
+                let mut r = 0;
+                if e.flags & FD_READ != 0 {
+                    if p.count > 0 || p.writers == 0 { r |= 0x001; }
+                    if p.writers == 0 { r |= 0x010; }
+                }
+                if e.flags & FD_WRITE != 0 {
+                    if p.readers == 0 { r |= 0x008; }
+                    else if p.count < PIPE_BUF { r |= 0x004; }
+                }
+                r
+            }
+            FdKind::Pair if e.index < MAX_PAIRS => {
+                let p = &PAIRS[e.index];
+                let (read, write, peers) = if e.flags == 0 {
+                    (p.ring_b.count, p.ring_a.count, p.side1)
+                } else { (p.ring_a.count, p.ring_b.count, p.side0) };
+                let mut r = 0;
+                if read > 0 || peers == 0 { r |= 0x001; }
+                if peers == 0 { r |= 0x010; }
+                else if write < PAIR_BUF { r |= 0x004; }
+                r
+            }
+            // Message queue flags/priority semantics are not poll-compatible yet.
+            _ => 0x008,
+        }
+    };
+    if saved & 2 != 0 { unsafe { asm!("csrsi sstatus, 2"); } }
+    events
+}
+
 // ==================== 等待者辅助 ====================
 
 /// 登记一个等待线程；空位不足返回 false（调用方应避免阻塞，直接返回忙）。

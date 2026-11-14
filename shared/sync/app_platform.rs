@@ -50,11 +50,14 @@ impl Fs for SysFs {
         let mut p = [0u8; 128];
         sync_copy(&mut p, path);
         unsafe {
-            let fd = syscall3(SYS_OPENAT, AT_FDCWD, p.as_ptr() as usize, O_CREAT | O_TRUNC | O_WRONLY);
+            let fd = syscall3(SYS_OPENAT, AT_FDCWD, p.as_ptr() as usize, O_CREAT | O_WRONLY);
             if (fd as isize) < 0 {
                 return false;
             }
-            syscall3(SYS_LSEEK, fd as usize, off as usize, 0);
+            if syscall3(SYS_LSEEK, fd, off as usize, 0) as isize != off as isize {
+                syscall1(SYS_CLOSE, fd);
+                return false;
+            }
             let n = syscall3(SYS_WRITE, fd, data.as_ptr() as usize, data.len());
             syscall1(SYS_CLOSE, fd);
             n as isize == data.len() as isize
@@ -64,10 +67,7 @@ impl Fs for SysFs {
     fn delete_file(&mut self, path: &[u8]) -> bool {
         let mut p = [0u8; 128];
         sync_copy(&mut p, path);
-        unsafe {
-            syscall3(SYS_UNLINKAT, AT_FDCWD, p.as_ptr() as usize, 0);
-        }
-        true
+        unsafe { syscall3(SYS_UNLINKAT, AT_FDCWD, p.as_ptr() as usize, 0) as isize == 0 }
     }
 
     fn file_exists(&mut self, path: &[u8]) -> bool {

@@ -138,8 +138,18 @@ pub fn user_range_mapped(root: usize, va: VirtAddr, len: usize) -> bool {
 /// 此函数对它们返回 `false` —— 与记录表一致，不把设备寄存器区放行给
 /// 用户指针。
 pub fn user_page_pte_u(root: usize, va: usize) -> bool {
+    let flags = user_page_pte_flags(root, va);
+    flags & (U | R) == U | R
+}
+
+pub fn user_page_pte_writable(root: usize, va: usize) -> bool {
+    let flags = user_page_pte_flags(root, va);
+    flags & (U | W) == U | W
+}
+
+fn user_page_pte_flags(root: usize, va: usize) -> u64 {
     if root == 0 {
-        return false;
+        return 0;
     }
     let l1_idx = (va >> 30) & 0x1FF;
     let l2_idx = (va >> 21) & 0x1FF;
@@ -147,23 +157,23 @@ pub fn user_page_pte_u(root: usize, va: usize) -> bool {
     unsafe {
         let l1 = (*(root as *const PageTable)).entries[l1_idx];
         if l1 & VALID == 0 {
-            return false;
+            return 0;
         }
-        if l1 & LEAF_MASK == 0 {
+        if l1 & LEAF_MASK != 0 {
             // 1GB 大页：仅当 U 可访问才放行
-            return l1 & U != 0;
+            return l1;
         }
         let l2p = pte_to_addr(l1) as *const PageTable;
         let l2 = (*l2p).entries[l2_idx];
         if l2 & VALID == 0 {
-            return false;
+            return 0;
         }
-        if l2 & LEAF_MASK == 0 {
-            return l2 & U != 0;
+        if l2 & LEAF_MASK != 0 {
+            return l2;
         }
         let l3p = pte_to_addr(l2) as *const PageTable;
         let l3 = (*l3p).entries[l3_idx];
-        l3 & VALID != 0 && l3 & U != 0
+        if l3 & VALID != 0 && l3 & LEAF_MASK != 0 { l3 } else { 0 }
     }
 }
 
@@ -281,6 +291,37 @@ pub fn is_user_ro(flags: MapFlags) -> bool {
 /// 位选择：bit 8 是 Sv39 PTE 的 RSW 软件可用位（bits[9:8]），硬件忽略，
 /// 可安全写入页表描述符而不会改变翻译行为。
 pub const FLAG_COW: MapFlags = 1 << 8;
+/// Software-only PROT_NONE marker. Keep original permissions for page ownership
+/// and COW reference accounting, but publish an invalid PTE until restored.
+pub const FLAG_NO_ACCESS: MapFlags = 1 << 9;
+
+pub fn user_readable(flags: MapFlags) -> bool {
+    flags & FLAG_NO_ACCESS == 0 && flags & (U | R) == U | R
+}
+
+pub fn user_writable(flags: MapFlags) -> bool {
+    flags & FLAG_NO_ACCESS == 0 && flags & (U | W) == U | W
+}
+
+/// Rebuild data permissions, explicitly discarding the old executable bit.
+pub fn data_permissions(flags: MapFlags, ap: MapFlags) -> MapFlags {
+    (flags & !AP_MASK & !EXEC & !FLAG_COW & !FLAG_NO_ACCESS) | ap
+}
+
+/// Any overlap, including lazy reservations and PROT_NONE records, is a
+/// MAP_FIXED_NOREPLACE collision.
+pub fn user_range_occupied(root: usize, va: usize, len: usize) -> bool {
+    if !user_va_range_ok(va, len) { return true; }
+    let mut page = va & !(PAGE_SIZE - 1);
+    let end = va + len;
+    while page < end {
+        if crate::process::root_page_reserved(root, page) || user_page_pte_u(root, page) {
+            return true;
+        }
+        page += PAGE_SIZE;
+    }
+    false
+}
 
 /// 是否为 COW 共享页（fork 后待复制）。
 #[inline]
@@ -668,6 +709,7 @@ fn block_2m(addr: usize, flags: MapFlags) -> u64 {
 
 /// 构造 4KB 页描述符（L3 使用），`flags` 为 `MapFlags` 组合。
 fn page_descriptor(paddr: usize, flags: MapFlags) -> u64 {
+    if flags & FLAG_NO_ACCESS != 0 { return 0; }
     addr_to_ppn(paddr) | flags | VALID
 }
 
@@ -794,7 +836,6 @@ pub fn map_page_in(root: usize, vaddr: usize, paddr: usize, flags: MapFlags) -> 
         let l2_ptr = l2 as *mut PageTable;
         let Some(l3) = ensure_l3(&mut (*l2_ptr).entries[l2_idx]) else { return false };
         let l3_ptr = l3 as *mut PageTable;
-        let existed = (*l3_ptr).entries[l3_idx] & VALID != 0;
         (*l3_ptr).entries[l3_idx] = page_descriptor(paddr, flags);
         if vaddr == 0x400000 {
             static mut DUMPED2: bool = false;
@@ -817,10 +858,8 @@ pub fn map_page_in(root: usize, vaddr: usize, paddr: usize, flags: MapFlags) -> 
         }
         // 确保页表写入对页表遍历可见
         asm!("fence rw, rw");
-        if existed {
-            // 覆盖了已有映射：使该虚拟地址的旧 TLB 项失效
-            asm!("sfence.vma {}, zero", in(reg) vaddr as u64);
-        }
+        // RISC-V may cache invalid PTEs too (e.g. PROT_NONE restoration).
+        asm!("sfence.vma {}, zero", in(reg) vaddr as u64);
     }
     true
 }
@@ -869,13 +908,13 @@ pub fn unmap_page_in(root: usize, vaddr: usize) {    let l1_idx = (vaddr >> 30) 
         let root_ptr = root as *mut PageTable;
         let l1_entry = (*root_ptr).entries[l1_idx];
         // L1 项必须是表（否则该地址不是按 4KB 页映射，无从取消）
-        if l1_entry & VALID == 0 || l1_entry & LEAF_MASK == 0 {
+        if l1_entry & VALID == 0 || l1_entry & LEAF_MASK != 0 {
             return;
         }
         let l2 = pte_to_addr(l1_entry);
         let l2_ptr = l2 as *mut PageTable;
         let l2_entry = (*l2_ptr).entries[l2_idx];
-        if l2_entry & VALID == 0 || l2_entry & LEAF_MASK == 0 {
+        if l2_entry & VALID == 0 || l2_entry & LEAF_MASK != 0 {
             return;
         }
         let l3 = pte_to_addr(l2_entry);

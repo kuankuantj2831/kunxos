@@ -12,9 +12,8 @@ pub trait Fs {
     /// 覆盖写入整个文件（创建或截断）。成功返回 true。
     fn write_file(&mut self, path: &[u8], data: &[u8]) -> bool;
 
-    /// 打开文件（截断）后按偏移写入一段（store 流式重建 blob 文件用）。
-    /// 首次调用等价于创建；后续调用在既有内容上覆写。
-    /// 实现约定：每次调用都重新 open(O_CREAT|O_TRUNC|O_WRONLY) 并 lseek 到 off。
+    /// 按偏移写入一段，保留范围以外的既有内容；不存在时创建。
+    /// 重建文件的调用方必须先用 write_file(path, &[]) 截断一次。
     fn write_file_at(&mut self, path: &[u8], off: u32, data: &[u8]) -> bool;
 
     /// 删除文件。成功（或不存在）返回 true。

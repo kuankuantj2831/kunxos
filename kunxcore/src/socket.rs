@@ -265,6 +265,29 @@ pub fn is_socket(h: i32) -> bool {
     socket_index(h).is_some()
 }
 
+/// Snapshot poll readiness under the same lock as send/recv and packet input.
+pub fn poll_events(h: i32) -> Option<i16> {
+    net_stack::net_lock();
+    let result = socket_index(h).map(|s| unsafe {
+        if s.ty == SOCK_UDP {
+            0x004 | if UDPS[s.index].rx_count > 0 { 0x001 } else { 0 }
+        } else {
+            let t = &TCPS[s.index];
+            if t.state == T_LISTEN {
+                if t.pending_count > 0 { 0x001 } else { 0 }
+            } else {
+                let mut events = 0;
+                if t.rx_count > 0 || t.peer_fin || t.state == T_CLOSED { events |= 0x001; }
+                if (t.state == T_ESTABLISHED || t.state == T_CLOSE_WAIT) && !t.rtx_active { events |= 0x004; }
+                if t.state == T_CLOSED { events |= 0x010; }
+                events
+            }
+        }
+    });
+    net_stack::net_unlock();
+    result
+}
+
 // ==================== 公共接口 ====================
 
 /// 端口是否已被任一 UDP/TCP 套接字绑定（临时端口自动分配时跳过冲突）。

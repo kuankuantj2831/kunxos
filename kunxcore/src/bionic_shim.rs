@@ -640,6 +640,10 @@ pub fn brk_set(new_brk: usize) -> usize {
 /// 按需分页：仅预留地址空间（记录 `LAZY_PAGE`），不分配物理页；首次访问时
 /// 由内核 page fault 处理器落地。`brk` 堆仍为立即分配（堆小、malloc 立即写）。
 pub fn mmap_anon(len: usize) -> i64 {
+    mmap_anon_with_flags(len, vm::FLAG_USER_DATA)
+}
+
+pub fn mmap_anon_with_flags(len: usize, flags: vm::MapFlags) -> i64 {
     if len == 0 {
         return -1;
     }
@@ -663,7 +667,8 @@ pub fn mmap_anon(len: usize) -> i64 {
         }
         let mut reserved = 0usize;
         for i in 0..pages {
-            if !process::reserve_user_page(va + i * vm::PAGE_SIZE) {
+            if vm::user_range_occupied(process::current_root(), va + i * vm::PAGE_SIZE, vm::PAGE_SIZE)
+                || !process::reserve_user_page_with_flags(va + i * vm::PAGE_SIZE, flags) {
                 // 记录表满：回滚已预留页，避免泄漏；游标同步回退（否则
                 // 反复失败的 mmap 会把地址空间烧穿，该 pid 永久 ENOMEM）
                 process::rollback_user_pages(va, reserved);

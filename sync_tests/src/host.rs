@@ -52,7 +52,7 @@ impl Fs for HostFs {
             std::fs::create_dir_all(parent).ok();
         }
         use std::io::{Seek, SeekFrom};
-        match std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&p) {
+        match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&p) {
             Ok(mut f) => {
                 if f.seek(SeekFrom::Start(off as u64)).is_err() {
                     return false;

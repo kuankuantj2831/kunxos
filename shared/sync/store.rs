@@ -218,22 +218,39 @@ impl<'a> Store<'a> {
 
     /// 持久化：重写索引文件 + 流式重建 blob 文件，然后回读 blob 刷新内存布局。
     pub fn save(&mut self, fs: &mut dyn Fs) -> bool {
+        // Validate all old ranges before touching either file. Serialize the final
+        // compacted offsets, rather than persisting the old in-memory layout.
+        let mut final_len = 0u32;
+        for r in &self.recs[..self.n] {
+            if r.is_deleted() || r.blen == 0 {
+                continue;
+            }
+            let Some(end) = r.boff.checked_add(r.blen) else { return false };
+            if end as usize > self.blob_len { return false; }
+            let Some(end) = final_len.checked_add(r.blen) else { return false };
+            final_len = end;
+        }
         let idx_buf = idx_scratch();
         idx_buf[0..4].copy_from_slice(&IDX_MAGIC.to_le_bytes());
         idx_buf[4..8].copy_from_slice(&(self.n as u32).to_le_bytes());
         idx_buf[8..12].copy_from_slice(&self.next_id.to_le_bytes());
+        let mut next_off = 0u32;
         for i in 0..self.n {
             let mut rec_buf = [0u8; REC_SIZE];
-            self.recs[i].to_bytes(&mut rec_buf);
+            let mut rec = self.recs[i];
+            rec.boff = next_off;
+            if !rec.is_deleted() { next_off += rec.blen; }
+            rec.to_bytes(&mut rec_buf);
             idx_buf[12 + i * REC_SIZE..12 + (i + 1) * REC_SIZE].copy_from_slice(&rec_buf);
         }
         let idx_len = 12 + self.n * REC_SIZE;
-        if !fs.write_file(&self.idx_path[..self.idx_path_len], &idx_buf[..idx_len]) {
+        // Truncate once, then preserve preceding chunks on every offset write.
+        // Publish the index only after its matching blob has been written.
+        if !fs.write_file(&self.blob_path[..self.blob_path_len], &[]) {
             return false;
         }
         // blob：按记录顺序流式写入（跳过墓碑），从内存旧布局读、向文件写
         let mut off = 0u32;
-        let mut any = false;
         for i in 0..self.n {
             let r = &self.recs[i];
             if r.is_deleted() || r.blen == 0 {
@@ -248,17 +265,10 @@ impl<'a> Store<'a> {
                 return false;
             }
             off += r.blen;
-            any = true;
-        }
-        if !any {
-            // 无存活记录：确保 blob 文件存在（空文件），便于回读
-            if !fs.write_file(&self.blob_path[..self.blob_path_len], &[]) {
-                return false;
-            }
         }
         // 回读 blob 刷新内存布局（压实后偏移重排）
         let bgot = fs.read_file(&self.blob_path[..self.blob_path_len], self.blob);
-        if bgot < 0 {
+        if bgot != final_len as isize {
             return false;
         }
         self.blob_len = bgot as usize;
@@ -271,7 +281,7 @@ impl<'a> Store<'a> {
             self.recs[i].boff = off;
             off += self.recs[i].blen;
         }
-        true
+        fs.write_file(&self.idx_path[..self.idx_path_len], &idx_buf[..idx_len])
     }
 
     // ==================== 查询 API ====================

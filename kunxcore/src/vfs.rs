@@ -28,6 +28,7 @@ pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x40;
+pub const O_EXCL: u32 = 0x80;
 pub const O_TRUNC: u32 = 0x200;
 pub const O_APPEND: u32 = 0x400;
 pub const O_NONBLOCK: u32 = 0x800;
@@ -654,6 +655,12 @@ fn open_impl(path: &str, flags: u32) -> i32 {
         return kos64_as_i32(crate::kos_vfs::posix_open(rel, flags, process::current_uid()));
     }
     let mut hops = 0u32;
+    if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL
+        && resolve_path(path, false, &mut hops).is_some()
+    {
+        return -17; // EEXIST, including a dangling final symlink
+    }
+    hops = 0;
     if let Some((dev, ino, typ)) = resolve_path(path, true, &mut hops) {
         if typ == T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
             return -1; // 目录不可写
