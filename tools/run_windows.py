@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run native Windows QEMU with a host-to-guest window-size bridge.
 
-The bridge observes only the QEMU process it launches. SDL's client rectangle
-is the drawing area (GTK's menus would require a separate content measurement).
+The bridge observes only the QEMU process it launches. GTK's menu is disabled
+so the client rectangle is the drawing area.
 Guest builds must include the display-resize protocol. No external packages.
 """
 import argparse
@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--qemu", type=Path, default=Path(r"C:\Program Files\qemu\qemu-system-riscv64.exe"))
     parser.add_argument("--kernel", type=Path, help="explicit ELF or kernel image")
     parser.add_argument("--build", action="store_true", help="build the adaptive Windows image before launch")
+    parser.add_argument("--display", choices=("gtk", "sdl"), default="gtk",
+                        help="native display backend (GTK is the tested Windows default)")
     parser.add_argument("--rate", type=int, help="override detected host refresh target (24..360 Hz)")
     parser.add_argument("--log", type=Path, default=ROOT / "qemu-windows-serial.log")
     parser.add_argument("--qmp-port", type=int, help="optional localhost QMP port for diagnostics")
@@ -75,7 +77,8 @@ def main():
                    "-cpu", "rv64", "-bios", "default", "-m", "512M",
                    "-kernel", str(args.kernel.resolve()),
                    "-append", f"shell verbose display-resize host-cursor display-hz={rate}",
-                   "-display", "sdl,gl=off,show-cursor=on", "-device", "ramfb", "-no-reboot",
+                   "-display", ("gtk,gl=off,show-cursor=on,show-menubar=off" if args.display == "gtk"
+                                else "sdl,gl=off,show-cursor=on"), "-device", "ramfb", "-no-reboot",
                    "-serial", f"tcp:127.0.0.1:{port}",
                    "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
                    "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",

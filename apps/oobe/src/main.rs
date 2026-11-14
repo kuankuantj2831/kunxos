@@ -2804,6 +2804,7 @@ fn draw_cursor_fb() {
 /// 整屏重绘（render + flip）后调用：备份光标下像素并以 overlay 画回显存，
 /// 用脏矩形呈现（光标画在 canvas 上，不呈现则屏幕看不到指针更新）。
 fn cursor_overlay_init() {
+    if cursor_sprite::host_cursor() { return; }
     if unsafe { MOUSE_SEEN && !FB_PTR.is_null() } {
         unsafe {
             save_cursor_under(CUR_X, CUR_Y);
@@ -2823,7 +2824,7 @@ fn cursor_overlay_init() {
 /// 用旧+新位置的并集小矩形呈现（避免整屏拖动卡顿）。
 fn move_cursor_fb() {
     unsafe {
-        if !MOUSE_SEEN || FB_PTR.is_null() {
+        if !MOUSE_SEEN || FB_PTR.is_null() || cursor_sprite::host_cursor() {
             CURSOR_DIRTY = false;
             return;
         }

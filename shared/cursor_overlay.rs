@@ -90,7 +90,7 @@ fn draw_arrow(fb: *mut u32, stride_px: usize, fw: i32, fh: i32, x: i32, y: i32) 
 
 /// 整屏重绘后调用：备份光标下像素并以 overlay 画回显存。
 pub fn overlay_redraw(fb: *mut u32, stride_px: usize, fw: i32, fh: i32, x: i32, y: i32) {
-    if fb.is_null() {
+    if fb.is_null() || cursor_sprite::host_cursor() {
         return;
     }
     save_under(fb, stride_px, fw, fh, x, y);
@@ -99,7 +99,7 @@ pub fn overlay_redraw(fb: *mut u32, stride_px: usize, fw: i32, fh: i32, x: i32, 
 
 /// 光标移动快速路径：恢复旧位置 → 备份新位置 → 画光标。
 pub fn overlay_move(fb: *mut u32, stride_px: usize, fw: i32, fh: i32, x: i32, y: i32) {
-    if fb.is_null() {
+    if fb.is_null() || cursor_sprite::host_cursor() {
         return;
     }
     restore_under(fb, stride_px, fw, fh);
@@ -126,7 +126,7 @@ pub fn overlay_move_rects(
     x: i32,
     y: i32,
 ) -> [(i32, i32, u32, u32); 2] {
-    if fb.is_null() {
+    if fb.is_null() || cursor_sprite::host_cursor() {
         return [(0, 0, 0, 0); 2];
     }
     let old = unsafe {
@@ -156,7 +156,7 @@ pub fn overlay_move_present(
     y: i32,
     present: Option<fn(&[(i32, i32, u32, u32)])>,
 ) {
-    if fb.is_null() {
+    if fb.is_null() || cursor_sprite::host_cursor() {
         return;
     }
     let rects = overlay_move_rects(fb, stride_px, fw, fh, x, y);

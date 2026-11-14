@@ -44,6 +44,7 @@ fn refresh_display_target() {
             if let Some(info) = display::DisplayMetrics::decode(&data) {
                 if FRAME_TARGET_MILLIHZ != info.target_millihz {
                     print("[launcher] pacing mHz="); print_dec(info.target_millihz); print("\n");
+                    print(if cursor_sprite::host_cursor() { "[cursor] host\n" } else { "[cursor] software\n" });
                 }
                 FRAME_TARGET_MILLIHZ = info.target_millihz;
             }

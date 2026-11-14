@@ -573,12 +573,11 @@ pub fn launch_blit(scale: u32, cx: i32, cy: i32, fade: u32, stretch: u32) {
         } else {
             None
         };
-        // 1. 已压暗的桌面快照作为背景（转场开始时 darken_frame_buf 压暗一次）；
-        //    白闪激活时同趟完成变白。
+        // Reuse the dimmed desktop; fade only the expanding tile so a full-screen
+        // RGB lookup does not consume the animation frame budget.
         back.copy_from_slice(frame);
-        // 2. 图标方块放大：ICON_TILE（ICON_SIZE x ICON_SIZE 圆角图标）按当前边长缩放，
-        //    以图标中心 (cx, cy) 为锚点。2px 块 + 块中心预乘双线性采样：放大途中
-        //    图标边缘平滑（最近邻 + 4px 块会呈现明显马赛克），迭代数仍远低于逐像素。
+        // Scale the prefiltered tile, reusing output rows with the same source row.
+        // Opaque spans use memcpy; only transparent edges need per-pixel blending.
         let s = (ICON_SIZE as u32 * scale / SCALE_1).max(1) as i32;
         // 纵向边长按 stretch（‰）超前，横纵分离。
         let sy = ((s as i64 * stretch.max(1000).min(2000) as i64) / 1000).max(1) as i32;
@@ -1268,10 +1267,13 @@ pub fn motion_advance(now: u64) -> bool {
                     // ★ 首帧基线必须在放行**之前**采样（自比较恒假守卫使
                     // 占位页无条件覆盖应用首帧）。
                     let baseline = fb_sample();
-                    gate_release();
                     let pid = LAUNCH_PID;
                     LAUNCH_PID = -1;
                     draw_placeholder(app, &baseline);
+                    // Finish all launcher writes before the child can paint its
+                    // first frame. A faster font init exposes this handoff race.
+                    placeholder_stop();
+                    gate_release();
                     // 进入前台管理态（非阻塞；应用退出/后台化由 app_life 处理）
                     super::app_life::launch_complete(app, pid);
                     // 返回 false：本帧不应再触发主循环重绘 —— phase 已置 Idle，

@@ -284,6 +284,38 @@ def main():
                                 collect(0.08)
                                 serial.sendall(b"\xaa\x00\0\0\0\0")
                                 await_marker(settings_ready, cycle)
+                                await_marker("启动过渡：".encode(), cycle)
+                                collect(0.5)
+                                # Before any resize/input can force an app redraw,
+                                # ensure the launcher's green Settings placeholder
+                                # did not overwrite the app's only initial frame.
+                                first_frame = work / f"settings-first-{cycle}.ppm"
+                                qmp.call("screendump", {"filename": str(first_frame), "format": "ppm"})
+                                frame_data = first_frame.read_bytes().split(b"\n", 3)[3]
+                                red, green, blue = frame_data[:3]
+                                assert not (green > red + 40 and green > blue + 40), "Settings first frame covered by launch placeholder"
+                                if args.host_cursor and cycle == 1:
+                                    collect(1)
+                                    def settings_pixels(label):
+                                        path = work / f"settings-cursor-{label}.ppm"
+                                        qmp.call("screendump", {"filename": str(path), "format": "ppm"})
+                                        _, size, _, data = path.read_bytes().split(b"\n", 3)
+                                        width, height = map(int, size.split())
+                                        return data[24 * width * 3:(height - 60) * width * 3]
+                                    clean = settings_pixels("before")
+                                    for index in range(30):
+                                        qmp.call("input-send-event", {"events": [
+                                            {"type": "abs", "data": {"axis": "x", "value": 3000 + index * 800}},
+                                            {"type": "abs", "data": {"axis": "y", "value": 26000}}]})
+                                        collect(0.01)
+                                    collect(0.3)
+                                    assert settings_pixels("moved") == clean, "host cursor movement changed Settings pixels"
+                                    for down in (True, False):
+                                        qmp.call("input-send-event", {"events": [
+                                            {"type": "btn", "data": {"button": "left", "down": down}}]})
+                                        collect(0.08)
+                                    collect(1)
+                                    assert settings_pixels("clicked") == clean, "blank click left cursor/ripple residue in Settings"
                                 if args.resize and cycle == 1:
                                     for w, h in ((960, 720), (540, 960)):
                                         serial.sendall(b"\xaa\x03" + struct.pack("<HH", w, h))
@@ -317,6 +349,9 @@ def main():
                 (work / "serial.log").write_text(text, encoding="utf-8")
                 expected = 1_000_000_000 // ((1_000_000_000 + args.rate * 1000 - 1) // (args.rate * 1000))
                 assert marker in output, "UI did not reach ready marker; see serial.log"
+                if not args.oobe:
+                    cursor_mode = b"[cursor] host" if args.host_cursor else b"[cursor] software"
+                    assert cursor_mode in output, "launcher cursor mode does not match boot contract"
                 assert f"target-mHz={expected}" in text, "display-hz target did not reach kernel/display ABI"
                 assert f"capabilities={(2 if args.resize else 0) | (4 if args.host_cursor else 0)}" in text, "incorrect display capabilities"
                 assert not re.search(r"PANIC:|panicked at|fatal trap", text), "guest fault; see serial.log"
@@ -337,13 +372,6 @@ def main():
                 (work / "report.json").write_text(json.dumps(report, indent=2))
                 print(json.dumps(report), flush=True)
         finally:
-            if __import__("sys").exc_info()[0] is not None:
-                try:
-                    serial.sendall(b"ps\nperf stats\n")
-                    collect(1)
-                    qmp.screenshot(work / "failure.png")
-                except (OSError, RuntimeError, ValueError):
-                    pass
             (work / "serial.log").write_text(output.decode("utf-8", errors="replace"), encoding="utf-8")
             process.terminate()
             try:

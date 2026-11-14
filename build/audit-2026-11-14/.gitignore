@@ -1,0 +1,3 @@
+# Local audit logs, staging images, generated harnesses and build products.
+*
+!.gitignore

@@ -1402,6 +1402,7 @@ pub fn fb_present_rects(rects: &[(i32, i32, u32, u32)]) {
 /// 随后把光标区域作为小脏矩形提交呈现（flip 的整屏提交不含光标像素，
 /// 不补这次提交光标不会出现在扫描输出上）。
 pub fn cursor_overlay_redraw() {
+    if cursor_sprite::host_cursor() { return; }
     unsafe {
         if !FB_PTR.is_null() {
             save_cursor_under(CUR_X, CUR_Y);
@@ -1422,6 +1423,7 @@ pub fn cursor_overlay_redraw() {
 /// 微秒级完成 —— 输入→画面延迟从「整屏提交数 ms + 等下一次全量重绘」降到
 /// 单次小矩形呈现。
 pub fn cursor_overlay_move() {
+    if cursor_sprite::host_cursor() { return; }
     unsafe {
         if FB_PTR.is_null() {
             return;
