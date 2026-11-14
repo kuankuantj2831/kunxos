@@ -90,11 +90,11 @@ fn fnv1a(seed: u64, data: &[u8]) -> u64 {
     h
 }
 
-/// 计算 32 字节签名（4 段不同种子的 FNV-1a 64 位哈希）。
+/// Legacy 32-byte checksum (public FNV seeds; NOT a signature).
 pub fn sign(data: &[u8]) -> [u8; SIG_LEN] {
     let mut out = [0u8; SIG_LEN];
     for i in 0..4 {
-        let seed = 0xCBF2_9CE4_8422_2325u64.wrapping_add(i as u64 * 0x9E37_79B9_7F4A_7C15);
+        let seed = 0xCBF2_9CE4_8422_2325u64.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let h = fnv1a(seed, data);
         out[i * 8..i * 8 + 8].copy_from_slice(&h.to_le_bytes());
     }
@@ -216,7 +216,7 @@ pub fn parse(data: &[u8]) -> Result<Pkg, i32> {
     Ok(Pkg { name, name_len, elf_off, elf_len, man_off, man_len, res_off, res_count })
 }
 
-/// 校验包签名（签名位于末尾 32 字节，覆盖其前全部数据）。
+/// Check legacy corruption checksum only; this does not authenticate a package.
 pub fn verify(data: &[u8], pkg: &Pkg) -> bool {
     if data.len() < 32 + SIG_LEN {
         return false;
@@ -230,19 +230,6 @@ pub fn verify(data: &[u8], pkg: &Pkg) -> bool {
 
 // ==================== 文件写入辅助 ====================
 
-fn write_file(path: &str, data: &[u8]) -> i32 {
-    let fd = vfs::open(path, vfs::O_WRONLY | vfs::O_CREAT | vfs::O_TRUNC);
-    if fd < 0 {
-        return -1;
-    }
-    let r = vfs::write(fd, data);
-    vfs::close(fd);
-    if r < 0 || (r as usize) < data.len() {
-        -1
-    } else {
-        0
-    }
-}
 
 /// 把 `/bin/name`、`/pkg/name.mf` 等路径拼入 `out`，返回末尾下标。
 fn join(out: &mut [u8], prefix: &str, name: &str, suffix: &str) -> usize {
@@ -278,138 +265,11 @@ fn path_str(out: &[u8]) -> &str {
 
 // ==================== 安装 / 卸载 / 列表 ====================
 
-/// 安装包：校验签名后写入 ELF、manifest 与资源。
-pub fn install(pkg: &Pkg, data: &[u8]) -> i32 {
-    if !verify(data, pkg) {
-        return -1; // 签名校验失败
-    }
-    let name = core::str::from_utf8(&pkg.name[..pkg.name_len]).unwrap_or("");
-    if name.is_empty() {
-        return -1;
-    }
-
-    // 先整体校验资源区：名字超文件系统上限（MAX_NAME=27）或非法时直接拒绝，
-    // 避免「先写 /bin、/pkg 再到写资源阶段才失败」造成半安装包残留。
-    let mut off = pkg.res_off;
-    for _ in 0..pkg.res_count {
-        if off + 8 > data.len() {
-            return -1;
-        }
-        let rnl = get_u32(data, off) as usize;
-        off += 4;
-        let rdl = get_u32(data, off) as usize;
-        off += 4;
-        if off + rnl + rdl > data.len() || rnl == 0 {
-            return -1;
-        }
-        let rname = &data[off..off + rnl];
-        if rnl > FS_NAME_MAX {
-            return -1; // 资源名超 FS 上限：文件系统会拒绝创建目录项
-        }
-        let rname_str = core::str::from_utf8(rname).unwrap_or("");
-        if !valid_res_name(rname_str) {
-            return -1;
-        }
-        off += rnl + rdl;
-    }
-
-    vfs::mkdir("/bin");
-    vfs::mkdir("/pkg");
-    vfs::mkdir("/res");
-
-    let mut path = [0u8; 96];
-
-    // ELF → /bin/<name>
-    join(&mut path, "/bin/", name, "");
-    if write_file(path_str(&path), &data[pkg.elf_off..pkg.elf_off + pkg.elf_len]) != 0 {
-        return -1;
-    }
-
-    // manifest → /pkg/<name>.mf
-    join(&mut path, "/pkg/", name, ".mf");
-    if write_file(path_str(&path), &data[pkg.man_off..pkg.man_off + pkg.man_len]) != 0 {
-        // 回滚已写的 /bin/<name>
-        join(&mut path, "/bin/", name, "");
-        vfs::unlink(path_str(&path));
-        return -1;
-    }
-
-    // 资源 → /res/<name>/<resname>
-    // 路径最长："/res/" + 28（包名）+ "/" + 27（资源名）= 62 字节（含 NUL）
-    let mut off = pkg.res_off;
-    for _ in 0..pkg.res_count {
-        if off + 8 > data.len() {
-            break;
-        }
-        let rnl = get_u32(data, off) as usize;
-        off += 4;
-        let rdl = get_u32(data, off) as usize;
-        off += 4;
-        if off + rnl + rdl > data.len() {
-            break;
-        }
-        let rname = &data[off..off + rnl];
-        off += rnl;
-        let rdata = &data[off..off + rdl];
-        off += rdl;
-
-        let rname_str = core::str::from_utf8(rname).unwrap_or("");
-        if rnl == 0 || rnl > FS_NAME_MAX || !valid_res_name(rname_str) {
-            break; // 防御：预检已保证合法，此处不写
-        }
-        // /res/<name>
-        join(&mut path, "/res/", name, "");
-        vfs::mkdir(path_str(&path));
-        // /res/<name>/<resname>
-        join(&mut path, "/res/", name, "/");
-        let base = path_str(&path);
-        let mut full = [0u8; 128];
-        join(&mut full, base, rname_str, "");
-        if write_file(path_str(&full), rdata) != 0 {
-            // 回滚：删除已写的 /bin、/pkg 文件与本包已写入的 /res/<name>/
-            // 资源（复用 uninstall 的枚举删除；此前残留的半包资源会在
-            // 重装同名包时与新文件混装）
-            join(&mut path, "/bin/", name, "");
-            vfs::unlink(path_str(&path));
-            join(&mut path, "/pkg/", name, ".mf");
-            vfs::unlink(path_str(&path));
-            let mut resdir = [0u8; 96];
-            join(&mut resdir, "/res/", name, "");
-            let dir = path_str(&resdir);
-            let mut entry = [0u8; 32];
-            let mut idx = 0usize;
-            let mut fails = 0usize;
-            loop {
-                let ino = vfs::readdir(dir, idx, &mut entry);
-                if ino < 0 {
-                    break;
-                }
-                let elen = entry.iter().position(|&c| c == 0).unwrap_or(entry.len());
-                let ename = core::str::from_utf8(&entry[..elen]).unwrap_or("");
-                if ename == "." || ename == ".." {
-                    idx += 1;
-                    continue;
-                }
-                let mut full2 = [0u8; 128];
-                join(&mut full2, dir, "/", "");
-                let base2 = path_str(&full2);
-                let mut full3 = [0u8; 128];
-                join(&mut full3, base2, ename, "");
-                let del = vfs::unlink(path_str(&full3));
-                // 删除成功不递增 idx（条目前移）；失败递增跳过，防死循环
-                if del != 0 {
-                    idx += 1;
-                    fails += 1;
-                    if fails > 64 {
-                        break;
-                    }
-                }
-            }
-            return -1;
-        }
-    }
-
-    0
+/// NOVAPKG1 contains only a public checksum, not an authenticated signature.
+/// Retain parsing for old archives, but never install executable content through
+/// this format. Use /bin/pkg (kunxpkg) and its Ed25519 certificate verification.
+pub fn install(_pkg: &Pkg, _data: &[u8]) -> i32 {
+    -95 // EOPNOTSUPP
 }
 
 /// 卸载包：删除 `/bin/<name>`、`/pkg/<name>.mf` 及 `/res/<name>/` 下内容。

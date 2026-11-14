@@ -21,3 +21,5 @@ pub mod sync;
 mod host;
 #[cfg(test)]
 mod integration;
+#[cfg(test)]
+mod storage_regression;

@@ -1089,7 +1089,7 @@ fn cmd_pkg(cmd: &Command, sink: &mut Sink) {
                     if pkg::install(&p, &buf[..total]) == 0 {
                         sink.emit_str("pkg: 已安装\n");
                     } else {
-                        sink.emit_str("pkg: 安装失败（签名不匹配？）\n");
+                        sink.emit_str("pkg: NOVAPKG1 校验和不提供验签，已停用安装；请使用 /bin/pkg 安装 Ed25519 签名包\n");
                     }
                 }
                 Err(_) => sink.emit_str("pkg: 软件包无效\n"),

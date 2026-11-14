@@ -2,7 +2,7 @@
 //
 // 依次执行：
 //   1. socketpair(AF_UNIX, SOCK_STREAM) → fd0/fd1；fd1 写 "hi"，fd0 读回校验
-//   2. truncate("/tmp/trunc_test", 0) 创建空文件
+//   2. 创建文件后 truncate("/tmp/trunc_test", 0)
 //   3. statx("/etc/inittab") 读取大小并打印
 // 全部通过打印 "SYSCALL-TEST PASS"，任一失败打印 FAIL。
 
@@ -181,7 +181,10 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
         syscall1(SYS_CLOSE, fd1 as usize);
     }
 
-    // 2. truncate：创建空文件
+    // 2. truncate acts on an existing file and must not create missing paths.
+    let create_fd = unsafe { syscall3(SYS_OPENAT, AT_FDCWD, cstr("/tmp/trunc_test"), O_WRONLY | O_CREAT | O_TRUNC) };
+    if (create_fd as isize) < 0 { fail("truncate fixture"); }
+    unsafe { syscall1(SYS_CLOSE, create_fd); }
     let r = unsafe { syscall2(SYS_TRUNCATE, cstr("/tmp/trunc_test"), 0) };
     print_str("[syscall-test] truncate 返回=");
     print_hex(r as u64);

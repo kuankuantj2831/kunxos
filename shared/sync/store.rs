@@ -142,10 +142,26 @@ pub struct Store<'a> {
 /// 放静态区避免叠加出超过 1MB 用户栈的大栈帧——曾导致 contacts 启动即崩）。
 static mut IDX_SCRATCH: [u8; 16 + MAX_RECORDS * REC_SIZE] =
     [0; 16 + MAX_RECORDS * REC_SIZE];
+static IDX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-#[allow(static_mut_refs)]
-fn idx_scratch() -> &'static mut [u8] {
-    unsafe { &mut *core::ptr::addr_of_mut!(IDX_SCRATCH) }
+struct IndexScratch;
+impl core::ops::Deref for IndexScratch {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { unsafe { &*core::ptr::addr_of!(IDX_SCRATCH) } }
+}
+impl core::ops::DerefMut for IndexScratch {
+    fn deref_mut(&mut self) -> &mut [u8] { unsafe { &mut *core::ptr::addr_of_mut!(IDX_SCRATCH) } }
+}
+impl Drop for IndexScratch {
+    fn drop(&mut self) { IDX_BUSY.store(false, core::sync::atomic::Ordering::Release); }
+}
+
+fn idx_scratch() -> IndexScratch {
+    use core::sync::atomic::Ordering;
+    while IDX_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    IndexScratch
 }
 
 impl<'a> Store<'a> {
@@ -170,8 +186,8 @@ impl<'a> Store<'a> {
 
     /// 从磁盘加载。文件不存在视为空存储（返回 true）。
     pub fn load(&mut self, fs: &mut dyn Fs) -> bool {
-        let idx_buf = idx_scratch();
-        let got = fs.read_file(&self.idx_path[..self.idx_path_len], idx_buf);
+        let mut idx_buf = idx_scratch();
+        let got = fs.read_file(&self.idx_path[..self.idx_path_len], &mut idx_buf);
         if got < 0 {
             // 不存在：空存储
             self.n = 0;
@@ -199,6 +215,7 @@ impl<'a> Store<'a> {
             self.recs[i] = Rec::from_bytes(&rec_buf);
         }
         self.n = count;
+        drop(idx_buf); // compact() below calls save(), which acquires the scratch.
         // 加载 blob
         let bgot = fs.read_file(&self.blob_path[..self.blob_path_len], self.blob);
         if bgot < 0 {
@@ -230,7 +247,7 @@ impl<'a> Store<'a> {
             let Some(end) = final_len.checked_add(r.blen) else { return false };
             final_len = end;
         }
-        let idx_buf = idx_scratch();
+        let mut idx_buf = idx_scratch();
         idx_buf[0..4].copy_from_slice(&IDX_MAGIC.to_le_bytes());
         idx_buf[4..8].copy_from_slice(&(self.n as u32).to_le_bytes());
         idx_buf[8..12].copy_from_slice(&self.next_id.to_le_bytes());
