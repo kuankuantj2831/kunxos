@@ -1,7 +1,6 @@
 //! 网络传输层（远程软件源用）：TCP socket + DNS，经内核 Linux 兼容层系统调用。
 //! 与 apps/cloud 使用的 `shared/app_kit.rs` 同一套协议（SYS_SOCKET 等）。
 
-use core::arch::asm;
 
 // ==================== 系统调用号 ====================
 
@@ -16,47 +15,13 @@ const SYS_DNS_RESOLVE: usize = 403;
 pub const AF_INET: usize = 2;
 pub const SOCK_STREAM: usize = 1;
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
-        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, in("a5") a6, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 /// 打开 TCP 套接字；失败返回负值。
 pub unsafe fn sock_open() -> isize {

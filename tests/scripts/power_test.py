@@ -15,65 +15,35 @@
 用法：python3 tests/scripts/power_test.py [logfile]
 退出码：0 = 全部通过，1 = 有失败。
 """
-import os
-import subprocess
+from qemu_test import Guest, kernel_path, temp_path, qemu_command
 import sys
 import tempfile
-import threading
 import time
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_power.log"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 else temp_path("kx_power.log")
 BOOT_TIMEOUT = 120  # GUI（OOBE/launcher）+ shell 并起，启动较慢
 
 WORKDIR = tempfile.mkdtemp(prefix="kxpow_")
-PIPE = os.path.join(WORKDIR, "kx")
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = [
-    "qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
+cmd = qemu_command() + [
+
     # selftest：启动期内核电源自检（BOOT_SELFTEST 默认跳过）；(boot) 断言
     # 依赖其结论行 [kernel] 电源自检完成：0 个失败（结论不受安静模式门控）。
     "-kernel", KERNEL, "-append", "shell selftest",
-    "-serial", "pipe:" + PIPE,
-    "-no-reboot", "-display", "none",
+    "-serial", "stdio",
+    "-no-reboot", "-display", "none", "-device", "ramfb",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
-    "-device", "virtio-rng-device", "-device", "AC97",
+    "-device", "virtio-rng-device", "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 results = []
 
 
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data)
-        logf.write(data)
-        logf.flush()
-
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
-
-
-def send(cmdline: str):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, cmdline.encode() + b"\n")
-    os.close(infd)
+def send(cmdline):
+    guest.send(cmdline.encode() + b"\n")
 
 
 def check(name: str, cond: bool):
@@ -90,16 +60,8 @@ def wait_for(marker: str, timeout: float = BOOT_TIMEOUT):
     return False
 
 
-def run_cmd_and_wait(cmdline: str, marker: str, timeout: float = 8.0):
-    """发命令并等待其输出特征；返回该命令输出是否出现。"""
-    before = len(log)
-    send(cmdline)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if marker.encode() in log[before:]:
-            return True
-        time.sleep(0.05)
-    return False
+def run_cmd_and_wait(cmdline, marker, timeout=15.0):
+    return marker.encode() in guest.shell(cmdline, timeout)
 
 
 try:
@@ -107,10 +69,10 @@ try:
         check("boot to shell", False)
         sys.exit(1)
     check("boot to shell", True)
-    time.sleep(0.5)
+    time.sleep(3)  # Let init finish starting services before reading status.
 
     # 1. 自检：boot 期与 shell 期均应 0 failure
-    check("selftest runs", run_cmd_and_wait("power selftest", "处失败"))
+    check("selftest runs", run_cmd_and_wait("power selftest", "[power] 自检完成："))
     check("selftest zero fails (boot)", b"[kernel] \xe7\x94\xb5\xe6\xba\x90\xe8\x87\xaa\xe6\xa3\x80\xe5\xae\x8c\xe6\x88\x90\xef\xbc\x9a0 \xe4\xb8\xaa\xe5\xa4\xb1\xe8\xb4\xa5" in log)
     check("selftest zero fails (shell)", b"[power] \xe8\x87\xaa\xe6\xa3\x80\xe5\xae\x8c\xe6\x88\x90\xef\xbc\x9a0 \xe4\xb8\xaa\xe5\xa4\xb1\xe8\xb4\xa5" in log)
 
@@ -152,7 +114,7 @@ try:
 
     # 6. 低电量
     run_cmd_and_wait("power battery 10", "", 2.0)
-    time.sleep(0.5)
+    time.sleep(1.3)
     run_cmd_and_wait("power status", "KunxOS power manager", 8.0)
     check("battery low shows", b"LOW" in log or b"battery-low" in log)
 
@@ -168,14 +130,7 @@ try:
     check("procfs power readable", b"KunxOS power manager" in log)
 
 finally:
-    send("poweroff")
-    time.sleep(0.5)
-    stop = True
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()
 
 fails = [n for n, ok in results if not ok]
 print(f"\n[power-test] {len(results) - len(fails)}/{len(results)} passed")

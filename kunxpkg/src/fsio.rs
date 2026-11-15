@@ -1,7 +1,6 @@
 //! 文件系统 I/O（经 Linux 兼容层系统调用）：openat/read/write/close/
 //! mkdirat/unlinkat/getdents64 + 路径工具。no_std、静态缓冲。
 
-use core::arch::asm;
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -34,41 +33,11 @@ static mut DIR_BUF: [u8; 4096] = [0; 4096];
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
 // ==================== 路径工具 ====================
 

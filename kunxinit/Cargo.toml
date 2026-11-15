@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kunxrt = { path = "../shared/runtime", features = ["memory-symbols"] }
 
 # 裸机 EL0 用户程序：panic 直接中止，不展开栈（无 unwinding 支持）。
 [profile.release]

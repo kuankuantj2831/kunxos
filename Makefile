@@ -116,6 +116,8 @@ MODEMTEST_ELF := $(APPS)/modemtest/target/$(TARGET)/release/modemtest
 SFSRACE_ELF   := $(APPS)/sfsrace/target/$(TARGET)/release/sfsrace
 CRASHME_ELF   := $(APPS)/crashme/target/$(TARGET)/release/crashme
 KOSTEST_ELF   := $(APPS)/kostest/target/$(TARGET)/release/kostest
+PROBE_ELF     := $(APPS)/probe/target/$(TARGET)/release/probe
+HELLO_ELF     := $(ROOTFS)/bin/hello
 KOSDEMO_ELF   := $(APPS)/kosdemo/target/$(TARGET)/release/kosdemo
 BUSYBOX    := $(KUNXCORE)/apps/busybox.elf
 RAMDISK    := $(KUNXCORE)/ramdisk.img
@@ -153,14 +155,15 @@ ROOTFS_FILES := \
 
 CARGO   ?= cargo
 OBJCOPY ?= llvm-objcopy
-# QEMU riscv64：宿主未安装系统包（无 root），使用用户目录解包版
-# （qemu-system-riscv + opensbi 固件，来自 Arch 官方仓库包）。
-QEMU_SYSROOT := $(HOME)/qemu-riscv-pkgs/root/usr
-QEMU    ?= $(QEMU_SYSROOT)/bin/qemu-system-riscv64
-# OpenSBI fw_dynamic（qemu -bios）：内核经其以 S 模式在 0x80200000 启动
-OPENBI  := $(QEMU_SYSROOT)/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+# QEMU riscv64：优先使用 PATH，兼容原有用户目录解包版。
+QEMU_SYSROOT ?= $(HOME)/qemu-riscv-pkgs/root/usr
+QEMU    ?= $(or $(shell command -v qemu-system-riscv64 2>/dev/null),$(QEMU_SYSROOT)/bin/qemu-system-riscv64)
+# OpenSBI：默认使用 QEMU 自带固件；BIOS/OPENBI 可指定 fw_dynamic 文件。
+OPENBI  ?= $(if $(BIOS),$(BIOS),default)
 # 加速后端：x86 宿主无 riscv KVM，恒为 TCG（纯软件模拟）。
 QEMU_ACCEL ?= tcg
+# Optional 2D backend: make run-gui QEMU_GPU=virtio-gpu-device
+QEMU_GPU ?= ramfb
 # 内核启动参数（QEMU -append）：如 QEMU_APPEND="verbose" 开启完整启动日志。
 QEMU_APPEND ?=
 
@@ -169,6 +172,14 @@ CARGO_FEATURES := --features qemu
 .PHONY: all kernel init networkd kosdisk kos-disk test-mailbox test-wireless wifid rild logd camerad audiod lifd pushd alarmd launcher lcapp oobe pkg store rootfs run run-gui run-input run-audio run-phone test-modem test-audio test-pdu test-wifi lifecycle-test lifecycle-core-test disk run-disk clean
 
 all: kernel
+
+# Guest syscall probes must be rebuilt for the same ISA as the kernel.
+$(PROBE_ELF): $(shell find $(APPS)/probe/src -name '*.rs') $(APPS)/probe/Cargo.toml $(APPS)/probe/build.rs $(APPS)/probe/linker.ld $(SHARED_SRC)
+	$(CARGO) build --release --target $(TARGET) --manifest-path $(APPS)/probe/Cargo.toml
+
+$(HELLO_ELF): $(TOPDIR)/tests/hello.rs $(KUNXCORE)/apps/hello.S $(KUNXCORE)/apps/hello.ld
+	@mkdir -p $(ROOTFS)/bin
+	rustc --edition=2021 --target $(TARGET) -C panic=abort -C relocation-model=static -C link-arg=-T$(KUNXCORE)/apps/hello.ld $(TOPDIR)/tests/hello.rs -o $@
 
 # ---- 用户态 ELF（Rust no_std，内核 ELF 加载器直接加载，无需 objcopy） ----
 $(INIT_ELF): $(shell find $(KUNXINIT)/src -name '*.rs') $(KUNXINIT)/Cargo.toml $(KUNXINIT)/build.rs $(KUNXINIT)/linker.ld
@@ -253,7 +264,7 @@ $(FILES_ELF): $(shell find $(FILES)/src -name '*.rs') $(FILES)/Cargo.toml $(FILE
 # 桌面应用（真实实现，共用 shared/app_kit.rs + 各自 CJK 字体子集）。
 # 宏：$1 = 应用名。
 define app_rule
-$(APPS)/$1/target/$(TARGET)/release/$1: $$(shell find $(APPS)/$1/src -name '*.rs') $(APPS)/$1/Cargo.toml $(APPS)/$1/build.rs $(APPS)/$1/linker.ld $(SHARED_SRC) $(TOPDIR)/shared/cjk_font_$1.rs
+$(APPS)/$1/target/$(TARGET)/release/$1: $$(shell find $(APPS)/$1/src -name '*.rs') $(APPS)/$1/Cargo.toml $(APPS)/$1/build.rs $(APPS)/$1/linker.ld $(SHARED_SRC)
 	$(CARGO) build --release --target $(TARGET) --manifest-path $(APPS)/$1/Cargo.toml
 endef
 $(foreach a,phone sms contacts browser clock calendar camera gallery music mail map weather cloud video notes,$(eval $(call app_rule,$a)))
@@ -368,7 +379,7 @@ $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done: $(CALC_ELF) $(TERMINAL_ELF) $(NOTES_
 $(ROOTFS)/var/lib/pkg/available: $(ROOTFS)/var/lib/pkg/repo/main/.kunx-done
 	cp -f $(ROOTFS)/var/lib/pkg/repo/main/Packages $@
 
-$(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(KOSDEMO_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
+$(RAMDISK): $(PROBE_ELF) $(HELLO_ELF) $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(KOSDEMO_ELF) $(SENSORD_ELF) $(POSITIOND_ELF) $(LAUNCHER_ELF) $(SETTINGS_ELF) $(TERMINAL_ELF) $(CALC_ELF) $(OOBE_ELF) $(STORE_ELF) $(FILES_ELF) $(PHONE_ELF) $(SMS_ELF) $(CONTACTS_ELF) $(BROWSER_ELF) $(CLOCK_ELF) $(CALENDAR_ELF) $(CAMERA_ELF) $(GALLERY_ELF) $(MUSIC_ELF) $(MAIL_ELF) $(MAP_ELF) $(WEATHER_ELF) $(CLOUD_ELF) $(VIDEO_ELF) $(NOTES_ELF) $(LCAPP_ELF) $(PKG_ELF) $(AUDIOD_ELF) $(CAMERAD_ELF) $(LIFD_ELF) $(PUSHD_ELF) $(ALARMD_ELF) $(AUDIOTEST_ELF) $(AUDIOMIX_ELF) $(AUDIOLAT_ELF) $(TLSTEST_ELF) $(RILD_ELF) $(WIFID_ELF) $(MODEMTEST_ELF) $(SFSRACE_ELF) $(BUSYBOX) $(ROOTFS_FILES) $(FONT_SUBSET) $(FONT_BOLD_SUBSET) $(FONT_OOBE_CN_SUBSET) $(FONT_OOBE_BOLD_SUBSET) $(FONT_LAUNCHER_CN_SUBSET) $(FONT_LAUNCHER_BOLD_SUBSET) $(FONT_ICON_FILL_SUBSET) $(FONT_ICON_LINE_SUBSET) $(wildcard $(ROOTFS)/etc/oobe_default/*) $(wildcard $(ROOTFS)/var/www/*) $(wildcard $(ROOTFS)/sfsrace-test) $(wildcard $(ROOTFS)/etc/audio-test) $(TOOLS)/mkfs_sfs.py FORCE
 	@mkdir -p $(ROOTFS)/bin $(ROOTFS)/dev $(ROOTFS)/etc/init.d $(ROOTFS)/proc \
 		$(ROOTFS)/tmp $(ROOTFS)/var/run $(ROOTFS)/var/log $(ROOTFS)/data $(ROOTFS)/data/oobe \
 		$(ROOTFS)/data/photos $(ROOTFS)/data/videos \
@@ -378,6 +389,7 @@ $(RAMDISK): $(INIT_ELF) $(NET_ELF) $(LOGD_ELF) $(CRASHME_ELF) $(KOSTEST_ELF) $(K
 		$(ROOTFS)/data/app $(ROOTFS)/fonts
 	# /data/oobe 必须为空目录：不预置 .done 或任何 OOBE 配置，保证首次启动进入向导。
 	rm -f $(ROOTFS)/data/oobe/.done
+	cp -f $(PROBE_ELF) $(ROOTFS)/bin/probe
 	cp -f $(INIT_ELF) $(ROOTFS)/init
 	cp -f $(NET_ELF) $(ROOTFS)/bin/networkd
 	cp -f $(LOGD_ELF) $(ROOTFS)/bin/logd
@@ -520,7 +532,7 @@ run: kernel $(KOS_DISK_IMG)
 		-audiodev none,id=aud0 -device virtio-sound-device,audiodev=aud0
 
 run-gui: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -serial stdio -device ramfb -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -append "$(QEMU_APPEND)" -serial stdio -device $(QEMU_GPU) -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
 		-device virtio-rng-device \
@@ -554,7 +566,7 @@ run-audio: kernel
 # 电话/短信演示模式：GUI + virtio-sound（铃声/提示音）+ 虚拟调制解调器。
 # 来电/短信经 /dev/modemctl 注入（shell: echo "CALL_IN:13800000001" > /dev/modemctl）。
 run-phone: kernel
-	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -serial stdio -device ramfb -no-reboot \
+	$(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -serial stdio -device $(QEMU_GPU) -no-reboot \
 		-netdev user,id=n0 -device virtio-net-device,netdev=n0 \
 		-device virtio-keyboard-device -device virtio-tablet-device \
 		-device virtio-rng-device \
@@ -588,7 +600,7 @@ test-modem: $(RILD_ELF) $(MODEMTEST_ELF)
 	-timeout 240 $(QEMU) -M virt,accel=$(QEMU_ACCEL) -cpu rv64 -bios $(OPENBI) -m 512M -kernel $(KERNEL_IMG) -nographic -no-reboot \
 		-device virtio-rng-device | tee $(TEST_MODEM_LOG)
 	@rm -f $(ROOTFS)/data/modemtest.flag
-	@grep -q "\[MODEMTEST\] PASS" $(TEST_MODEM_LOG) && echo "MODEM TEST: PASS" \
+	@grep -q "\[MODEMTEST\] summary: PASS" $(TEST_MODEM_LOG) && echo "MODEM TEST: PASS" \
 		|| (echo "MODEM TEST: FAIL (see $(TEST_MODEM_LOG))"; exit 1)
 
 # ---- SFS v2 并发回归测试 ----
@@ -731,23 +743,24 @@ test-wifi: kernel
 # ---- 电源管理测试 ----
 # 构建内核后在 QEMU 上跑 power selftest / 热注入节流 / 调速器 / 电池状态机回归。
 power-test: kernel
-	python3 tests/scripts/power_test.py /tmp/kx_power.log
+	QEMU="$(QEMU)" BIOS="$(OPENBI)" QEMU_ACCEL="$(QEMU_ACCEL)" python3 tests/scripts/power_test.py /tmp/kx_power.log
 
 # ---- 生命周期测试（docs/lifecycle-test.md） ----
 # 无头完整回归 + 命令信箱背靠背连发（cmd_<pid>_<seq> 生产协议不丢命令）。
 # 两个都绿才算过：前者覆盖状态机全链路，后者守护 IPC 原子发布语义。
 lifecycle-test: kernel
-	python3 tests/scripts/lifecycle_test.py /tmp/kx_life.log
-	python3 tests/scripts/lifecycle_cmd_burst.py /tmp/kx_life_burst.log
+	QEMU="$(QEMU)" BIOS="$(OPENBI)" QEMU_ACCEL="$(QEMU_ACCEL)" python3 tests/scripts/lifecycle_test.py /tmp/kx_life.log
+	QEMU="$(QEMU)" BIOS="$(OPENBI)" QEMU_ACCEL="$(QEMU_ACCEL)" python3 tests/scripts/lifecycle_cmd_burst.py /tmp/kx_life_burst.log
 
 # 无头核心回归（快速、确定性）：仅串口 shell 驱动 /data/life 文件信箱与
 # /proc/pressure 注入，直接验证 lifd 状态机（R/B/S/T）、SIGSTOP/SIGCONT、
 # 后台任务白名单与超时、通知转发与延迟补投，不经过 GUI。
 lifecycle-core-test: kernel
-	python3 tests/scripts/lifecycle_core_test.py /tmp/kx_life_core.log
+	QEMU="$(QEMU)" BIOS="$(OPENBI)" QEMU_ACCEL="$(QEMU_ACCEL)" python3 tests/scripts/lifecycle_core_test.py /tmp/kx_life_core.log
 
 # ---- 清理 ----
 clean:
+	$(CARGO) clean --manifest-path $(APPS)/probe/Cargo.toml
 	$(CARGO) clean --manifest-path $(KUNXCORE)/Cargo.toml
 	$(CARGO) clean --manifest-path $(KUNXINIT)/Cargo.toml
 	$(CARGO) clean --manifest-path $(NETWORKD)/Cargo.toml
@@ -779,6 +792,7 @@ clean:
 	$(CARGO) clean --manifest-path $(KUNXPKG)/Cargo.toml
 	$(CARGO) clean --manifest-path $(ALARMD)/Cargo.toml
 	$(CARGO) clean --manifest-path $(LCAPP)/Cargo.toml
+	rm -f $(ROOTFS)/bin/hello $(ROOTFS)/bin/probe
 	rm -f $(RAMDISK) $(KERNEL_IMG) $(ROOTFS)/init $(ROOTFS)/bin/networkd \
 		$(ROOTFS)/bin/lcapp \
 		$(ROOTFS)/bin/logd \

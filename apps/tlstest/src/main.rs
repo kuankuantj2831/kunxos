@@ -18,8 +18,6 @@ extern crate alloc;
 
 extern crate kunxsec as kxsec;
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 #[path = "../../browser/src/tls/mod.rs"]
@@ -29,27 +27,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-// ==================== 全局分配器 ====================
-
-const SYS_BRK: usize = 214;
-
-struct BrkAlloc;
-
-unsafe impl GlobalAlloc for BrkAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(1) + layout.align();
-        let raw = syscall1(SYS_BRK, 0);
-        let new = syscall1(SYS_BRK, raw + size);
-        if new < raw + size {
-            return core::ptr::null_mut();
-        }
-        ((raw + layout.align() - 1) & !(layout.align() - 1)) as *mut u8
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
-#[global_allocator]
-static GLOBAL_ALLOC: BrkAlloc = BrkAlloc;
+kunxrt::allocator!();
 
 // ==================== 系统调用 ====================
 
@@ -66,50 +44,13 @@ const CLOCK_MONOTONIC: i32 = 1;
 const SYS_DNS_RESOLVE: usize = 403;
 const SYS_GETRANDOM: usize = 278;
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        in("a5") a6,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 fn print(s: &str) {
     unsafe {
@@ -364,19 +305,7 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

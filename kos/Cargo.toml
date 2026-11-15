@@ -7,15 +7,12 @@ description = "KOS: KunxOS Object Storage — 磁盘格式 / 哈希 / Merkle 树
 [features]
 default = ["std", "sign"]
 std = []
-# kosctl 签名支持（复用 kunxseC Ed25519；仅宿主工具用，内核构建
-# default-features=false 不含此项）。
-sign = ["dep:kunxsec"]
+# kosctl 签名命令开关；kunxsec 同时提供必需的 SHA-256/CRC，始终依赖。
+# 内核 default-features=false 不启用签名命令。
+sign = []
 
 [dependencies]
-blake3 = { version = "1", default-features = false }
-kunxsec = { path = "../kunxsec", optional = true }
-sha2 = { version = "0.10", default-features = false }
-crc32fast = { version = "1", default-features = false }
+kunxsec = { path = "../kunxsec" }
 
 [dev-dependencies]
 criterion = "0.5"

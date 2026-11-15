@@ -22,8 +22,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
@@ -187,10 +185,10 @@ pub(crate) fn list_bottom() -> i32 { sys_nav::nav_y() }
 
 // ==================== 颜色（0x00RRGGBB，ui.rs 复用；浅色主题） ====================
 
-pub(crate) const C_SW_ON: u32 = 0x00_00_B9_6B;
+pub(crate) const C_SW_ON: u32 = 0x00_5B_63_D9;
 pub(crate) const C_WHITE: u32 = 0x00_FF_FF_FF;
 pub(crate) const C_BLACK: u32 = 0x00_00_00_00;
-pub(crate) const C_PRIMARY: u32 = 0x00_00_7A_FF;
+pub(crate) const C_PRIMARY: u32 = 0x00_5B_63_D9;
 pub(crate) const C_DANGER: u32 = 0x00_FF_3B_30;
 /// 次要/弱化文字（白底浅玻璃上可读的蓝灰）。
 pub(crate) const C_SUB: u32 = 0x00_6B_72_80;
@@ -249,50 +247,13 @@ pub(crate) static mut PM_STATUS: u64 = 0;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-pub(crate) unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+pub(crate) use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-pub(crate) unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+pub(crate) use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-pub(crate) unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+pub(crate) use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-pub(crate) unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        in("a5") a6,
-        options(nostack)
-    );
-    ret
-}
+pub(crate) use kunxrt::syscall::syscall6;
 
 // ==================== 基础 I/O ====================
 
@@ -1582,42 +1543,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
-    struct BufWriter {
-        buf: [u8; 256],
-        len: usize,
-    }
-    impl core::fmt::Write for BufWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: settings\n");
-        write_fd(2, &w.buf[..w.len]);
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("settings");

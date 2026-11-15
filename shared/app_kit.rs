@@ -6,8 +6,7 @@
 //! 见 `ttf_text`）、鼠标/触摸/键盘输入、光标、标题栏与返回键、墙钟时间与公历换算。
 //!
 //! 约定：
-//! - 应用入口：`k_main(argc, argv)`，内部自行 `global_asm!` 定义 `_start`
-//!   蹦床（见 stub 应用示例）。
+//! - 应用入口：`k_main(argc, argv)`，通过 `kunxrt::entry!()` 定义 `_start`。
 //! - 每应用独占当前显示尺寸；返回键 / ESC 退出后由 launcher 重绘桌面。
 //! - 文本渲染使用 cn.ttf 平滑字体：首次绘制前调用 `ttf_text::font_init()`
 //!   （字体未就绪时文本渲染为空操作）。
@@ -77,30 +76,10 @@ pub fn draw_glass_style(x: i32, y: i32, w: i32, h: i32, r: i32, st: &GlassStyle)
 /// 液态玻璃基底：垂直渐变背景（顶部提亮、底部压暗同色系），让面板玻璃有
 /// 可模糊的内容层次。应用在整屏背景填充处调用以替代纯色填充。
 pub fn draw_gradient_bg(color: u32, dark: bool) {
-    let cr = ((color >> 16) & 0xFF) as u32;
-    let cg = ((color >> 8) & 0xFF) as u32;
-    let cb = (color & 0xFF) as u32;
-    let (lift, sink) = if dark { (0, 22) } else { (18, 14) };
-    let tr = (cr + lift).min(255);
-    let tg = (cg + lift).min(255);
-    let tb = (cb + lift).min(255);
-    let br = cr.saturating_sub(sink);
-    let bg_ = cg.saturating_sub(sink);
-    let bb = cb.saturating_sub(sink);
-    for y in 0..display_h() as i32 {
-        let t = (y as u32 * 255 / display_h() as u32).min(255);
-        let inv = 255 - t;
-        let r = (tr * inv + br * t) / 255;
-        let g = (tg * inv + bg_ * t) / 255;
-        let b = (tb * inv + bb * t) / 255;
-        let row = (r << 16) | (g << 8) | b;
-        let iy = y as usize * display_w();
-        unsafe {
-            for x in 0..display_w() {
-                BACK_BUF[iy + x] = row;
-            }
-        }
-    }
+    let palette = if dark { (color, blend(color, 0x00283152, 110), 0x006B69B6) }
+        else { glass::starlight::LIGHT };
+    unsafe { glass::starlight::paint(&mut BACK_BUF, display_w(), display_h(),
+        (0, 0, display_w() as i32, display_h() as i32), palette); }
 }
 
 /// 玻璃按钮：液态玻璃底 + 居中标签；accent = 强调色玻璃（全胶囊圆角，ColorOS 15 风格）。
@@ -393,7 +372,7 @@ pub const C_TEXT: u32 = 0x00_1A_1C_22;
 pub const C_DIM: u32 = 0x00_6B_72_80;
 pub const C_BTN: u32 = 0x00_FF_FF_FF;
 pub const C_BTN_BORDER: u32 = 0x00_D9_DE_E6;
-pub const C_ACCENT: u32 = 0x00_00_B9_6B;
+pub const C_ACCENT: u32 = glass::starlight::ACCENT;
 
 // ==================== 全局状态 ====================
 
@@ -536,74 +515,16 @@ pub fn light_animating() -> bool {
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-pub unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+pub use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+pub use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall3;
 
 /// renameat / fsync 等四参系统调用（文件信箱原子提交用）。
-#[inline(always)]
-pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-pub unsafe fn syscall6(
-    n: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        in("a5") a6,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall6;
 
 // ==================== 基础 I/O ====================
 

@@ -9,64 +9,40 @@
 
 用法：python3 tests/scripts/cloud_e2e.py [logfile] [shotsdir]
 """
-import subprocess, sys, time, threading, os, tempfile, json, urllib.request
+from qemu_test import Guest, kernel_path, temp_path, qemu_command, monitor_address, monitor_option, launcher_layout, screenshot, desktop_ready
+import sys, time, os, tempfile, json, urllib.request
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_cloud.log"
-SHOTS = sys.argv[2] if len(sys.argv) > 2 else "/tmp/kx_cloud_shots"
-GW = "http://127.0.0.1:8080"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 else temp_path("kx_cloud.log")
+SHOTS = sys.argv[2] if len(sys.argv) > 2 else temp_path("kx_cloud_shots")
+GW = os.environ.get("CLOUD_GATEWAY", "http://127.0.0.1:8080")
 GW_KEY = os.environ.get("CLOUD_ADMIN_KEY", "admin")
 os.makedirs(SHOTS, exist_ok=True)
 WORKDIR = tempfile.mkdtemp(prefix="kxc_")
-PIPE = os.path.join(WORKDIR, "kx")
-MON = os.path.join(WORKDIR, "mon")
+MON = monitor_address()
 
 FRAME_DOWN, FRAME_UP, FRAME_MOVE = 0x01, 0x00, 0x02
 
 def frame(kind, x=0, y=0):
     return bytes([0xAA, kind, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF])
 
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
-       "-kernel", KERNEL, "-serial", "pipe:" + PIPE,
+cmd = qemu_command() + [
+       "-kernel", KERNEL, "-serial", "stdio",
        "-device", "ramfb", "-no-reboot", "-display", "none",
        "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
        "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
        "-device", "virtio-rng-device",
-       # 注意：不加 -device AC97 —— QEMU 在 -display none 下 AC97 DMA 不完成、
-       # 内核 play_tone 的 deadline 轮询不退出导致启动挂起（音频与云服务无关）。
-       "-monitor", "unix:" + MON + ",server,nowait"]
+       "-monitor", monitor_option(MON)]
 
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 results = []
 
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data); logf.write(data); logf.flush()
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
 
 def send_frame(fr):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, fr)
-    os.close(infd)
+    guest.send(fr)
 
 def tap(x, y, hold=0.06):
     send_frame(frame(FRAME_MOVE, x, y))
@@ -89,18 +65,11 @@ def swipe(x1, y1, x2, y2, steps=10, step_ms=0.012):
     time.sleep(0.1)
 
 def shot(name):
-    try:
-        s = socket_create()
-        s.connect(MON)
-        s.sendall(b'screendump ' + (os.path.join(SHOTS, name) + '\n').encode())
-        time.sleep(0.3)
-        s.close()
-    except Exception:
-        pass
+    screenshot(MON, SHOTS, name)
 
 def socket_create():
     import socket
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(3)
     return s
 
@@ -131,17 +100,7 @@ def check(cond, msg):
         sys.exit(1)
 
 try:
-    if not wait_for("[oobe] 欢迎使用 KunxOS", 90):
-        print("FAIL: kernel did not boot to OOBE")
-        sys.exit(1)
-    time.sleep(0.5)
-    # 快进 OOBE（10 步，前 9 步点下一步）
-    for i in range(9):
-        tap(465, 925)
-        time.sleep(0.35)
-    if not wait_for("[launcher] 桌面就绪", 90):
-        print("FAIL: no desktop after OOBE")
-        sys.exit(1)
+    desktop_ready(guest, tap)
     time.sleep(1.5)
     # 锁屏：OOBE 配置了安全方式（默认 PIN=1234），launcher 启动即上锁，
     # 需先解锁才能点击云服务图标（与 apps_regression.py 的处理一致）。
@@ -159,20 +118,19 @@ try:
         time.sleep(0.8)
     shot("00_desktop_page0.ppm")
 
-    # 第 1 页：云服务在「系统工具」文件夹内（launcher 硬编码布局：
-    # FOLDER_KEYS = calculator/clock/files/terminal/cloud/mail，3 列网格，
-    # 面板 396x500 居中 → cloud 位于第 2 行中列，中心 (270,378)；
-    # 文件夹图标在页面网格 (0,0)，中心 ≈ (150,272)）。
-    swipe(400, 500, 120, 500)
-    time.sleep(1.0)
-    shot("01_desktop_page1.ppm")
-    tap(150, 178)              # 打开「系统工具」文件夹（第二页网格 (0,0)）
-    if not wait_for("[launcher] 已打开文件夹", 10):
-        print("FAIL: could not open system tools folder")
-        sys.exit(1)
-    time.sleep(0.8)
-    tap(206, 378)              # 文件夹内 cloud 图标（"calculator" 键不匹配被跳过，
-                               #  实际内容 clock/files/terminal/cloud/mail → cloud 在第 2 行左列）
+    _, _, folders, folder_apps = launcher_layout(log)
+    check("tools" in folders and "cloud" in folder_apps, "cloud folder layout present")
+    pg, fx, fy = folders["tools"]
+    for target_page in range(1, pg + 1):
+        page_start = len(log)
+        swipe(440, 500, 100, 500)
+        check(guest.wait_for(f"[launcher] page={target_page}", 15, page_start), "page turn completed")
+        time.sleep(0.5)
+    start = len(log)
+    tap(fx, fy)
+    check(guest.wait_for("[launcher] 已打开文件夹", 10, start), "system tools folder opened")
+    time.sleep(1)
+    tap(*folder_apps["cloud"])
     if not wait_for("[cloud] 已就绪", 30):
         print("FAIL: cloud app did not start")
         sys.exit(1)
@@ -236,10 +194,4 @@ try:
 
     print("\n=== E2E CLOUD TEST %s ===" % ("ALL PASS" if all(c for _, c in results) else "FAILED"))
 finally:
-    stop = True
-    logf.close()
-    try:
-        p.terminate()
-    except Exception:
-        pass
-    sys.exit(0 if all(c for _, c in results) else 1)
+    guest.close()

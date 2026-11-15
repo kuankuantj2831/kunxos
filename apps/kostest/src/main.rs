@@ -8,7 +8,7 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 use core::panic::PanicInfo;
 
 const SYS_WRITE: usize = 64;
@@ -581,19 +581,7 @@ fn print_hex(v: u64) {
     unsafe { write_fd(1, &s); };
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

@@ -18,8 +18,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/audio.rs"]
 mod audio;
@@ -44,57 +42,13 @@ const O_RDWR: usize = 2;
 const O_CREAT: usize = 0x40;
 const SIGCHLD: usize = 17;
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall5;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
@@ -126,7 +80,7 @@ fn print_dec(mut v: u64) {
 // ==================== 进程原语 ====================
 
 unsafe fn fork() -> isize {
-    syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as isize
+    kunxrt::process::fork() as isize
 }
 
 unsafe fn execve(path: &[u8], argv: *const usize) -> isize {
@@ -391,42 +345,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
-    struct BufWriter {
-        buf: [u8; 256],
-        len: usize,
-    }
-    impl core::fmt::Write for BufWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: audiomix\n");
-        write_fd(2, &w.buf[..w.len]);
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("audiomix");

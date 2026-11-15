@@ -33,6 +33,8 @@ const MAX_SHMS: usize = 8;
 /// 文件描述符访问标志：读端 / 写端。
 pub const FD_READ: u32 = 0x1;
 pub const FD_WRITE: u32 = 0x2;
+/// 管道端点的 O_NONBLOCK 状态（仅用于 FdKind::Pipe；Pair 的 flags 表示端点编号，不可混用）。
+pub const FD_NONBLOCK: u32 = 0x4;
 
 /// Nonblocking readiness snapshot. Preserve the caller's IRQ state.
 pub fn poll_events(e: process::FdEntry) -> i16 {
@@ -293,10 +295,10 @@ pub fn pipe_create() -> (i32, i32) {
 /// 临界区全程屏蔽 IRQ：「检查缓冲 → 写入 → 唤醒读者」原子化，防止单核
 /// 抢占下多读者/多写者并发读写环形缓冲；登记等待者与阻塞之间也屏蔽 IRQ，
 /// 消除「登记后、阻塞前」丢唤醒的竞态窗口。
-pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
+pub fn pipe_write(fd: i32, data: &[u8]) -> isize {
     let entry = match process::get_fd(fd) {
-        Some(e) if e.kind == FdKind::Pipe => e,
-        _ => return 0,
+        Some(e) if e.kind == FdKind::Pipe && e.flags & FD_WRITE != 0 => e,
+        _ => return -9,
     };
     let idx = entry.index;
     unsafe { asm!("csrci sstatus, 2") };
@@ -310,7 +312,12 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
                 // 缓冲满、读者全部关闭后写者永久挂起。
                 if !PIPES[idx].used || PIPES[idx].readers == 0 {
                     asm!("csrsi sstatus, 2");
-                    return written;
+                    return written as isize;
+                }
+                // O_NONBLOCK：缓冲已满且无法继续写，已有进度则返回进度，否则 EAGAIN。
+                if entry.flags & FD_NONBLOCK != 0 {
+                    asm!("csrsi sstatus, 2");
+                    return if written > 0 { written as isize } else { -11 };
                 }
                 if !wait_reg(&mut PIPES[idx].writer_wait, sched_cfs::current_tid()) {
                     // 等待者表满（≥5 并发等待者）：让出 CPU 后重试登记。
@@ -330,7 +337,7 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
             if !pipe.used || pipe.readers == 0 {
                 // 等待期间对端全部关闭：不再写入
                 asm!("csrsi sstatus, 2");
-                return written;
+                return written as isize;
             }
             pipe.buf[pipe.tail] = data[written];
             pipe.tail = (pipe.tail + 1) % PIPE_BUF;
@@ -341,17 +348,17 @@ pub fn pipe_write(fd: i32, data: &[u8]) -> usize {
         written += 1;
     }
     unsafe { asm!("csrsi sstatus, 2") };
-    written
+    written as isize
 }
 
 /// 从管道读取数据：阻塞直到至少 1 字节可用，然后返回当前可读字节数
 /// （至多 `out.len()` 字节，不会等到填满缓冲区）。
 ///
 /// 与 [`pipe_write`] 相同：临界区屏蔽 IRQ，保证并发读写安全且不丢唤醒。
-pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
+pub fn pipe_read(fd: i32, out: &mut [u8]) -> isize {
     let entry = match process::get_fd(fd) {
-        Some(e) if e.kind == FdKind::Pipe => e,
-        _ => return 0,
+        Some(e) if e.kind == FdKind::Pipe && e.flags & FD_READ != 0 => e,
+        _ => return -9,
     };
     if out.is_empty() {
         return 0;
@@ -360,6 +367,11 @@ pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
     unsafe { asm!("csrci sstatus, 2") };
     // 阻塞直到至少 1 字节；所有写端关闭（writers == 0）或槽位清空 = EOF。
     while unsafe { PIPES[idx].count == 0 && PIPES[idx].used && PIPES[idx].writers > 0 } {
+        // O_NONBLOCK：无数据但写端仍在 → EAGAIN（EOF 由下方判断返回 0）。
+        if entry.flags & FD_NONBLOCK != 0 {
+            unsafe { asm!("csrsi sstatus, 2") };
+            return -11;
+        }
         unsafe {
             if !wait_reg(&mut PIPES[idx].reader_wait, sched_cfs::current_tid()) {
                 // 等待者表满：让出 CPU 后重试登记。此前 return 0 会被应用
@@ -391,7 +403,7 @@ pub fn pipe_read(fd: i32, out: &mut [u8]) -> usize {
         wait_wake(&mut pipe.writer_wait);
     }
     unsafe { asm!("csrsi sstatus, 2") };
-    n
+    n as isize
 }
 
 // ==================== 消息队列接口 ====================

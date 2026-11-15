@@ -299,7 +299,7 @@ class Backend:
             return {"ok": False, "error": "denied"}
         if not self.store.get_device(device_id):
             return {"ok": False, "error": "no_such_device"}
-        if ctype not in ("find", "lock", "wipe"):
+        if ctype not in ("find", "lock", "unlock", "wipe"):
             return {"ok": False, "error": "bad_type"}
         self.store.add_command(device_id, ctype, payload)
         return {"ok": True}
@@ -355,7 +355,7 @@ a{color:#4a9fe8}
 <div>
   设备 <input id="did" placeholder="设备 ID">
   类型 <select id="ctype"><option value="find">查找设备</option>
-  <option value="lock">远程锁定</option><option value="wipe">远程擦除</option></select>
+  <option value="lock">远程锁定</option><option value="unlock">远程解锁</option><option value="wipe">远程擦除</option></select>
   <input id="payload" placeholder="备注（可选）">
   <button onclick="sendCmd()">下发</button>
 </div>

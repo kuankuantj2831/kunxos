@@ -114,6 +114,9 @@ pub struct Process {
     pub pt: vm::ProcPageTable,
     /// 文件描述符表
     pub fds: [FdEntry; FD_MAX],
+    /// FD_CLOEXEC 位图（bit N 对应 fds[N]）。fork 继承，execve 成功后关闭
+    /// 置位的描述符；fd 被释放或重新分配时清零对应位。
+    pub cloexec: u32,
     /// 待处理信号位图（bit N 对应信号 N）
     pub signals: u64,
     /// 父进程 pid（-1 表示无）
@@ -151,6 +154,7 @@ impl Process {
             state: ProcessState::Free,
             pt: vm::ProcPageTable::empty(),
             fds: [EMPTY_FD; FD_MAX],
+            cloexec: 0,
             signals: 0,
             parent: -1,
             exit_code: 0,
@@ -509,6 +513,7 @@ fn create_child_process(
 
     // 先拷贝父进程的 fd 表 / 信号 / 名称 / 工作目录，避免与后续写入产生重叠借用。
     let fds: [FdEntry; FD_MAX];
+    let cloexec: u32;
     let signals: u64;
     let name: [u8; MAX_NAME];
     let name_len: usize;
@@ -517,6 +522,7 @@ fn create_child_process(
     unsafe {
         let p = &PROCESSES[parent_pid as usize];
         fds = p.fds;
+        cloexec = p.cloexec;
         signals = p.signals;
         name = p.name;
         name_len = p.name_len;
@@ -563,6 +569,7 @@ fn create_child_process(
         (*dst).cwd = cwd;
         (*dst).cwd_len = cwd_len;
         (*dst).fds = fds;
+        (*dst).cloexec = cloexec;
         // 安全模型：子进程继承父进程身份（uid/gid 随 fork 传递，随 exec 保持）
         (*dst).uid = PROCESSES[parent_pid as usize].uid;
         (*dst).gid = PROCESSES[parent_pid as usize].gid;
@@ -864,6 +871,7 @@ pub fn init(init_entry: fn(usize) -> !) {
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
+        (*dst).cloexec = 0;
         crate::kinfo! { crate::uart_send_str("[pinit] fields\n"); }
         // 移动语义转入 PCB（pt 内含堆记录表 Box）：deref-move 消费 Box，
         // 防止 u64 字拷贝复制 Box 指针 + 随后 pt drop 造成的双释放。
@@ -922,6 +930,7 @@ pub fn spawn(
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
+        (*dst).cloexec = 0;
         (*dst).kthread = true; // 函数入口线程（shell/perflog 等）：软复位不清理
         // 移动语义转入 PCB（pt 内含堆记录表 Box，deref-move 消费 Box 防双释放）
         core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
@@ -984,6 +993,7 @@ pub fn create_process(mut pt: alloc::boxed::Box<vm::ProcPageTable>, name: &str) 
         (*dst).cwd = DEFAULT_CWD;
         (*dst).cwd_len = 1;
         (*dst).fds = [EMPTY_FD; FD_MAX];
+        (*dst).cloexec = 0;
         // 移动语义转入 PCB（pt 内含堆记录表 Box，deref-move 消费 Box 防双释放）
         core::ptr::write(core::ptr::addr_of_mut!((*dst).pt), *pt);
     }
@@ -1007,6 +1017,7 @@ pub fn assign_fd(pid: u32, fd: usize, entry: FdEntry) -> i32 {
     }
     unsafe {
         PROCESSES[pid as usize].fds[fd] = entry;
+        PROCESSES[pid as usize].cloexec &= !(1u32 << fd);
     }
     0
 }
@@ -1880,12 +1891,18 @@ pub fn signal_pending(pid: u32) -> u64 {
 
 /// 在当前进程 fd 表中分配一个描述符。
 pub fn alloc_fd(kind: FdKind, index: usize, flags: u32) -> i32 {
+    alloc_fd_from(kind, index, flags, 0)
+}
+
+/// Allocate the lowest unused descriptor at or above min_fd (F_DUPFD).
+pub fn alloc_fd_from(kind: FdKind, index: usize, flags: u32, min_fd: usize) -> i32 {
     let pid = current_pid();
     unsafe {
         let p = &mut PROCESSES[pid as usize];
-        for i in 0..FD_MAX {
+        for i in min_fd..FD_MAX {
             if p.fds[i].kind == FdKind::None {
                 p.fds[i] = FdEntry { kind, index, flags };
+                p.cloexec &= !(1u32 << i);
                 return i as i32;
             }
         }
@@ -1917,6 +1934,63 @@ pub fn close_fd(fd: i32) {
     let pid = current_pid();
     unsafe {
         PROCESSES[pid as usize].fds[fd as usize] = EMPTY_FD;
+        PROCESSES[pid as usize].cloexec &= !(1u32 << fd as usize);
+    }
+}
+
+/// 查询当前进程某 fd 的 FD_CLOEXEC 标志。
+pub fn fd_cloexec(fd: i32) -> bool {
+    if fd < 0 || (fd as usize) >= FD_MAX {
+        return false;
+    }
+    let pid = current_pid();
+    unsafe { PROCESSES[pid as usize].cloexec & (1u32 << fd as usize) != 0 }
+}
+
+/// 设置或清除当前进程某 fd 的 FD_CLOEXEC 标志；fd 未打开返回 -1。
+pub fn set_fd_cloexec(fd: i32, on: bool) -> i32 {
+    if fd < 0 || (fd as usize) >= FD_MAX {
+        return -1;
+    }
+    let pid = current_pid();
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        if p.fds[fd as usize].kind == FdKind::None {
+            return -1;
+        }
+        if on {
+            p.cloexec |= 1u32 << fd as usize;
+        } else {
+            p.cloexec &= !(1u32 << fd as usize);
+        }
+    }
+    0
+}
+
+/// 仅更新当前进程某 fd 表项的 flags（保留 FD_CLOEXEC 与对象引用）；fd 未打开返回 -1。
+pub fn set_fd_flags(fd: i32, flags: u32) -> i32 {
+    if fd < 0 || (fd as usize) >= FD_MAX {
+        return -1;
+    }
+    let pid = current_pid();
+    unsafe {
+        let e = &mut PROCESSES[pid as usize].fds[fd as usize];
+        if e.kind == FdKind::None {
+            return -1;
+        }
+        e.flags = flags;
+    }
+    0
+}
+
+/// 取出并清零当前进程的 FD_CLOEXEC 位图（execve 成功后由调用方逐个关闭）。
+pub fn take_cloexec_mask() -> u32 {
+    let pid = current_pid();
+    unsafe {
+        let p = &mut PROCESSES[pid as usize];
+        let m = p.cloexec;
+        p.cloexec = 0;
+        m
     }
 }
 
@@ -1928,6 +2002,8 @@ pub fn set_fd(fd: usize, entry: FdEntry) -> i32 {
     let pid = current_pid();
     unsafe {
         PROCESSES[pid as usize].fds[fd] = entry;
+        // dup2/dup3 的目标描述符按 POSIX 清除 FD_CLOEXEC（dup3 带 O_CLOEXEC 时由调用方再置位）
+        PROCESSES[pid as usize].cloexec &= !(1u32 << fd);
     }
     0
 }
@@ -2270,25 +2346,25 @@ pub fn mprotect_page(vaddr: usize, ap: vm::MapFlags) -> bool {
             let wants_rw = ap == vm::AP_USER_RW;
             if wants_rw && (vm::is_cow(p.pt.user_pages[i].flags) || vm::is_user_ro(p.pt.user_pages[i].flags))
             {
-                    // COW and shared read-only pages both need a private copy.
-                    // This also restores PROT_NONE without relaxing permissions
-                    // through the page-fault-only cow_break entry point.
-                    let old_pa = p.pt.user_pages[i].paddr;
-                    let Some(new_pa) = allocator::alloc_page() else { return false };
-                    core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, vm::PAGE_SIZE);
-                    let new_flags = vm::data_permissions(p.pt.user_pages[i].flags, ap);
-                    // 先映射新页（覆盖旧 PTE），成功后再解除旧页共享：
-                    // 映射失败时旧页仍完好，不会留下指向已释放页的 PTE。
-                    if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
-                        allocator::free_page(new_pa);
-                        crate::uart_send_str("[mprotect] 页表 OOM\n");
-                        return false;
-                    }
-                    if allocator::unshare_page(old_pa) {
-                        allocator::free_page(old_pa);
-                    }
-                    p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: new_pa, flags: new_flags };
-                    return true;
+                // COW and shared read-only pages both need a private copy.
+                // This also restores PROT_NONE without relaxing permissions
+                // through the page-fault-only cow_break entry point.
+                let old_pa = p.pt.user_pages[i].paddr;
+                let Some(new_pa) = allocator::alloc_page() else { return false };
+                core::ptr::copy_nonoverlapping(old_pa as *const u8, new_pa as *mut u8, vm::PAGE_SIZE);
+                let new_flags = vm::data_permissions(p.pt.user_pages[i].flags, ap);
+                // 先映射新页（覆盖旧 PTE），成功后再解除旧页共享：
+                // 映射失败时旧页仍完好，不会留下指向已释放页的 PTE。
+                if !vm::map_page_in(p.pt.ttbr0, page, new_pa, vm::cow_pte_flags(new_flags)) {
+                    allocator::free_page(new_pa);
+                    crate::uart_send_str("[mprotect] 页表 OOM\n");
+                    return false;
+                }
+                if allocator::unshare_page(old_pa) {
+                    allocator::free_page(old_pa);
+                }
+                p.pt.user_pages[i] = vm::UserPage { vaddr: page, paddr: new_pa, flags: new_flags };
+                return true;
             }
             // 普通路径：更新 AP（清除 COW 标记；只读页保持共享池语义）
             let rec = p.pt.user_pages[i];

@@ -497,6 +497,50 @@ fn push_create_event() {
 }
 
 #[test]
+fn deletion_survives_restart_and_is_acknowledged_once() {
+    let mut ctx = setup(MockDav::new());
+    let mut meta = meta_with(account_for(ctx.port), calendar_coll());
+    let mut blob = [0u8; 65536];
+    let mut store = store_new(&mut ctx.fs, &mut blob, COLL_CALENDAR);
+    let mut ev = Event::new();
+    ev.summary_len = util::copy_into(&mut ev.summary, b"Delete after restart");
+    ev.dtstart = DateTime::new(2025, 9, 1, 10, 0, 0, 0, true);
+    ev.dtend = DateTime::new(2025, 9, 1, 11, 0, 0, 0, true);
+    let mut resp = [0u8; 65536];
+    let mut req = [0u8; 8192];
+    let mut xml = [0u8; 65536];
+    {
+        let mut env = make_env(&mut ctx.fs, RESOLVE_MANUAL);
+        assert!(sync::create_event_local(&mut env, &mut store, 1, b"/dav/calendars/cal1/", &mut ev, 42));
+        sync::sync_collection(&mut env, &mut meta, 1, &mut store, COLL_CALENDAR,
+            &mut resp, &mut req, &mut xml, &mut SyncStats::new()).unwrap();
+    }
+    assert_eq!(ctx.server.lock().unwrap().resources.len(), 1);
+    store.remove(0);
+    assert!(store.save(&mut ctx.fs));
+    let mut reloaded_blob = [0u8; 65536];
+    let mut reloaded = store_new(&mut ctx.fs, &mut reloaded_blob, COLL_CALENDAR);
+    assert_eq!(reloaded.query_dirty(1, &mut [0usize; 8]), 1);
+    let mut stats = SyncStats::new();
+    {
+        let mut env = make_env(&mut ctx.fs, RESOLVE_MANUAL);
+        sync::sync_collection(&mut env, &mut meta, 1, &mut reloaded, COLL_CALENDAR,
+            &mut resp, &mut req, &mut xml, &mut stats).unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(reloaded.query_dirty(1, &mut [0usize; 8]), 0);
+        let mut next = SyncStats::new();
+        sync::sync_collection(&mut env, &mut meta, 1, &mut reloaded, COLL_CALENDAR,
+            &mut resp, &mut req, &mut xml, &mut next).unwrap();
+        assert_eq!(next.deleted, 0);
+        assert_eq!(next.pushed, 0);
+    }
+    assert!(ctx.server.lock().unwrap().resources.is_empty());
+    assert_eq!(reloaded.query_coll(1, &mut [0usize; 8]), 0);
+    assert!(reloaded.compact(&mut ctx.fs));
+    assert_eq!(reloaded.n, 0);
+}
+
+#[test]
 fn incremental_pull_and_push() {
     let mut ctx = setup(MockDav::new());
     // 服务器预置两个事件

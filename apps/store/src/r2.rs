@@ -107,36 +107,14 @@ const SYS_DNS_RESOLVE: usize = 403;
 const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
 
-use core::arch::asm;
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, in("a2") a3, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
-        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, in("a5") a6, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 /// 当前墙钟（微秒，UTC epoch）。失败返回 0。
 fn now_us() -> u64 {

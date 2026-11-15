@@ -5,7 +5,7 @@
 - [x] 内核（`kunxcore`）：MMU 分页、物理页分配器、slab 堆、CFS 调度器、进程/线程、系统调用
 - [x] 内核安全硬化：COW fork、PAN（EL1 用户内存隔离）、W^X、栈/堆 ASLR、per-app UID 沙箱（`setuid` + kill 权限检查）
 - [x] 虚拟文件系统：VFS、devfs、SFS（Simple FS）、ELF 加载器、内核 IPC 与 socket
-- [x] 设备驱动：virtio-blk、virtio-net、PLIC、16550 UART、SBI 定时器、GPU/合成器（`ramfb`）
+- [x] 设备驱动：virtio-blk、virtio-net、PLIC、16550 UART、SBI 定时器、软件合成器与显示（`ramfb` / `virtio-gpu` 2D）
 - [x] 硬件抽象层（`kunxhal`）：display / input / audio / net / storage / power 平台抽象
 - [x] 系统服务（`kunxserv`）：`networkd` 网络守护进程
 - [x] 用户态 init（`kunxinit`）：PID 1，解析 `/etc/inittab` 并拉起系统服务
@@ -38,6 +38,7 @@
 make            # 编译全部（内核 + init + 服务 + 应用 + rootfs）
 make run        # 无图形，串口输出到当前终端（QEMU virt）
 make run-gui    # 带图形窗口（ramfb），串口输出到当前终端
+make run-gui QEMU_GPU=virtio-gpu-device # virtio-gpu 2D 显示，仍由 CPU 绘制
 make run-disk   # 经 OpenSBI 启动内核并挂载磁盘镜像
 make clean      # 清理所有构建产物
 ```
@@ -88,7 +89,7 @@ kunxos/
 
 | 平台 | CPU / 板卡 | 状态 |
 | --- | --- | --- |
-| QEMU `virt` | RISC-V rv64 | ✅ 完整支持（串口 / 网络 / virtio-blk / ramfb） |
+| QEMU `virt` | RISC-V rv64 | ✅ 支持串口 / 网络 / virtio-blk / ramfb / virtio-gpu 2D（无 3D 加速） |
 
 ## 快速开始
 

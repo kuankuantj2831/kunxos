@@ -1,4 +1,5 @@
-//! 帧缓冲驱动：QEMU ramfb（RAM 帧缓冲，经 fw_cfg 配置）。
+//! 显示后端：优先 virtio-gpu 2D，无设备或初始化失败时回退 QEMU ramfb。
+//! 应用仍使用 XRGB8888 /dev/fb0；两种后端均使用软件合成，无硬件 VSYNC。
 //!
 //! `-M virt` 下添加 `-device ramfb` 时，QEMU 通过 fw_cfg 暴露一个纯内存
 //! 帧缓冲。内核通过 fw_cfg DMA 接口向 `etc/ramfb` 文件写入 `RAMFBCfg`
@@ -27,16 +28,45 @@ static RESIZE_REQUEST: AtomicU32 = AtomicU32::new(0);
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 static PRESENTS: AtomicU32 = AtomicU32::new(0);
 static RECONFIGURATIONS: AtomicU32 = AtomicU32::new(0);
+// 0 = unavailable, 1 = ramfb, 2 = virtio-gpu. Explicit selection is useful
+// for old firmware, performance comparisons and machines exposing both devices.
+static BACKEND: AtomicU32 = AtomicU32::new(0);
+static FORCE_RAMFB: AtomicU32 = AtomicU32::new(0);
 static mut SCANOUT: (usize, u32, u32, u32) = (0, 0, 0, 0);
+
+pub fn backend_name() -> &'static str {
+    match BACKEND.load(Ordering::Relaxed) {
+        1 => "ramfb", 2 => "virtio-gpu", _ => "none",
+    }
+}
+
+/// virtio-gpu snapshots backing memory into a host resource before completing
+/// its fence. The compositor may reuse its composition buffer afterwards.
+pub fn uses_host_resource() -> bool {
+    BACKEND.load(Ordering::Relaxed) == 2
+}
 
 pub fn scanout_stats() -> (u32, u32) {
     (PRESENTS.load(Ordering::Relaxed), RECONFIGURATIONS.load(Ordering::Relaxed))
 }
 
 // The compositor serializes presentation. Retain a surface until its binding changes.
-unsafe fn bind_scanout(pa: usize) {
+unsafe fn bind_scanout(pa: usize, damage: Option<crate::virtio_gpu_protocol::Damage>) {
     PRESENTS.fetch_add(1, Ordering::Relaxed);
     asm!("fence iorw, iorw");
+    if BACKEND.load(Ordering::Relaxed) == 2 {
+        if let Some(changed) = crate::virtio_gpu::present(pa, WIDTH, HEIGHT, damage) {
+            if changed { RECONFIGURATIONS.fetch_add(1, Ordering::Relaxed); }
+            return;
+        }
+        // The GPU keeps all DMA pages pinned after a failure. The same front
+        // buffer can be scanned by ramfb when the machine exposes that device.
+        BACKEND.store(if RAMFB_SEL != 0 { 1 } else { 0 }, Ordering::Relaxed);
+        crate::uart_send_str("[gpu] display fallback: ");
+        crate::uart_send_str(backend_name());
+        crate::uart_send_str("\n");
+    }
+    if BACKEND.load(Ordering::Relaxed) != 1 { return; }
     let binding = (pa, WIDTH, HEIGHT, STRIDE);
     if SCANOUT != binding && write_ramfb_cfg(pa, WIDTH, HEIGHT, STRIDE) {
         SCANOUT = binding;
@@ -74,7 +104,7 @@ pub unsafe fn set_geometry(w: u32, h: u32) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
-/// The ramfb backend has neither a VSYNC interrupt nor a host resize event.
+/// Neither current backend implements a VSYNC interrupt or a host resize event.
 /// Keep both capability bits clear until a display driver implements them.
 pub fn configure_display(info: Option<&kunxhal::DisplayInfo>) {
     if let Some(info) = info {
@@ -84,10 +114,11 @@ pub fn configure_display(info: Option<&kunxhal::DisplayInfo>) {
 }
 
 /// Explicit QEMU host hint, not a hardware refresh measurement.
-/// Used only when ramfb cannot report a native rate.
+/// Used only when the display backend cannot report a native rate.
 static HOST_RATE_MILLIHZ: AtomicU32 = AtomicU32::new(0);
 pub fn configure_host_rate(args: &str) {
     for arg in args.split_whitespace() {
+        if arg == "display-backend=ramfb" { FORCE_RAMFB.store(1, Ordering::Relaxed); }
         if arg == "host-cursor" { HOST_CURSOR.store(4, Ordering::Relaxed); }
         if arg == "display-resize" { RESIZE_ENABLED.store(1, Ordering::Relaxed); }
         if let Some(hz) = arg.strip_prefix("display-hz=").and_then(|s| s.parse::<u32>().ok()) {
@@ -98,10 +129,19 @@ pub fn configure_host_rate(args: &str) {
     }
 }
 
+/// 未知刷新率时的软件目标帧率（mHz）。
+///
+/// ramfb 查不到刷新率、也没有 `display-hz=` 提示时才使用，只是一个目标，
+/// 不是实测值。取 120Hz 而非 240Hz：QEMU TCG（Windows/x86 宿主无 KVM）下
+/// 每次定时器中断往返都是纯软件模拟，240Hz 的 IRQ 密度本身就会吃掉大量
+/// CPU，留给合成与应用渲染的时间反而更少。需要更高目标请显式传
+/// `display-hz=<N>`（真机/KVM 宿主）。
+const FALLBACK_TARGET_MILLIHZ: u32 = 120_000;
+
 pub fn frame_interval_us() -> u64 {
     let native = REFRESH_MILLIHZ.load(Ordering::Relaxed);
     let host = HOST_RATE_MILLIHZ.load(Ordering::Relaxed);
-    let rate = if native != 0 { native } else if host != 0 { host } else { 240_000 };
+    let rate = if native != 0 { native } else if host != 0 { host } else { FALLBACK_TARGET_MILLIHZ };
     1_000_000_000u64.div_ceil(rate.clamp(1_000, 1_000_000) as u64)
 }
 
@@ -319,15 +359,18 @@ fn clean_dcache(va: usize, len: usize) {
 ///
 /// * `fwcfg_base` - fw_cfg MMIO 基地址（设备树解析所得，缺失时回退默认值）。
 ///
-/// 成功返回 `(宽, 高)`；未找到 ramfb（如未加 `-device ramfb`）返回 `None`。
-pub fn init(fwcfg_base: usize) -> Option<(u32, u32)> {
+/// 优先探测 virtio-gpu，失败时使用 ramfb；均不可用时返回 `None`。
+/// 成功返回 `(宽, 高)`，应用的 framebuffer ABI 与后端无关。
+pub fn init(fwcfg_base: usize, devs: &[crate::net_virtio::MmioDev]) -> Option<(u32, u32)> {
     unsafe {
         FWCFG_BASE = fwcfg_base;
         RAMFB_SEL = find_ramfb_selector();
     }
-    if unsafe { RAMFB_SEL } == 0 {
+    let virtio = FORCE_RAMFB.load(Ordering::Relaxed) == 0 && crate::virtio_gpu::init(devs);
+    if !virtio && unsafe { RAMFB_SEL } == 0 {
         return None;
     }
+    BACKEND.store(if virtio { 2 } else { 1 }, Ordering::Relaxed);
     unsafe {
         WIDTH = DEFAULT_WIDTH;
         HEIGHT = DEFAULT_HEIGHT;
@@ -382,7 +425,9 @@ pub fn present(pa: usize) {
     let bytes = unsafe { (WIDTH * HEIGHT * 4) as usize };
     clean_dcache(pa, bytes);
     unsafe {
-        bind_scanout(pa);
+        bind_scanout(pa, Some(crate::virtio_gpu_protocol::Damage {
+            x: 0, y: 0, w: WIDTH, h: HEIGHT,
+        }));
     }
 }
 
@@ -396,7 +441,11 @@ pub fn present_rects(pa: usize, rects: &[crate::compositor::Rect]) {
     let sw = unsafe { WIDTH } as i32;
     let sh = unsafe { HEIGHT } as i32;
     let stride = unsafe { STRIDE } as usize;
+    let mut damage: Option<crate::virtio_gpu_protocol::Damage> = None;
     for r in rects {
+        if let Some(d) = crate::virtio_gpu_protocol::Damage::clip(r.x, r.y, r.w, r.h, sw as u32, sh as u32) {
+            damage = Some(damage.map_or(d, |old| old.union(d)));
+        }
         let x0 = r.x.max(0);
         let y0 = r.y.max(0);
         let x1 = r.right().min(sw);
@@ -410,7 +459,7 @@ pub fn present_rects(pa: usize, rects: &[crate::compositor::Rect]) {
         clean_dcache(pa + start, end - start);
     }
     unsafe {
-        bind_scanout(pa);
+        bind_scanout(pa, damage);
     }
 }
 

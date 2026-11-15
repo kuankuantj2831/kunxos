@@ -15,8 +15,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::global_asm;
-use core::panic::PanicInfo;
 
 // ==================== 系统调用 ====================
 
@@ -46,39 +44,11 @@ const PDU_UCS2: &str = "00000B813108000000F2000842807221436520184F60597DFF0C004B
 const PDU_CONCAT_1: &str = "00100B813108000000F30000428072214365201505000309020182C160B025140A85ADE1703804";
 const PDU_CONCAT_2: &str = "00100B813108000000F300004280722143652015050003090202884422B1552C168B2DA3D16804";
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    core::arch::asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    core::arch::asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    core::arch::asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
@@ -498,42 +468,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     0
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
-    struct BufWriter {
-        buf: [u8; 256],
-        len: usize,
-    }
-    impl core::fmt::Write for BufWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: modemtest\n");
-        write_fd(2, &w.buf[..w.len]);
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("modemtest");

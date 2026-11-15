@@ -53,10 +53,40 @@ jobs:
           # - tests/text_host：shared/l10n 宿主测试 bin（同上，编译检查）
           # - tools/sfs_host_test：include 内核 fs_simple.rs 真源的掉电/并发/
           #   撕裂宿主测试（同上；真跑需生成测试盘，见 tools/mkfs_sfs.py）
-          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml kos/Cargo.toml apps/browser/hosttest/Cargo.toml tests/text_host/Cargo.toml tools/sfs_host_test/Cargo.toml; do
+          for m in shared/jpeg/Cargo.toml wireless/Cargo.toml kos/Cargo.toml kunxsec/Cargo.toml sync_tests/Cargo.toml tests/font_startup_host/Cargo.toml apps/browser/hosttest/Cargo.toml tests/text_host/Cargo.toml tools/sfs_host_test/Cargo.toml; do
             echo "==> cargo test $m"
             cargo test --manifest-path "$m"
           done
+
+      - name: Run host regression programs
+        run: |
+          set -euo pipefail
+          python3 docs/audit-2026-11-14-repro.py
+          python3 docs/audit-2026-11-15-repro.py
+          cargo run --manifest-path tests/text_host/Cargo.toml
+          cargo run --manifest-path tests/weather_json/Cargo.toml
+          python3 tools/mkfs_sfs.py rootfs /tmp/kunxos-audit-sfs.img 4096
+          cargo run --manifest-path tools/sfs_host_test/Cargo.toml -- "" /tmp/kunxos-audit-sfs.img
+          rustc --edition=2021 --target "$TARGET" -C panic=abort -C opt-level=2 \
+            -C link-arg=-Tapps/probe/linker.ld -C link-arg=-z \
+            -C link-arg=max-page-size=0x1000 tests/audit_guest.rs -o /tmp/kunxos-audit-guest
+          rustc --edition=2021 --target "$TARGET" -C panic=abort -C opt-level=2 \
+            -C link-arg=-Tapps/probe/linker.ld -C link-arg=-z \
+            -C link-arg=max-page-size=0x1000 tests/audit_second_guest.rs -o /tmp/kunxos-audit-second-guest
+
+      - name: Check test harness and packaged guest architecture
+        run: |
+          python3 -m compileall -q tests/scripts tools/kunxrepo
+          python3 tests/scripts/test_qemu_test.py
+
+      - name: Install RISC-V QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+
+      - name: Run RISC-V guest regressions
+        run: |
+          set -euo pipefail
+          python3 tests/scripts/smoke_test.py --build-dir build/test-riscv
+          python3 tests/scripts/browser_test.py --build-dir build/test-riscv
 
       # 代码尚未全量按 rustfmt 格式化，fmt 检查暂作非阻塞参考。
       - name: cargo fmt --check

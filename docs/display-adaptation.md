@@ -1,6 +1,49 @@
 # 显示适配与流畅度
 
-Windows 使用原生 QEMU SDL 窗口，启动器观察该进程的客户区尺寸，通过 localhost
+## virtio-gpu 2D 后端
+
+内核支持 QEMU `virtio-gpu-device`（virtio-mmio），发现设备后优先使用；
+没有该设备时继续使用 ramfb。应用仍通过 `/dev/fb0` 绘制 XRGB8888，显示 ABI 不变。
+新后端使用 2D resource、guest backing、脏区上传与 flush；合成缓冲直接作为上传源，
+省去 ramfb 路径中 back → front 的一次来宾 CPU 复制。多个脏区合并为裁剪后的包围矩形，
+每帧最多一次 transfer 和一次 flush。模式改变时上传完整新资源，绑定后释放旧资源。
+
+这是 **CPU 软件绘制 + virtio-gpu 2D 显示**，尚未实现 VirGL、OpenGL/Vulkan、
+GPU 模糊或 GPU 合成，也没有硬件 VSYNC。命令 fence 只保证设备处理完成，不能当作垂直同步。
+是否比 ramfb 更快取决于宿主、分辨率和脏区，不能用目标刷新率代替实测 FPS。
+
+```powershell
+# 构建后由 Windows 启动器自动选择新后端
+python tools/run_windows.py --build
+# 显式指定，或退回原来的显示设备
+python tools/run_windows.py --gpu virtio-gpu
+python tools/run_windows.py --gpu ramfb
+```
+
+Windows 默认 `--gpu auto`。构建脚本在内核旁生成 `.display.json`，记录支持的后端和
+内核 SHA-256；只有元数据与镜像匹配时才自动选择 virtio-gpu。旧镜像、没有元数据或镜像
+被外部替换时自动使用 ramfb，避免给旧内核配置它不认识的设备。手动构建的内核可显式选后端。
+Linux 使用 `make run-gui QEMU_GPU=virtio-gpu-device`；Makefile 默认仍为 ramfb。
+
+启动日志与 `display` 命令报告实际后端、呈现/重配计数；virtio-gpu 额外报告命令数与失败数。
+支持 legacy/modern MMIO split ring，modern 协商 VERSION_1 并检查 FEATURES_OK。
+请求和响应使用常驻 DMA 页，检查 used 元素、响应类型和 fence；单条命令等待上限 100ms。
+错误后停止使用该队列，保留 DMA 页以容纳迟到完成，避免设备写入已回收内存。
+机器同时暴露 ramfb 时可回退到它；只有 virtio-gpu 的机器发生设备故障后保留串口控制台。
+同时添加两个显示设备会形成两个 QEMU 显示控制台，必要时应切换到对应控制台。
+`display-backend=ramfb` 启动参数可强制选择 ramfb。
+
+验证命令（测试目录中的镜像应由当前源码构建）：
+
+```powershell
+python tools/test_display.py --qemu "C:/Program Files/qemu/qemu-system-riscv64.exe" --gpu virtio-gpu --resize --animate
+python tools/test_gpu.py --qemu "C:/Program Files/qemu/qemu-system-riscv64.exe" --kernel build/windows/target/riscv64gc-unknown-none-elf/release/rust-kernel --build-dir build/gpu-fallback
+```
+
+`test_gpu.py` 在无窗口 QEMU 中通过 qtest 复位 GPU，验证超时、ramfb 回退和 shell 继续响应；
+`--modern` 覆盖 modern 传输，`--force-ramfb` 覆盖两种设备同时存在时的强制选择。
+
+Windows 默认使用原生 QEMU GTK 窗口，启动器观察该进程的客户区尺寸，通过 localhost
 串口把尺寸送进来宾。桌面和已迁移应用按新尺寸重新绘制，文字不会作为旧截图被拉伸。
 当前支持 360–1920 × 480–1200 像素，默认 540×960；范围以外的窗口请求会被钳制。
 
@@ -127,3 +170,11 @@ Windows 默认 GTK 使用 `show-cursor=on` 和 `host-cursor` 启动契约，由�
 Windows 原生启动器默认使用 GTK（隐藏菜单栏，使客户区对应绘图区）。当前安装的 QEMU 11.1 在 SDL 后端启动 ramfb 时出现无响应，GTK 已验证可进入桌面并处理 QMP；`--display sdl` 仅作为诊断选项。
 
 启动交接先完成占位页提交并停止其刷新，再放行应用，避免快速启动的首帧被占位页覆盖。回归测试在任何窗口调整或后续输入前检查设置首帧，防止重绘掩盖该问题。
+
+## Windows 双击启动
+
+双击项目根目录的 `启动KunxOS.bat`，即可通过 `tools/run_windows.py` 打开 QEMU GUI。
+脚本自动切换到项目目录；默认复用 `build/windows` 内核，首次缺少内核时自动构建。
+需要 Python 3、QEMU，以及首次构建所需的 Rust/RISC-V 工具链。
+修改源码后可运行 `启动KunxOS.bat --build` 更新镜像；普通双击不会自动检查源码变化。
+启动失败时保留控制台错误提示。串口日志为 `qemu-windows-serial.log`，QEMU 错误日志为 `qemu-windows-serial.error.log`。

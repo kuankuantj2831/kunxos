@@ -139,6 +139,13 @@ const I_DIRECT: usize = 24;
 const I_INDIRECT: usize = I_DIRECT + NDIRECT * 4; // 120
 const I_DOUBLE: usize = I_INDIRECT + 4; // 124
 const I_TRIPLE: usize = I_DOUBLE + 4; // 128
+// 归属元数据（占用原保留区 @132..143；旧镜像该区为 0 = 无归属，行为同旧版）。
+// 非 root 身份创建的 inode 在创建事务内盖章；root/系统创建的保持无归属。
+const I_UID: usize = 132; // u32 所有者
+const I_GID: usize = 136; // u32 所属组
+const I_MODE: usize = 140; // u16 权限位（rwxrwxrwx 及 setuid 等高位）
+const I_OWNF: usize = 142; // u16 标志：bit0 = 归属元数据有效
+const OWNF_VALID: u16 = 1;
 
 // 日志头块字段偏移。
 const JH_MAGIC: usize = 0;
@@ -2105,6 +2112,15 @@ txn_begin(major);
     inode_set_nlink(&mut inode, 1);
     inode_set_rdev(&mut inode, rdev);
     inode_set_gen(&mut inode, 1);
+    // 由非 root 身份创建：在同一事务内记录归属（默认 0644 / 目录 0755），
+    // 避免“先创建、后补写 owner”之间掉电造成无归属窗口。
+    let cuid = crate::process::current_uid();
+    if cuid != 0 {
+        put_u32(&mut inode, I_UID, cuid);
+        put_u32(&mut inode, I_GID, crate::process::current_gid());
+        put_u16(&mut inode, I_MODE, if typ == T_DIR { 0o755 } else { 0o644 });
+        put_u16(&mut inode, I_OWNF, OWNF_VALID);
+    }
     if !write_inode(major, ino as u32, &inode) {
         txn_abort(major);
         return -1;
@@ -2115,6 +2131,57 @@ txn_begin(major);
     }
     txn_commit(major);
     ino
+}
+
+/// 读取 inode 的归属元数据 (uid, gid, mode)；无归属（旧文件 / root 创建）返回 None。
+pub fn fs_owner(major: u32, ino: u32) -> Option<(u32, u32, u16)> {
+    fs_lock();
+    let mut inode = [0u8; INODE_SIZE];
+    let r = if read_inode(major, ino, &mut inode) && get_u16(&inode, I_OWNF) & OWNF_VALID != 0 {
+        Some((get_u32(&inode, I_UID), get_u32(&inode, I_GID), get_u16(&inode, I_MODE)))
+    } else {
+        None
+    };
+    fs_unlock();
+    r
+}
+
+/// 修改归属元数据（chmod / chown 的底层）；`None` 的字段保持不变。
+/// inode 原本无归属时以 root:root 与按类型的默认权限起步，再套用本次修改。
+/// 一个日志事务内完成；失败返回 -1。
+pub fn fs_set_owner(major: u32, ino: u32, uid: Option<u32>, gid: Option<u32>, mode: Option<u16>) -> i32 {
+    fs_lock();
+    txn_begin(major);
+    let mut inode = [0u8; INODE_SIZE];
+    if !read_inode(major, ino, &mut inode) {
+        txn_abort(major);
+        fs_unlock();
+        return -1;
+    }
+    if get_u16(&inode, I_OWNF) & OWNF_VALID == 0 {
+        put_u32(&mut inode, I_UID, 0);
+        put_u32(&mut inode, I_GID, 0);
+        let default_mode = if inode_type(&inode) == T_DIR { 0o755 } else { 0o644 };
+        put_u16(&mut inode, I_MODE, default_mode);
+    }
+    if let Some(u) = uid {
+        put_u32(&mut inode, I_UID, u);
+    }
+    if let Some(g) = gid {
+        put_u32(&mut inode, I_GID, g);
+    }
+    if let Some(m) = mode {
+        put_u16(&mut inode, I_MODE, m & 0o7777);
+    }
+    put_u16(&mut inode, I_OWNF, OWNF_VALID);
+    if !write_inode(major, ino, &inode) {
+        txn_abort(major);
+        fs_unlock();
+        return -1;
+    }
+    txn_commit(major);
+    fs_unlock();
+    0
 }
 
 /// 在目录 `dir_ino` 下创建名为 `name` 的符号链接，目标为 `target`，返回 inode 号；失败 -1。

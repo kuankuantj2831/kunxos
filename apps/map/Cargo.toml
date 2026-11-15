@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fontdue = { path = "../../third_party/fontdue", features = ["lazy"] }
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
+kunxfont = { path = "../../shared/font" }
 
 [profile.release]
 opt-level = "z"

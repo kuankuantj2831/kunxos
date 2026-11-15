@@ -13,7 +13,6 @@
 #![no_std]
 #![no_main]
 
-use core::arch::asm;
 use core::panic::PanicInfo;
 
 const SYS_WRITE: usize = 64;
@@ -36,21 +35,9 @@ const OTA_CMD_WIPE_DATA: usize = 7;
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 const O_RDWR: usize = 2;
 
-unsafe fn sc1(n: usize, a1: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, options(nostack));
-    r
-}
-unsafe fn sc2(n: usize, a1: usize, a2: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, options(nostack));
-    r
-}
-unsafe fn sc3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, in("a2") a3, options(nostack));
-    r
-}
+use kunxrt::syscall::syscall1 as sc1;
+use kunxrt::syscall::syscall2 as sc2;
+use kunxrt::syscall::syscall3 as sc3;
 
 fn out(_tty: i64, s: &str) {
     unsafe {
@@ -105,7 +92,7 @@ fn prompt_str(tty: i64, ask: &str) -> [u8; 128] {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn k_main(_argc: usize, _argv: *const *const u8) -> usize {
     let tty: i64 = 1; // 内核为每个进程预置 fd 0/1/2 = /dev/tty
 
     out(tty, "\n=== KunxOS Recovery ===");
@@ -171,6 +158,8 @@ pub extern "C" fn _start() -> ! {
         }
     }
 }
+
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

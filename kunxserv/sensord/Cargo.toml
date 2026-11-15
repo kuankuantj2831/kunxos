@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
 kunxhal = { path = "../../kunxhal" }
 
 [profile.release]

@@ -16,8 +16,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::global_asm;
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/cjk_font_camera.rs"]
 mod cjk_font;
@@ -110,19 +108,7 @@ static mut RESP_BUF: [u8; 256] = [0u8; 256];
 static mut CMD_BUF: [u8; 96] = [0u8; 96];
 static mut LATEST_BUF: [u8; 16] = [0u8; 16];
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    core::arch::asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 unsafe fn read_fd(fd: usize, buf: &mut [u8]) -> isize {
     syscall3(SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len()) as isize
@@ -751,42 +737,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
-    struct BufWriter {
-        buf: [u8; 256],
-        len: usize,
-    }
-    impl core::fmt::Write for BufWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: camera\n");
-        write_fd(2, &w.buf[..w.len]);
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("camera");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KunxOS QEMU 触摸注入工具（PL011 UART 协议）。
+"""KunxOS QEMU 触摸注入工具（RISC-V 16550 UART 协议）。
 
 与内核 kunxcore/src/input.rs 的 UART 协议帧解析器配合，把触摸手势编码为
 6 字节小端协议帧，经 QEMU 的串口 TCP 服务器（-serial tcp::1234,server）发送。

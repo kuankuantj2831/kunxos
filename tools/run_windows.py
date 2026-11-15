@@ -6,6 +6,8 @@ so the client rectangle is the drawing area.
 Guest builds must include the display-resize protocol. No external packages.
 """
 import argparse
+import hashlib
+import json
 import ctypes
 from ctypes import wintypes as wt
 from pathlib import Path
@@ -20,6 +22,21 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def select_gpu(requested, kernel):
+    if requested != "auto":
+        return requested
+    # Only opt a known build into the new backend. Old kernels and externally
+    # replaced images remain bootable through ramfb; the hash rejects stale metadata.
+    try:
+        metadata = json.loads(kernel.with_suffix(".display.json").read_text(encoding="utf-8"))
+        if ("virtio-gpu" in metadata.get("backends", [])
+                and metadata.get("sha256") == hashlib.sha256(kernel.read_bytes()).hexdigest()):
+            return "virtio-gpu"
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return "ramfb"
+
+
 def main():
     if os.name != "nt":
         raise SystemExit("This launcher requires Windows; use make run-gui on Linux.")
@@ -27,6 +44,8 @@ def main():
     parser.add_argument("--qemu", type=Path, default=Path(r"C:\Program Files\qemu\qemu-system-riscv64.exe"))
     parser.add_argument("--kernel", type=Path, help="explicit ELF or kernel image")
     parser.add_argument("--build", action="store_true", help="build the adaptive Windows image before launch")
+    parser.add_argument("--gpu", choices=("auto", "ramfb", "virtio-gpu"), default="auto",
+                        help="auto selects virtio-gpu for verified new builds, ramfb for old images (2D only)")
     parser.add_argument("--display", choices=("gtk", "sdl"), default="gtk",
                         help="native display backend (GTK is the tested Windows default)")
     parser.add_argument("--rate", type=int, help="override detected host refresh target (24..360 Hz)")
@@ -42,6 +61,7 @@ def main():
         args.kernel = built_kernel if built_kernel.is_file() else ROOT / "kunxcore/kernel.img"
     if not args.qemu.is_file() or not args.kernel.is_file():
         parser.error("QEMU or kernel does not exist; supply --qemu and --kernel.")
+    args.gpu = select_gpu(args.gpu, args.kernel)
     if args.rate is not None and not 24 <= args.rate <= 360:
         parser.error("--rate must be between 24 and 360")
     user = ctypes.WinDLL("user32", use_last_error=True)
@@ -78,7 +98,8 @@ def main():
                    "-kernel", str(args.kernel.resolve()),
                    "-append", f"shell verbose display-resize host-cursor display-hz={rate}",
                    "-display", ("gtk,gl=off,show-cursor=on,show-menubar=off" if args.display == "gtk"
-                                else "sdl,gl=off,show-cursor=on"), "-device", "ramfb", "-no-reboot",
+                                else "sdl,gl=off,show-cursor=on"), "-device",
+                   ("virtio-gpu-device,xres=540,yres=960" if args.gpu == "virtio-gpu" else "ramfb"), "-no-reboot",
                    "-serial", f"tcp:127.0.0.1:{port}",
                    "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
                    "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
@@ -91,7 +112,7 @@ def main():
             process = subprocess.Popen(command, cwd=ROOT, stderr=errors,
                                        stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
                                        env=dict(os.environ, SDL_WINDOWS_DPI_AWARENESS="permonitorv2"))
-            print(f"QEMU PID={process.pid}; target={rate} Hz; log={args.log}", flush=True)
+            print(f"QEMU PID={process.pid}; gpu={args.gpu}; target={rate} Hz; log={args.log}", flush=True)
             try:
                 connect_until = time.monotonic() + 20
                 while True:

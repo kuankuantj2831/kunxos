@@ -241,7 +241,7 @@ async function adminCommand(env, body) {
   const dev = await env.DB.prepare("SELECT device_id FROM devices WHERE device_id = ?")
     .bind(device_id).first();
   if (!dev) return { ok: false, error: "no_such_device" };
-  if (type !== "find" && type !== "lock" && type !== "wipe") {
+  if (type !== "find" && type !== "lock" && type !== "unlock" && type !== "wipe") {
     return { ok: false, error: "bad_type" };
   }
   await env.DB.prepare(
@@ -293,7 +293,7 @@ a{color:#4a9fe8}
 <div>
   设备 <input id="did" placeholder="设备 ID">
   类型 <select id="ctype"><option value="find">查找设备</option>
-  <option value="lock">远程锁定</option><option value="wipe">远程擦除</option></select>
+  <option value="lock">远程锁定</option><option value="unlock">远程解锁</option><option value="wipe">远程擦除</option></select>
   <input id="payload" placeholder="备注（可选）">
   <button onclick="sendCmd()">下发</button>
 </div>

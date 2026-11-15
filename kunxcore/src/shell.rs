@@ -5013,12 +5013,18 @@ fn cmd_display(sink: &mut Sink) {
     sink.emit_str(" capabilities="); sink.emit_u32(info.capabilities);
     sink.emit_str("\n");
     let (presents, configs) = crate::gpu_simple::scanout_stats();
-    sink.emit_str("ramfb: presents="); sink.emit_u32(presents);
+    let backend = crate::gpu_simple::backend_name();
+    sink.emit_str(backend); sink.emit_str(": presents="); sink.emit_u32(presents);
     sink.emit_str(" reconfigurations="); sink.emit_u32(configs); sink.emit_str("\n");
+    let (commands, failures) = crate::virtio_gpu::stats();
+    if backend == "virtio-gpu" || failures != 0 {
+        sink.emit_str("virtio-gpu: commands="); sink.emit_u32(commands);
+        sink.emit_str(" failures="); sink.emit_u32(failures); sink.emit_str("\n");
+    }
     if info.capabilities == 0 {
-        sink.emit_str("ramfb: software pacing; no VSYNC or host resize notification\n");
+        sink.emit_str(backend); sink.emit_str(": software pacing; no VSYNC or host resize notification\n");
     } else if info.capabilities & 2 != 0 {
-        sink.emit_str("ramfb: host resize bridge enabled; software pacing, no hardware VSYNC\n");
+        sink.emit_str(backend); sink.emit_str(": host resize bridge enabled; software pacing, no hardware VSYNC\n");
     }
 }
 

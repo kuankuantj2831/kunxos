@@ -9,6 +9,7 @@ qemu = ["kunxhal/qemu"]
 pi4 = ["kunxhal/pi4"]
 
 [dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
 kunxhal = { path = "../../kunxhal", default-features = false }
 kunxjpeg = { path = "../../shared/jpeg" }
 

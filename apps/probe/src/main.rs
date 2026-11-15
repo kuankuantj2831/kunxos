@@ -10,7 +10,6 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
@@ -35,37 +34,11 @@ const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x200;
 
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, options(nostack));
-    r
-}
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, options(nostack));
-    r
-}
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, in("a2") a3, options(nostack));
-    r
-}
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => r, in("a1") a2, in("a2") a3, in("a3") a4, options(nostack));
-    r
-}
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let r: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => r,
-        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, in("a5") a6,
-        options(nostack)
-    );
-    r
-}
+use kunxrt::syscall::syscall1;
+use kunxrt::syscall::syscall2;
+use kunxrt::syscall::syscall3;
+use kunxrt::syscall::syscall4;
+use kunxrt::syscall::syscall6;
 
 const SYS_SENDTO: usize = 206;
 const SYS_RECVFROM: usize = 207;
@@ -160,7 +133,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     //    引用计数正确增减，物理内存不泄漏。
     print_str("[syscall-test] COW fork 循环测试\n");
     for _i in 0..8 {
-        let p = unsafe { syscall1(SYS_CLONE, SIGCHLD) } as i64;
+        let p = unsafe { kunxrt::process::fork() } as i64;
         if p < 0 {
             fail("克隆循环");
         }
@@ -408,19 +381,7 @@ fn print_hex(mut v: u64) {
     print_str(core::str::from_utf8(&buf).unwrap_or(""));
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

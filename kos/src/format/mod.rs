@@ -67,7 +67,7 @@ pub(crate) fn get_array<const N: usize>(buf: &[u8], off: usize) -> [u8; N] {
 /// 生成与校验用同一函数：新建映像时缓冲区零初始化、CRC 字段位置
 /// 最后才写入；校验时直接跳过磁盘上存储的 CRC 字节。
 pub(crate) fn crc32_skip_field(image: &[u8], field_off: usize, field_len: usize) -> u32 {
-    let mut h = crc32fast::Hasher::new();
+    let mut h = kunxsec::crc32::Crc32::new();
     h.update(&image[..field_off]);
     h.update(&image[field_off + field_len..]);
     h.finalize()
@@ -105,7 +105,7 @@ mod tests {
         without[16..].copy_from_slice(&image[20..]);
         let skipped = crc32_skip_field(&image, 16, 4);
         let plain = {
-            let mut h = crc32fast::Hasher::new();
+            let mut h = kunxsec::crc32::Crc32::new();
             h.update(&without);
             h.finalize()
         };

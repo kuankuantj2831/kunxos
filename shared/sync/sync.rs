@@ -190,8 +190,10 @@ fn push_dirty(
             };
             match st {
                 Ok(204) | Ok(200) | Ok(404) => {
-                    // 服务器已删：移除墓碑
-                    store.recs[i].flags &= !(FLAG_DIRTY | FLAG_DELETED);
+                    // Keep it hidden until compaction, but remove it from the
+                    // outgoing queue only after the server acknowledges DELETE.
+                    store.recs[i].flags = (store.recs[i].flags | FLAG_DELETED)
+                        & !(FLAG_DIRTY | FLAG_CONFLICT | FLAG_ON_SERVER);
                     store.recs[i].blen = 0;
                     stats.deleted += 1;
                 }

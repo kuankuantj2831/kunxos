@@ -1,4 +1,4 @@
-//! 共享 TTF 平滑字体渲染（基于 fontdue，no_std + alloc）。
+//! 共享 TTF 平滑字体渲染（基于自研 kunxfont，no_std + alloc）。
 //!
 //! 字形来自 `fonts/uiputong.ttf`（构建期子集化为 `tools/fonts/cn-subset.ttf`，
 //! 随 rootfs 以 `/fonts/cn.ttf` 提供）渲染普通文字；标题使用
@@ -18,7 +18,7 @@ pub mod icons;
 
 extern crate alloc;
 
-use fontdue::{Font, FontSettings};
+use kunxfont::Font;
 
 /// 默认字号（像素）。ASCII 与 CJK 统一使用该字号，宽度由字体度量决定。
 pub const FONT_PX: f32 = 16.0;
@@ -157,7 +157,7 @@ fn font_bold() -> &'static Font {
 
 /// 从 cn.ttf 字节解析字体。失败返回 None。
 pub fn font_from_bytes(data: &[u8]) -> Option<Font> {
-    Font::from_bytes(data, FontSettings::default()).ok()
+    Font::from_bytes(data).ok()
 }
 
 // ==================== 缺字形懒加载兜底（仅用户态） ====================
@@ -338,7 +338,7 @@ pub fn bold_line_metrics(px: f32) -> (i32, i32) {
     }
 }
 
-/// 把「行顶 y（版式坐标）」换算为某字形位图的绘制顶部。fontdue 的 `ymin` 是
+/// 把「行顶 y（版式坐标）」换算为某字形位图的绘制顶部。字形的 `ymin` 是
 /// **位图底边**相对基线的偏移（负值 = 底边在基线下方），位图从底边向上共
 /// `height` 行，因此：顶部 = 行顶 + 常规字体 ascent − (−ymin) − (height−1)
 /// = 行顶 + ascent − ymin − height + 1。所有 TTF 字形按此基线统一对齐，
@@ -391,7 +391,7 @@ pub struct Glyph {
 
 // ==================== 字形缓存 ====================
 //
-// fontdue 栅格化较慢（轮廓解析 + 填充），而鼠标移动会触发整屏重绘，每帧对
+// 轮廓栅格化涉及解析和填充，而鼠标移动会触发整屏重绘，每帧对
 // 每个字形重新栅格化会让光标严重拖影/不跟手。字体在初始化后不可变，用一个
 // 固定容量环缓存（key = 码点 + 字号）保存最近用过的字形，命中时直接拷贝
 // 位图，把「每帧几十次栅格化」降为「每次 memcpy」。
@@ -697,7 +697,7 @@ fn rasterize_sel(sel: u64, ch: char, px: f32) -> Option<Glyph> {
         SEL_ICON_FILL => font_icon(true).rasterize(ch, px),
         SEL_ICON_LINE => font_icon(false).rasterize(ch, px),
         _ => font().rasterize(ch, px),
-    };
+    }.ok()?;
     let advance = fround(m.advance_width);
     if data.len() <= GLYPH_MAX_BYTES {
         cache_store(key, m.xmin, m.ymin, m.width, m.height, advance, &data);

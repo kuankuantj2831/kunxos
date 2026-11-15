@@ -5,6 +5,7 @@ Requires cargo/rustc, riscv64gc-unknown-none-elf and qemu-system-riscv64.
 Example: python tools/test_display.py --qemu "C:/Program Files/qemu/qemu-system-riscv64.exe"
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -82,16 +83,20 @@ class Qmp:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", default="qemu-system-riscv64")
+    parser.add_argument("--gpu", choices=("ramfb", "virtio-gpu"), default="ramfb")
     parser.add_argument("--rate", type=int, default=144, choices=range(24, 361), metavar="24..360")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--oobe", action="store_true", help="validate OOBE instead of desktop")
     parser.add_argument("--animate", action="store_true", help="exercise Settings launch/return transitions")
     parser.add_argument("--resize", action="store_true", help="validate negotiated desktop modesets")
+    parser.add_argument("--restart-launcher", action="store_true", help="restart desktop at wide and portrait modes to validate cold buffer sizing")
     parser.add_argument("--host-cursor", action="store_true", help="validate native host pointer contract")
     parser.add_argument("--all-apps", action="store_true", help="rebuild all adaptive desktop apps")
     parser.add_argument("--no-build", action="store_true", help="reuse the kernel in --build-dir for runtime checks")
     parser.add_argument("--build-only", action="store_true", help="build the isolated image without booting")
     args = parser.parse_args()
+    if args.restart_launcher and (args.oobe or not args.resize):
+        parser.error("--restart-launcher requires a desktop run with --resize")
     if args.oobe and args.animate:
         parser.error("--animate requires the desktop")
     work = args.build_dir or Path(tempfile.mkdtemp(prefix="kunxos-display-"))
@@ -103,6 +108,9 @@ def main():
         tests = work / ("display-tests.exe" if os.name == "nt" else "display-tests")
         run(["rustc", "--edition=2021", "--test", ROOT / "shared/display.rs", "-o", tests])
         run([tests])
+        gpu_tests = work / ("gpu-protocol-tests.exe" if os.name == "nt" else "gpu-protocol-tests")
+        run(["rustc", "--edition=2021", "--test", ROOT / "kunxcore/src/virtio_gpu_protocol.rs", "-o", gpu_tests])
+        run([gpu_tests])
         page_tests = work / ("page-record-tests.exe" if os.name == "nt" else "page-record-tests")
         run(["rustc", "--edition=2021", "--test", ROOT / "kunxcore/src/page_records.rs", "-o", page_tests])
         run([page_tests])
@@ -140,6 +148,11 @@ def main():
         env = dict(os.environ, KUNX_RAMDISK=str(ramdisk))
         run(["cargo", "build", "--release", "--target", TARGET, "--target-dir", target_dir,
              "--manifest-path", ROOT / "kunxcore/Cargo.toml"], env=env)
+        kernel = target_dir / TARGET / "release/rust-kernel"
+        kernel.with_suffix(".display.json").write_text(json.dumps({
+            "sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
+            "backends": ["ramfb", "virtio-gpu"],
+        }), encoding="utf-8")
     if args.build_only:
         print("Kernel:", target_dir / TARGET / "release/rust-kernel", flush=True)
         return
@@ -148,7 +161,8 @@ def main():
         serial_port = free_port()
     qemu_args = [args.qemu, "-M", "virt,accel=tcg", "-cpu", "rv64", "-bios", "default",
                  "-m", "512M", "-kernel", str(target_dir / TARGET / "release/rust-kernel"),
-                 "-append", f"shell verbose display-hz={args.rate}" + (" display-resize" if args.resize else "") + (" host-cursor" if args.host_cursor else ""), "-device", "ramfb",
+                 "-append", f"shell verbose display-hz={args.rate}" + (" display-resize" if args.resize else "") + (" host-cursor" if args.host_cursor else ""), "-device",
+                 ("virtio-gpu-device,xres=540,yres=960" if args.gpu == "virtio-gpu" else "ramfb"),
                  "-display", "none", "-no-reboot", "-S",
                  "-qmp", f"tcp:127.0.0.1:{qmp_port},server=on,wait=off",
                  "-serial", f"tcp:127.0.0.1:{serial_port},server=on,wait=off",
@@ -226,7 +240,7 @@ def main():
                                 deadline = time.monotonic() + 5
                                 while time.monotonic() < deadline:
                                     collect(0.2)
-                                    stats = re.search(rb"ramfb: presents=(\d+) reconfigurations=(\d+)", output[start:])
+                                    stats = re.search(re.escape(args.gpu.encode()) + rb": presents=(\d+) reconfigurations=(\d+)", output[start:])
                                     if stats:
                                         return tuple(int(x) for x in stats.groups())
                                 raise AssertionError("missing scanout counters")
@@ -239,9 +253,28 @@ def main():
                                 header, size, maximum, data = path.read_bytes().split(b"\n", 3)
                                 assert header == b"P6" and maximum == b"255"
                                 return data
+                            def settled_pointer_pixels(path):
+                                # A modeset may expose the new size before the
+                                # large wallpaper repaint finishes under TCG.
+                                # Compare pointer trails only after real, stable
+                                # content has arrived in the otherwise static band.
+                                deadline = time.monotonic() + 20
+                                previous = None
+                                stable = 0
+                                while time.monotonic() < deadline:
+                                    data = pixels(path)
+                                    band = data[400*1920*3:800*1920*3]
+                                    stable = stable + 1 if band == previous else 0
+                                    # A handful of stale pixels at the previous
+                                    # stride must not qualify a cleared surface.
+                                    if stable >= 2 and band.count(0) < len(band) // 2 and len(set(band)) > 32:
+                                        return data
+                                    previous = band
+                                    collect(0.3)
+                                raise AssertionError("wide desktop did not finish repainting")
                             pointer(3000, 16000)
                             collect(0.2)
-                            pointer_before = pixels(work / "pointer-before.ppm")
+                            pointer_before = settled_pointer_pixels(work / "pointer-before.ppm")
                             before = scanout_stats()
                             for index in range(60):
                                 qmp.call("input-send-event", {"events": [
@@ -255,7 +288,7 @@ def main():
                             qmp.screenshot(work / "wide-after.png", 1920, 1001)
                             pointer(3000, 16000)
                             collect(0.3)
-                            pointer_after = pixels(work / "pointer-after.ppm")
+                            pointer_after = settled_pointer_pixels(work / "pointer-after.ppm")
                             # The motion path crosses this otherwise static band. Returning
                             # to the same position must leave exactly the original pixels.
                             assert pointer_before[400*1920*3:800*1920*3] == pointer_after[400*1920*3:800*1920*3], "pointer trails in framebuffer"
@@ -340,6 +373,26 @@ def main():
                                     collect(1)
                                 qmp.call("send-key", {"keys": [{"type": "qcode", "data": "esc"}], "hold-time": 60})
                                 await_marker(returned, 4)
+                        if args.restart_launcher:
+                            for w, h in ((1920, 1001), (540, 960)):
+                                count = output.count(f"[launcher] resize {w}x{h}".encode())
+                                serial.sendall(b"\xaa\x03" + struct.pack("<HH", w, h))
+                                await_marker(f"[launcher] resize {w}x{h}".encode(), count + 1, 30)
+                                collect(1)
+                                start = len(output)
+                                ps_count = output.count("PID  用户  名称".encode())
+                                serial.sendall(b"ps\n")
+                                await_marker("PID  用户  名称".encode(), ps_count + 1, 30)
+                                collect(0.5)
+                                pids = re.findall(rb"(?m)^(\d+)\s+\d+\s+launcher\s*\r?$", output[start:])
+                                assert len(pids) == 1, "expected one launcher process before restart"
+                                ready_count = output.count(b"[launcher] pacing mHz=")
+                                serial.sendall(b"kill " + pids[0] + b"\n")
+                                await_marker(b"[launcher] pacing mHz=", ready_count + 1, 45)
+                                collect(1)
+                                assert f"[launcher] 帧缓冲 {w}x{h} 已映射".encode() in output[start:]
+                                assert f"[launcher] 已渲染 {w * h} px".encode() in output[start:]
+                                qmp.screenshot(work / f"restart-{w}x{h}.png", w, h)
                         sent = True
                         collect(0.5)
                     if ready_at is not None and time.monotonic() - ready_at > 5:
@@ -349,6 +402,10 @@ def main():
                 (work / "serial.log").write_text(text, encoding="utf-8")
                 expected = 1_000_000_000 // ((1_000_000_000 + args.rate * 1000 - 1) // (args.rate * 1000))
                 assert marker in output, "UI did not reach ready marker; see serial.log"
+                assert f"[gpu] {args.gpu} 540x960" in text, "requested display backend did not initialize"
+                assert "virtio-gpu failed:" not in text, "GPU device command failed; see serial.log"
+                if args.gpu == "virtio-gpu":
+                    assert re.search(r"virtio-gpu: commands=[1-9]\d* failures=0", text), "GPU queue was not exercised"
                 if not args.oobe:
                     cursor_mode = b"[cursor] host" if args.host_cursor else b"[cursor] software"
                     assert cursor_mode in output, "launcher cursor mode does not match boot contract"
@@ -358,8 +415,11 @@ def main():
                 if args.animate:
                     assert "返回过渡：" in text, "return animation did not complete; see serial.log"
                 report = {"result": "PASS", "ui": "oobe" if args.oobe else "launcher",
+                          "gpu": args.gpu,
                           "requested_hz": args.rate, "target_millihz": expected,
                           "host_resize_bridge": args.resize, "host_cursor": args.host_cursor, "hardware_vsync": False}
+                if args.restart_launcher:
+                    report["launcher_restart_modes"] = [[1920, 1001], [540, 960]]
                 if args.resize and not args.oobe:
                     report["wide_pointer_presents"] = pointer_presents
                     report["pointer_surface_reconfigurations"] = after[1] - before[1]

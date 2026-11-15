@@ -1,5 +1,8 @@
 # Rust build artifacts
 build/windows/
+build/test-riscv/
+build/host-tools/
+build/runtime-validation/
 target/
 **/target/
 

@@ -1,62 +1,48 @@
 #!/usr/bin/env python3
-"""KunxOS 全应用回归测试：启动 → OOBE → 桌面 → 逐一打开全部 19 个应用并返回。
+"""KunxOS 全应用回归测试：启动 → OOBE → 桌面 → 逐一打开可用应用并返回。
 
 用法：python3 tests/scripts/apps_regression.py [logfile] [shotsdir]
 """
-import subprocess, sys, time, threading, os, tempfile, socket
+from qemu_test import Guest, kernel_path, temp_path, qemu_command, monitor_address, monitor_option, launcher_layout, screenshot, monitor_command
+import sys, time, os, tempfile
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_apps.log"
-SHOTS = sys.argv[2] if len(sys.argv) > 2 else "/tmp/kx_apps_shots"
+import argparse
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("logfile", nargs="?", default=temp_path("kx_apps.log"))
+parser.add_argument("shotsdir", nargs="?", default=temp_path("kx_apps_shots"))
+parser.add_argument("--only", nargs="+", help="only check these application keys")
+args = parser.parse_args()
+
+KERNEL = kernel_path()
+LOGFILE = args.logfile
+SHOTS = args.shotsdir
 os.makedirs(SHOTS, exist_ok=True)
 WORKDIR = tempfile.mkdtemp(prefix="kxa_")
-PIPE = os.path.join(WORKDIR, "kx")
-MON = os.path.join(WORKDIR, "mon")
+MON = monitor_address()
 
 FRAME_DOWN, FRAME_UP, FRAME_MOVE = 0x01, 0x00, 0x02
 
 def frame(kind, x=0, y=0):
     return bytes([0xAA, kind, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF])
 
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
-       "-kernel", KERNEL, "-serial", "pipe:" + PIPE,
+cmd = qemu_command() + [
+       "-kernel", KERNEL, "-serial", "stdio",
        "-device", "ramfb", "-no-reboot", "-display", "none",
        "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
        "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
-       "-device", "virtio-rng-device", "-device", "AC97",
-       "-monitor", "unix:" + MON + ",server,nowait"]
+       "-device", "virtio-rng-device", "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
+       "-monitor", monitor_option(MON)]
 
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 results = []
 
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data); logf.write(data); logf.flush()
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
 
 def send_frame(fr):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, fr)
-    os.close(infd)
+    guest.send(fr)
 
 def tap(x, y, hold=0.06):
     send_frame(frame(FRAME_DOWN, x, y))
@@ -78,32 +64,10 @@ def swipe(x1, y1, x2, y2, steps=10, step_ms=0.012):
     time.sleep(0.1)
 
 def send_esc():
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(MON)
-        s.sendall(b"sendkey esc\n")
-        time.sleep(0.3)
-        try:
-            s.settimeout(0.5); s.recv(4096)
-        except socket.timeout:
-            pass
-        s.close()
-    except Exception:
-        pass
+    monitor_command(MON, "sendkey esc")
 
 def shot(name):
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(MON)
-        s.sendall(("screendump %s\n" % os.path.join(SHOTS, name)).encode())
-        time.sleep(0.4)
-        try:
-            s.settimeout(0.5); s.recv(4096)
-        except socket.timeout:
-            pass
-        s.close()
-    except Exception:
-        pass
+    screenshot(MON, SHOTS, name)
 
 def wait_for(text, timeout=60):
     deadline = time.time() + timeout
@@ -171,15 +135,7 @@ try:
     # dump_layout）。模块过滤（OOBE 步骤可关模块，如 sms）与网格列数变化
     # 会让固定坐标失效，因此按真实坐标点击；被过滤的应用记 SKIP。
     wait_for("[launcher] 已加载", 20)
-    tiles, docks = {}, {}
-    for line in log.decode(errors="replace").splitlines():
-        f = line.split()
-        if len(f) >= 6 and f[0] == "[launcher]" and f[1] == "tile":
-            # [launcher] tile <key> page=<p> cx=<x> cy=<y>
-            tiles[f[2]] = (int(f[3].split("=")[1]), int(f[4].split("=")[1]), int(f[5].split("=")[1]))
-        elif len(f) >= 5 and f[0] == "[launcher]" and f[1] == "dock":
-            # [launcher] dock <key> cx=<x> cy=<y>
-            docks[f[2]] = (int(f[3].split("=")[1]), int(f[4].split("=")[1]))
+    tiles, docks, folders, folder_apps = launcher_layout(log)
     if not tiles and not docks:
         print("FAIL: no [launcher] tile/dock layout lines")
         sys.exit(1)
@@ -215,6 +171,8 @@ try:
         if key in tiles:
             pg, cx, cy = tiles[key]
             return (cx, cy, pg)
+        if key in folder_apps and "tools" in folders:
+            return (*folder_apps[key], folders["tools"][0])
         return None
 
     def home_gesture():
@@ -225,14 +183,24 @@ try:
         c = app_coords(name)
         if c is None:
             print("%s: SKIP (filtered by module config)" % name)
-            results.append((name, True))
             return
         x, y, pg = c
         if name not in docks:
             goto_page(pg)
+        if name in folder_apps:
+            pg, fx, fy = folders["tools"]
+            goto_page(pg)
+            before = len(log)
+            tap(fx, fy)
+            if not guest.wait_for("[launcher] 已打开文件夹", 10, before):
+                results.append((name, False))
+                return
+            time.sleep(1)
+        start = len(log)
         tap(x, y)
-        ok = wait_for(marker, 20)
-        time.sleep(0.8)
+        ok = guest.wait_for(marker, 30, start)
+        ok = ok and guest.wait_for("启动过渡：", 30, start)
+        time.sleep(1)  # Do not send Back while launcher is still animating the launch.
         shot(shotname or ("01_%s.ppm" % name))
         # 返回语义：先点标题栏返回 (24,24)（launcher 打印「应用 X 已退出，
         # 退出码=0」，任何应用都生效）；超时（browser 等应用内导航不退）
@@ -242,10 +210,10 @@ try:
             time.sleep(0.5)
         else:
             send_esc()
-        back = wait_for("应用 '%s' 已退出" % disp, 10)
+        back = guest.wait_for("应用 '%s' 已退出" % disp, 10, start)
         if not back and not terminal:
             home_gesture()
-            back = wait_for("应用 '%s' 已退出" % disp, 10)
+            back = guest.wait_for("应用 '%s' 已退出" % disp, 10, start)
             if back:
                 state["page"] = 0
         time.sleep(2.5)
@@ -268,9 +236,19 @@ try:
         ("store",    "Store",    "[store] 就绪"),
         ("video",    "Video",    "[video] 就绪"),
         ("notes",    "Notes",    "[notes] 就绪"),
+        ("files",    "Files",    "[files] 就绪"),
+        ("clock",    "Clock",    "[clock] 就绪"),
+        ("cloud",    "Cloud",    "[cloud] 已就绪"),
+        ("mail",     "Mail",     "[mail] 就绪"),
     ]
     for name, disp, marker in apps:
-        open_and_exit(name, disp, marker)
+        if args.only and name not in args.only:
+            continue
+        open_and_exit(name, disp, marker, terminal=(name == "terminal"))
+
+    if args.only:
+        assert results, "No selected application was available"
+        sys.exit(0 if all(ok for _, ok in results) else 1)
 
     # ==================== 交互抽查 ====================
     # phone 拨号 + 呼叫
@@ -354,11 +332,6 @@ try:
     print("total=%d fail=%d" % (len(results), fails))
     print("=== LOG TAIL ===")
     print(log.decode(errors="replace")[-4000:])
+    sys.exit(1 if fails else 0)
 finally:
-    stop = True
-    p.terminate()
-    try:
-        p.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        p.kill()
-    logf.close()
+    guest.close()

@@ -4,8 +4,10 @@
 // 此处显式放行 Rust 2021 的 static_mut_refs 提示。
 #![allow(static_mut_refs)]
 // 各 Phase 的子系统（图形/UI/输入等）按阶段演进，部分接口在 demo 流程替换后暂未
-// 被引用，这里统一放行 dead_code，避免构建日志被大量提示淹没。
-#![allow(dead_code)]
+// 被引用。默认构建放行 dead_code，避免构建日志被大量提示淹没；
+// 启用 `strict-dead-code` feature 可让这些告警显现（tools/dead_code_report.sh 汇总清单），
+// 逐项确认后改为局部 #[allow]（寄存器常量、预留接口）或删除，最终移除本行。
+#![cfg_attr(not(feature = "strict-dead-code"), allow(dead_code))]
 
 extern crate alloc;
 
@@ -219,6 +221,8 @@ mod fsops;
 mod plic;
 mod sbi;
 mod gpu_simple;
+mod virtio_gpu;
+mod virtio_gpu_protocol;
 mod gesture;
 mod heap;
 mod health;
@@ -1079,7 +1083,7 @@ pub extern "C" fn rust_main() -> ! {
     modem::init();
 
     // ===== 5.8 初始化图形（Phase 6：帧缓冲 + 合成器 + 输入 + UI） =====
-    gfx_boot(fwcfg_base);
+    gfx_boot(fwcfg_base, &virtio_devs[..virtio_count]);
 
     // ===== 6. 初始化中断控制器与定时器 =====
     plic::plic_init(plic_base);
@@ -2263,12 +2267,14 @@ fn boot_splash(fb_base: usize, w: u32, h: u32) {
 /// 分配一整屏显存并立即翻转为扫描输出，同时注册 `/dev/fb0` 字符设备，
 /// 使 `mmap` 能把显存映射到用户空间。launcher 等 EL0 进程直接 open/mmap
 /// `/dev/fb0` 绘制，无需再经过 displayd 合成器。
-fn gfx_boot(fwcfg_base: usize) {
+fn gfx_boot(fwcfg_base: usize, devs: &[net_virtio::MmioDev]) {
     kinfo! { uart_send_str("[gpu] Phase 6: 图形\n"); }
-    match gpu_simple::init(fwcfg_base) {
+    match gpu_simple::init(fwcfg_base, devs) {
         Some((w, h)) => {
             kinfo! {
-                uart_send_str("[gpu] ramfb ");
+                uart_send_str("[gpu] ");
+                uart_send_str(gpu_simple::backend_name());
+                uart_send_str(" ");
                 print_dec(w as u64);
                 uart_send_str("x");
                 print_dec(h as u64);
@@ -2277,7 +2283,8 @@ fn gfx_boot(fwcfg_base: usize) {
             // bootloader 启动画面交接：沿用其帧缓冲（不重新翻转，画面保持显示），
             // 直到用户态渲染出桌面首帧后由 splash_fade 线性淡出
             if let Some(ho) = splash_handoff() {
-                if ho.fb_addr != 0 && ho.width == w && ho.height == h
+                if gpu_simple::backend_name() == "ramfb"
+                    && ho.fb_addr != 0 && ho.width == w && ho.height == h
                     && gpu_simple::backing_len() == gpu_simple::fb_len() {
                     let fb_base = gpu_simple::fb_adopt(ho.fb_addr as usize);
                     allocator::reserve_region(ho.fb_addr as usize, gpu_simple::fb_len());
@@ -2310,7 +2317,7 @@ fn gfx_boot(fwcfg_base: usize) {
             boot_splash(fb_base, w, h);
         }
         None => {
-            kinfo! { uart_send_str("[gpu] 无 ramfb 设备（运行需加 -device ramfb）\n"); }
+            kinfo! { uart_send_str("[gpu] 无可用显示设备（需 -device ramfb 或 virtio-gpu-device）\n"); }
         }
     }
 }

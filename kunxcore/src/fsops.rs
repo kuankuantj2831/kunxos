@@ -256,6 +256,22 @@ pub fn fs_block_size(dev: u32) -> u32 {
     }
 }
 
+/// 归属元数据 (uid, gid, mode)；无归属或文件系统不支持（FAT32）返回 None。
+pub fn fs_owner(dev: u32, ino: u32) -> Option<(u32, u32, u16)> {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::fs_owner(dev, ino),
+        FsKind::Fat32 => None,
+    }
+}
+
+/// 修改归属元数据；文件系统不支持（FAT32）返回 -38 (ENOSYS)。
+pub fn fs_set_owner(dev: u32, ino: u32, uid: Option<u32>, gid: Option<u32>, mode: Option<u16>) -> i32 {
+    match kind_of(dev) {
+        FsKind::Sfs => fs_simple::fs_set_owner(dev, ino, uid, gid, mode),
+        FsKind::Fat32 => -38,
+    }
+}
+
 /// 类型码。
 pub fn fs_type(dev: u32, ino: u32) -> u16 {
     match kind_of(dev) {

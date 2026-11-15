@@ -143,8 +143,10 @@ C|<命令ID>|<类型>|<payload urlencoded>
 
 - **find**：执行「查找设备」= 立即 `ack`，结果 `r` 携带当前 IP
   （如 `ip=10.0.2.15`），服务端以此刷新设备 `ip/last_seen`。
-- **lock**：写 `/data/oobe/locked=1`，客户机显示锁定界面；解锁写回 `0`。
-  `ack` 结果 `r=done`（解锁时 `r=unlocked`）。
+- **lock**：写 `/data/oobe/locked=1`，客户机显示锁定界面。`ack` 结果 `r=done`。
+- **unlock**：解除远程锁定的**唯一**途径。仅当设备处于锁定态时写回 `0`，
+  `ack` 结果 `r=unlocked`（本就未锁定则 `r=noop`，落盘失败则 `r=failed` 并保持锁定）。
+  客户机锁定界面不再提供本机直接解锁，用户点击「检查解锁」触发一次 `poll`。
 - **wipe**：删除 `/data/oobe` 全部内容（含 `.done`），设备回到首次启动
   状态；`ack` 结果 `r=wiped`。
 - 客户机启动时自动 `poll` 一次；后续由用户点击「检查命令」触发。

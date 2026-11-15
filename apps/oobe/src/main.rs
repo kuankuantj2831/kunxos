@@ -22,8 +22,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
 
@@ -128,6 +126,7 @@ fn resize_buffers() {
         PREV_BUF.resize_len(FB_W * nav_y() as usize);
         TRANS_NAV_SNAP.resize_len(FB_W * NAV_H as usize);
         BG_ROWS_READY = false;
+        idle_snap_invalidate();
         sys_nav::set_viewport(FB_W as i32, FB_H as i32);
     }
 }
@@ -230,19 +229,19 @@ const OPT_RY: i32 = 15; // 卡片内垂直居中偏移（(54-24)/2）
 
 // ==================== 颜色（0x00RRGGBB） ====================
 
-// 浅色向导标准配色：白色基底 + 深灰正文 + 绿高亮（色板见 /tmp/light_theme_spec.md）。
+// 星光向导配色：冷白玻璃、深灰正文和蓝紫色高亮。
 const C_TEXT: u32 = 0x00_1A_1C_22;      // 主文字（白底/浅玻璃上）
 const C_DIM: u32 = 0x00_6B_72_80;       // 次要/弱化文字
 const C_HINT: u32 = 0x00_95_9A_9F;      // 提示文字
-const C_ACCENT: u32 = 0x00_00_B9_6B;    // OPPO 绿（单选/描边/进度点）
-const C_ACCENT_STRONG: u32 = 0x00_00_8F_53; // 深绿（按压/描边加深）
-const C_ACCENT_TINT: u32 = 0x00_E6_F7_EE;   // 选中卡片淡绿底
-const C_ACCENT_SOFT: u32 = 0x00_B5_E4_C9;   // 已完成进度点淡绿
+const C_ACCENT: u32 = 0x00_5B_63_D9;    // 星光蓝紫（单选/描边/进度点）
+const C_ACCENT_STRONG: u32 = 0x00_47_4D_B3; // 深蓝紫（按压/描边加深）
+const C_ACCENT_TINT: u32 = 0x00_E6_E9_FC;   // 选中卡片淡紫底
+const C_ACCENT_SOFT: u32 = 0x00_BD_C4_F0;   // 已完成进度点淡紫
 const C_CARD_BORDER: u32 = 0x00_D9_DE_E6;   // 卡片描边
 const C_RADIO_BORDER: u32 = 0x00_C7_CC_D3;  // 未选中单选圈
 const C_BTN_PRIMARY: u32 = 0x00_1A_1C_22;   // 外观步骤「深色」选项预览圆（示例色，非页面主题色）
 const C_RED: u32 = 0x00_FF_5A_5A;
-const C_GREEN: u32 = 0x00_00_B9_6B;
+const C_GREEN: u32 = 0x00_5B_63_D9;
 const C_BTN_BORDER: u32 = 0x00_FF_FF_FF;
 const C_WHITE: u32 = 0x00_FF_FF_FF;
 
@@ -562,50 +561,13 @@ fn module_on(i: usize) -> bool {
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        in("a5") a6,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 // ==================== 基础 I/O ====================
 
@@ -977,8 +939,8 @@ fn draw_glass_style(x: i32, y: i32, w: i32, h: i32, r: i32, st: &GlassStyle) {
 
 /// 主按钮玻璃样式：浅色磨砂（白色着色 + 浅灰描边，液态玻璃质感）。
 static STYLE_PRIMARY: GlassStyle = GlassStyle {
-    tint: 0x00_FF_FF_FF,
-    alpha: 225,
+    tint: 0x00_DD_E2_FF,
+    alpha: 190,
     spec: 60,
     sheen: 18,
     border: 0x00_D9_DE_E6,
@@ -988,9 +950,9 @@ static STYLE_PRIMARY: GlassStyle = GlassStyle {
 /// 次要芯片按钮玻璃样式：白色着色 + 浅灰描边。
 static STYLE_SECONDARY: GlassStyle = GlassStyle {
     tint: 0x00_FF_FF_FF,
-    alpha: 232,
-    spec: 66,
-    sheen: 26,
+    alpha: 156,
+    spec: 38,
+    sheen: 12,
     border: 0x00_D9_DE_E6,
     border_a: 200,
 };
@@ -998,7 +960,7 @@ static STYLE_SECONDARY: GlassStyle = GlassStyle {
 /// 底部导航面板：白色半透玻璃 + 浅灰顶描边（浅色「底sheet」）。
 static STYLE_SHEET: GlassStyle = GlassStyle {
     tint: 0x00_FF_FF_FF,
-    alpha: 222,
+    alpha: 164,
     spec: 34,
     sheen: 12,
     border: 0x00_D9_DE_E6,
@@ -1370,32 +1332,19 @@ fn draw_cjk(x: i32, y: i32, cp: u16, color: u32) {
     ttf_glyph(x, y, cp as u32, color, ttf_text::font_render::FONT_PX);
 }
 
-/// ColorOS 15 浅色向导背景：近白底 + 极淡绿冷色垂直渐变。
-/// 背景渐变**行缓存**：背景静态，每行颜色只算一次，之后每帧整行 u32
-/// 拷贝（动画期 draw_background 每帧调用，原版每帧重算 47 万次渐变混合）。
-static mut BG_ROWS: [u32; display::MAX_HEIGHT] = [0; display::MAX_HEIGHT];
+/// 星光向导背景：缓存完整静态画面，动画期间仅复制，不重复计算星点和光域。
+static mut STAR_BG: PixelBuffer = PixelBuffer::new(display::MAX_PIXELS, 540 * 960);
 static mut BG_ROWS_READY: bool = false;
 
 fn draw_background() {
     unsafe {
         if !BG_ROWS_READY {
-            let (tr, tg, tb) = (0xF9u32, 0xFBu32, 0xFD);
-            let (br, bg, bb) = (0xE9u32, 0xF1u32, 0xF4);
-            for y in 0..display_h() as i32 {
-                let t = (y as u32 * 255 / display_h() as u32).min(255);
-                let inv = 255 - t;
-                let r = (tr * inv + br * t) / 255;
-                let g = (tg * inv + bg * t) / 255;
-                let b = (tb * inv + bb * t) / 255;
-                BG_ROWS[y as usize] = (r << 16) | (g << 8) | b;
-            }
+            STAR_BG.resize_len(display_w() * display_h());
+            sys_nav::glass::starlight::paint(&mut STAR_BG, display_w(), display_h(),
+                (0, 0, display_w() as i32, display_h() as i32), sys_nav::glass::starlight::LIGHT);
             BG_ROWS_READY = true;
         }
-        for y in 0..display_h() as i32 {
-            let row = BG_ROWS[y as usize];
-            let iy = y as usize * display_w();
-            BACK_BUF[iy..iy + display_w()].fill(row);
-        }
+        BACK_BUF[..display_w() * display_h()].copy_from_slice(&STAR_BG);
     }
 }
 
@@ -1482,13 +1431,13 @@ fn card_border(x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
     sys_nav::glass::smooth_stroke_rr(&mut OobeSmooth, x, y, w, h, r, color, 255);
 }
 
-/// ColorOS 15 白色选择卡片：未选中 = 白底 + 中性灰描边；选中 = 淡绿底 + 绿描边。
+/// 星光选择卡片：未选中为磨砂玻璃，选中为淡紫底和蓝紫描边。
 fn draw_option_card(x: i32, y: i32, w: i32, h: i32, selected: bool) {
     if selected {
         fill_rounded(x, y, w, h, CARD_R, C_ACCENT_TINT);
         card_border(x, y, w, h, CARD_R, C_ACCENT_STRONG);
     } else {
-        fill_rounded(x, y, w, h, CARD_R, C_WHITE);
+        draw_glass(x, y, w, h, CARD_R);
         card_border(x, y, w, h, CARD_R, C_CARD_BORDER);
     }
 }
@@ -1564,7 +1513,7 @@ fn render_hero_glow(cy: i32, glow_r: i32, a: u32) {
             let fall = (glow_r * glow_r - d) * (a as i32) / (glow_r * glow_r);
             let ga = (fall / 8).min(120) as u32;
             if ga > 0 {
-                let g = blend_px(put_pixel_get(x, y), 0x00_5A_D2_8A, ga);
+                let g = blend_px(put_pixel_get(x, y), 0x00_9B_A4_F2, ga);
                 put_pixel(x, y, g);
             }
             dx += 1;
@@ -1599,10 +1548,10 @@ fn draw_brand_ex(e: f32, scale: f32, glow: bool) {
         if (dy2 as f32) >= rf2 {
             continue; // 整行在圆外
         }
-        // ColorOS 绿垂直渐变（顶部亮绿 → 底部深绿）：行内同色，一次算好
+        // 星光蓝紫垂直渐变：行内同色，一次算好
         let t = (((dy as f32 / rf) + 1.0) * 127.5).min(255.0) as u32;
-        let c = blend_px(0x00_45_E0_8B, 0x00_09_9E_58, t);
-        let disc = blend_px(0x00_F0_FA_F6, c, a);
+        let c = blend_px(0x00_96_A4_F5, 0x00_57_5D_C8, t);
+        let disc = blend_px(0x00_EC_EF_FF, c, a);
         // 完全覆盖内段：|dx| <= isqrt((rf-1)² - dy²) 直接行写。
         let inn2f = rin2f - dy2 as f32;
         let half_in = if inn2f > 0.0 { isqrt(inn2f as i32) } else { -1 };
@@ -1957,15 +1906,11 @@ fn restore_icon_bg() {
     let y1 = (cy + CONE_AREA_HALF)
         .min(PAGE_TITLE_Y - 1)
         .min(display_h() as i32 - 1);
-    for y in y0..=y1 {
-        let t = (y as u32 * 255 / display_h() as u32).min(255);
-        let inv = 255 - t;
-        let r = (0xF9u32 * inv + 0xE9u32 * t) / 255;
-        let g = (0xFBu32 * inv + 0xF1u32 * t) / 255;
-        let b = (0xFDu32 * inv + 0xF4u32 * t) / 255;
-        let row = (r << 16) | (g << 8) | b;
-        for x in x0..=x1 {
-            unsafe { BACK_BUF[y as usize * display_w() + x as usize] = row };
+    unsafe {
+        for y in y0..=y1 {
+            let start = y as usize * display_w() + x0 as usize;
+            let end = y as usize * display_w() + x1 as usize + 1;
+            BACK_BUF[start..end].copy_from_slice(&STAR_BG[start..end]);
         }
     }
 }
@@ -5019,39 +4964,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: oobe ");
-        if let Some(loc) = info.location() {
-            write_fd(2, loc.file().as_bytes());
-            write_fd(2, b":");
-            let mut buf = [0u8; 12];
-            let mut i = buf.len();
-            let mut n = loc.line() as u64;
-            while n > 0 {
-                i -= 1;
-                buf[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-            write_fd(2, &buf[i..]);
-        }
-        write_fd(2, b"\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("oobe");

@@ -16,8 +16,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::global_asm;
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/cjk_font_cloud.rs"]
 mod cjk_font;
@@ -1247,6 +1245,26 @@ fn exec_command(line: &[u8]) {
     print(unsafe { core::str::from_utf8(ctype) }.unwrap_or(""));
     print("\n");
 
+    // 服务器下发的解锁：这是解除远程锁定的唯一途径。仅在确实处于锁定态时有效。
+    if ctype == b"unlock" {
+        let was_locked = unsafe { LOCKED };
+        if was_locked {
+            if !write_file(F_LOCKED, b"0") {
+                // 持久化失败则保持锁定，宁可不解也不留下状态不一致。
+                print("[cloud] 写入 F_LOCKED 失败，保持锁定\n");
+                let _ = api_ack(id, b"failed");
+                return;
+            }
+            unsafe {
+                LOCKED = false;
+            }
+            print("[cloud] unlock：已由服务器解锁\n");
+            set_status("设备已解锁（服务器指令）".as_bytes());
+        }
+        let _ = api_ack(id, if was_locked { b"unlocked" } else { b"noop" });
+        return;
+    }
+
     // 设备端最后一道策略闸门：OOBE/设置里明确关闭的远程控制能力必须拒绝
     // 执行（此前只在渲染层展示开关，服务器下发 lock/wipe 仍无条件执行）。
     if ctype == b"find" && unsafe { !CTRL_FIND } {
@@ -1445,77 +1463,20 @@ fn btn(x: i32, y: i32, label: &[u8]) {
 fn render_lock() {
     draw_gradient_bg(C_LOCK_BG, glass_dark());
     draw_center(360, "设备已被远程锁定".as_bytes(), C_WARN);
-    draw_center(392, "输入云服务账号后可在服务器解除".as_bytes(), C_DIM);
+    draw_center(392, "请在服务器管理后台解除锁定，然后点击下方按钮".as_bytes(), C_DIM);
     // 解锁按钮
     let bw = 200i32;
     let bx = (display_w() as i32 - bw) / 2;
     let by = 460i32;
     let bh = 64i32;
     draw_glass_style(bx, by, bw, bh, (bh * 25 / 100).min(16), &STYLE_ACCENT);
-    let tx = bx + (bw - text_width("解锁".as_bytes())) / 2;
+    let tx = bx + (bw - text_width("检查解锁".as_bytes())) / 2;
     // 强调绿玻璃上保持白字。
-    draw_text(tx, by + (bh - 8) / 2, "解锁".as_bytes(), C_ON_ACCENT);
+    draw_text(tx, by + (bh - 8) / 2, "检查解锁".as_bytes(), C_ON_ACCENT);
 }
 
-/// 本轮按压已触发长按解锁（抬起后吞掉一次点击，防误触主界面按钮）。
-static mut UNLOCK_HOLD_FIRED: bool = false;
-
-/// 长按解锁的按住检测（每帧调用，无需抬起）：按下起点与当前位置都在
-/// 解锁按钮内且持续 ≥2s 即解锁。此前实现只在抬起帧判定 —— 实际语义是
-/// 「两次点击间隔 2-3s」，真长按（按住 2s 再抬）反而无法解锁。
-fn unlock_hold_check() {
-    unsafe {
-        if !LOCKED {
-            UNLOCK_HOLD_FIRED = false;
-            return;
-        }
-        if !TOUCH_DOWN {
-            UNLOCK_HOLD_FIRED = false;
-            return;
-        }
-        if UNLOCK_HOLD_FIRED {
-            return;
-        }
-        if TOUCH_US == 0 {
-            return;
-        }
-        let held = now_us().saturating_sub(TOUCH_US);
-        if held >= 2_000_000
-            && unlock_hit(TOUCH_PX, TOUCH_PY)
-            && unlock_hit(CUR_X, CUR_Y)
-        {
-            UNLOCK_HOLD_FIRED = true;
-            LOCKED = false;
-            if !write_file(F_LOCKED, b"0") {
-                print("[cloud] 写入 F_LOCKED 失败\n");
-                show_error("解锁状态保存失败".as_bytes());
-            }
-            let mut line = [0u8; 64];
-            let la = read_oobe("local_account");
-            let mut m = 0usize;
-            let tag = b"[unlock] local long-press user=";
-            for &c in tag {
-                line[m] = c;
-                m += 1;
-            }
-            for &c in &la[..la.len().min(line.len() - m - 1)] {
-                if c == b':' || c == b'\n' {
-                    break;
-                }
-                line[m] = c;
-                m += 1;
-            }
-            line[m] = b'\n';
-            m += 1;
-            append_file("/data/cloud/unlock.log", &line[..m]);
-            print("[cloud] 长按解锁成功\n");
-            set_status("设备已解锁（长按确认）".as_bytes());
-            render();
-            flip();
-            cursor_overlay_redraw();
-        }
-    }
-}
+// 安全：远程锁定只能由服务器下发 `unlock` 命令解除（见 exec_command）。
+// 此前锁屏按钮允许本机长按 2s 直接解锁，无任何认证，持有设备者可绕过远程锁定。
 
 /// 墙钟微秒（失败返回 0，长按计时退化为不可用即不可解锁 —— 安全方向）。
 fn now_us() -> u64 {
@@ -1677,8 +1638,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     loop {
         let pr = poll_input();
         if pr.resized { render(); flip(); cursor_overlay_redraw(); }
-        // 长按解锁：按住 ≥2s 每帧检测（无需抬起）。
-        unlock_hold_check();
         let tap = pr.tap;
         let moved = pr.moved;
         if moved {
@@ -1700,13 +1659,14 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
                 break;
             }
             if unsafe { LOCKED } {
-                // 解锁走 unlock_hold_check 的按住检测；这里只吞掉长按后的
-                // 首次抬起（解锁按钮区与主界面按钮区有重叠，不吞会误触
-                // 「立即同步/注册设备」），并吞掉锁定态的全部点击。
-                unsafe {
-                    if UNLOCK_HOLD_FIRED && !TOUCH_DOWN {
-                        UNLOCK_HOLD_FIRED = false;
-                    }
+                // 锁定态吞掉全部点击；仅「检查解锁」按钮会向服务器轮询，
+                // 解锁只能由服务器下发的 unlock 命令完成。
+                if unlock_hit(x, y) {
+                    set_status("检查服务器解锁指令...".as_bytes());
+                    do_poll();
+                    render();
+                    flip();
+                    cursor_overlay_redraw();
                 }
                 continue;
             }
@@ -1741,33 +1701,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: cloud ");
-        if let Some(loc) = info.location() {
-            write_fd(2, loc.file().as_bytes());
-            write_fd(2, b":");
-            let mut num = [0u8; 8];
-            let nl = fmt_dec(loc.line() as u64, &mut num);
-            write_fd(2, &num[..nl]);
-        }
-        write_fd(2, b"\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("cloud");

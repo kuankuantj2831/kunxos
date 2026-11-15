@@ -3,12 +3,15 @@
 //! 算法：对面板下方的背景做 4x 降采样（2x2 对角采样平均）→ 小缓冲 3x3 盒式
 //! 模糊 → 双线性放大回原尺寸；期间叠加半透明着色（深色玻璃 / 浅色玻璃 /
 //! 自定义着色）、顶部镜面高光、左上→右下斜向液态光泽与 1px 描边，并裁剪圆角。
-//! 效果对标 iOS / Android 的毛玻璃与液态玻璃材质，用于导航栏、标题栏、面板、
+//! 星光磨砂材质使用冷色着色与柔和高光，用于导航栏、标题栏、面板、
 //! 卡片、按钮、键盘等一切界面元素。
 //!
 //! 使用方式：实现 [`GlassTarget`]（背景读取 + 像素写入），调用 [`glass_rect`] 或
 //! [`glass_rect_style`]。本模块被 `nav.rs` 及各应用经 `#[path]` 共享，每进程只有
 //! 一份降采样缓冲，无堆分配。
+
+#[path = "starlight.rs"]
+pub mod starlight;
 
 /// 降采样缓冲宽度（540 / 4 上取整）。
 pub const GLASS_DOWN_W: usize = 135;
@@ -204,31 +207,31 @@ pub struct GlassStyle {
 
 /// 深色玻璃：暗蓝着色 + 弱高光（系统默认，导航栏 / 深色应用）。
 pub const STYLE_DARK: GlassStyle = GlassStyle {
-    tint: 0x00_17_1B_28,
-    alpha: 152,
+    tint: 0x00_20_26_45,
+    alpha: 166,
     spec: 26,
     sheen: 14,
     border: 0x00_7C_92_B8,
     border_a: 130,
 };
 
-/// 浅色玻璃：白色着色 + 强高光（浅色主题默认，白色背景上以浅灰描边保持轮廓）。
+/// 浅色星光玻璃：冷白半透明着色、柔和高光与细亮边。
 pub const STYLE_LIGHT: GlassStyle = GlassStyle {
-    tint: 0x00_FF_FF_FF,
-    alpha: 190,
-    spec: 88,
-    sheen: 34,
-    border: 0x00_D9_DE_E6,
-    border_a: 200,
+    tint: 0x00_F6_F7_FF,
+    alpha: 156,
+    spec: 38,
+    sheen: 12,
+    border: 0x00_FF_FF_FF,
+    border_a: 180,
 };
 
-/// 强调色玻璃（主按钮 / 开关）：半透明强调绿 + 高光。
+/// 强调色玻璃（主按钮 / 开关）：半透明星光蓝紫 + 高光。
 pub const STYLE_ACCENT: GlassStyle = GlassStyle {
-    tint: 0x00_1E_A8_52,
+    tint: starlight::ACCENT,
     alpha: 238,
     spec: 46,
     sheen: 22,
-    border: 0x00_A6_EF_C4,
+    border: 0x00_C8_CE_FF,
     border_a: 160,
 };
 

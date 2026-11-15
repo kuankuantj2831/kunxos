@@ -27,8 +27,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 // TLS 1.2 客户端：与 apps/browser / apps/tlstest 共用同一份源码，
 // https:// 软件源传输层加密用（证书链验证见 tls/x509.rs）。
@@ -54,31 +52,7 @@ mod repo;
 mod delta;
 mod review;
 
-// ==================== TLS 堆分配器 ====================
-//
-// kunxpkg 其余部分静态分配零堆；tls 模块内部用 Vec（握手缓冲 / 证书链，
-// 峰值 ~100KB 量级）。SYS_BRK 单调递增分配、不回收 —— pkg 是短命进程，
-// 退出即整体归还，无需更复杂的分配器。
-
-const SYS_BRK: usize = 214;
-
-struct BrkAlloc;
-
-unsafe impl core::alloc::GlobalAlloc for BrkAlloc {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        let size = layout.size().max(1) + layout.align();
-        let raw = syscall1(SYS_BRK, 0);
-        let new = syscall1(SYS_BRK, raw + size);
-        if new < raw + size {
-            return core::ptr::null_mut();
-        }
-        ((raw + layout.align() - 1) & !(layout.align() - 1)) as *mut u8
-    }
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
-}
-
-#[global_allocator]
-static GLOBAL_ALLOC: BrkAlloc = BrkAlloc;
+kunxrt::allocator!();
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -125,26 +99,9 @@ static mut TMP_BUF: [u8; 4096] = [0; 4096];
 
 // ==================== 基础 I/O ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
@@ -2424,25 +2381,6 @@ pub extern "C" fn k_main(argc: usize, argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: kunxpkg\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("kunxpkg");

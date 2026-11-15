@@ -5,73 +5,43 @@
 
 用法：python3 tests/scripts/weather_e2e.py [logfile] [shots_dir]
 """
-import subprocess, sys, time, threading, os, tempfile, socket
+from qemu_test import Guest, kernel_path, temp_path, qemu_command, monitor_address, monitor_option, screenshot
+import sys, time, os, tempfile
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_weather.log"
-SHOTS = sys.argv[2] if len(sys.argv) > 2 else "/tmp/kx_weather_shots"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 else temp_path("kx_weather.log")
+SHOTS = sys.argv[2] if len(sys.argv) > 2 else temp_path("kx_weather_shots")
 os.makedirs(SHOTS, exist_ok=True)
 WORKDIR = tempfile.mkdtemp(prefix="kxw_")
-PIPE = os.path.join(WORKDIR, "kx")
-MON = os.path.join(WORKDIR, "mon")
+MON = monitor_address()
 
 FRAME_DOWN, FRAME_UP = 0x01, 0x00
 
 def frame(kind, x=0, y=0):
     return bytes([0xAA, kind, x & 0xFF, (x >> 8) & 0xFF, y & 0xFF, (y >> 8) & 0xFF])
 
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
-       "-kernel", KERNEL, "-serial", "pipe:" + PIPE,
+cmd = qemu_command() + [
+       "-kernel", KERNEL, "-serial", "stdio",
        "-device", "ramfb", "-no-reboot", "-display", "none",
-       "-monitor", "unix:" + MON + ",server,nowait",
+       "-monitor", monitor_option(MON),
        "-append", "shell",
        "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
        "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]
 
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 
-log = bytearray()
-stop = False
-
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            c = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not c:
-            time.sleep(0.02)
-            continue
-        log.extend(c)
-        logf.write(c)
-        logf.flush()
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
-
-infd = -1
-try:
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-except OSError:
-    pass
 
 def send_bytes(data):
-    if infd < 0:
-        return
-    try:
-        os.write(infd, data)
-    except OSError:
-        pass
+    guest.send(data)
+
+phase_start = 0
 
 def type_cmd(s):
+    global phase_start
+    phase_start = len(log)
     # UART 输入需逐字符发送：一次整串写入在 shell 忙碌时会丢字节。
     send_bytes(b"\r")
     time.sleep(0.3)
@@ -81,21 +51,15 @@ def type_cmd(s):
     send_bytes(b"\n")
 
 def tap(x, y, hold=0.06):
+    global phase_start
+    phase_start = len(log)
     send_bytes(frame(FRAME_DOWN, x, y))
     time.sleep(hold)
     send_bytes(frame(FRAME_UP, 0, 0))
     time.sleep(0.05)
 
 def shot(name):
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(3)
-        s.connect(MON)
-        s.sendall(("screendump " + os.path.join(SHOTS, name) + "\n").encode())
-        time.sleep(0.8)
-        s.close()
-    except Exception:
-        pass
+    screenshot(MON, SHOTS, name)
 
 def text():
     try:
@@ -106,7 +70,7 @@ def text():
 def wait_for(marker, timeout=60):
     dl = time.time() + timeout
     while time.time() < dl:
-        if marker in text():
+        if marker in log[phase_start:].decode("utf-8", "replace"):
             return True
         time.sleep(0.3)
     return False
@@ -199,16 +163,7 @@ try:
             print("OK: 缓存文件存在 -", m)
         else:
             print("FAIL: 缺少缓存文件 -", m); fail = 1
-    # 小组件文件内容
-    if "[weather] ok" in t or True:
-        pass
     print("DONE: 天气应用 E2E 完成" if fail == 0 else "DONE: 存在失败项")
     sys.exit(fail)
 finally:
-    stop = True
-    p.terminate()
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()

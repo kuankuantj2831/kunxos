@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
 # 无线协议栈共享库：/dev/wifi 字节协议常量（devproto）与扫描/状态记录布局。
 kunxwireless = { path = "../../wireless" }
 

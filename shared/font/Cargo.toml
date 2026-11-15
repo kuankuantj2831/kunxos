@@ -1,0 +1,8 @@
+[package]
+name = "kunxfont"
+version = "0.1.0"
+edition = "2021"
+description = "KunxOS TrueType parser and grayscale rasterizer"
+license = "MIT"
+
+[dependencies]

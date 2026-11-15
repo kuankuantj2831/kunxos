@@ -80,19 +80,7 @@ const SYS_CLOSE: usize = 57;
 const AT_FDCWD: usize = 0xFFFF_FFFF_FFFF_FF9C;
 const O_RDONLY: usize = 0;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    core::arch::asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 /// 读取当前导航模式：文件内容含 "buttons" → 三键，否则手势（默认）。
 pub fn nav_mode() -> u8 {

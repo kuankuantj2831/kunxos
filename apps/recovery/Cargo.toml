@@ -5,6 +5,7 @@ edition = "2021"
 description = "KunxOS 恢复模式串口菜单（无 GUI，仅 UART 交互 + 内核 OTA 系统调用）"
 
 [dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
 
 [profile.release]
 opt-level = "z"
