@@ -21,6 +21,18 @@ jobs:
           targets: ${{ env.TARGET }}
           components: rustfmt
 
+      # kunxcore 用 include_bytes! 内嵌 kunxcore/kosdisk.img；*.img 被 .gitignore
+      # 忽略，干净检出里没有它，须按 Makefile 的 `kosdisk` 目标先生成。
+      - name: Generate embedded KOS volume
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path kos/Cargo.toml --bin kosctl
+          KOSCTL="$PWD/kos/target/debug/kosctl"
+          echo "KOS volume seeded by CI" > /tmp/kos-seed.txt
+          "$KOSCTL" mkfs kunxcore/kosdisk.img.tmp 1024
+          "$KOSCTL" put kunxcore/kosdisk.img.tmp /seed.txt /tmp/kos-seed.txt
+          mv kunxcore/kosdisk.img.tmp kunxcore/kosdisk.img
+
       - name: cargo build
         run: |
           set -euo pipefail
