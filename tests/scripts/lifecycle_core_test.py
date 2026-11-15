@@ -6,7 +6,7 @@
   1. 守护进程就绪（[lifd]/[pushd] starting、/proc/pressure 可读）
   2. 应用登记（reg_<key>）与 recents 状态表（R/B/S）
   3. 状态机：Running -> Background（SIGSTOP：/proc/processes 显示 T）
-     -> 恢复（FG + SIGCONT -> R）-> Suspended（SET_TIMEOUT 超时）-> 
+     -> 恢复（FG + SIGCONT -> R）-> Suspended（SET_TIMEOUT 超时）->
      Terminated（/proc/pressure force 2 触发 LMK）
   4. 多应用切换（appA/appB 交替前台与后台互不影响）
   5. 后台任务白名单：每应用 2 上限、第 3 拒绝、下载 400ms 到期
@@ -18,73 +18,36 @@ SIGCONT/SIGKILL 由内核处理），测试结束前全部恢复，不影响系�
 用法：python3 tests/scripts/lifecycle_core_test.py [logfile]
 退出码：0 = 全部通过，1 = 有失败。
 """
-import os
+from qemu_test import Guest, kernel_path, temp_path, qemu_command
 import re
-import subprocess
 import sys
 import tempfile
-import threading
 import time
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_life_core.log"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 else temp_path("kx_life_core.log")
 BOOT_TIMEOUT = 90
 
 WORKDIR = tempfile.mkdtemp(prefix="kxlc_")
-PIPE = os.path.join(WORKDIR, "kx")
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-# RISC-V 移植后（2026-09 架构切换）重定向：QEMU/BIOS 与顶层 Makefile 同源，
-# 可用环境变量 QEMU / BIOS 覆盖；AC97（aarch64 遗留）换 virtio-sound。
-QEMU = os.environ.get(
-    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
-BIOS = os.environ.get(
-    "BIOS", os.path.expanduser(
-        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
 
-cmd = [
-    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
+cmd = qemu_command() + [
+
     "-kernel", KERNEL, "-append", "shell",
-    "-serial", "pipe:" + PIPE,
-    "-no-reboot", "-display", "none",
+    "-serial", "stdio",
+    "-no-reboot", "-display", "none", "-device", "ramfb",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
     "-device", "virtio-rng-device",
     "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 results = []
 
 
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data)
-        logf.write(data)
-        logf.flush()
-
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
-
-
 def send(s):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, s.encode() + b"\n")
-    os.close(infd)
+    guest.send(s.encode() + b"\n")
 
 
 def check(name, cond):
@@ -256,14 +219,7 @@ try:
     check("pending removed", not run_wait("cat /data/push/pending/%s" % sen, "NOTIFY", 2.5))
 
 finally:
-    send("poweroff")
-    time.sleep(0.5)
-    stop = True
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()
 
 fails = [n for n, ok in results if not ok]
 print("\n[lifecycle-core] %d/%d passed" % (len(results) - len(fails), len(results)))

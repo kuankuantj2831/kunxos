@@ -1,8 +1,7 @@
 //! 哈希封装：统一接口屏蔽算法选择（BLAKE3 vs SHA-256 选型是设计
 //! 文档未决问题 №1，由基准数据说话）。
 //!
-//! 两个实现（`blake3`、`sha2` crate）均以 `default-features = false`
-//! 引入，`no_std` 下可用。
+//! 两个算法均使用 KunxOS 自研实现，支持 `no_std`。
 
 pub mod blake3;
 pub mod sha256;

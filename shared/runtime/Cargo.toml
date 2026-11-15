@@ -1,0 +1,12 @@
+[package]
+name = "kunxrt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "KunxOS native userspace runtime"
+
+[features]
+default = []
+memory-symbols = []
+
+[dependencies]

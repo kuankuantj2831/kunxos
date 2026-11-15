@@ -1184,7 +1184,7 @@ fn cc_build_glass() {
                 let c = CC_SMALL[j1 as usize * cc_small_w() + i0 as usize];
                 let d = CC_SMALL[j1 as usize * cc_small_w() + i1 as usize];
                 let bl = cc_bilerp(a, b, c, d, tx, ty);
-                CC_GLASS[y as usize * display_w() + x] = blend(bl, 0x00_FF_FF_FF, 150);
+                CC_GLASS[y as usize * display_w() + x] = blend(bl, 0x00_F2_F4_FF, 112);
             }
         }
     }

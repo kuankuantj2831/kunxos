@@ -17,8 +17,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 use kunxhal::fusion::MahonyFilter;
 use kunxhal::motion::{RaiseDetector, StepDetector};
@@ -56,39 +54,11 @@ const STATE_MS: usize = 20;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 // ==================== 基础 I/O ====================
 
@@ -155,19 +125,7 @@ unsafe fn open(path: &str, flags: usize) -> isize {
     syscall3(SYS_OPENAT, AT_FDCWD, PATH_BUF.as_ptr() as usize, flags) as isize
 }
 
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
 unsafe fn unlink(path: &str) -> i32 {
     let n = path.len().min(PATH_BUF.len() - 1);
@@ -522,41 +480,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：打印 panic 位置（文件:行:列），无堆、固定缓冲。
-    struct PanicBuf { buf: [u8; 256], len: usize }
-    impl core::fmt::Write for PanicBuf {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = PanicBuf { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: sensord\n");
-        if w.len > 0 {
-            write_fd(2, &w.buf[..w.len]);;
-        }
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("sensord");

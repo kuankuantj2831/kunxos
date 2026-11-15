@@ -11,60 +11,32 @@ round-004 实测旧协议（单文件 `echo > cmd_<pid>` 覆盖式）在 lifd 50
 用法：python3 tests/scripts/lifecycle_cmd_burst.py [logfile]
 退出码：0 = 通过，1 = 失败。
 """
-import os
-import subprocess
+from qemu_test import Guest, kernel_path, temp_path, qemu_command
 import sys
 import tempfile
-import threading
 import time
 
-QEMU = os.environ.get(
-    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
-BIOS = os.environ.get(
-    "BIOS", os.path.expanduser(
-        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kx_cmd_burst.log"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 else temp_path("kx_cmd_burst.log")
 
 WORKDIR = tempfile.mkdtemp(prefix="kxbs_")
-PIPE = os.path.join(WORKDIR, "kx")
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = [
-    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
+cmd = qemu_command() + [
+
     "-kernel", KERNEL, "-append", "shell",
-    "-serial", "pipe:" + PIPE,
-    "-no-reboot", "-display", "none",
+    "-serial", "stdio",
+    "-no-reboot", "-display", "none", "-device", "ramfb",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
     "-device", "virtio-rng-device",
     "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
-
-
-def reader():
-    outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    while not stop:
-        data = os.read(outfd, 4096)
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data)
-        logf.write(data)
-        logf.flush()
-
-
-threading.Thread(target=reader, daemon=True).start()
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 
 
 def send(line):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, line.encode() + b"\n")
-    os.close(infd)
+    guest.send(line.encode() + b"\n")
 
 
 def wait_for(marker, timeout=90.0):
@@ -122,14 +94,7 @@ try:
     if grants != 2 or denies != 1:
         ok = False
 finally:
-    send("poweroff")
-    time.sleep(0.5)
-    stop = True
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()
 
 print("[burst] PASS" if ok else "[burst] FAIL (see %s)" % LOGFILE, flush=True)
 sys.exit(0 if ok else 1)

@@ -9,6 +9,7 @@ edition = "2021"
 # 经 shell `run /bin/tlstest [host]` 启动；串口断言 [tls-selftest] PASS。
 
 [dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
 kunxsec = { path = "../../kunxsec" }
 
 [profile.release]

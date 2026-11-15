@@ -578,6 +578,10 @@ struct PosixFd {
     key: [u8; 32],
     pos: u64,
     append_mode: bool,
+    /// open 时的访问模式（O_ACCMODE 位），供 F_GETFL 回报。
+    acc_mode: u32,
+    /// FD_CLOEXEC：execve 成功后由 close_cloexec_fds 回收。
+    cloexec: bool,
 }
 
 static mut POSIX_FDS: Option<alloc::collections::BTreeMap<u32, PosixFd>> = None;
@@ -667,6 +671,8 @@ pub fn posix_open(rel: &str, flags: u32, uid: u32) -> i64 {
                 key,
                 pos: 0,
                 append_mode: flags & O_APPEND != 0,
+                acc_mode: flags & 0x3,
+                cloexec: flags & 0x80000 != 0, // O_CLOEXEC
             },
         );
         fd
@@ -814,6 +820,68 @@ pub fn posix_close(fd: u32) -> i64 {
 /// fd 是否属于 POSIX 桥接（供 read/write/close/lseek 分发）。
 pub fn is_posix_fd(fd: i32) -> bool {
     fd >= KOS_FD_BASE as i32
+}
+
+/// KOS 桥接 fd 的 fcntl：支持 F_GETFD / F_SETFD / F_GETFL / F_SETFL（仅 O_APPEND 可改）。
+/// F_DUPFD 等需要复制共享偏移的命令明确返回 ENOSYS；非本进程或不存在的 fd 返回 EBADF。
+pub fn posix_fcntl(fd: u32, cmd: i32, arg: u64) -> i64 {
+    const EBADF: i64 = -9;
+    const EINVAL: i64 = -22;
+    const ENOSYS: i64 = -38;
+    const O_APPEND: u32 = 0x400;
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    let r = unsafe {
+        match posix_table_locked().get_mut(&fd) {
+            Some(e) if e.pid == pid => match cmd {
+                1 => e.cloexec as i64,
+                2 => {
+                    e.cloexec = arg & 1 != 0;
+                    0
+                }
+                3 => (e.acc_mode | if e.append_mode { O_APPEND } else { 0 }) as i64,
+                4 => {
+                    if arg > u32::MAX as u64 {
+                        EINVAL
+                    } else if (arg as u32) & !(0x3 | O_APPEND) != 0 {
+                        ENOSYS
+                    } else {
+                        e.append_mode = (arg as u32) & O_APPEND != 0;
+                        0
+                    }
+                }
+                _ => ENOSYS,
+            },
+            _ => EBADF,
+        }
+    };
+    crate::fs_simple::fs_unlock();
+    r
+}
+
+/// execve 成功后回收当前进程带 FD_CLOEXEC 的 KOS 桥接 fd。
+pub fn close_cloexec_fds() {
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    // SAFETY：fs_lock 临界区内。
+    unsafe {
+        if let Some(t) = POSIX_FDS.as_mut() {
+            t.retain(|_, e| !(e.pid == pid && e.cloexec));
+        }
+    }
+    crate::fs_simple::fs_unlock();
+}
+
+/// Distinguish a live bridge descriptor from an arbitrary number in its range.
+pub fn posix_fd_valid(fd: u32) -> bool {
+    let pid = crate::process::current_pid();
+    crate::fs_simple::fs_lock();
+    let valid = unsafe {
+        POSIX_FDS.as_ref().and_then(|table| table.get(&fd)).map_or(false, |entry| entry.pid == pid)
+    };
+    crate::fs_simple::fs_unlock();
+    valid
 }
 
 // ==================== KOS fd 层（470..=474 的 472..474） ====================

@@ -25,8 +25,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -53,57 +51,13 @@ const O_RDONLY: usize = 0;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall5;
 
 // ==================== 基础 I/O ====================
 
@@ -173,7 +127,7 @@ unsafe fn poweroff() -> ! {
 /// fork：AArch64 无独立 fork 系统调用，经 clone(SIGCHLD) 实现。
 /// 成功父进程返回子 pid（>=0），子进程返回 0；失败返回负 errno。
 unsafe fn fork() -> isize {
-    syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as isize
+    kunxrt::process::fork() as isize
 }
 
 /// execve：替换当前进程映像；失败返回负 errno。
@@ -601,27 +555,8 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 // ==================== panic ====================
 
-#[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: kunxinit\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("kunxinit");

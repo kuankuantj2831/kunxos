@@ -30,7 +30,6 @@
 //! 优先级：电话(0) > 导航(1) > 音乐(2) > 游戏(3)。持焦的最高优先级应用
 //! 全音量；电话持焦时其余全部静音；更低优先级应用被压低（0.25 增益）。
 
-use core::arch::asm;
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
 
@@ -92,26 +91,9 @@ pub const ERR_BAD_CHUNK: i32 = -2;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
 // ==================== 内部状态 ====================
 

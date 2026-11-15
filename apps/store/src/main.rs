@@ -37,8 +37,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/display.rs"]
 mod display;
@@ -341,57 +339,17 @@ fn save_config() -> bool {
 
 // ==================== 基础工具 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, in("a1") a2, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
-        in("a1") a2, in("a2") a3, in("a3") a4, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
-        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall5;
 
-#[inline(always)]
-unsafe fn syscall6(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret,
-        in("a1") a2, in("a2") a3, in("a3") a4, in("a4") a5, in("a5") a6, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())
@@ -1064,7 +1022,7 @@ fn run_pkg_file(path: &str) -> bool {
             p.as_ptr() as usize,
             0,
         ];
-        let pid = syscall5(SYS_CLONE, 17, 0, 0, 0, 0) as isize;
+        let pid = kunxrt::process::fork() as isize;
         if pid == 0 {
             syscall3(SYS_EXECVE, cmd.as_ptr() as usize, argv.as_ptr() as usize, 0);
             syscall1(SYS_EXIT, 127);
@@ -1112,7 +1070,7 @@ fn run_pkg_by_name(name: &[u8]) -> bool {
             nm.as_ptr() as usize,
             0,
         ];
-        let pid = syscall5(SYS_CLONE, 17, 0, 0, 0, 0) as isize;
+        let pid = kunxrt::process::fork() as isize;
         if pid == 0 {
             syscall3(SYS_EXECVE, cmd.as_ptr() as usize, argv.as_ptr() as usize, 0);
             syscall1(SYS_EXIT, 127);
@@ -1127,6 +1085,21 @@ fn run_pkg_by_name(name: &[u8]) -> bool {
             false
         }
     }
+}
+
+/// 包名/版本允许的字符集：ASCII 字母数字与 `-_.+`，且不得以 `.` 开头、不含 `..`。
+/// 用于拼接本地路径前的校验，阻止路径分隔符与父目录跳转。
+fn is_safe_pkg_component(s: &[u8]) -> bool {
+    if s.is_empty() || s.len() > 96 || s[0] == b'.' {
+        return false;
+    }
+    if !s
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'+'))
+    {
+        return false;
+    }
+    !s.windows(2).any(|w| w == b"..")
 }
 
 /// 完整安装流程：下载 → 验签（Ed25519 + 证书链）→ pkg install-file。
@@ -1156,6 +1129,17 @@ fn install_app(idx: usize) -> bool {
             status("索引未签名".as_bytes());
             show_error("软件源索引未签名（缺 Packages.json.sig），已阻止安装".as_bytes());
             print("[store] 拒绝安装：索引未签名\n");
+            return false;
+        }
+        // 本地落盘路径由 name/version 拼成（DOWNLOAD_DIR/<name>-<version>.kunx）。
+        // 这两个字段来自索引，必须限定字符集：否则含 '/' 或 '..' 的名字可把下载
+        // 写到缓存目录之外（路径穿越，覆盖任意文件）。
+        if !is_safe_pkg_component(&p.name[..p.name_len])
+            || !is_safe_pkg_component(&p.version[..p.version_len])
+        {
+            status("索引包名非法".as_bytes());
+            show_error("软件源索引中的包名/版本非法，已阻止安装".as_bytes());
+            print("[store] 拒绝安装：包名/版本含非法字符\n");
             return false;
         }
         // 构造对象键：优先索引的 filename，否则 packages/<name>-<version>.kunx
@@ -2706,42 +2690,6 @@ fn store_status_init() {
     status("就绪（点击安装或右上角设置）".as_bytes());
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // 诊断：把 panic 消息与位置（文件:行:列）写入 fd 2（无堆，固定缓冲）。
-    struct BufWriter {
-        buf: [u8; 256],
-        len: usize,
-    }
-    impl core::fmt::Write for BufWriter {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let b = s.as_bytes();
-            let k = b.len().min(self.buf.len() - self.len);
-            self.buf[self.len..self.len + k].copy_from_slice(&b[..k]);
-            self.len += k;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter { buf: [0u8; 256], len: 0 };
-    let _ = core::fmt::Write::write_fmt(&mut w, core::format_args!("{}\n", info));
-    unsafe {
-        write_fd(2, b"PANIC: store\n");
-        write_fd(2, &w.buf[..w.len]);
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("store");

@@ -118,6 +118,9 @@ const SYS_FACCESSAT: usize = 48;
 const SYS_CHDIR: usize = 49;
 const SYS_FCHDIR: usize = 50;
 const SYS_FCHMOD: usize = 52;
+const SYS_FCHMODAT: usize = 53;
+const SYS_FCHOWNAT: usize = 54;
+const SYS_FCHOWN: usize = 55;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
 const SYS_PIPE2: usize = 59;
@@ -301,6 +304,10 @@ const O_CREAT: u32 = 0x40;
 const O_TRUNC: u32 = 0x200;
 const O_APPEND: u32 = 0x400;
 const O_DIRECTORY: u32 = 0x10000;
+/// open/pipe2/dup3 的 close-on-exec 标志（Linux riscv64 ABI：02000000）。
+const O_CLOEXEC: u32 = 0x80000;
+const F_DUPFD_CLOEXEC: i32 = 1030;
+const FD_CLOEXEC_BIT: u64 = 1;
 
 /// `mmap` 标志位。
 const MAP_FIXED: u32 = 0x10;
@@ -377,7 +384,7 @@ fn user_ok_writable(addr: u64, len: usize) -> bool {
         return true;
     }
     // ensure_user_range_writable 内部已按页做 user_range_mapped（含
-    // SHM/共享映射的 PTE 漫游放行）并完成 LAZY 落地/COW break/只读改写，
+    // SHM/共享映射的 PTE 漫游放行）并完成 LAZY 落地/COW break 与写权限检查，
     // 成功即保证「已映射且可写」——此处此前再跑一遍全量 user_range_mapped
     // 是纯冗余的第二轮记录表线性扫描（clock_gettime 实测 ~27µs 的大头，
     // 记录数大的进程更甚），删。
@@ -576,6 +583,10 @@ fn dispatch_inner(nr: usize, f: &mut TrapFrame) -> i64 {
         SYS_RENAMEAT => sys_renameat(f),
         SYS_STATFS => sys_statfs(f),
         SYS_FACCESSAT => sys_faccessat(f),
+        SYS_FCHMOD => sys_fchmod(f),
+        SYS_FCHMODAT => sys_fchmodat(f),
+        SYS_FCHOWN => sys_fchown(f),
+        SYS_FCHOWNAT => sys_fchownat(f),
         SYS_READLINKAT => sys_readlinkat(f),
         SYS_SYMLINKAT => sys_symlinkat(f),
         SYS_NEWFSTATAT => sys_newfstatat(f),
@@ -819,7 +830,7 @@ fn dt_of(t: u16) -> u8 {
 ///
 /// 关键字段：st_dev@0, st_ino@8, st_mode@16, st_nlink@20, st_size@48, st_blksize@56。
 /// 目标指针非法（越界/未映射）时返回 `false`，调用方应返回 `EFAULT`。
-unsafe fn write_stat(stat_ptr: u64, t: u16, size: u64) -> bool {
+unsafe fn write_stat(stat_ptr: u64, t: u16, size: u64, own: Option<(u32, u32, u16)>) -> bool {
     if !user_ok_writable(stat_ptr, 128) {
         return false;
     }
@@ -828,7 +839,14 @@ unsafe fn write_stat(stat_ptr: u64, t: u16, size: u64) -> bool {
     core::ptr::write_bytes(p, 0, 128);
     *(p as *mut u64) = 0; // st_dev
     *((p as *mut u64).add(1)) = 1; // st_ino
-    *((p as *mut u32).add(4)) = s_ifmt(t) | if t == fs_simple::T_DIR { 0o755 } else { 0o644 }; // st_mode
+    // st_mode / st_uid / st_gid：有归属元数据时返回真实值，否则沿用旧默认（root:root 0755/0644）。
+    let (suid, sgid, perm) = match own {
+        Some((u, g, m)) => (u, g, (m as u32) & 0o7777),
+        None => (0, 0, if t == fs_simple::T_DIR { 0o755 } else { 0o644 }),
+    };
+    *((p as *mut u32).add(4)) = s_ifmt(t) | perm; // st_mode
+    *((p as *mut u32).add(6)) = suid; // st_uid @24
+    *((p as *mut u32).add(7)) = sgid; // st_gid @28
     *((p as *mut u32).add(5)) = if t == fs_simple::T_DIR { 2 } else { 1 }; // st_nlink
     *((p as *mut i64).add(6)) = size as i64; // st_size @48
     *((p as *mut i32).add(14)) = 4096; // st_blksize @56
@@ -880,7 +898,9 @@ fn sys_openat(f: &mut TrapFrame) -> i64 {
     if flags & O_APPEND != 0 {
         vfs::seek(fd, 0, vfs::SEEK_END);
     }
-    // O_CLOEXEC：本内核无 exec，忽略
+    if flags & O_CLOEXEC != 0 {
+        process::set_fd_cloexec(fd, true);
+    }
     fd as i64
 }
 
@@ -1023,145 +1043,65 @@ fn sys_write(f: &mut TrapFrame) -> i64 {
     }
 }
 
-/// iovec：`{ base: u64, len: u64 }`。
-fn sys_writev(f: &mut TrapFrame) -> i64 {
+/// Scatter/gather I/O consumes one continuous prefix of the iovec sequence.
+/// Snapshot descriptors once; a 4KB scratch chunk never skips the remaining
+/// bytes of an element. After progress, faults/errors return that prefix length.
+fn sys_iov_io(f: &mut TrapFrame, reading: bool) -> i64 {
     let fd = f.x[10] as i32;
-    let iov = f.x[11];
-    let iovcnt = f.x[12] as usize;
-    if iovcnt == 0 || iovcnt > 64 {
-        return EINVAL;
-    }
-    if !user_ok(iov, iovcnt * 16) {
-        return EFAULT;
-    }
-    // 第一遍：预校验全部 iovec 的 base/len 均合法（用户空间、已映射）。
-    // 全程 uaccess 放行读 iovec 数组（此前逐项边写边查，读到第 2 个非法
-    // iovec 时第 1 个已写入文件——局部写入；Linux 语义应整体返回 EFAULT）。
-    unsafe {
-        crate::mmu::uaccess_begin();
-    }
-    let mut all_ok = true;
-    for i in 0..iovcnt {
-        let base = unsafe { *(iov as *const u64).add(i * 2) };
-        let len = unsafe { *(iov as *const u64).add(i * 2 + 1) } as usize;
-        // 预校验范围钳到实际拷贝量（下方拷贝每 iovec 只用 len.min(4096)）：
-        // 对用户给的完整 len 逐页 ensure 会强制落地/清零至多 ~256MB 预留页
-        // ——单条 syscall 打穿物理内存 + 数十亿次映射记录扫描。
-        if len == 0 {
-            continue; // 零长度 iov 项合法（base 可为 NULL）：按 POSIX 忽略
-        }
-        if !user_ok(base, len.min(4096)) {
-            all_ok = false;
-            break;
-        }
-    }
-    unsafe {
-        crate::mmu::uaccess_end();
-    }
-    if !all_ok {
-        return EFAULT;
+    let count = f.x[12] as usize;
+    if count > 64 { return EINVAL; }
+    if count == 0 { return 0; }
+    let mut descriptors = [0u8; 64 * 16];
+    if unsafe { copy_from_user(f.x[11], &mut descriptors[..count * 16]) } != count * 16 { return EFAULT; }
+    let entry = match process::get_fd(fd) { Some(e) => e, None => return EBADF };
+    if !matches!(entry.kind, FdKind::File | FdKind::Pipe | FdKind::Pair) { return EBADF; }
+    let mut sum = 0u64;
+    for bytes in descriptors[..count * 16].chunks_exact(16) {
+        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let Some(next) = sum.checked_add(len) else { return EINVAL };
+        if next > i64::MAX as u64 { return EINVAL; }
+        sum = next;
     }
     let mut total = 0i64;
-    for i in 0..iovcnt {
-        // iovec 数组在用户内存：PAN 下需 uaccess 放行
-        unsafe { crate::mmu::uaccess_begin() };
-        let base = unsafe { *(iov as *const u64).add(i * 2) };
-        let len = unsafe { *(iov as *const u64).add(i * 2 + 1) } as usize;
-        unsafe { crate::mmu::uaccess_end() };
-        let n = len.min(4096);
-        if n == 0 {
-            continue; // 零长度 iov 项：跳过而非 break（否则 musl 无缓冲流死循环）
-        }
-        let mut tmp = [0u8; 4096];
-        let c = unsafe { copy_from_user(base, &mut tmp[..n]) };
-        if c == 0 {
-            break;
-        }
-        let entry = match process::get_fd(fd) {
-            Some(e) => e,
-            None => return EBADF,
-        };
-        let w = match entry.kind {
-            FdKind::File => vfs::write(fd, &tmp[..c]),
-            FdKind::Pipe => ipc::pipe_write(fd, &tmp[..c]) as i32,
-            _ => return EBADF,
-        };
-        if w < 0 {
-            return w as i64;
-        }
-        total += w as i64;
-        if (w as usize) < c {
-            break;
+    let mut scratch = [0u8; 4096];
+    for bytes in descriptors[..count * 16].chunks_exact(16) {
+        let base = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let mut offset = 0u64;
+        while offset < len {
+            let n = (len - offset).min(scratch.len() as u64) as usize;
+            let Some(ptr) = base.checked_add(offset) else { return if total > 0 { total } else { EFAULT } };
+            let result = if reading {
+                if !user_ok_writable(ptr, n) { return if total > 0 { total } else { EFAULT }; }
+                let r = match entry.kind {
+                    FdKind::File => vfs::read(fd, &mut scratch[..n]) as i64,
+                    FdKind::Pipe => ipc::pipe_read(fd, &mut scratch[..n]) as i64,
+                    FdKind::Pair => ipc::pair_read(fd, &mut scratch[..n]) as i64,
+                    _ => unreachable!(),
+                };
+                if r > 0 && unsafe { copy_to_user(ptr, &scratch[..r as usize]) } != r as usize {
+                    return if total > 0 { total } else { EFAULT };
+                }
+                r
+            } else {
+                if unsafe { copy_from_user(ptr, &mut scratch[..n]) } != n { return if total > 0 { total } else { EFAULT }; }
+                match entry.kind {
+                    FdKind::File => vfs::write(fd, &scratch[..n]) as i64,
+                    FdKind::Pipe => ipc::pipe_write(fd, &scratch[..n]) as i64,
+                    FdKind::Pair => ipc::pair_write(fd, &scratch[..n]) as i64,
+                    _ => unreachable!(),
+                }
+            };
+            if result < 0 { return if total > 0 { total } else { result }; }
+            total += result;
+            if result < n as i64 { return total; }
+            offset += result as u64;
         }
     }
     total
 }
-
-fn sys_readv(f: &mut TrapFrame) -> i64 {
-    let fd = f.x[10] as i32;
-    let iov = f.x[11];
-    let iovcnt = f.x[12] as usize;
-    if iovcnt == 0 || iovcnt > 64 {
-        return EINVAL;
-    }
-    if !user_ok(iov, iovcnt * 16) {
-        return EFAULT;
-    }
-    // 第一遍：预校验全部 iovec 的 base/len **可写**（用户空间、已映射、COW
-    // 已 break）。此前边读边拷，读到第 2 个非法 iovec 时第 1 个已写脏用户缓冲
-    // ——部分完成反而掩盖错误；Linux 语义应整体返回 EFAULT。
-    unsafe {
-        crate::mmu::uaccess_begin();
-    }
-    let mut all_ok = true;
-    for i in 0..iovcnt {
-        let base = unsafe { *(iov as *const u64).add(i * 2) };
-        let len = unsafe { *(iov as *const u64).add(i * 2 + 1) } as usize;
-        // 预校验范围钳到实际拷贝量（同 writev：每 iovec 只用 len.min(4096)），
-        // 防止单条 syscall 对完整 len 逐页分配/清零预留页打穿物理内存。
-        if !user_ok_writable(base, len.min(4096)) {
-            all_ok = false;
-            break;
-        }
-    }
-    unsafe {
-        crate::mmu::uaccess_end();
-    }
-    if !all_ok {
-        return EFAULT;
-    }
-    let mut total = 0i64;
-    for i in 0..iovcnt {
-        // iovec 数组在用户内存：PAN 下需 uaccess 放行
-        unsafe { crate::mmu::uaccess_begin() };
-        let base = unsafe { *(iov as *const u64).add(i * 2) };
-        let len = unsafe { *(iov as *const u64).add(i * 2 + 1) } as usize;
-        unsafe { crate::mmu::uaccess_end() };
-        let n = len.min(4096);
-        let mut tmp = [0u8; 4096];
-        let entry = match process::get_fd(fd) {
-            Some(e) => e,
-            None => return EBADF,
-        };
-        let r = match entry.kind {
-            FdKind::File => vfs::read(fd, &mut tmp[..n]),
-            FdKind::Pipe => ipc::pipe_read(fd, &mut tmp[..n]) as i32,
-            _ => return EBADF,
-        };
-        if r <= 0 {
-            break;
-        }
-        let copied = unsafe { copy_to_user(base, &tmp[..r as usize]) };
-        if copied != r as usize {
-            return EFAULT;
-        }
-        total += r as i64;
-        if (r as usize) < n {
-            break;
-        }
-    }
-    total
-}
+fn sys_writev(f: &mut TrapFrame) -> i64 { sys_iov_io(f, false) }
+fn sys_readv(f: &mut TrapFrame) -> i64 { sys_iov_io(f, true) }
 
 /// `pread64`：在指定偏移处读取（不改变文件位置）。
 fn sys_pread64(f: &mut TrapFrame) -> i64 {
@@ -1292,6 +1232,11 @@ fn sys_lseek(f: &mut TrapFrame) -> i64 {
 
 fn sys_pipe2(f: &mut TrapFrame) -> i64 {
     let fds_ptr = f.x[10];
+    let pflags = f.x[11] as u32;
+    // Linux：只接受 O_CLOEXEC / O_NONBLOCK（O_DIRECT 包模式未实现，同样拒绝）。
+    if pflags & !(O_CLOEXEC | vfs::O_NONBLOCK) != 0 {
+        return EINVAL;
+    }
     if !user_ok_writable(fds_ptr, 8) {
         return EFAULT;
     }
@@ -1300,6 +1245,16 @@ fn sys_pipe2(f: &mut TrapFrame) -> i64 {
         // 池满/fd 表满：此前不检查、把两个 -1 写给用户还返回成功，应用拿
         // fd=-1 后续 read/close 全乱。与 sys_socketpair 同款处理。
         return EMFILE;
+    }
+    for fd in [r, w] {
+        if pflags & O_CLOEXEC != 0 {
+            process::set_fd_cloexec(fd, true);
+        }
+        if pflags & vfs::O_NONBLOCK != 0 {
+            if let Some(e) = process::get_fd(fd) {
+                process::set_fd_flags(fd, e.flags | ipc::FD_NONBLOCK);
+            }
+        }
     }
     // PAN 放行：写入用户 fds[2]（此前只校验后裸写，PAN 开启时挂死内核）
     unsafe {
@@ -1317,6 +1272,10 @@ fn sys_pipe2(f: &mut TrapFrame) -> i64 {
 /// （若已被占用先关闭，引用计数相应 -1）。对象引用计数对 File/Shm +1，避免
 /// 复制的描述符关闭后提前释放对象。
 fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
+    dup_fd_min(oldfd, newfd, 0)
+}
+
+fn dup_fd_min(oldfd: i32, newfd: i32, min_fd: usize) -> i64 {
     let e = match process::get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
@@ -1330,7 +1289,7 @@ fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
     let nfd = match e.kind {
         FdKind::File => {
             vfs::open_ref(e.index);
-            let f = process::alloc_fd(FdKind::File, e.index, e.flags);
+            let f = process::alloc_fd_from(FdKind::File, e.index, e.flags, min_fd);
             if f < 0 {
                 vfs::close_ref(e.index);
                 return EMFILE;
@@ -1339,7 +1298,7 @@ fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
         }
         FdKind::Shm => {
             ipc::shm_add_ref(e.index);
-            let f = process::alloc_fd(FdKind::Shm, e.index, e.flags);
+            let f = process::alloc_fd_from(FdKind::Shm, e.index, e.flags, min_fd);
             if f < 0 {
                 // 撤销刚加的一次 fd 引用（绝不能走 shm_close_index——它会清光
                 // 本进程的映射记录但不 unmap，活着回滚 = 记录没了 PTE 还在）。
@@ -1358,7 +1317,7 @@ fn dup_fd_common(oldfd: i32, newfd: i32) -> i64 {
                 FdKind::Pair => ipc::pair_add_ref(e.index, e.flags as u32),
                 _ => {}
             }
-            let f = process::alloc_fd(e.kind, e.index, e.flags);
+            let f = process::alloc_fd_from(e.kind, e.index, e.flags, min_fd);
             if f < 0 {
                 match e.kind {
                     FdKind::Pipe => ipc::pipe_drop_ref(e.index, e.flags & ipc::FD_WRITE != 0),
@@ -1439,10 +1398,14 @@ fn sys_dup(f: &mut TrapFrame) -> i64 {
     dup_fd_common(oldfd, -1)
 }
 
-/// `dup3(oldfd, newfd, flags)`：复制到指定描述符（flags 本内核恒等，忽略）。
+/// `dup3(oldfd, newfd, flags)`：复制到指定描述符；flags 只允许 O_CLOEXEC。
 fn sys_dup3(f: &mut TrapFrame) -> i64 {
     let oldfd = f.x[10] as i32;
     let newfd = f.x[11] as i32;
+    let dflags = f.x[12] as u32;
+    if dflags & !O_CLOEXEC != 0 {
+        return EINVAL;
+    }
     if newfd < 0 {
         return EINVAL;
     }
@@ -1452,26 +1415,74 @@ fn sys_dup3(f: &mut TrapFrame) -> i64 {
         return EBADF;
     }
     if oldfd == newfd {
-        // Linux dup3：oldfd == newfd 且未置 O_CLOEXEC 时成功（本内核无
-        // CLOEXEC 语义）—— 前提是 oldfd 有效，无效描述符返回 EBADF。
+        // 兼容 bionic/musl 的 dup2(fd, fd) 路径：oldfd 有效则原样返回，
+        // 不改动 FD_CLOEXEC；无效描述符返回 EBADF。
         if process::get_fd(oldfd).is_none() {
             return EBADF;
         }
         return newfd as i64;
     }
-    dup_fd_common(oldfd, newfd)
+    let r = dup_fd_common(oldfd, newfd);
+    if r >= 0 && dflags & O_CLOEXEC != 0 {
+        process::set_fd_cloexec(r as i32, true);
+    }
+    r
 }
 
-/// `fcntl`：仅支持 F_DUPFD / F_GETFD / F_SETFD / F_GETFL / F_SETFL（其余忽略）。
+/// fcntl：已实现 F_DUPFD / F_DUPFD_CLOEXEC / F_GETFD / F_SETFD / F_GETFL / F_SETFL；
+/// 其余命令明确返回 ENOSYS。状态标志（O_APPEND / O_NONBLOCK）按 fd 表项保存。
 fn sys_fcntl(f: &mut TrapFrame) -> i64 {
     let fd = f.x[10] as i32;
     let cmd = f.x[11] as i32;
-    let _arg = f.x[12];
+    let arg = f.x[12];
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return crate::kos_vfs::posix_fcntl(fd as u32, cmd, arg);
+    }
+    let e = match process::get_fd(fd) { Some(e) => e, None => return EBADF };
     match cmd {
-        // F_DUPFD = 0：复制 fd（分配最小可用描述符），语义与 dup 一致
-        0 => dup_fd_common(fd, -1),
-        // F_GETFD/F_GETFL/F_SETFD/F_SETFL 等：无状态，返回 0
-        _ => 0,
+        0 | F_DUPFD_CLOEXEC => { // F_DUPFD / F_DUPFD_CLOEXEC
+            if arg >= process::FD_MAX as u64 { return EINVAL; }
+            let r = dup_fd_min(fd, -1, arg as usize);
+            if r >= 0 && cmd == F_DUPFD_CLOEXEC {
+                process::set_fd_cloexec(r as i32, true);
+            }
+            r
+        }
+        1 => if process::fd_cloexec(fd) { FD_CLOEXEC_BIT as i64 } else { 0 }, // F_GETFD
+        2 => { // F_SETFD：仅 FD_CLOEXEC 位有意义，其余位按 Linux 忽略
+            process::set_fd_cloexec(fd, arg & FD_CLOEXEC_BIT != 0);
+            0
+        }
+        3 => match e.kind { // F_GETFL
+            FdKind::File => vfs::status_flags(fd).map_or(EBADF, |flags| flags as i64),
+            FdKind::Pipe => {
+                let acc = if e.flags & ipc::FD_WRITE != 0 { vfs::O_WRONLY as i64 } else { 0 };
+                let nb = if e.flags & ipc::FD_NONBLOCK != 0 { vfs::O_NONBLOCK as i64 } else { 0 };
+                acc | nb
+            }
+            FdKind::Pair => vfs::O_RDWR as i64,
+            _ => ENOSYS,
+        },
+        4 => { // F_SETFL: unsupported bits must not be silently accepted.
+            if arg > u32::MAX as u64 { return EINVAL; }
+            match e.kind {
+                FdKind::File => vfs::set_status_flags(fd, arg as u32) as i64,
+                FdKind::Pipe => {
+                    let a = arg as u32;
+                    if a & !(3 | vfs::O_NONBLOCK) != 0 { return ENOSYS; }
+                    let nf = if a & vfs::O_NONBLOCK != 0 {
+                        e.flags | ipc::FD_NONBLOCK
+                    } else {
+                        e.flags & !ipc::FD_NONBLOCK
+                    };
+                    process::set_fd_flags(fd, nf);
+                    0
+                }
+                FdKind::Pair => if arg & !3 == 0 { 0 } else { ENOSYS },
+                _ => ENOSYS,
+            }
+        }
+        _ => ENOSYS,
     }
 }
 
@@ -1787,6 +1798,7 @@ fn sys_renameat(f: &mut TrapFrame) -> i64 {
         0 => 0,
         -18 => -18, // EXDEV：跨文件系统
         -16 => EBUSY, // 目标 inode 仍被打开
+        -13 => EACCES, // 无目录写权限，或源/目标属于其他用户（此前被误报为 EEXIST）
         _ => EEXIST,
     }
 }
@@ -1878,7 +1890,7 @@ fn sys_newfstatat(f: &mut TrapFrame) -> i64 {
     let Some(s) = resolve_user_path(p, &mut abspath) else { return ENAMETOOLONG; };
     match vfs::stat_path(s) {
         Some((t, size)) => {
-            if !unsafe { write_stat(stat_ptr, t, size) } {
+            if !unsafe { write_stat(stat_ptr, t, size, vfs::owner_of_path(s)) } {
                 return EFAULT;
             }
             0
@@ -1887,12 +1899,64 @@ fn sys_newfstatat(f: &mut TrapFrame) -> i64 {
     }
 }
 
+/// 读取并解析用户路径参数（path 在 x[11]），要求绝对路径或 AT_FDCWD。
+fn user_abs_path<'a>(f: &TrapFrame, abspath: &'a mut [u8; 128]) -> Result<&'a str, i64> {
+    let mut path = [0u8; 128];
+    let n = match unsafe { read_cstr(f.x[11], &mut path) } { Ok(n) => n, Err(e) => return Err(e) };
+    if n == 0 {
+        return Err(EFAULT);
+    }
+    if path[0] != b'/' && f.x[10] as i32 != -100 {
+        return Err(ENOSYS);
+    }
+    let p = core::str::from_utf8(&path[..n]).unwrap_or("");
+    resolve_user_path(p, abspath).ok_or(ENAMETOOLONG)
+}
+
+/// `fchmod(fd, mode)`。
+fn sys_fchmod(f: &mut TrapFrame) -> i64 {
+    let fd = f.x[10] as i32;
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return ENOSYS;
+    }
+    vfs::chmod_fd(fd, (f.x[11] & 0o7777) as u16) as i64
+}
+
+/// `fchmodat(dirfd, path, mode, flags)`：仅支持绝对路径 / AT_FDCWD，跟随符号链接。
+fn sys_fchmodat(f: &mut TrapFrame) -> i64 {
+    let mut abspath = [0u8; 128];
+    let s = match user_abs_path(f, &mut abspath) { Ok(s) => s, Err(e) => return e };
+    vfs::chmod_path(s, (f.x[12] & 0o7777) as u16) as i64
+}
+
+/// Linux 以 (uid_t)-1 表示“不修改”。
+fn id_arg(v: u64) -> Option<u32> {
+    let v = v as u32;
+    if v == u32::MAX { None } else { Some(v) }
+}
+
+/// `fchown(fd, owner, group)`。
+fn sys_fchown(f: &mut TrapFrame) -> i64 {
+    let fd = f.x[10] as i32;
+    if crate::kos_vfs::is_posix_fd(fd) {
+        return ENOSYS;
+    }
+    vfs::chown_fd(fd, id_arg(f.x[11]), id_arg(f.x[12])) as i64
+}
+
+/// `fchownat(dirfd, path, owner, group, flags)`：仅支持绝对路径 / AT_FDCWD，跟随符号链接。
+fn sys_fchownat(f: &mut TrapFrame) -> i64 {
+    let mut abspath = [0u8; 128];
+    let s = match user_abs_path(f, &mut abspath) { Ok(s) => s, Err(e) => return e };
+    vfs::chown_path(s, id_arg(f.x[12]), id_arg(f.x[13])) as i64
+}
+
 fn sys_fstat(f: &mut TrapFrame) -> i64 {
     let fd = f.x[10] as i32;
     let stat_ptr = f.x[11];
     match vfs::fstat(fd) {
         Some((t, size)) => {
-            if !unsafe { write_stat(stat_ptr, t, size) } {
+            if !unsafe { write_stat(stat_ptr, t, size, vfs::owner_of_fd(fd)) } {
                 return EFAULT;
             }
             0
@@ -2461,6 +2525,7 @@ fn sys_execve(f: &mut TrapFrame) -> i64 {
     let envp_ptr = f.x[12];
 
     let mut exec_path = [0u8; 128];
+    let mut exec_absolute_path = [0u8; 128];
     let mut exec_argv: [[u8; EXEC_STR_LEN]; MAX_EXEC_ARGS] =
         [[0; EXEC_STR_LEN]; MAX_EXEC_ARGS];
     let mut exec_envp: [[u8; EXEC_STR_LEN]; MAX_EXEC_ARGS] =
@@ -2471,7 +2536,8 @@ fn sys_execve(f: &mut TrapFrame) -> i64 {
         if path_len == 0 {
             return EFAULT;
         }
-        let path = core::str::from_utf8(&exec_path[..path_len]).unwrap_or("");
+        let path = match core::str::from_utf8(&exec_path[..path_len]) { Ok(path) => path, Err(_) => return EINVAL };
+        let Some(path) = resolve_user_path(path, &mut exec_absolute_path) else { return ENAMETOOLONG; };
 
         let argc = match read_str_array(argv_ptr, &mut exec_argv) { Ok(n) => n, Err(e) => return e };
         let envc = match read_str_array(envp_ptr, &mut exec_envp) { Ok(n) => n, Err(e) => return e };
@@ -2487,7 +2553,18 @@ fn sys_execve(f: &mut TrapFrame) -> i64 {
             envp[i] = core::str::from_utf8(&exec_envp[i][..l]).unwrap_or("");
         }
 
-        elf::execve(path, &argv[..argc], &envp[..envc], f) as i64
+        let r = elf::execve(path, &argv[..argc], &envp[..envc], f) as i64;
+        if r >= 0 {
+            // 新映像已安装：关闭所有带 FD_CLOEXEC 的描述符（fd 表随进程保留）。
+            let mut mask = process::take_cloexec_mask();
+            while mask != 0 {
+                let fd = mask.trailing_zeros() as i32;
+                mask &= mask - 1;
+                sys_close_raw(fd);
+            }
+            crate::kos_vfs::close_cloexec_fds();
+        }
+        r
     }
 }
 
@@ -2969,7 +3046,12 @@ fn poll_wait(deadline: Option<u64>) -> bool {
 fn sys_poll_family(f: &mut TrapFrame, tmo_reg: usize) -> i64 {
     let nfds = f.x[10] as usize;
     if nfds > 1024 { return EINVAL; }
-    if f.x[15] != 0 { return ENOSYS; }
+    if f.x[15] != 0 {
+        // libc may pass a sigset descriptor whose mask pointer is NULL.
+        let mut descriptor = [0u8; 16];
+        if unsafe { copy_from_user(f.x[15], &mut descriptor) } != 16 { return EFAULT; }
+        if u64::from_le_bytes(descriptor[..8].try_into().unwrap()) != 0 { return ENOSYS; }
+    }
     let deadline = match poll_deadline(f.x[tmo_reg]) { Ok(v) => v, Err(e) => return e };
     let ptrs = [f.x[11], f.x[12], f.x[13]];
     // fd_set is an array of machine words, even when nfds is small.

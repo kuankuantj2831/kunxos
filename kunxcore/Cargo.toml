@@ -7,9 +7,11 @@ edition = "2021"
 default = ["qemu"]
 qemu = ["kunxhal/qemu"]
 pi4 = ["kunxhal/pi4"]
+# 让内核的 dead_code 告警显现（默认被放行），用于整理清单：见 tools/dead_code_report.sh
+strict-dead-code = []
 
 [dependencies]
-fontdue = "0.9.4"
+kunxfont = { path = "../shared/font" }
 kunxhal = { path = "../kunxhal", default-features = false }
 kunxwireless = { path = "../wireless" }
 kunxsec = { path = "../kunxsec" }

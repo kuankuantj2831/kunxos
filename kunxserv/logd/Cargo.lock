@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "kunxrt"
+version = "0.1.0"
+
+[[package]]
 name = "logd"
 version = "0.1.0"
+dependencies = [
+ "kunxrt",
+]

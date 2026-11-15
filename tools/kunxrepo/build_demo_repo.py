@@ -50,7 +50,7 @@ def find_elf(m, apps_dir):
         with open(TINY_ELF_PATH, "wb") as f:
             f.write(m["_elf_text"].encode() + b"\n")
         return TINY_ELF_PATH
-    return os.path.join(apps_dir, m["name"], "target", "aarch64-unknown-none", "release", m["name"])
+    return os.path.join(apps_dir, m["name"], "target", "riscv64gc-unknown-none-elf", "release", m["name"])
 
 
 def corrupt_signature(pkg_path):

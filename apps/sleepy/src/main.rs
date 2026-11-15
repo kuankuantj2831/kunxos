@@ -4,7 +4,7 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 use core::panic::PanicInfo;
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
@@ -33,19 +33,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     0
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

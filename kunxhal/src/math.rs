@@ -1,6 +1,6 @@
 //! 极简 f32 数学库（no_std 纯实现，不依赖 libm）。
 //!
-//! `aarch64-unknown-none` 目标下 `core` 不提供 `sqrt/sin/cos/atan2/asin`
+//! `riscv64gc-unknown-none-elf` 目标下 `core` 不提供 `sqrt/sin/cos/atan2/asin`
 //! （这些在 `std` 里由 libm 提供），而传感器融合（Mahony）、姿态角换算、
 //! 模拟传感器旋转、WGS84 距离计算都需要它们。这里用纯 Rust 实现：
 //!
@@ -19,7 +19,7 @@ pub fn abs(x: f32) -> f32 {
     if x < 0.0 { -x } else { x }
 }
 
-/// 向下取整（`aarch64-unknown-none` 的 `core` 不提供 `f32::floor`）。
+/// 向下取整（`riscv64gc-unknown-none-elf` 的 `core` 不提供 `f32::floor`）。
 pub fn floor(x: f32) -> f32 {
     let t = x as i64 as f32;
     if t <= x { t } else { t - 1.0 }

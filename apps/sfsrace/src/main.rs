@@ -17,7 +17,6 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 // ==================== 系统调用号（AArch64 asm-generic） ====================
@@ -54,70 +53,15 @@ const PAYLOAD: usize = 3 * 4096;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall5;
 
 // ==================== 基础 I/O ====================
 
@@ -323,7 +267,7 @@ fn fsync(fd: i64) -> i64 {
 }
 
 fn fork() -> i64 {
-    unsafe { syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as i64 }
+    unsafe { kunxrt::process::fork() as i64 }
 }
 
 fn wait4(pid: i64, status: &mut i32) -> i64 {
@@ -1096,19 +1040,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     }
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

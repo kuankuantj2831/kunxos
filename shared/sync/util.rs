@@ -1,7 +1,7 @@
 //! KunxOS 同步栈通用工具：无堆、core-only 字节处理。
 //!
 //! 该模块被两类 crate 经 `#[path]` 引入：
-//!   - 应用（no_std / aarch64-unknown-none）：日历、通讯录
+//!   - 应用（no_std / riscv64gc-unknown-none-elf）：日历、通讯录
 //!   - 宿主测试 crate（std）：单元 / 集成测试
 //! 因此本文件只用 `core`，不触碰任何平台 API；文件系统与网络传输
 //! 均由调用方注入（见 fs.rs / http.rs 的 trait）。
@@ -208,7 +208,14 @@ pub fn parse_i64(b: &[u8]) -> Option<i64> {
 /// FNV-1a 32 位哈希（与内核 / 云服务的既有实现一致，用于
 /// 稳定 ID 派生、密钥混淆与轻量指纹，**非密码学安全**）。
 pub fn fnv1a(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
+    fnv1a_update(FNV1A_BASIS, data)
+}
+
+/// FNV-1a 初始值。
+pub const FNV1A_BASIS: u32 = 0x811c_9dc5;
+
+/// 增量 FNV-1a：`fnv1a(a ++ b) == fnv1a_update(fnv1a(a), b)`。
+pub fn fnv1a_update(mut h: u32, data: &[u8]) -> u32 {
     for &b in data {
         h ^= b as u32;
         h = h.wrapping_mul(0x0100_0193);

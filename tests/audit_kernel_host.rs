@@ -145,6 +145,8 @@ fn pselect_handles_writefds_and_original_requests() {
 fn pselect_zero_timeout_reads_a4() {
     let mut f=frame(); let t=[0i64,0]; f.x[14]=t.as_ptr() as u64;
     assert_eq!(sys_poll_family(&mut f,14),0); assert_eq!(timer::now_us(),0);
+    let descriptor=[0u64,8]; f.x[15]=descriptor.as_ptr() as u64;
+    assert_eq!(sys_poll_family(&mut f,14),0);
 }
 #[test]
 fn mprotect_none_validates_range() {

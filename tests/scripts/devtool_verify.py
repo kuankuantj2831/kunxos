@@ -4,6 +4,7 @@
 用法: python3 tests/scripts/devtool_verify.py [--timeout N] [--port P]
 通过 QEMU 串口 TCP 交互，验证 shell 工具 / crash / perf / log。
 """
+import argparse
 import socket
 import sys
 import time
@@ -49,7 +50,11 @@ def check(name, out, *needles):
     return ok
 
 def main():
-    s = connect(PORT)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--timeout", type=int, default=30)
+    args = parser.parse_args()
+    s = connect(args.port, tries=max(1, args.timeout * 2))
     boot = drain(s, 3.0).decode("utf-8", "replace")
     print("=== boot output (tail) ===")
     print(boot[-2000:])
@@ -123,6 +128,7 @@ def main():
         print(("PASS" if ok else "FAIL") + " | " + name)
     print("%d/%d passed" % (sum(1 for _, ok in results if ok), len(results)))
     s.close()
+    return 0 if all(ok for _, ok in results) else 1
 
 def first_tombstone(out):
     import re
@@ -130,4 +136,4 @@ def first_tombstone(out):
     return m.group(0) if m else ""
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

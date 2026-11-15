@@ -17,8 +17,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 
 #[path = "../../../shared/app_kit.rs"]
 mod kit;
@@ -262,36 +260,9 @@ static mut OP_NAME_LEN: usize = 0;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall5;
 
 // ==================== 路径工具 ====================
 
@@ -813,7 +784,7 @@ fn child_run_move() -> usize {
 
 fn fork_child(f: fn() -> usize) -> i32 {
     unsafe {
-        let pid = syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as isize;
+        let pid = kunxrt::process::fork() as isize;
         if pid == 0 {
             let _ = f();
             syscall1(SYS_EXIT, 0);
@@ -939,7 +910,7 @@ fn open_file(full: &[u8], name: &[u8]) {
                 argv[0] = a0.as_ptr() as usize;
                 argv[1] = a1.as_ptr() as usize;
                 argv[2] = 0;
-                let pid = syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as i32;
+                let pid = kunxrt::process::fork() as i32;
                 if pid == 0 {
                     syscall3(SYS_EXECVE, a0.as_ptr() as usize, argv.as_ptr() as usize, 0);
                     syscall1(SYS_EXIT, 127);
@@ -2629,41 +2600,6 @@ fn ui_mode_back(nav: NavAction) -> bool {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: files @ ");
-        if let Some(loc) = info.location() {
-            let f = loc.file().as_bytes();
-            let fl = f.len().min(48);
-            write_fd(2, &f[f.len() - fl..]);
-            write_fd(2, b":");
-            let mut nb = [0u8; 8];
-            let mut i = nb.len();
-            let mut v = loc.line() as u64;
-            while v > 0 {
-                i -= 1;
-                nb[i] = b'0' + (v % 10) as u8;
-                v /= 10;
-            }
-            write_fd(2, &nb[i..]);
-        }
-        write_fd(2, b"\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("files");

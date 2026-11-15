@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "kunxhal",
  "kunxjpeg",
+ "kunxrt",
 ]
 
 [[package]]
@@ -19,6 +20,10 @@ dependencies = [
 
 [[package]]
 name = "kunxjpeg"
+version = "0.1.0"
+
+[[package]]
+name = "kunxrt"
 version = "0.1.0"
 
 [[package]]

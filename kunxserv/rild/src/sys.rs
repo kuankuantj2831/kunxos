@@ -1,7 +1,6 @@
 // rild 系统调用封装（EL0 用户态，裸 syscall、no_std、无堆）。
 // AArch64 asm-generic 系统调用编号，与其它 KunxOS 服务一致。
 
-use core::arch::asm;
 
 pub const SYS_READ: usize = 63;
 pub const SYS_WRITE: usize = 64;
@@ -30,70 +29,15 @@ pub const O_APPEND: usize = 0x400;
 pub const SEEK_SET: usize = 0;
 pub const SEEK_END: usize = 2;
 
-#[inline(always)]
-pub unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+pub use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-pub unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+pub use kunxrt::syscall::syscall5;
 
 pub unsafe fn write_fd(fd: usize, buf: &[u8]) -> usize {
     syscall3(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len())

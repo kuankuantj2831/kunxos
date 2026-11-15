@@ -50,6 +50,16 @@ mod smp {
     }
 }
 
+mod process {
+    /// 宿主测试桩：以 root 身份运行（fs_create 不盖归属章，行为同改动前）。
+    pub fn current_uid() -> u32 {
+        0
+    }
+    pub fn current_gid() -> u32 {
+        0
+    }
+}
+
 mod timer {
     pub fn now_us() -> u64 {
         0

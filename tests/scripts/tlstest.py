@@ -4,62 +4,35 @@
 用法：python3 tests/scripts/tlstest.py [host] [logfile]
 断言串口出现 "[tls-selftest] PASS"。
 """
-import subprocess, sys, time, os, tempfile, threading
+from qemu_test import Guest, kernel_path, temp_path, qemu_command
+import sys, time, os, tempfile
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "www.baidu.com"
-LOGFILE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/kx_tls.log"
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-DISK = os.path.abspath(os.environ.get("DISK", "disk.img"))
+LOGFILE = sys.argv[2] if len(sys.argv) > 2 else temp_path("kx_tls.log")
+KERNEL = kernel_path()
+DISK = os.environ.get("DISK")
 TOP = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(TOP)
 
 WORKDIR = tempfile.mkdtemp(prefix="kxt_")
-PIPE = os.path.join(WORKDIR, "kx")
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-cmd = ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a72", "-m", "512M",
+cmd = qemu_command() + [
        "-kernel", KERNEL,
-       "-drive", f"file={DISK},format=raw,if=none,id=disk0",
-       "-device", "virtio-blk-device,drive=disk0",
-       "-serial", "pipe:" + PIPE, "-no-reboot", "-display", "none",
+       "-serial", "stdio", "-no-reboot", "-display", "none", "-device", "ramfb",
        "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
        "-device", "virtio-rng-device",
        "-append", "shell"]
 
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
-
-
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data)
-        logf.write(data)
-        logf.flush()
-
-
-threading.Thread(target=reader, daemon=True).start()
-infd = None
+if DISK:
+    cmd += ["-drive", f"file={os.path.abspath(DISK)},format=raw,if=none,id=disk0,snapshot=on",
+            "-device", "virtio-blk-device,drive=disk0"]
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 
 
 def send(s):
-    global infd
-    if infd is None:
-        infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, s.encode())
+    guest.send(s.encode())
 
 
 def wait_for(needle, timeout, from_idx=0):
@@ -79,11 +52,13 @@ rc = 1
 try:
     boot = wait_for("kunxos$", 180)
     print(f"[driver] shell 就绪 ({boot >= 0})", flush=True)
+    if boot < 0:
+        raise RuntimeError("RISC-V guest shell did not boot")
     time.sleep(2)
     send(f"run /bin/tlstest {HOST}\n")
     res = wait_for("[tls-selftest]", 420, boot)
     if res < 0:
-        print("[driver] 未看到 [tls-selftest] 输出")
+        raise RuntimeError("No TLS selftest result; inspect " + LOGFILE)
     deadline = time.time() + 60
     while time.time() < deadline:
         text = log.decode("utf-8", "replace")
@@ -95,14 +70,7 @@ try:
             break
         time.sleep(0.5)
 finally:
-    stop = True
-    time.sleep(0.3)
-    try:
-        p.terminate()
-        p.wait(5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()
 
 print("TLS GUEST SELFTEST:", "PASS" if rc == 0 else "FAIL")
 sys.exit(rc)

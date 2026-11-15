@@ -8,7 +8,7 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 use core::panic::PanicInfo;
 
 const SYS_WRITE: usize = 64;
@@ -24,18 +24,9 @@ const O_RDONLY: usize = 0;
 const SEEK_SET: usize = 0;
 const SEEK_END: usize = 2;
 
-unsafe fn sc3(n: usize, a: usize, b: usize, c: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, in("a0") a, in("a1") b, in("a2") c,
-         lateout("a0") r, options(nostack));
-    r
-}
+use kunxrt::syscall::syscall3 as sc3;
 
-unsafe fn sc1(n: usize, a: usize) -> usize {
-    let r: usize;
-    asm!("ecall", in("a7") n, in("a0") a, lateout("a0") r, options(nostack));
-    r
-}
+use kunxrt::syscall::syscall1 as sc1;
 
 fn print(s: &str) {
     unsafe { sc3(SYS_WRITE, 1, s.as_ptr() as usize, s.len()) };
@@ -156,19 +147,7 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
     0
 }
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

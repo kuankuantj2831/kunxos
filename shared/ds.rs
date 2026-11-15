@@ -2,7 +2,7 @@
 //!
 //! 各应用以 `#[path = "../../../shared/ds.rs"] mod ds;` 引入，再 `use ds::*;`
 //! 使用统一设计令牌与组件：
-//! - 页面背景：#F2F2F7（浅色）/ #000000（深色），由 /data/oobe/theme 决定
+//! - 页面背景：星光珍珠白（应用通过公共背景绘制入口渲染）
 //! - 导航栏：56px，背景 #FFFFFF / #1C1C1E，底部 1px 分割线 #E5E5EA / #38383A
 //! - 列表单元格：56px 高，左侧留白 16px，右侧箭头
 //! - 图标：统一 24x24 系统图标库（`Icon` 枚举 + 几何绘制）
@@ -27,7 +27,7 @@ pub const EMPTY_ICON_SZ: i32 = 64;
 /// 空状态说明文字字号（px）。
 pub const EMPTY_TEXT_PX: f32 = 17.0;
 
-pub const C_BG_LIGHT: u32 = 0x00_F2_F2_F7;
+pub const C_BG_LIGHT: u32 = 0x00_F2_F5_FF;
 pub const C_BG_DARK: u32 = 0x00_00_00_00;
 pub const C_NAV_LIGHT: u32 = 0x00_FF_FF_FF;
 pub const C_NAV_DARK: u32 = 0x00_1C_1C_1E;
@@ -38,7 +38,7 @@ pub const C_TEXT_DARK: u32 = 0x00_FF_FF_FF;
 /// 次要文字 / 空状态文字（深浅色通用）。
 pub const C_DIM: u32 = 0x00_8E_8E_93;
 /// 系统强调色。
-pub const C_ACCENT: u32 = 0x00_00_B9_6B;
+pub const C_ACCENT: u32 = glass::starlight::ACCENT;
 
 static mut DS_DARK: bool = false;
 

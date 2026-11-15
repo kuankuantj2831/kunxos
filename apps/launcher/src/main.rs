@@ -19,8 +19,6 @@
 #![allow(static_mut_refs)]
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
-use core::panic::PanicInfo;
 #[path = "../../../shared/ttf_text.rs"]
 mod ttf_text;
 
@@ -166,6 +164,22 @@ fn display_w() -> usize { unsafe { FB_W } }
 fn display_h() -> usize { unsafe { FB_H } }
 fn screen_pixels() -> usize { display_w() * display_h() }
 
+// Cold start (including init's restart after a crash) must size the same buffers
+// as a live modeset before any drawing or snapshot can index them.
+fn resize_buffers() {
+    unsafe {
+        BACK_BUF.resize_len(screen_pixels());
+        BG_BUF.resize_len(screen_pixels());
+        FOLDER_DIM_BUF.resize_len(screen_pixels());
+        REC_BG_BUF.resize_len(screen_pixels());
+        GLASS_SB_BUF.resize_len(status_pixels());
+        GLASS_DOCK_BUF.resize_len(dock_pixels());
+        app_launch::resize_buffers();
+        app_life::resize_buffers();
+        sys_nav::set_viewport(FB_W as i32, FB_H as i32);
+    }
+}
+
 fn refresh_geometry() {
     unsafe {
         if FB_FD < 0 { return; }
@@ -180,15 +194,7 @@ fn refresh_geometry() {
         FB_W = info.width as usize;
         FB_H = info.height as usize;
         FB_STRIDE_PX = info.stride_bytes as usize / 4;
-        BACK_BUF.resize_len(screen_pixels());
-        BG_BUF.resize_len(screen_pixels());
-        FOLDER_DIM_BUF.resize_len(screen_pixels());
-        REC_BG_BUF.resize_len(screen_pixels());
-        GLASS_SB_BUF.resize_len(status_pixels());
-        GLASS_DOCK_BUF.resize_len(dock_pixels());
-        app_launch::resize_buffers();
-        app_life::resize_buffers();
-        sys_nav::set_viewport(FB_W as i32, FB_H as i32);
+        resize_buffers();
         GRID_COLS = (((FB_W as i32 - 32) / CELL_W) - 2).clamp(4, 8);
         BG_KEY = (u32::MAX, u32::MAX, u32::MAX);
         GLASS_SB_KEY = (BG_KEY, false);
@@ -261,7 +267,7 @@ const COLOR_DIVIDER: u32 = 0x00_E5_E9_F0;
 const COLOR_ICON_BORDER: u32 = 0x00_FF_FF_FF;
 const COLOR_PANEL: u32 = 0x00_FF_FF_FF;
 const COLOR_PANEL_ROW: u32 = 0x00_F7_F8_FA;
-const COLOR_ACCENT: u32 = 0x00_00_B9_6B;
+const COLOR_ACCENT: u32 = 0x00_5B_63_D9;
 const COLOR_WARN: u32 = 0x00_E7_4C_3C;
 const COLOR_DIM: u32 = 0x00_6B_72_80;
 const COLOR_FOLDER: u32 = 0x00_E8_A0_2D;
@@ -1154,7 +1160,7 @@ pub fn take_launch_anchor() -> Option<(i32, i32)> {
 }
 
 static mut THEME_DARK: bool = false;
-static mut WALLPAPER: usize = 2;
+static mut WALLPAPER: usize = 0;
 /// 小组件显示位掩码（bit0 时钟 bit1 天气 bit2 日历 bit3 相册 bit4 电池）。
 static mut WGT_MASK: u32 = 0x1F;
 static mut LANG_ZH: bool = true;
@@ -1370,95 +1376,17 @@ static mut LOCK_MIN_T0: u64 = u64::MAX;
 
 // ==================== 系统调用封装 ====================
 
-#[inline(always)]
-unsafe fn syscall1(n: usize, a1: usize) -> usize {
-    let ret: usize;
-    asm!("ecall", in("a7") n, inlateout("a0") a1 => ret, options(nostack));
-    ret
-}
+use kunxrt::syscall::syscall1;
 
-#[inline(always)]
-unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall2;
 
-#[inline(always)]
-unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall3;
 
-#[inline(always)]
-unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall4;
 
-#[inline(always)]
-unsafe fn syscall5(n: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall5;
 
-#[inline(always)]
-unsafe fn syscall6(
-    n: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-) -> usize {
-    let ret: usize;
-    asm!(
-        "ecall",
-        in("a7") n,
-        inlateout("a0") a1 => ret,
-        in("a1") a2,
-        in("a2") a3,
-        in("a3") a4,
-        in("a4") a5,
-        in("a5") a6,
-        options(nostack)
-    );
-    ret
-}
+use kunxrt::syscall::syscall6;
 
 // ==================== 基础 I/O ====================
 
@@ -2412,10 +2340,32 @@ fn dump_layout() {
                     print(" cy=");
                     print_dec((y + w / 2) as u32);
                     print("\n");
+                } else if let ItemKind::Folder = PLACED[i].kind {
+                    let (x, y, w, h) = item_rect(&PLACED[i], GRID_COLS);
+                    print("[launcher] folder tools page=");
+                    print_dec(p as u32);
+                    print(" cx=");
+                    print_dec((x + w / 2) as u32);
+                    print(" cy=");
+                    print_dec((y + h / 2) as u32);
+                    print("\n");
                 }
             }
         }
         layout_current();
+        // Use the same geometry as folder_hit so host tests follow module filtering.
+        let (px, py, pw, _) = folder_panel_rect();
+        let cell = FOLDER_ICON + 16;
+        let ox = px + (pw - (3 * cell - 16)) / 2;
+        for i in 0..FOLDER_COUNT {
+            print("[launcher] folder-app ");
+            print(APPS[FOLDER_APPS[i]].key);
+            print(" cx=");
+            print_dec((ox + (i % 3) as i32 * cell + FOLDER_ICON / 2) as u32);
+            print(" cy=");
+            print_dec((py + 88 + (i / 3) as i32 * cell + FOLDER_ICON / 2) as u32);
+            print("\n");
+        }
         for i in 0..DOCK_COUNT {
             let (dx, dy) = dock_rect(i);
             let app = &APPS[DOCK_APPS[i]];
@@ -2491,7 +2441,7 @@ fn fb_init() -> bool {
             // 合法性钳制：异常分辨率（0 / 超大）会让下方 FB_W*FB_H*4 在
             // release 下回绕成 0 → mmap 收到 len=0 恒 EINVAL（此前观测到的
             // 偶发 EINVAL 的可疑路径）。非法值一律保留默认 540x960。
-            let sane = w > 0 && h > 0 && w <= 4096 && h <= 4096;
+            let sane = w > 0 && h > 0 && w <= display::MAX_WIDTH && h <= display::MAX_HEIGHT;
             if sane {
                 FB_W = w;
                 FB_H = h;
@@ -2525,6 +2475,8 @@ fn fb_init() -> bool {
         // 保留 fd：FBIO_PRESENT 提交脏区依赖它（映射建立后页表已指向画布，
         // 关闭 fd 不影响 mmap，但 ioctl 需要有效 fd）。
         FB_FD = fd as isize;
+        resize_buffers();
+        control_center::invalidate_geometry();
         true
     }
 }
@@ -2925,14 +2877,11 @@ fn draw_rect(x: i32, y: i32, w: i32, h: i32, color: u32) {
 /// 壁纸调色板（顶部渐变色、底部渐变色、棋盘强调色），按 (深色, 壁纸序号)。
 fn wallpaper_palette(dark: bool, idx: usize) -> (u32, u32, u32) {
     match (dark, idx) {
-        (false, 0) => (0x00_EF_F6_FF, 0x00_BF_DB_FE, 0x00_60_A5_FA),
-        (false, 1) => (0x00_F0_FD_FA, 0x00_A7_F3_D0, 0x00_14_B8_A6),
-        (false, 2) => (0x00_FF_F7_ED, 0x00_FE_D7_AA, 0x00_F9_73_16),
-        (false, _) => (0x00_FA_F5_FF, 0x00_E9_D5_FF, 0x00_A8_55_F7),
-        (true, 0) => (0x00_0B_10_20, 0x00_1E_3A_5F, 0x00_25_63_EB),
-        (true, 1) => (0x00_0B_1F_1A, 0x00_13_46_3B, 0x00_0F_76_6E),
-        (true, 2) => (0x00_1A_1A_2E, 0x00_16_21_3E, 0x00_EA_58_0C),
-        (true, _) => (0x00_18_10_2A, 0x00_31_1B_53, 0x00_7E_22_CE),
+        (false, 0) => glass::starlight::LIGHT,
+        (false, 1) => (0x00EDF8FF, 0x00BCDCE8, 0x008ABBDD),
+        (false, 2) => (0x00F7F1FF, 0x00D5CAEB, 0x00ADA0DE),
+        (false, _) => (0x00F2F7FF, 0x00C9DDEB, 0x0091B5D3),
+        (true, _) => (0x000D142B, 0x00283152, 0x006B69B6),
     }
 }
 
@@ -3006,28 +2955,8 @@ fn draw_background_rect(x0: i32, y0: i32, rw: u32, rh: u32) {
             }
             return;
         }
-        let (top, bottom, accent) = key;
-        for y in ya..yb {
-            let t = y as u32;
-            let inv = display_h() as u32 - t;
-            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / display_h() as u32;
-            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / display_h() as u32;
-            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / display_h() as u32;
-            let row = (r << 16) | (g << 8) | b;
-            for x in xa..xb {
-                let wave = if ((x as u32 / 72 + t / 96) & 1) == 0 {
-                    accent
-                } else {
-                    row
-                };
-                let color = if x as u32 % 72 < 2 && t > 180 {
-                    blend(row, wave, 26)
-                } else {
-                    row
-                };
-                put_pixel(x, y, color);
-            }
-        }
+        glass::starlight::paint(&mut BACK_BUF, display_w(), display_h(),
+            (xa, ya, xb - xa, yb - ya), key);
     }
 }
 
@@ -3049,32 +2978,8 @@ fn draw_background() {
             BACK_BUF[..n].copy_from_slice(&BG_BUF);
             return;
         }
-        let (top, bottom, accent) = key;
-        for y in 0..display_h() {
-            let t = y as u32;
-            let inv = display_h() as u32 - t;
-            let r = (((top >> 16) & 0xFF) * inv + ((bottom >> 16) & 0xFF) * t) / display_h() as u32;
-            let g = (((top >> 8) & 0xFF) * inv + ((bottom >> 8) & 0xFF) * t) / display_h() as u32;
-            let b = ((top & 0xFF) * inv + (bottom & 0xFF) * t) / display_h() as u32;
-            let row = (r << 16) | (g << 8) | b;
-            let base = y * display_w();
-            for x in 0..display_w() {
-                let wave = if ((x / 72 + y / 96) & 1) == 0 {
-                    accent
-                } else {
-                    row
-                };
-                let color = if x % 72 < 2 && y > 180 {
-                    blend(row, wave, 26)
-                } else {
-                    row
-                };
-                // 直接写缓存（等价 put_pixel 的不透明路径：颜色无逐像素
-                // alpha、PIX_ALPHA=255；本函数只在桌面渲染路径调用，瓦片
-                // 模式不会与之并发）。
-                BG_BUF[base + x] = color;
-            }
-        }
+        glass::starlight::paint(&mut BG_BUF, display_w(), display_h(),
+            (0, 0, display_w() as i32, display_h() as i32), key);
         BG_KEY = key;
         BACK_BUF[..n].copy_from_slice(&BG_BUF);
     }
@@ -5012,7 +4917,7 @@ impl GlassTarget for LauncherGlass {
     }
 }
 
-/// 毛玻璃面板（浅色玻璃，THEME_DARK = false 桌面风格）。
+/// 星光磨砂面板，共享背景模糊与柔和边缘高光。
 fn draw_glass(x: i32, y: i32, w: i32, h: i32, r: i32) {
     glass_rect(
         &mut LauncherGlass,
@@ -6529,32 +6434,19 @@ fn render_lock_screen() {
 /// 渐变按行预计算后整行直写，锁屏首帧显著更快。
 /// 转场时仅绘制层覆盖的屏幕行（层上移出屏的部分露出下方桌面）。
 fn draw_lock_background(off: i32) {
+    let key = wallpaper_colors();
     unsafe {
-        let (top_r, top_g, top_b, bot_r, bot_g, bot_b) = if THEME_DARK {
-            (0x10u32, 0x15u32, 0x27u32, 0x1Bu32, 0x24u32, 0x36u32)
-        } else {
-            (0xF7u32, 0xFAu32, 0xFDu32, 0xE7u32, 0xEFu32, 0xF7u32)
-        };
-        // 层上移 |off| 时：屏幕可见行 0..(H+off) 对应渐变行 (-off)..H。
-        let end = (display_h() as i32 + off).min(display_h() as i32);
-        // off > 0（跟手上滑后往回下拖）：层整体下移，顶部 y<off 的行不再属于
-        // 锁屏层（露出下方桌面）——跳过这些行；否则 gy<0 经 as u32 回绕成
-        // ~4×10⁹，乘 255 再回绕，渐变顶行变成垃圾色。
-        let start = if off > 0 { off } else { 0 };
-        let mut y = start;
-        while y < end {
-            let gy = y - off;
-            let t = (gy as u32 * 255 / display_h() as u32).min(255);
-            let inv = 255 - t;
-            let r = (top_r * inv + bot_r * t) / 255;
-            let g = (top_g * inv + bot_g * t) / 255;
-            let b = (top_b * inv + bot_b * t) / 255;
-            let row = (r << 16) | (g << 8) | b;
-            let iy = y as usize * display_w();
-            for x in 0..display_w() {
-                BACK_BUF[iy + x] = row;
-            }
-            y += 1;
+        if BG_KEY != key {
+            glass::starlight::paint(&mut BG_BUF, display_w(), display_h(),
+                (0, 0, display_w() as i32, display_h() as i32), key);
+            BG_KEY = key;
+        }
+        let start = off.max(0).min(display_h() as i32);
+        let end = (display_h() as i32 + off).clamp(0, display_h() as i32);
+        for y in start..end {
+            let src = (y - off) as usize * display_w();
+            let dst = y as usize * display_w();
+            BACK_BUF[dst..dst + display_w()].copy_from_slice(&BG_BUF[src..src + display_w()]);
         }
     }
 }
@@ -7492,7 +7384,7 @@ fn count_pixels() -> usize {
 
 /// fork：经 clone(SIGCHLD) 实现；成功父进程返回子 pid，子进程返回 0，失败返回负 errno。
 unsafe fn fork() -> isize {
-    syscall5(SYS_CLONE, SIGCHLD, 0, 0, 0, 0) as isize
+    kunxrt::process::fork() as isize
 }
 
 /// execve：替换当前进程映像；失败返回负 errno。
@@ -9391,39 +9283,6 @@ pub extern "C" fn k_main(_argc: usize, _argv: *const usize) -> usize {
 
 // ==================== 入口 ====================
 
-global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    ".type _start, %function",
-    "_start:",
-    "    mv a1, sp",
-    "    ld a0, 0(a1)",
-    "    addi a1, a1, 8",
-    "    call k_main",
-    "    li a7, 93",
-    "    ecall",
-    "    j .",
-);
+kunxrt::entry!();
 
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        write_fd(2, b"PANIC: launcher ");
-        if let Some(loc) = info.location() {
-            write_fd(2, loc.file().as_bytes());
-            write_fd(2, b":");
-            let mut buf = [0u8; 12];
-            let mut i = buf.len();
-            let mut n = loc.line() as u64;
-            while n > 0 {
-                i -= 1;
-                buf[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-            write_fd(2, &buf[i..]);
-        }
-        write_fd(2, b"\n");
-        syscall1(SYS_EXIT, 1);
-    }
-    loop {}
-}
+kunxrt::panic_handler!("launcher");

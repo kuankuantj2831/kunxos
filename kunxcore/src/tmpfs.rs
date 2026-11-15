@@ -14,8 +14,10 @@ pub const TMPFS_MAJOR: u32 = 3;
 ///
 /// 必须是 SFS 布局可用的最小卷：JLOG_MIN=64 + inode 表 16 + 位图 1 + 前导
 /// 元数据 3 = 84 块，64 块时 `layout()` 算出 data_start=84 > total=64，mkfs
-/// 直接拒绝（tmpfs 无法挂载）。取 160 留出 76 个数据块的余量（640KB）。
-pub const TMPFS_BLOCKS: usize = 160;
+/// 直接拒绝（tmpfs 无法挂载）。取 320 留出约 236 个数据块（约 944KB）：
+/// camerad 预览环形缓冲 6 帧 × ~115KB ≈ 690KB 需要放得下（原 160 块仅 ~300KB，
+/// 帧文件会被截断/为空）。
+pub const TMPFS_BLOCKS: usize = 320;
 
 /// 初始化 tmpfs：创建内存块设备 → mkfs → 挂载到 /tmp。
 /// 返回 0 成功；失败 -1（不致命，/tmp 退化为 rootfs 目录）。

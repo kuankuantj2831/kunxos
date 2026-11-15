@@ -9,6 +9,7 @@
 退出码 0 = 完整跑到桌面。
 """
 import os
+from pathlib import Path
 import re
 import socket
 import struct
@@ -18,12 +19,9 @@ import tempfile
 import threading
 import time
 
-QEMU = os.environ.get(
-    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
-BIOS = os.environ.get(
-    "BIOS", os.path.expanduser(
-        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests/scripts"))
+from qemu_test import kernel_path, qemu_command, launcher_layout
+KERNEL = kernel_path()
 
 PREFIX = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") \
     else "/tmp/kunxos-boot"
@@ -41,8 +39,7 @@ MON = os.path.join(WORKDIR, "mon")
 os.mkfifo(PIPE + ".in")
 os.mkfifo(PIPE + ".out")
 
-cmd = [
-    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
+cmd = qemu_command() + [
     "-kernel", KERNEL,
     "-serial", "pipe:" + PIPE,
     "-monitor", "unix:" + MON + ",server,nowait",
@@ -174,7 +171,7 @@ def main():
     try:
         # 到桌面：可能直接就绪（旧镜像已走完 OOBE），否则 OOBE 快进——
         # 普通步点「下一步」(465,925)；密码/胁迫 PIN 步拒绝空输入，停手
-        # 35s 等「30 秒无输入自动下一步」（与 app_open_shots.py 同款）。
+        # 35s 等「30 秒无输入自动下一步」（旧测试镜像的行为）。
         if not wait_for("[launcher] 桌面就绪", 30):
             # 连续风暴快进（r053，r052 定证变现）：r47 窗口化点按的
             # 「52 发 8 达」是时序伪影——连续风暴实测 40/40 全达且卡片页
@@ -222,13 +219,19 @@ def main():
                     time.sleep(1.0)
         # 桌面交互 t2f 采集（r44）：点应用图标 → 等就绪标记（超时 25s 放弃
         # 继续下一个），共产出多段 [perf] t2f 样本（内核 perf.rs 已按帧记录
-        # 触控→上屏延迟）。坐标取 app_open_shots.py APPS_DB。
-        # 坐标以实测为准（r54 定证）：APPS_DB 的 calculator(230,182) 在
-        # 当前 21 应用布局实际命中 Clock——旧表过时。三连点改为
-        # clock×2+settings（两处独立坐标均实证可启动）。
-        taps = [("clock", 150, 182, "[clock]"),
-                ("clock2", 230, 182, "[clock]"),
-                ("settings", 418, 872, "[settings]")]
+        # 触控→上屏延迟）。坐标从 launcher 的布局日志读取。
+        tiles, docks, _, _ = launcher_layout(Path(LOG).read_bytes())
+        taps = []
+        for name in ("contacts", "calendar", "settings"):
+            if name in docks:
+                x, y = docks[name]
+            elif name in tiles and tiles[name][0] == 0:
+                _, x, y = tiles[name]
+            else:
+                continue
+            taps.append((name, x, y, "[" + name + "]"))
+        if not taps:
+            raise RuntimeError("No launcher layout available for performance probes")
         import re as _re
         print("[boot-trace] 桌面就绪，开始应用点按采集", flush=True)
         for name, x, y, marker in taps:

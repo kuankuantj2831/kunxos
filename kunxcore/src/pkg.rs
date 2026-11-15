@@ -16,8 +16,8 @@
 //!            签名 signature[32]（覆盖 offset 32 到末尾 32 字节前的全部内容）
 //! ```
 //!
-//! 安装：校验签名 → 把 ELF 写入 `/bin/<name>`、manifest 写入 `/pkg/<name>.mf`、
-//! 资源写入 `/res/<name>/<resname>`。卸载：删除上述文件与资源目录内容。
+//! NOVAPKG1 uses a public checksum and its installation entry is disabled.
+//! Authenticated installation uses /bin/pkg (kunxpkg) with Ed25519 certificates.
 
 use crate::vfs;
 
@@ -31,12 +31,6 @@ const NAME_MAX: usize = 28;
 const MAX_RES: usize = 8;
 /// 资源名单串长度上限。
 const RES_NAME_MAX: usize = 64;
-/// 文件系统单条目录名上限（对应 `fs_simple::MAX_NAME = 27`）。
-///
-/// 包内可以携带更长名字，但写盘时 `fs_create` 会拒绝超长名字，
-/// 若等到写资源阶段才发现，会让 /bin、/pkg 文件半安装残留，这里保持一致。
-const FS_NAME_MAX: usize = 27;
-
 /// 校验包名/资源名：仅允许 `[A-Za-z0-9_-]`，拒绝路径分隔符、`.`、`..` 与 NUL，
 /// 防止 `/bin/../evil` 之类的路径穿越与任意文件写。
 fn valid_name(s: &str) -> bool {
@@ -228,7 +222,7 @@ pub fn verify(data: &[u8], pkg: &Pkg) -> bool {
     expected == &computed[..]
 }
 
-// ==================== 文件写入辅助 ====================
+// ==================== Legacy path helpers (uninstall/list) ====================
 
 
 /// 把 `/bin/name`、`/pkg/name.mf` 等路径拼入 `out`，返回末尾下标。

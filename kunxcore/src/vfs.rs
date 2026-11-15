@@ -665,6 +665,9 @@ fn open_impl(path: &str, flags: u32) -> i32 {
         if typ == T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
             return -1; // 目录不可写
         }
+        if !acl_allows(dev, ino, acl_want_for_open(flags, typ)) {
+            return EACCES;
+        }
         // ★ 先占打开文件表/进程 fd 槽位、再执行 O_TRUNC：若 fd 表或打开
         // 文件表已满，open 会返回 -1，此时不得先截断——否则文件内容已被
         // 销毁而调用方拿到的是失败返回值。
@@ -700,6 +703,9 @@ fn open_impl(path: &str, flags: u32) -> i32 {
     if flags & O_CREAT != 0 {
         match resolve_parent(path) {
             Some((d, pino, name)) => {
+                if !acl_dir_write(d, pino) {
+                    return EACCES;
+                }
                 let new_ino = fsops::fs_create(d, pino, name, T_REG, 0);
                 if new_ino >= 0 {
                     return open_file(d, new_ino as u32, T_REG, 0, flags);
@@ -810,7 +816,13 @@ pub fn write(fd: i32, buf: &[u8]) -> i32 {
             //（O_WRONLY fd 不消费 offset，lseek 返回值不影响信箱语义）。
             let cur = &mut OPEN_FILES[entry.index];
             if cur.used && cur.dev == of.dev && cur.ino == of.ino && cur.typ == of.typ {
-                cur.offset = cur.offset.wrapping_add(n as usize);
+                if append && of.typ == T_REG {
+                    // Linux 语义：O_APPEND 写完后偏移位于文件末尾（而非旧偏移 + n），
+                    // 这样随后的 lseek(SEEK_CUR) / 读取看到的是真实尾部。
+                    cur.offset = fsops::fs_size(of.dev, of.ino) as usize;
+                } else {
+                    cur.offset = cur.offset.wrapping_add(n as usize);
+                }
             }
         }
     }
@@ -856,7 +868,32 @@ pub fn truncate(fd: i32) -> i32 {
     if !of.used || of.typ != T_REG {
         return -1;
     }
+    if of.flags & 3 == O_RDONLY { return -9; } // EBADF: no write access
     fsops::fs_truncate(of.dev, of.ino)
+}
+
+/// File status flags belong to the shared open-file description, not the fd.
+pub fn status_flags(fd: i32) -> Option<u32> {
+    let e = process::get_fd(fd)?;
+    if e.kind != FdKind::File { return None; }
+    let saved = unsafe { irq_save() };
+    let of = unsafe { OPEN_FILES[e.index] };
+    unsafe { irq_restore(saved) };
+    if of.used { Some(of.flags & (3 | O_APPEND | O_NONBLOCK)) } else { None }
+}
+
+pub fn set_status_flags(fd: i32, flags: u32) -> i32 {
+    let Some(e) = process::get_fd(fd) else { return -9 };
+    if e.kind != FdKind::File { return -9; }
+    if flags & !(3 | O_APPEND | O_NONBLOCK) != 0 { return -38; }
+    let saved = unsafe { irq_save() };
+    let of = unsafe { &mut OPEN_FILES[e.index] };
+    let result = if of.used {
+        of.flags = (of.flags & !(O_APPEND | O_NONBLOCK)) | (flags & (O_APPEND | O_NONBLOCK));
+        0
+    } else { -9 };
+    unsafe { irq_restore(saved) };
+    result
 }
 
 /// 移动文件位置，返回新位置；失败 -1。
@@ -894,9 +931,16 @@ pub fn seek(fd: i32, offset: i64, whence: u32) -> i64 {
 /// 删除文件，返回 0；失败 -1。
 pub fn unlink(path: &str) -> i32 {
     let Some((d, pino, name)) = resolve_parent(path) else { return -1 };
+    // 访问控制：目录须可写+搜索；带归属的目标只有所有者/root 可删除。
+    if !acl_dir_write(d, pino) {
+        return EACCES;
+    }
     // 仍被打开的文件不可删除：inode 号被释放后会被 fs_create 复用，旧 fd 将与
     // 新文件别名（H-6 修复的延伸）。拒绝删除（EBUSY 语义）。
     let ino = fsops::fs_lookup(d, pino, name);
+    if ino >= 0 && !acl_owner_or_root(d, ino as u32) {
+        return EACCES;
+    }
     if ino >= 0 {
         let ino = ino as u32;
         if fsops::fs_type(d, ino) != fsops::T_DIR && is_open(d, ino) {
@@ -919,6 +963,14 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
     if od != nd {
         return -18;
     }
+    // 访问控制：两个目录都须可写+搜索；带归属的源文件只有所有者/root 可改名。
+    if !acl_dir_write(od, oi) || !acl_dir_write(nd, ni) {
+        return EACCES;
+    }
+    let src = fsops::fs_lookup(od, oi, on);
+    if src >= 0 && !acl_owner_or_root(od, src as u32) {
+        return EACCES;
+    }
     // 目标仍被打开时拒绝替换（EBUSY 语义，与 unlink 的守护同源）：替换会
     // 回收目标 inode，而打开中的 fd 仍指向该 inode 号——之后 fs_create
     // 复用该号即与新文件别名（H-6 同类缺陷）。
@@ -933,6 +985,8 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
             r = -1;
         } else if is_open(nd, t) {
             r = -16;
+        } else if !acl_owner_or_root(nd, t) {
+            r = EACCES; // 不得替换他人带归属的文件
         }
     }
     if r == 0 {
@@ -945,6 +999,9 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
 /// 创建设备文件（或 FIFO），返回 0；失败 -1。
 pub fn mknod(path: &str, typ: FileType, major: u32, minor: u32) -> i32 {
     let Some((d, pino, name)) = resolve_parent(path) else { return -1 };
+    if !acl_dir_write(d, pino) {
+        return EACCES;
+    }
     let ino = fsops::fs_create(d, pino, name, typ.as_u16(), make_rdev(major, minor));
     if ino < 0 {
         -1
@@ -958,6 +1015,9 @@ pub fn mknod(path: &str, typ: FileType, major: u32, minor: u32) -> i32 {
 /// 目录部分跟随符号链接（可在链接指向的目录下创建）；最后一段已存在则失败。
 pub fn symlink(target: &str, path: &str) -> i32 {
     let Some((d, pino, name)) = resolve_parent(path) else { return -1 };
+    if !acl_dir_write(d, pino) {
+        return EACCES;
+    }
     let ino = fsops::fs_symlink(d, pino, name, target);
     if ino < 0 {
         -1
@@ -994,12 +1054,183 @@ pub fn mkdir(path: &str) -> i32 {
     if fsops::fs_lookup(d, pino, name) >= 0 {
         return -17; // -EEXIST
     }
+    if !acl_dir_write(d, pino) {
+        return EACCES;
+    }
     let ino = fsops::fs_mkdir(d, pino, name);
     if ino < 0 {
         -1
     } else {
         0
     }
+}
+
+
+// ==================== 文件归属与访问检查 ====================
+//
+// 策略（"只拦截有归属的文件"）：
+//   - root（uid 0）不受限；
+//   - 没有归属元数据的 inode（旧镜像文件、root/系统创建的文件、FAT32）按旧行为放行；
+//   - 由非 root 身份创建、或被 chmod/chown 过的 SFS inode 带有 (uid, gid, mode)：
+//     所有者按 owner 位、同组按 group 位、其余按 other 位判断；
+//   - 删除/重命名带归属的文件，调用者须是所有者或 root（类似 sticky 目录）；
+//   - 在带归属的目录里创建/删除/重命名条目，须对该目录有 写+搜索(w+x) 权限。
+// 已知限制：路径遍历不逐级检查目录的 x 位（只在目标文件与直接父目录上执法）；
+// execve 不检查 x 位；FAT32 / tmpfs 不保存归属。
+
+pub const ACL_R: u32 = 4;
+pub const ACL_W: u32 = 2;
+pub const ACL_X: u32 = 1;
+const EACCES: i32 = -13;
+const EPERM: i32 = -1;
+
+/// 当前进程对 (dev, ino) 是否具备 `want`（ACL_R/W/X 位或组合）权限。
+pub fn acl_allows(dev: u32, ino: u32, want: u32) -> bool {
+    let uid = process::current_uid();
+    if uid == 0 {
+        return true;
+    }
+    match fsops::fs_owner(dev, ino) {
+        None => true,
+        Some((ouid, ogid, mode)) => {
+            let m = mode as u32;
+            let class = if uid == ouid {
+                (m >> 6) & 7
+            } else if process::current_gid() == ogid {
+                (m >> 3) & 7
+            } else {
+                m & 7
+            };
+            class & want == want
+        }
+    }
+}
+
+/// 目录条目修改（创建 / 删除 / 重命名）所需权限：对目录 写 + 搜索。
+fn acl_dir_write(dev: u32, dir_ino: u32) -> bool {
+    acl_allows(dev, dir_ino, ACL_W | ACL_X)
+}
+
+/// 无归属文件任何人可处理；带归属文件只有所有者或 root 可删除 / 改名 / chmod。
+fn acl_owner_or_root(dev: u32, ino: u32) -> bool {
+    let uid = process::current_uid();
+    if uid == 0 {
+        return true;
+    }
+    match fsops::fs_owner(dev, ino) {
+        None => true,
+        Some((ouid, _, _)) => ouid == uid,
+    }
+}
+
+/// open 所需权限：读 / 写 / 读写，O_TRUNC 额外需要写。
+fn acl_want_for_open(flags: u32, typ: u16) -> u32 {
+    let acc = flags & 3;
+    let mut w = if acc == O_RDONLY {
+        ACL_R
+    } else if acc == O_WRONLY {
+        ACL_W
+    } else {
+        ACL_R | ACL_W
+    };
+    if typ == T_REG && flags & O_TRUNC != 0 {
+        w |= ACL_W;
+    }
+    w
+}
+
+/// (uid, gid, mode)：路径对应 inode 的归属；无归属返回 None（供 stat）。
+pub fn owner_of_path(path: &str) -> Option<(u32, u32, u16)> {
+    let mut d = 0u32;
+    let mut i = 0u32;
+    if resolve(path, &mut d, &mut i) != 0 {
+        return None;
+    }
+    fsops::fs_owner(d, i)
+}
+
+/// 已打开文件的归属（供 fstat）。
+pub fn owner_of_fd(fd: i32) -> Option<(u32, u32, u16)> {
+    let entry = process::get_fd(fd)?;
+    if entry.kind != FdKind::File {
+        return None;
+    }
+    let of = unsafe { OPEN_FILES[entry.index] };
+    if !of.used {
+        return None;
+    }
+    fsops::fs_owner(of.dev, of.ino)
+}
+
+/// chmod / chown 的公共实现。
+/// - root：任意修改；
+/// - 非 root：只能 chmod 自己拥有的、带归属的文件，且不能改变所有者；
+///   chown 到自己当前的 uid/gid（空操作）允许。
+fn set_owner_checked(dev: u32, ino: u32, uid: Option<u32>, gid: Option<u32>, mode: Option<u16>) -> i32 {
+    let cur = process::current_uid();
+    if cur != 0 {
+        let Some((ouid, _, _)) = fsops::fs_owner(dev, ino) else { return EPERM };
+        if ouid != cur {
+            return EPERM;
+        }
+        if let Some(u) = uid {
+            if u != cur {
+                return EPERM;
+            }
+        }
+        if let Some(g) = gid {
+            if g != process::current_gid() {
+                return EPERM;
+            }
+        }
+    }
+    fsops::fs_set_owner(dev, ino, uid, gid, mode)
+}
+
+/// 按路径 chmod（跟随符号链接）。成功 0，失败负 errno。
+pub fn chmod_path(path: &str, mode: u16) -> i32 {
+    let mut d = 0u32;
+    let mut i = 0u32;
+    if resolve(path, &mut d, &mut i) != 0 {
+        return -2;
+    }
+    set_owner_checked(d, i, None, None, Some(mode))
+}
+
+/// 按路径 chown（跟随符号链接）；`None` 表示不改（Linux 的 -1）。
+pub fn chown_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> i32 {
+    let mut d = 0u32;
+    let mut i = 0u32;
+    if resolve(path, &mut d, &mut i) != 0 {
+        return -2;
+    }
+    set_owner_checked(d, i, uid, gid, None)
+}
+
+/// 按 fd chmod。
+pub fn chmod_fd(fd: i32, mode: u16) -> i32 {
+    let Some(entry) = process::get_fd(fd) else { return -9 };
+    if entry.kind != FdKind::File {
+        return -9;
+    }
+    let of = unsafe { OPEN_FILES[entry.index] };
+    if !of.used {
+        return -9;
+    }
+    set_owner_checked(of.dev, of.ino, None, None, Some(mode))
+}
+
+/// 按 fd chown。
+pub fn chown_fd(fd: i32, uid: Option<u32>, gid: Option<u32>) -> i32 {
+    let Some(entry) = process::get_fd(fd) else { return -9 };
+    if entry.kind != FdKind::File {
+        return -9;
+    }
+    let of = unsafe { OPEN_FILES[entry.index] };
+    if !of.used {
+        return -9;
+    }
+    set_owner_checked(of.dev, of.ino, uid, gid, None)
 }
 
 /// 读取已打开文件的大小（字节），失败返回 -1。

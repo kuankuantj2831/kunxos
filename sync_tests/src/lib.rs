@@ -3,7 +3,7 @@
 //! 两种编译模式：
 //!   - `cargo test`（宿主 / x86_64，cfg(test)）：std 可用，运行全部
 //!     单元测试与 mock DAV 服务器集成测试；
-//!   - `cargo build --target aarch64-unknown-none`（CI 全仓构建循环）：
+//!   - `cargo build --target riscv64gc-unknown-none-elf`（CI 全仓构建循环）：
 //!     非 test 模式编译为 no_std rlib，保证同步栈在裸机目标可编译。
 //!
 //! 平台实现（host）：
@@ -23,3 +23,7 @@ mod host;
 mod integration;
 #[cfg(test)]
 mod storage_regression;
+#[cfg(test)]
+mod storage_state_regression;
+#[cfg(test)]
+mod storage_power_loss;

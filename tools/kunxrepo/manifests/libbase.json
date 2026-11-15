@@ -9,5 +9,5 @@
   "dependencies": {"libc": ">=1.0.0"},
   "provides": [],
   "conflicts": [],
-  "_elf": "kunxpkg/target/aarch64-unknown-none/release/kunxpkg"
+  "_elf": "kunxpkg/target/riscv64gc-unknown-none-elf/release/kunxpkg"
 }

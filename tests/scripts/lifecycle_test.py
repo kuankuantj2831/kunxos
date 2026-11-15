@@ -37,79 +37,42 @@
 用法：python3 tests/scripts/lifecycle_test.py [logfile]
 退出码：0 = 全部通过，1 = 有失败。
 """
-import os
+from qemu_test import Guest, kernel_path, temp_path, qemu_command
 import re
-import subprocess
 import sys
 import tempfile
-import threading
 import time
 
-KERNEL = os.path.abspath(os.environ.get("KERNEL", "kunxcore/kernel.img"))
-LOGFILE = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "/tmp/kx_life.log"
+KERNEL = kernel_path()
+LOGFILE = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else temp_path("kx_life.log")
 BOOT_TIMEOUT = 120
 
 WORKDIR = tempfile.mkdtemp(prefix="kxl_")
-PIPE = os.path.join(WORKDIR, "kx")
-os.mkfifo(PIPE + ".in")
-os.mkfifo(PIPE + ".out")
 
-# RISC-V 移植后（2026-09 架构切换）重定向：QEMU/BIOS 与顶层 Makefile 同源，
-# 可用环境变量 QEMU / BIOS 覆盖；AC97（aarch64 遗留）换 virtio-sound。
-QEMU = os.environ.get(
-    "QEMU", os.path.expanduser("~/qemu-riscv-pkgs/root/usr/bin/qemu-system-riscv64"))
-BIOS = os.environ.get(
-    "BIOS", os.path.expanduser(
-        "~/qemu-riscv-pkgs/root/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"))
 
-cmd = [
-    QEMU, "-M", "virt", "-accel", "tcg", "-cpu", "rv64", "-bios", BIOS, "-m", "512M",
+cmd = qemu_command() + [
+
     "-kernel", KERNEL, "-append", "shell",
-    "-serial", "pipe:" + PIPE,
-    "-no-reboot", "-display", "none",
+    "-serial", "stdio",
+    "-no-reboot", "-display", "none", "-device", "ramfb",
     "-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0",
     "-device", "virtio-rng-device",
     "-audiodev", "none,id=aud0", "-device", "virtio-sound-device,audiodev=aud0",
 ]
-logf = open(LOGFILE, "wb")
-p = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-log = bytearray()
-stop = False
+guest = Guest(cmd, LOGFILE, cwd=WORKDIR)
+p = guest.process
+log = guest.log
 results = []
 
 
-def reader():
-    try:
-        outfd = os.open(PIPE + ".out", os.O_RDONLY)
-    except OSError:
-        return
-    while not stop:
-        try:
-            data = os.read(outfd, 4096)
-        except OSError:
-            break
-        if not data:
-            time.sleep(0.02)
-            continue
-        log.extend(data)
-        logf.write(data)
-        logf.flush()
-
-
-t = threading.Thread(target=reader, daemon=True)
-t.start()
-
-
-def send(cmdline: str):
-    infd = os.open(PIPE + ".in", os.O_WRONLY)
-    os.write(infd, cmdline.encode() + b"\n")
-    os.close(infd)
+def send(cmdline):
+    guest.send(cmdline.encode() + b"\n")
 
 
 def check(name: str, cond: bool):
     results.append((name, cond))
     print(f"[life] {'OK  ' if cond else 'FAIL'} {name}")
-    logf.write(f"[check] {'OK' if cond else 'FAIL'} {name}\n".encode())
+    guest.log_file.write(f"[check] {'OK' if cond else 'FAIL'} {name}\n".encode())
 
 
 def wait_for(marker: str, timeout: float = BOOT_TIMEOUT):
@@ -289,14 +252,7 @@ try:
     check("state read", run_cmd_and_wait("cat /data/state/sample.bin", "save-test-123", 3.0))
 
 finally:
-    send("poweroff")
-    time.sleep(0.5)
-    stop = True
-    try:
-        p.wait(timeout=5)
-    except Exception:
-        p.kill()
-    logf.close()
+    guest.close()
 
 fails = [n for n, ok in results if not ok]
 print(f"\n[life] {len(results) - len(fails)}/{len(results)} passed")

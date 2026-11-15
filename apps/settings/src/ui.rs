@@ -313,31 +313,10 @@ pub(crate) fn font_px() -> f32 {
 // ==================== 渐变背景 ====================
 
 pub(crate) fn draw_gradient_bg() {
-    let base = c_page();
-    let cr = ((base >> 16) & 0xFF) as u32;
-    let cg = ((base >> 8) & 0xFF) as u32;
-    let cb = (base & 0xFF) as u32;
-    let (lift, sink) = if dark_on() { (0, 24) } else { (20, 16) };
-    let (tr, tg, tb) = ((cr + lift).min(255), (cg + lift).min(255), (cb + lift).min(255));
-    let (br, bg_, bb) = (
-        cr.saturating_sub(sink),
-        cg.saturating_sub(sink),
-        cb.saturating_sub(sink),
-    );
-    for y in 0..display_h() as i32 {
-        let t = (y as u32 * 255 / display_h() as u32).min(255);
-        let inv = 255 - t;
-        let r = (tr * inv + br * t) / 255;
-        let g = (tg * inv + bg_ * t) / 255;
-        let b = (tb * inv + bb * t) / 255;
-        let row = (r << 16) | (g << 8) | b;
-        let iy = y as usize * display_w();
-        unsafe {
-            for x in 0..display_w() {
-                BACK_BUF[iy + x] = row;
-            }
-        }
-    }
+    let palette = if dark_on() { (0x000D142B, 0x00283152, 0x006B69B6) }
+        else { sys_nav::glass::starlight::LIGHT };
+    unsafe { sys_nav::glass::starlight::paint(&mut BACK_BUF, display_w(), display_h(),
+        (0, 0, display_w() as i32, display_h() as i32), palette); }
 }
 
 // ==================== 标题栏 ====================

@@ -579,7 +579,7 @@ pub fn fb_target() -> usize {
 /// 当前 front 缓冲物理地址（正在扫描输出的缓冲）。
 #[allow(dead_code)]
 pub fn front_buffer() -> usize {
-    unsafe { C.front as usize }
+    unsafe { if gpu_simple::uses_host_resource() { C.back as usize } else { C.front as usize } }
 }
 
 /// 待翻转的 back 缓冲物理地址（合成器自绘/overlay 的正确绘制目标：
@@ -1395,7 +1395,8 @@ pub fn restore_back_from_canvas(x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
-/// 将已合成的脏区复制到固定扫描缓冲。ramfb 配置只在绑定或模式改变时更新。
+/// ramfb copies damage into a fixed scanout. virtio-gpu uploads directly from
+/// the composition buffer; its completed fence makes subsequent reuse safe.
 pub fn present() {
     unsafe {
         if C.width == 0 {
@@ -1415,10 +1416,16 @@ pub fn present() {
             rects[0] = Rect::new(0, 0, C.width, C.height);
             count = 1;
         }
-        for r in &rects[..count] {
-            copy_rect_pixels(C.back, C.front, *r, C.width as usize);
+        if gpu_simple::uses_host_resource() {
+            // Host resources retain all unchanged pixels. Avoid a second guest
+            // CPU copy (back -> front) on the virtio-gpu path.
+            gpu_simple::present_rects(C.back as usize, &rects[..count]);
+        } else {
+            for r in &rects[..count] {
+                copy_rect_pixels(C.back, C.front, *r, C.width as usize);
+            }
+            gpu_simple::present_rects(C.front as usize, &rects[..count]);
         }
-        gpu_simple::present_rects(C.front as usize, &rects[..count]);
         crate::perf::note_frame();
     }
 }

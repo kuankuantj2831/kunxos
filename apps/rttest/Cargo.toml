@@ -1,0 +1,15 @@
+[package]
+name = "rttest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kunxrt = { path = "../../shared/runtime", features = ["memory-symbols"] }
+kunxfont = { path = "../../shared/font" }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+
