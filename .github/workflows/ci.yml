@@ -92,7 +92,15 @@ jobs:
           python3 tests/scripts/test_qemu_test.py
 
       - name: Install RISC-V QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-misc
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc
+          # 新版 Ubuntu（qemu 10.x）把 riscv64 拆到独立的 qemu-system-riscv 包。
+          if ! command -v qemu-system-riscv64 >/dev/null; then
+            sudo apt-get install -y qemu-system-riscv
+          fi
+          qemu-system-riscv64 --version
 
       - name: Run RISC-V guest regressions
         run: |
